@@ -1,0 +1,52 @@
+[package]
+name = "ctdozlite"
+version = "0.1.0"
+edition = "2021"
+authors = ["TIPC1110 <tienichpc1110@gmail.com>"]
+description = "Lightweight, high-performance native Zalo PC client written in Rust (zero Node.js, zero Electron)"
+repository = "https://github.com/ctdoteam1110/ctdozlite"
+license = "MIT OR Apache-2.0"
+default-run = "zalo-rust"
+
+[dependencies]
+aes = "0.8"
+cbc = "0.1"
+cipher = "0.4"
+md-5 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+anyhow = "1"
+qrcode = { version = "0.14.1", default-features = false }
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+ratatui = "0.29"
+crossterm = "0.28"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[lib]
+name = "zalo_rust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zalo-rust"
+path = "src/main.rs"
+
+[[bin]]
+name = "test_fetch"
+path = "src/bin/test_fetch.rs"
+
+[[bin]]
+name = "probe_media"
+path = "src/bin/probe_media.rs"
+
+[[bin]]
+name = "compare"
+path = "src/bin/compare.rs"
+
+[[bin]]
+name = "test_qr_tag"
+path = "src/bin/test_qr_tag.rs"

@@ -1,0 +1,36 @@
+# Rust build artifacts
+target/
+
+# Active session credentials and tokens (CRITICAL: NEVER COMMIT)
+session.json
+session*.json
+session*.bak
+
+# Local message caches & databases
+threads_cache.json
+threads_cache*.json
+*.db
+*.db-shm
+*.db-wal
+zalo_history.db
+
+# Media and packet capture caches
+stickers_cache/
+dump/
+qr.png
+*.flow
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.log
+src.bak*
+.env
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# OS files
+.DS_Store
+Thumbs.db
