@@ -175,9 +175,21 @@ pub fn call_target_allowed(partner_id: &str, partner_name: &str, is_group: bool)
     if partner_id.trim_start().to_ascii_lowercase().starts_with("group") {
         return false;
     }
-    call_name_allowed(partner_name) || call_name_allowed(partner_id)
+    if call_name_allowed(partner_name) || call_name_allowed(partner_id) {
+        return true;
+    }
+    // When `dispatch_send_signal_inner` only has `calleeId` (`partner_name == ""`), look up the
+    // contact's display name in the local gitignored `threads_cache.json` so allowlisted contacts
+    // (Hoang, Đỗ Thành, ĐTC) work out of the box without hardcoding live UIDs in Git.
+    if !id.is_empty() && partner_name.trim().is_empty() {
+        for t in crate::chat::load_threads_cache() {
+            if !t.is_group && only_digits(&t.id) == id && call_name_allowed(&t.name) {
+                return true;
+            }
+        }
+    }
+    false
 }
-
 /// Same as [`call_target_allowed`], returning the Vietnamese refusal reason for the UI.
 pub fn ensure_call_target_allowed(
     partner_id: &str,

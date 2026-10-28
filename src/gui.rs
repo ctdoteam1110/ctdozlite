@@ -5848,308 +5848,513 @@ impl ZaloGuiApp {
         let Some(mut call) = self.active_call.clone() else {
             return;
         };
-        // Keep timer updating every second while call modal is visible
-        ctx.request_repaint_after(Duration::from_secs(1));
+        // Keep timer and pulse animation updating smoothly while call modal is visible
+        ctx.request_repaint_after(Duration::from_millis(250));
 
-        let elapsed = call.started_at.elapsed().as_secs();
+        if ctx.input(|i| i.key_pressed(Key::Escape)) && call.error_reason.is_some() {
+            self.active_call = None;
+            return;
+        }
+
+        let elapsed_f = call.started_at.elapsed().as_secs_f32();
+        let elapsed = elapsed_f as u64;
         let mins = elapsed / 60;
         let secs = elapsed % 60;
         let timer_str = format!("{mins:02}:{secs:02}");
 
-        let title = if call.is_video {
-            format!("{} Cuộc gọi Video Zalo (In-App + ZRTP)", lucide::VIDEO)
-        } else {
-            format!("{} Cuộc gọi Thoại Zalo (In-App + ZRTP)", lucide::PHONE)
-        };
-
+        let screen_rect = ctx.screen_rect();
         let mut hangup_clicked = false;
+        let mut retry_clicked = false;
 
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .default_width((ctx.screen_rect().width() * 0.76).clamp(280.0, 380.0))
-            .frame(
-                egui::Frame::window(&ctx.style())
-                    .fill(pal.bg_elevated)
-                    .rounding(Rounding::same(16.0))
-                    .stroke(Stroke::new(1.5_f32, pal.primary))
-                    .inner_margin(Margin::symmetric(24.0, 20.0)),
-            )
+        // 1. Dimmed theater backdrop
+        egui::Area::new(Id::new("call_overlay_backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen_rect.min)
             .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(6.0);
-                    // Partner Avatar Circle
-                    let (av_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(72.0, 72.0), Sense::hover());
-                    let call_ava = self
-                        .threads
-                        .iter()
-                        .find(|t| t.id == call.partner_id || t.name == call.partner_name)
-                        .and_then(|t| t.avatar.as_deref());
-                    paint_user_avatar(
-                        ui.painter(),
-                        av_rect.center(),
-                        36.0,
-                        &call.partner_name,
-                        call.is_group,
-                        call_ava,
-                        &self.sticker_textures,
-                        &mut self.loading_stickers,
-                    );
-                    ui.painter().circle_stroke(
-                        av_rect.center(),
-                        36.0,
-                        Stroke::new(2.0_f32, pal.primary),
-                    );
-
-                    ui.add_space(10.0);
-                    ui.label(
-                        RichText::new(&call.partner_name)
-                            .size(17.5)
-                            .color(pal.text_primary)
-                            .strong(),
-                    );
-                    if !call.partner_id.is_empty() {
-                        ui.label(
-                            RichText::new(format!("UID: {}", call.partner_id))
-                                .size(11.5)
-                                .color(pal.text_muted),
-                        );
-                    }
-
-                    ui.add_space(6.0);
-                    if let Some(ref err_msg) = call.error_reason {
-                        ui.label(
-                            RichText::new(&call.state_label)
-                                .size(13.5)
-                                .color(pal.danger)
-                                .strong(),
-                        );
-                        ui.add_space(6.0);
-                        egui::Frame::none()
-                            .fill(pal.danger.linear_multiply(0.14))
-                            .stroke(Stroke::new(1.0_f32, pal.danger))
-                            .rounding(Rounding::same(8.0))
-                            .inner_margin(Margin::symmetric(12.0, 8.0))
-                            .show(ui, |ui| {
-                                ui.vertical_centered(|ui| {
-                                    ui.label(
-                                        RichText::new(format!("[!] {err_msg}"))
-                                            .size(12.5)
-                                            .color(pal.text_primary)
-                                            .strong(),
-                                    );
-                                    if call.error_code == Some(7) {
-                                        ui.add_space(3.0);
-                                        ui.label(
-                                            RichText::new(
-                                                "Gợi ý: Tài khoản hiện tại chưa kết bạn (isFr=0) với người này nên máy chủ Zalo chặn cuộc gọi trước khi đổ chuông.",
-                                            )
-                                            .size(11.0)
-                                            .color(pal.text_secondary),
-                                        );
-                                        if !call.partner_id.is_empty() && !call.is_group {
-                                            ui.add_space(6.0);
-                                            let add_fr_btn = egui::Button::new(
-                                                RichText::new("+ Gửi lời mời kết bạn")
-                                                    .size(12.0)
-                                                    .color(Color32::WHITE)
-                                                    .strong(),
-                                            )
-                                            .fill(pal.primary)
-                                            .rounding(Rounding::same(6.0))
-                                            .min_size(Vec2::new(150.0, 28.0));
-                                            if ui
-                                                .add(add_fr_btn)
-                                                .on_hover_cursor(CursorIcon::PointingHand)
-                                                .clicked()
-                                            {
-                                                if let Some(tx) = WORKER_TX.get() {
-                                                    let _ = tx.send(WorkerCmd::AddFriend {
-                                                        user_id: call.partner_id.clone(),
-                                                        user_name: call.partner_name.clone(),
-                                                    });
-                                                }
-                                                call.state_label =
-                                                    "Đã gửi lời mời kết bạn! Hãy chờ đối phương đồng ý.".into();
-                                            }
-                                        }
-                                    } else if call.error_code == Some(1) {
-                                        ui.add_space(3.0);
-                                        ui.label(
-                                            RichText::new(
-                                                "Gợi ý: Hội thoại này là tài khoản hệ thống / Cloud của tôi nên không hỗ trợ cuộc gọi thoại/video.",
-                                            )
-                                            .size(11.0)
-                                            .color(pal.text_secondary),
-                                        );
-                                    }
-                                });
-                            });
-                    } else {
-                        ui.label(
-                            RichText::new(format!("{} · {timer_str}", call.state_label))
-                                .size(13.5)
-                                .color(pal.accent_online)
-                                .strong(),
-                        );
-                    }
-
-                    ui.add_space(14.0);
-                    if call.is_incoming_ringing && call.error_reason.is_none() {
-                        ui.horizontal(|ui| {
-                            let avail = ui.available_width();
-                            ui.add_space((avail - 210.0).max(0.0) * 0.5);
-
-                            let accept_btn = egui::Button::new(
-                                RichText::new(format!("{} Nghe máy", lucide::PHONE_CALL))
-                                    .size(13.0)
-                                    .color(Color32::WHITE)
-                                    .strong(),
-                            )
-                            .fill(pal.accent_online)
-                            .rounding(Rounding::same(8.0))
-                            .min_size(Vec2::new(98.0, 36.0));
-                            if ui
-                                .add(accept_btn)
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .clicked()
-                            {
-                                call.is_incoming_ringing = false;
-                                call.state_label = "Đang kết nối cuộc gọi…".into();
-                                if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::AnswerCall { accept: true });
-                                }
-                            }
-
-                            let decline_btn = egui::Button::new(
-                                RichText::new(format!("{} Từ chối", lucide::PHONE_OFF))
-                                    .size(13.0)
-                                    .color(Color32::WHITE)
-                                    .strong(),
-                            )
-                            .fill(pal.danger)
-                            .rounding(Rounding::same(8.0))
-                            .min_size(Vec2::new(98.0, 36.0));
-                            if ui
-                                .add(decline_btn)
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .clicked()
-                            {
-                                if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::AnswerCall { accept: false });
-                                }
-                                self.active_call = None;
-                                return;
-                            }
-                        });
-                    } else {
-                        ui.horizontal(|ui| {
-                            let avail = ui.available_width();
-                            ui.add_space((avail - 280.0).max(0.0) * 0.5);
-
-                            // Mic Toggle
-                            let mic_label = if call.mic_muted {
-                                format!("{} Bật Mic", lucide::MIC_OFF)
-                            } else {
-                                format!("{} Tắt Mic", lucide::MIC)
-                            };
-                            let mic_btn = egui::Button::new(
-                                RichText::new(mic_label)
-                                    .size(12.5)
-                                    .color(pal.text_primary)
-                                    .strong(),
-                            )
-                            .fill(if call.mic_muted {
-                                pal.warning.linear_multiply(0.25)
-                            } else {
-                                pal.bg_input
-                            })
-                            .rounding(Rounding::same(8.0))
-                            .min_size(Vec2::new(84.0, 34.0));
-                            if ui
-                                .add(mic_btn)
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .clicked()
-                            {
-                                call.mic_muted = !call.mic_muted;
-                                if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::SetCallMediaState {
-                                        is_on_mic: !call.mic_muted,
-                                        is_on_cam: call.cam_enabled,
-                                    });
-                                }
-                            }
-
-                            // Camera Toggle
-                            let cam_label = if call.cam_enabled {
-                                format!("{} Tắt Cam", lucide::VIDEO_OFF)
-                            } else {
-                                format!("{} Bật Cam", lucide::CAMERA)
-                            };
-                            let cam_btn = egui::Button::new(
-                                RichText::new(cam_label)
-                                    .size(12.5)
-                                    .color(pal.text_primary)
-                                    .strong(),
-                            )
-                            .fill(if call.cam_enabled {
-                                pal.primary.linear_multiply(0.25)
-                            } else {
-                                pal.bg_input
-                            })
-                            .rounding(Rounding::same(8.0))
-                            .min_size(Vec2::new(84.0, 34.0));
-                            if ui
-                                .add(cam_btn)
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .clicked()
-                            {
-                                call.cam_enabled = !call.cam_enabled;
-                                call.is_video = call.cam_enabled;
-                                if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::SetCallMediaState {
-                                        is_on_mic: !call.mic_muted,
-                                        is_on_cam: call.cam_enabled,
-                                    });
-                                }
-                            }
-
-                            // End Call / Close Button
-                            let end_text = if call.error_reason.is_some() {
-                                format!("{} Đóng", lucide::X)
-                            } else {
-                                format!("{} Kết thúc", lucide::PHONE_OFF)
-                            };
-                            let end_btn = egui::Button::new(
-                                RichText::new(end_text)
-                                    .size(12.5)
-                                    .color(Color32::WHITE)
-                                    .strong(),
-                            )
-                            .fill(pal.danger)
-                            .rounding(Rounding::same(8.0))
-                            .min_size(Vec2::new(92.0, 34.0));
-                            if ui
-                                .add(end_btn)
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .clicked()
-                            {
-                                hangup_clicked = true;
-                            }
-                        });
-                    }
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("100% Pure-Rust VoIP Signaling (Không dùng tiến trình ZaloCall.exe)")
-                            .size(10.5)
-                            .color(pal.text_muted),
-                    );
-                });
+                let (bg_rect, bg_resp) =
+                    ui.allocate_exact_size(screen_rect.size(), Sense::click());
+                ui.painter().rect_filled(
+                    bg_rect,
+                    Rounding::ZERO,
+                    Color32::from_rgba_unmultiplied(5, 8, 17, 210),
+                );
+                if bg_resp.clicked() && call.error_reason.is_some() {
+                    hangup_clicked = true;
+                }
             });
 
-        if hangup_clicked {
+        let card_w = (screen_rect.width() * 0.84).clamp(300.0, 344.0);
+        let has_err = call.error_reason.is_some();
+        let card_h = if has_err { 356.0 } else { 368.0 };
+        let card_rect = Rect::from_center_size(screen_rect.center(), Vec2::new(card_w, card_h));
+
+        let call_ava = self
+            .threads
+            .iter()
+            .find(|t| t.id == call.partner_id || t.name == call.partner_name)
+            .and_then(|t| t.avatar.as_deref());
+
+        egui::Area::new(Id::new("call_overlay_card"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(card_rect.min)
+            .show(ctx, |ui| {
+                let border_col = if has_err {
+                    Color32::from_rgba_unmultiplied(239, 68, 68, 120)
+                } else {
+                    Color32::from_rgba_unmultiplied(59, 130, 246, 110)
+                };
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(15, 23, 42))
+                    .stroke(Stroke::new(1.2_f32, border_col))
+                    .rounding(Rounding::same(22.0))
+                    .inner_margin(Margin::symmetric(22.0, 18.0))
+                    .show(ui, |ui| {
+                        ui.set_width(card_w - 44.0);
+
+                        // Top Bar: Encrypted ZRTP Pill + Subtle Close Icon
+                        ui.horizontal(|ui| {
+                            let pill_col = if has_err {
+                                pal.danger.linear_multiply(0.16)
+                            } else {
+                                pal.accent_online.linear_multiply(0.15)
+                            };
+                            let pill_fg = if has_err {
+                                Color32::from_rgb(252, 165, 165)
+                            } else {
+                                Color32::from_rgb(110, 231, 183)
+                            };
+                            let badge_txt = if call.is_video {
+                                format!("{} Zalo Video · ZRTP", lucide::VIDEO)
+                            } else {
+                                format!("{} Zalo Voice · ZRTP", lucide::SHIELD_CHECK)
+                            };
+                            egui::Frame::none()
+                                .fill(pill_col)
+                                .rounding(Rounding::same(12.0))
+                                .inner_margin(Margin::symmetric(10.0, 4.0))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(badge_txt)
+                                            .size(11.0)
+                                            .color(pill_fg)
+                                            .strong(),
+                                    );
+                                });
+
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let (x_rect, x_resp) =
+                                    ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+                                if x_resp.hovered() {
+                                    ui.painter().circle_filled(
+                                        x_rect.center(),
+                                        14.0,
+                                        Color32::from_rgb(30, 41, 59),
+                                    );
+                                }
+                                draw_lucide_icon(
+                                    ui.painter(),
+                                    x_rect.center(),
+                                    lucide::X,
+                                    14.5,
+                                    pal.text_secondary,
+                                );
+                                if x_resp
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("Đóng / Kết thúc cuộc gọi")
+                                    .clicked()
+                                {
+                                    hangup_clicked = true;
+                                }
+                            });
+                        });
+
+                        ui.add_space(16.0);
+
+                        // Center Avatar with Pulsing Ring Halo
+                        ui.vertical_centered(|ui| {
+                            let (av_rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(92.0), Sense::hover());
+                            let center = av_rect.center();
+                            let ring_col = if has_err {
+                                pal.danger
+                            } else if call.is_incoming_ringing {
+                                pal.accent_online
+                            } else {
+                                pal.primary_hover
+                            };
+                            let pulse = ((elapsed_f * 2.6).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+                            ui.painter().circle_filled(
+                                center,
+                                42.0 + pulse * 5.0,
+                                ring_col.linear_multiply(0.10),
+                            );
+                            ui.painter().circle_stroke(
+                                center,
+                                40.0,
+                                Stroke::new(1.8_f32, ring_col.linear_multiply(0.75)),
+                            );
+                            paint_user_avatar(
+                                ui.painter(),
+                                center,
+                                37.0,
+                                &call.partner_name,
+                                call.is_group,
+                                call_ava,
+                                &self.sticker_textures,
+                                &mut self.loading_stickers,
+                            );
+
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new(&call.partner_name)
+                                    .size(18.5)
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            );
+                            ui.add_space(3.0);
+
+                            if let Some(ref err_msg) = call.error_reason {
+                                ui.label(
+                                    RichText::new("Cuộc gọi chưa kết nối được")
+                                        .size(12.5)
+                                        .color(Color32::from_rgb(248, 113, 113))
+                                        .strong(),
+                                );
+                                ui.add_space(8.0);
+                                let clean_err = err_msg
+                                    .strip_prefix("Lỗi khởi tạo cuộc gọi (401): ")
+                                    .unwrap_or(err_msg);
+                                egui::Frame::none()
+                                    .fill(Color32::from_rgba_unmultiplied(127, 29, 29, 68))
+                                    .stroke(Stroke::new(
+                                        1.0_f32,
+                                        Color32::from_rgba_unmultiplied(239, 68, 68, 110),
+                                    ))
+                                    .rounding(Rounding::same(12.0))
+                                    .inner_margin(Margin::symmetric(12.0, 8.0))
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(clean_err)
+                                                    .size(11.8)
+                                                    .color(Color32::from_rgb(254, 226, 226)),
+                                            )
+                                            .wrap(),
+                                        );
+                                    });
+                            } else {
+                                ui.label(
+                                    RichText::new(&call.state_label)
+                                        .size(12.8)
+                                        .color(Color32::from_rgb(148, 163, 184)),
+                                );
+                                ui.add_space(4.0);
+                                egui::Frame::none()
+                                    .fill(Color32::from_rgb(30, 41, 59))
+                                    .rounding(Rounding::same(10.0))
+                                    .inner_margin(Margin::symmetric(12.0, 3.0))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(&timer_str)
+                                                .monospace()
+                                                .size(14.0)
+                                                .color(pal.accent_online)
+                                                .strong(),
+                                        );
+                                    });
+                            }
+
+                            ui.add_space(18.0);
+
+                            // Bottom Action Dock: Circular Native Call Controls
+                            if has_err {
+                                ui.horizontal(|ui| {
+                                    let w = ui.available_width();
+                                    ui.add_space(((w - 216.0) * 0.5).max(0.0));
+
+                                    let retry_btn = egui::Button::new(
+                                        RichText::new(format!("{} Gọi lại", lucide::PHONE_CALL))
+                                            .size(12.8)
+                                            .color(Color32::WHITE)
+                                            .strong(),
+                                    )
+                                    .fill(pal.primary)
+                                    .rounding(Rounding::same(18.0))
+                                    .min_size(Vec2::new(104.0, 36.0));
+                                    if ui
+                                        .add(retry_btn)
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        retry_clicked = true;
+                                    }
+
+                                    let close_btn = egui::Button::new(
+                                        RichText::new(format!("{} Đóng", lucide::X))
+                                            .size(12.8)
+                                            .color(Color32::from_rgb(226, 232, 240))
+                                            .strong(),
+                                    )
+                                    .fill(Color32::from_rgb(30, 41, 59))
+                                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(51, 65, 85)))
+                                    .rounding(Rounding::same(18.0))
+                                    .min_size(Vec2::new(100.0, 36.0));
+                                    if ui
+                                        .add(close_btn)
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        hangup_clicked = true;
+                                    }
+                                });
+                            } else if call.is_incoming_ringing {
+                                ui.horizontal(|ui| {
+                                    let w = ui.available_width();
+                                    ui.add_space(((w - 156.0) * 0.5).max(0.0));
+
+                                    // Circular Decline Button
+                                    ui.vertical(|ui| {
+                                        let (dec_r, dec_resp) = ui.allocate_exact_size(
+                                            Vec2::splat(52.0),
+                                            Sense::click(),
+                                        );
+                                        ui.painter().circle_filled(
+                                            dec_r.center(),
+                                            25.0,
+                                            pal.danger,
+                                        );
+                                        draw_lucide_icon(
+                                            ui.painter(),
+                                            dec_r.center(),
+                                            lucide::PHONE_OFF,
+                                            20.0,
+                                            Color32::WHITE,
+                                        );
+                                        if dec_resp
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .on_hover_text("Từ chối cuộc gọi")
+                                            .clicked()
+                                        {
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                let _ =
+                                                    tx.send(WorkerCmd::AnswerCall { accept: false });
+                                            }
+                                            hangup_clicked = true;
+                                        }
+                                        ui.label(
+                                            RichText::new("Từ chối")
+                                                .size(11.0)
+                                                .color(pal.text_secondary),
+                                        );
+                                    });
+
+                                    ui.add_space(44.0);
+
+                                    // Circular Accept Button
+                                    ui.vertical(|ui| {
+                                        let (acc_r, acc_resp) = ui.allocate_exact_size(
+                                            Vec2::splat(52.0),
+                                            Sense::click(),
+                                        );
+                                        ui.painter().circle_filled(
+                                            acc_r.center(),
+                                            25.0,
+                                            pal.accent_online,
+                                        );
+                                        draw_lucide_icon(
+                                            ui.painter(),
+                                            acc_r.center(),
+                                            lucide::PHONE_CALL,
+                                            20.0,
+                                            Color32::WHITE,
+                                        );
+                                        if acc_resp
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .on_hover_text("Nghe máy")
+                                            .clicked()
+                                        {
+                                            call.is_incoming_ringing = false;
+                                            call.state_label = "Đang kết nối cuộc gọi…".into();
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                let _ =
+                                                    tx.send(WorkerCmd::AnswerCall { accept: true });
+                                            }
+                                        }
+                                        ui.label(
+                                            RichText::new("Nghe máy")
+                                                .size(11.0)
+                                                .color(pal.accent_online),
+                                        );
+                                    });
+                                });
+                            } else {
+                                // Active / Outgoing Call: Circular Mic · Hangup · Camera Dock
+                                ui.horizontal(|ui| {
+                                    let w = ui.available_width();
+                                    ui.add_space(((w - 204.0) * 0.5).max(0.0));
+                                    ui.spacing_mut().item_spacing.x = 22.0;
+
+                                    // 1) Circular Mic Button
+                                    let (mic_r, mic_resp) =
+                                        ui.allocate_exact_size(Vec2::splat(48.0), Sense::click());
+                                    let mic_bg = if call.mic_muted {
+                                        pal.warning.linear_multiply(0.28)
+                                    } else if mic_resp.hovered() {
+                                        Color32::from_rgb(51, 65, 85)
+                                    } else {
+                                        Color32::from_rgb(30, 41, 59)
+                                    };
+                                    ui.painter().circle_filled(mic_r.center(), 23.0, mic_bg);
+                                    ui.painter().circle_stroke(
+                                        mic_r.center(),
+                                        23.0,
+                                        Stroke::new(
+                                            1.0_f32,
+                                            if call.mic_muted {
+                                                pal.warning
+                                            } else {
+                                                Color32::from_rgb(71, 85, 105)
+                                            },
+                                        ),
+                                    );
+                                    draw_lucide_icon(
+                                        ui.painter(),
+                                        mic_r.center(),
+                                        if call.mic_muted {
+                                            lucide::MIC_OFF
+                                        } else {
+                                            lucide::MIC
+                                        },
+                                        18.5,
+                                        if call.mic_muted {
+                                            pal.warning
+                                        } else {
+                                            Color32::WHITE
+                                        },
+                                    );
+                                    if mic_resp
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .on_hover_text(if call.mic_muted {
+                                            "Bật Mic"
+                                        } else {
+                                            "Tắt Mic"
+                                        })
+                                        .clicked()
+                                    {
+                                        call.mic_muted = !call.mic_muted;
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let _ = tx.send(WorkerCmd::SetCallMediaState {
+                                                is_on_mic: !call.mic_muted,
+                                                is_on_cam: call.cam_enabled,
+                                            });
+                                        }
+                                    }
+
+                                    // 2) Prominent Circular Red Hangup Button
+                                    let (end_r, end_resp) =
+                                        ui.allocate_exact_size(Vec2::splat(56.0), Sense::click());
+                                    ui.painter().circle_filled(
+                                        end_r.center(),
+                                        27.0,
+                                        if end_resp.hovered() {
+                                            Color32::from_rgb(220, 38, 38)
+                                        } else {
+                                            pal.danger
+                                        },
+                                    );
+                                    draw_lucide_icon(
+                                        ui.painter(),
+                                        end_r.center(),
+                                        lucide::PHONE_OFF,
+                                        21.0,
+                                        Color32::WHITE,
+                                    );
+                                    if end_resp
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .on_hover_text("Kết thúc cuộc gọi")
+                                        .clicked()
+                                    {
+                                        hangup_clicked = true;
+                                    }
+
+                                    // 3) Circular Camera Button
+                                    let (cam_r, cam_resp) =
+                                        ui.allocate_exact_size(Vec2::splat(48.0), Sense::click());
+                                    let cam_bg = if call.cam_enabled {
+                                        pal.primary.linear_multiply(0.32)
+                                    } else if cam_resp.hovered() {
+                                        Color32::from_rgb(51, 65, 85)
+                                    } else {
+                                        Color32::from_rgb(30, 41, 59)
+                                    };
+                                    ui.painter().circle_filled(cam_r.center(), 23.0, cam_bg);
+                                    ui.painter().circle_stroke(
+                                        cam_r.center(),
+                                        23.0,
+                                        Stroke::new(
+                                            1.0_f32,
+                                            if call.cam_enabled {
+                                                pal.primary_hover
+                                            } else {
+                                                Color32::from_rgb(71, 85, 105)
+                                            },
+                                        ),
+                                    );
+                                    draw_lucide_icon(
+                                        ui.painter(),
+                                        cam_r.center(),
+                                        if call.cam_enabled {
+                                            lucide::VIDEO
+                                        } else {
+                                            lucide::VIDEO_OFF
+                                        },
+                                        18.5,
+                                        Color32::WHITE,
+                                    );
+                                    if cam_resp
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .on_hover_text(if call.cam_enabled {
+                                            "Tắt Camera"
+                                        } else {
+                                            "Bật Camera"
+                                        })
+                                        .clicked()
+                                    {
+                                        call.cam_enabled = !call.cam_enabled;
+                                        call.is_video = call.cam_enabled;
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let _ = tx.send(WorkerCmd::SetCallMediaState {
+                                                is_on_mic: !call.mic_muted,
+                                                is_on_cam: call.cam_enabled,
+                                            });
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                    });
+            });
+
+        if retry_clicked {
+            call.error_code = None;
+            call.error_reason = None;
+            call.started_at = std::time::Instant::now();
+            call.state_label = if call.is_video {
+                "Đang kết nối cuộc gọi video…".into()
+            } else {
+                "Đang kết nối cuộc gọi thoại…".into()
+            };
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::StartCall {
+                    partner_id: call.partner_id.clone(),
+                    partner_name: call.partner_name.clone(),
+                    partner_avatar: None,
+                    is_video: call.is_video,
+                    is_group: call.is_group,
+                });
+            }
+            self.active_call = Some(call);
+        } else if hangup_clicked {
             self.active_call = None;
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::EndCall);
