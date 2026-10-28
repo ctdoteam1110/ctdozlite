@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
                 });
             }
             list.push(zalo_rust::chat::Thread {
-                id: "5226566053441588578".into(),
+                id: "1000000000000000001".into(),
                 name: "Zalo".into(),
                 preview: String::new(),
                 time: "12:00".into(),

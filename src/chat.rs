@@ -3266,9 +3266,9 @@ mod tests {
 
     #[test]
     fn test_merge_previews_incoming_1_1_and_group_and_cloud() {
-        let mut cloud = sample_thread("7223873394142226858");
+        let mut cloud = sample_thread("9000000000000000001");
         cloud.name = "Cloud của tôi (Lưu trữ)".into();
-        let friend = sample_thread("5226566053441588578");
+        let friend = sample_thread("1000000000000000001");
         let mut group = sample_thread("888999000");
         group.is_group = true;
         let mut threads = vec![cloud, friend, group];
@@ -3281,7 +3281,7 @@ mod tests {
                         "msgId": "in_1",
                         "content": "Tin nhan den tu ban be",
                         "idTo": "0",
-                        "uidFrom": "5226566053441588578",
+                        "uidFrom": "1000000000000000001",
                         "ts": "1729505000000"
                     },
                     {
@@ -3306,12 +3306,12 @@ mod tests {
         });
 
         merge_previews(&mut threads, &resp);
-        // Cloud message routed to `7223873394142226858`
+        // Cloud message routed to `9000000000000000001`
         assert_eq!(threads[0].messages.len(), 1);
         assert_eq!(threads[0].messages[0].text, "Tin nhan tu gui vao Cloud");
         assert!(threads[0].messages[0].is_outgoing);
 
-        // Incoming 1-1 routed to `5226566053441588578`
+        // Incoming 1-1 routed to `1000000000000000001`
         assert_eq!(threads[1].messages.len(), 1);
         assert_eq!(threads[1].messages[0].text, "Tin nhan den tu ban be");
         assert!(!threads[1].messages[0].is_outgoing);
@@ -3460,11 +3460,11 @@ mod tests {
     #[test]
     fn test_deduplicate_threads_migrates_session_scoped_ids() {
         let old_dtc = Thread {
-            id: "7602591761395115371".into(),
+            id: "1000000000000000005".into(),
             name: "Đtc".into(),
             preview: "Hi".into(),
             time: "10:21".into(),
-            avatar: Some("https://s120-26-ava-talk.zadn.vn/5/f18d1f0b7014a4b21657e0e970ce9a87.jpg?key=abc&time=1797763127".into()),
+            avatar: Some("https://s120-26-ava-talk.zadn.vn/5/00000000000000000000000000000001.jpg?key=abc&time=1797763127".into()),
             is_group: false,
             messages: vec![ChatMessage {
                 id: "m1".into(),
@@ -3477,18 +3477,18 @@ mod tests {
             }],
         };
         let new_dtc = Thread {
-            id: "3226508141940973766".into(),
+            id: "1000000000000000006".into(),
             name: "Đtc".into(),
             preview: "".into(),
             time: "16:48".into(),
-            avatar: Some("https://s160-26-ava-talk.zadn.vn/5/f18d1f0b7014a4b21657e0e970ce9a87.jpg?key=xyz&time=1797876325".into()),
+            avatar: Some("https://s160-26-ava-talk.zadn.vn/5/00000000000000000000000000000001.jpg?key=xyz&time=1797876325".into()),
             is_group: false,
             messages: Vec::new(),
         };
         let mut threads = vec![old_dtc, new_dtc];
         deduplicate_threads(&mut threads, None);
         assert_eq!(threads.len(), 1);
-        assert_eq!(threads[0].id, "3226508141940973766");
+        assert_eq!(threads[0].id, "1000000000000000006");
         assert_eq!(threads[0].messages.len(), 1);
         assert_eq!(threads[0].preview, "Hi");
     }
@@ -3496,7 +3496,7 @@ mod tests {
     #[test]
     fn test_merge_group_history_parses_stringified_cloud_data() {
         let mut cloud_thread = Thread {
-            id: "2379961596042963975".into(),
+            id: "9000000000000000002".into(),
             name: "Cloud của tôi (Lưu trữ)".into(),
             preview: String::new(),
             time: String::new(),
@@ -3506,7 +3506,7 @@ mod tests {
         };
         let raw_cloud_resp = json!({
             "error_code": 0,
-            "data": r#"{"error":0,"groupMsgs":[{"msgId":"6535716960416","cliMsgId":"1745456005456","msgType":"chat.recommended","uidFrom":"0","idTo":"2379961596042963975","dName":"Đỗ Thành","ts":"1745456005783","content":{"title":"","description":"Ghi chú đám mây","href":"https://zalo.me/test","action":"recommened.link"}}]}"#
+            "data": r#"{"error":0,"groupMsgs":[{"msgId":"6535716960416","cliMsgId":"1745456005456","msgType":"chat.recommended","uidFrom":"0","idTo":"9000000000000000002","dName":"User Test","ts":"1745456005783","content":{"title":"","description":"Ghi chú đám mây","href":"https://zalo.me/test","action":"recommened.link"}}]}"#
         });
         merge_group_history(&mut cloud_thread, &raw_cloud_resp);
         assert_eq!(cloud_thread.messages.len(), 1);

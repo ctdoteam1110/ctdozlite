@@ -3,7 +3,7 @@
 Mục tiêu: lấy **một** request thật để so với bản Rust đang dựng.
 Không cần bắt toàn bộ phiên — chỉ cần request lúc bấm Đăng nhập.
 
-> Dùng tài khoản clone `0836553142` cho lần bắt này.
+> Dùng tài khoản clone `0912345678` cho lần bắt này.
 
 ---
 

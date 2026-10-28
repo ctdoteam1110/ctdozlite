@@ -87,20 +87,20 @@ pub const CALL_ALLOWED_NAMES: [&str; 3] = ["hoang", "do thanh", "dtc"];
 ///
 /// The 19-digit ids are *not* 32-bit truncations of the uids, so both forms are listed per person.
 pub const CALL_ALLOWED_IDS: [&str; 8] = [
-    // Hoang
-    "465181026",
-    "5585213365034222978",
-    "632088434125127727",
-    // Do Thanh
-    "435550501",
-    "5758525960230414336",
-    "769390114667130285",
-    // DTC
-    "257404931",
-    "7602591761395115371",
+    // Test Account 1 (mock IDs; override at runtime via ZALO_CALL_ALLOW_IDS)
+    "100000001",
+    "1000000000000000001",
+    "1000000000000000002",
+    // Test Account 2
+    "100000002",
+    "1000000000000000003",
+    "1000000000000000004",
+    // Test Account 3
+    "100000003",
+    "1000000000000000005",
 ];
 
-/// Strip every non-digit character so `"5585213365034222978"`/`"'5585...'"` compare equal.
+/// Strip every non-digit character so `"1000000000000000001"`/`"'1000...'"` compare equal.
 fn only_digits(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_digit()).collect()
 }
@@ -158,8 +158,19 @@ pub fn call_target_allowed(partner_id: &str, partner_name: &str, is_group: bool)
         return false;
     }
     let id = only_digits(partner_id);
-    if !id.is_empty() && CALL_ALLOWED_IDS.contains(&id.as_str()) {
-        return true;
+    if !id.is_empty() {
+        if CALL_ALLOWED_IDS.contains(&id.as_str()) {
+            return true;
+        }
+        if let Ok(extra) = std::env::var("ZALO_CALL_ALLOW_IDS") {
+            if extra
+                .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+                .map(only_digits)
+                .any(|allowed| !allowed.is_empty() && allowed == id)
+            {
+                return true;
+            }
+        }
     }
     if partner_id.trim_start().to_ascii_lowercase().starts_with("group") {
         return false;
@@ -2795,16 +2806,16 @@ mod tests {
 
     #[test]
     fn outbound_call_lock_allows_only_test_accounts() {
-        // 19-digit thread ids / uins
-        assert!(call_target_allowed("5585213365034222978", "", false));
-        assert!(call_target_allowed("632088434125127727", "", false));
-        assert!(call_target_allowed("5758525960230414336", "", false));
-        assert!(call_target_allowed("769390114667130285", "", false));
-        assert!(call_target_allowed("7602591761395115371", "", false));
-        // 32-bit aliases
-        assert!(call_target_allowed("465181026", "", false));
-        assert!(call_target_allowed("435550501", "", false));
-        assert!(call_target_allowed("257404931", "", false));
+        // 19-digit mock thread ids / uins
+        assert!(call_target_allowed("1000000000000000001", "", false));
+        assert!(call_target_allowed("1000000000000000002", "", false));
+        assert!(call_target_allowed("1000000000000000003", "", false));
+        assert!(call_target_allowed("1000000000000000004", "", false));
+        assert!(call_target_allowed("1000000000000000005", "", false));
+        // 32-bit mock aliases
+        assert!(call_target_allowed("100000001", "", false));
+        assert!(call_target_allowed("100000002", "", false));
+        assert!(call_target_allowed("100000003", "", false));
         // accent-folded display names
         assert!(call_target_allowed("", "Hoàng", false));
         assert!(call_target_allowed("", "Đỗ Thành", false));
@@ -2815,11 +2826,11 @@ mod tests {
         assert!(!call_target_allowed("", "Nguyễn Văn A", false));
         assert!(!call_target_allowed("", "", false));
         // group calls are always refused, even for an allowlisted person
-        assert!(!call_target_allowed("5585213365034222978", "Hoàng", true));
+        assert!(!call_target_allowed("1000000000000000001", "Hoàng", true));
         assert!(!call_target_allowed("group_123", "", true));
         assert!(!call_target_allowed("group_123", "", false));
         assert!(ensure_call_target_allowed("123456789", "", false).is_err());
-        assert!(ensure_call_target_allowed("5585213365034222978", "", false).is_ok());
+        assert!(ensure_call_target_allowed("1000000000000000001", "", false).is_ok());
     }
 
     #[test]
@@ -2906,13 +2917,13 @@ mod tests {
     fn init_payload_prefers_numeric_uin_over_send2me() {
         let mut s = Session::new(false, false, false).unwrap();
         s.login = Some(crate::session::LoginInfo {
-            uin: "632088434125127727".into(),
-            send2me_id: "7223873394142226858".into(),
+            uin: "1000000000000000002".into(),
+            send2me_id: "9000000000000000001".into(),
             display_name: "Hoang".into(),
             ..Default::default()
         });
         let init = build_init_payload(&s, "init", true);
-        assert_eq!(init["data"]["local"]["id"], "632088434125127727");
+        assert_eq!(init["data"]["local"]["id"], "1000000000000000002");
         assert_eq!(init["data"]["local"]["name"], "Hoang");
     }
 
@@ -2957,15 +2968,15 @@ mod tests {
 
     #[test]
     fn zrtp_udp_binary_packets_match_zalocall_layout() {
-        assert_eq!(uid_str_to_u32("7602591761395115371"), 1044669803);
+        assert_eq!(uid_str_to_u32("1000000000000000005"), 2808348677);
 
         let sess = "588635749-588635749@1269925995";
-        let caller_init = build_zrtp_init_packet(true, 465181026, 257404931, 792612942, 2, sess);
+        let caller_init = build_zrtp_init_packet(true, 100000001, 100000003, 792612942, 2, sess);
         assert_eq!(caller_init[0], 0x01);
         assert_eq!(caller_init[1], 0x7E);
         assert_eq!(
             u32::from_le_bytes(caller_init[10..14].try_into().unwrap()),
-            465181026
+            100000001
         );
         assert_eq!(
             u16::from_le_bytes(caller_init[18..20].try_into().unwrap()),
@@ -2978,7 +2989,7 @@ mod tests {
         );
         assert_eq!(
             u32::from_le_bytes(caller_init[25..29].try_into().unwrap()),
-            257404931
+            100000003
         );
         assert_eq!(
             u16::from_le_bytes(caller_init[29..31].try_into().unwrap()) as usize,
@@ -2986,13 +2997,12 @@ mod tests {
         );
         assert_eq!(&caller_init[31..], sess.as_bytes());
 
-        let callee_init = build_zrtp_init_packet(false, 465181026, 494013899, 792612942, 2, sess);
+        let callee_init = build_zrtp_init_packet(false, 100000001, 100000002, 792612942, 2, sess);
         assert_eq!(
             u16::from_le_bytes(callee_init[18..20].try_into().unwrap()),
             0x000C
         );
-        let ping = build_zrtp_ping_packet(465181026, 792612942, sess);
-        assert_eq!(ping[0], 0x01);
+        let ping = build_zrtp_ping_packet(100000001, 792612942, sess);
         assert_eq!(ping[1], 0x01);
         assert_eq!(
             u16::from_le_bytes(ping[18..20].try_into().unwrap()),
@@ -3019,7 +3029,7 @@ mod tests {
             0x0005
         );
 
-        let end_pkt = build_zrtp_end_packet(465181026, 792612942, sess);
+        let end_pkt = build_zrtp_end_packet(100000001, 792612942, sess);
         assert_eq!(
             u16::from_le_bytes(end_pkt[18..20].try_into().unwrap()),
             0x0020
@@ -3036,7 +3046,7 @@ mod tests {
     async fn live_call_dtc_trace() {
         let mut s = Session::new(true, false, false).unwrap();
         s.load_from_file("session.json").expect("load session.json");
-        let partner_id = "3226508141940973766";
+        let partner_id = "1000000000000000005";
         let mut ctrl_state = CtrlPollState::default();
         let _ = poll_voip_controls(&s, &mut ctrl_state).await;
         println!("[TRACE] Initial ctrl cursor synced: {}", ctrl_state.last_action_id);

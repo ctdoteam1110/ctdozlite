@@ -22,8 +22,8 @@ Tài liệu này cung cấp hướng dẫn toàn diện từ việc thiết lậ
 | `--qr` | Yêu cầu đăng nhập bằng mã QR trong terminal ngay khi mở. | `zalo-rust --tui --qr` |
 | `--dev` | Bật chế độ Dev Inspector (hiển thị lưu lượng mạng, payload giải mã và máy quét lỗi). | `zalo-rust --gui --dev` |
 | `--logout` | Xóa phiên đăng nhập lưu trữ (`session.json`) và thoát sạch sẽ. | `zalo-rust --logout` |
-| `--phone <SỐ>` | Điền sẵn số điện thoại khi đăng nhập bằng mật khẩu. | `zalo-rust --tui --phone 0836553142` |
-| `--pass <MK>` | Điền sẵn mật khẩu khi đăng nhập bằng mật khẩu. | `zalo-rust --tui --phone 0836553142 --pass MatKhau` |
+| `--phone <SỐ>` | Điền sẵn số điện thoại khi đăng nhập bằng mật khẩu. | `zalo-rust --tui --phone 0912345678` |
+| `--pass <MK>` | Điền sẵn mật khẩu khi đăng nhập bằng mật khẩu. | `zalo-rust --tui --phone 0912345678 --pass MatKhau` |
 | `--dump` | Ghi toàn bộ request/response ra thư mục `dump/` dạng JSON để phân tích. | `zalo-rust --dump` |
 
 ---
