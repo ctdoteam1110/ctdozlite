@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
         let native_options = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_inner_size([1020.0, 700.0])
-                .with_min_inner_size([720.0, 480.0])
+                .with_min_inner_size([480.0, 360.0])
                 .with_title("Zalo - Rust Native Client"),
             ..Default::default()
         };

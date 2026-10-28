@@ -3018,18 +3018,25 @@ impl ZaloGuiApp {
         self.status_msg = text.clone();
         self.toast_notice = Some((text, std::time::Instant::now()));
     }
-
     fn render_chat_workspace(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        // Responsive breakpoints based on live viewport width
         // -------------------------------------------------------------------
-        // 1. LEFT NAVIGATION RAIL (62px wide, replaces top bar & bottom bar)
+        let screen_rect = ctx.screen_rect();
+        let screen_w = screen_rect.width();
+        let is_compact_w = screen_w < 780.0;
+        let is_narrow_w = screen_w < 620.0;
+        let left_rail_w = if is_narrow_w { 52.0 } else { 62.0 };
+
+        // -------------------------------------------------------------------
+        // 1. LEFT NAVIGATION RAIL (Replaces top bar & bottom bar)
         // -------------------------------------------------------------------
         egui::SidePanel::left("left_nav_rail")
             .resizable(false)
-            .exact_width(62.0)
+            .exact_width(left_rail_w)
             .frame(
                 egui::Frame::none()
                     .fill(pal.bg_app)
-                    .inner_margin(Margin::symmetric(8.0, 14.0))
+                    .inner_margin(Margin::symmetric(if is_narrow_w { 4.0 } else { 8.0 }, 14.0))
                     .stroke(Stroke::new(1.0_f32, pal.border)),
             )
             .show(ctx, |ui| {
@@ -3292,12 +3299,22 @@ impl ZaloGuiApp {
             });
 
         // -------------------------------------------------------------------
-        // 2. CONVERSATION LIST SIDEBAR (310px, Underline Tabs, Sorted by Time)
+        // 2. CONVERSATION LIST SIDEBAR (Responsive width, auto-adapts on resize)
         // -------------------------------------------------------------------
+        let sidebar_default_w = if is_narrow_w {
+            76.0
+        } else if is_compact_w {
+            240.0
+        } else {
+            300.0
+        };
+        let sidebar_min_w = if is_narrow_w { 70.0 } else { 190.0 };
+        let sidebar_max_w = (screen_w * 0.45).clamp(240.0, 420.0);
+
         egui::SidePanel::left("conversation_sidebar")
-            .resizable(true)
-            .default_width(310.0)
-            .width_range(260.0..=400.0)
+            .resizable(!is_narrow_w)
+            .default_width(sidebar_default_w)
+            .width_range(sidebar_min_w..=sidebar_max_w)
             .frame(
                 egui::Frame::none()
                     .fill(pal.bg_sidebar)
@@ -3306,12 +3323,39 @@ impl ZaloGuiApp {
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .inner_margin(Margin {
-                        left: 14.0,
-                        right: 14.0,
-                        top: 14.0,
+                        left: if is_narrow_w { 4.0 } else { 14.0 },
+                        right: if is_narrow_w { 4.0 } else { 14.0 },
+                        top: 12.0,
                         bottom: 0.0,
                     })
                     .show(ui, |ui| {
+                        if is_narrow_w {
+                            // Compact mode: icon-only search / lookup button
+                            let btn_w = ui.available_width().min(46.0);
+                            let (srch_r, srch_resp) =
+                                ui.allocate_exact_size(Vec2::new(btn_w, 32.0), Sense::click());
+                            ui.painter()
+                                .rect_filled(srch_r, Rounding::same(8.0), pal.bg_input);
+                            ui.painter().rect_stroke(
+                                srch_r,
+                                Rounding::same(8.0),
+                                Stroke::new(1.0_f32, pal.border),
+                            );
+                            draw_icon_search(
+                                ui.painter(),
+                                srch_r.center(),
+                                16.0,
+                                pal.primary_hover,
+                            );
+                            if srch_resp
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .on_hover_text("Tìm kiếm hội thoại & Tra cứu SĐT")
+                                .clicked()
+                            {
+                                self.phone_modal_open = true;
+                            }
+                            ui.add_space(6.0);
+                        } else {
                         // Search Box + Quick Phone Lookup (`+👤`) Button
                         let avail_row_w = ui.available_width();
                         let mut trigger_phone_lookup: Option<String> = None;
@@ -3496,6 +3540,7 @@ impl ZaloGuiApp {
                                 }
                             });
                         });
+                        }
                     });
 
                 ui.add(egui::Separator::default().spacing(1.0));
@@ -3648,12 +3693,13 @@ impl ZaloGuiApp {
                             let is_selected = i == self.selected_thread_index;
                             let is_pinned_cloud = t.name.contains("Cloud của tôi");
 
-                            let row_width = ui.available_width() - 12.0;
+                            let row_height = if is_narrow_w { 50.0 } else { 58.0 };
+                            let row_width = (ui.available_width() - 8.0).max(44.0);
                             let (row_rect, row_resp) = ui.allocate_exact_size(
-                                Vec2::new(row_width, 58.0),
+                                Vec2::new(row_width, row_height),
                                 Sense::click(),
                             );
-                            let row_rect = row_rect.translate(Vec2::new(6.0, 0.0));
+                            let row_rect = row_rect.translate(Vec2::new(4.0, 0.0));
 
                             let bg = if is_selected {
                                 pal.bg_selected
@@ -3679,13 +3725,17 @@ impl ZaloGuiApp {
                                 );
                             }
 
-                            // Avatar circle (42x42) with real user/group image & Cutout Status Dot
-                            let avatar_center =
-                                Pos2::new(row_rect.left() + 29.0, row_rect.center().y);
+                            // Avatar circle with real user/group image & Cutout Status Dot
+                            let av_radius = if is_narrow_w { 18.0 } else { 20.5 };
+                            let avatar_center = if is_narrow_w {
+                                row_rect.center()
+                            } else {
+                                Pos2::new(row_rect.left() + 29.0, row_rect.center().y)
+                            };
                             paint_user_avatar(
                                 ui.painter(),
                                 avatar_center,
-                                20.5,
+                                av_radius,
                                 &t.name,
                                 t.is_group,
                                 t.avatar.as_deref(),
@@ -3698,12 +3748,14 @@ impl ZaloGuiApp {
                             } else {
                                 pal.bg_sidebar
                             };
-                            let badge_pos =
-                                Pos2::new(avatar_center.x + 14.5, avatar_center.y + 14.5);
-                            ui.painter().circle_filled(badge_pos, 6.5, cutout_col);
+                            let badge_pos = Pos2::new(
+                                avatar_center.x + av_radius * 0.71,
+                                avatar_center.y + av_radius * 0.71,
+                            );
+                            ui.painter().circle_filled(badge_pos, 6.0, cutout_col);
                             ui.painter().circle_filled(
                                 badge_pos,
-                                4.2,
+                                4.0,
                                 if t.is_group {
                                     pal.primary
                                 } else {
@@ -3711,72 +3763,80 @@ impl ZaloGuiApp {
                                 },
                             );
 
-                            // Thread Name
-                            let text_left = row_rect.left() + 60.0;
-                            let name_color = if is_selected && pal.is_dark {
-                                Color32::WHITE
-                            } else {
-                                pal.text_primary
-                            };
-                            let display_name = truncate_chars(&t.name, 21);
-                            ui.painter().text(
-                                Pos2::new(text_left, row_rect.top() + 12.0),
-                                egui::Align2::LEFT_TOP,
-                                display_name,
-                                FontId::proportional(13.8),
-                                name_color,
-                            );
+                            // Only show text labels when sidebar is expanded
+                            if !is_narrow_w {
+                                // Thread Name
+                                let text_left = row_rect.left() + 58.0;
+                                let name_color = if is_selected && pal.is_dark {
+                                    Color32::WHITE
+                                } else {
+                                    pal.text_primary
+                                };
+                                let max_name_chars = if is_compact_w { 15 } else { 21 };
+                                let display_name = truncate_chars(&t.name, max_name_chars);
+                                ui.painter().text(
+                                    Pos2::new(text_left, row_rect.top() + 12.0),
+                                    egui::Align2::LEFT_TOP,
+                                    display_name,
+                                    FontId::proportional(13.6),
+                                    name_color,
+                                );
 
-                            // Pin icon + Timestamp (top-right)
-                            let time_right = row_rect.right() - 10.0;
-                            if !t.time.is_empty() {
-                                let tw = ui.fonts(|f| {
-                                    f.layout_no_wrap(
-                                        t.time.clone(),
+                                // Pin icon + Timestamp (top-right)
+                                let time_right = row_rect.right() - 9.0;
+                                if !t.time.is_empty() {
+                                    let tw = ui.fonts(|f| {
+                                        f.layout_no_wrap(
+                                            t.time.clone(),
+                                            FontId::proportional(11.0),
+                                            pal.text_muted,
+                                        )
+                                        .size()
+                                        .x
+                                    });
+                                    ui.painter().text(
+                                        Pos2::new(time_right, row_rect.top() + 13.5),
+                                        egui::Align2::RIGHT_TOP,
+                                        &t.time,
                                         FontId::proportional(11.0),
                                         pal.text_muted,
-                                    )
-                                    .size()
-                                    .x
-                                });
-                                ui.painter().text(
-                                    Pos2::new(time_right, row_rect.top() + 13.5),
-                                    egui::Align2::RIGHT_TOP,
-                                    &t.time,
-                                    FontId::proportional(11.0),
-                                    pal.text_muted,
-                                );
-                                if is_pinned_cloud {
-                                    draw_icon_pin(
-                                        ui.painter(),
-                                        Pos2::new(time_right - tw - 10.0, row_rect.top() + 19.5),
-                                        11.0,
-                                        pal.text_muted,
                                     );
+                                    if is_pinned_cloud {
+                                        draw_icon_pin(
+                                            ui.painter(),
+                                            Pos2::new(
+                                                time_right - tw - 9.0,
+                                                row_rect.top() + 19.5,
+                                            ),
+                                            11.0,
+                                            pal.text_muted,
+                                        );
+                                    }
                                 }
-                            }
 
-                            // Snippet with `Bạn:` prefix when latest message is outgoing
-                            let last_outgoing = t
-                                .messages
-                                .last()
-                                .map(|m| m.is_outgoing)
-                                .unwrap_or(false);
-                            let raw_preview = if t.preview.is_empty() {
-                                "Chưa có tin nhắn".to_string()
-                            } else if last_outgoing && !t.preview.starts_with("Bạn:") {
-                                format!("Bạn: {}", t.preview)
-                            } else {
-                                t.preview.clone()
-                            };
-                            let snippet = truncate_chars(&raw_preview, 28);
-                            ui.painter().text(
-                                Pos2::new(text_left, row_rect.top() + 33.5),
-                                egui::Align2::LEFT_TOP,
-                                snippet,
-                                FontId::proportional(12.2),
-                                pal.text_secondary,
-                            );
+                                // Snippet with `Bạn:` prefix when latest message is outgoing
+                                let last_outgoing = t
+                                    .messages
+                                    .last()
+                                    .map(|m| m.is_outgoing)
+                                    .unwrap_or(false);
+                                let raw_preview = if t.preview.is_empty() {
+                                    "Chưa có tin nhắn".to_string()
+                                } else if last_outgoing && !t.preview.starts_with("Bạn:") {
+                                    format!("Bạn: {}", t.preview)
+                                } else {
+                                    t.preview.clone()
+                                };
+                                let max_snip_chars = if is_compact_w { 18 } else { 28 };
+                                let snippet = truncate_chars(&raw_preview, max_snip_chars);
+                                ui.painter().text(
+                                    Pos2::new(text_left, row_rect.top() + 33.5),
+                                    egui::Align2::LEFT_TOP,
+                                    snippet,
+                                    FontId::proportional(12.0),
+                                    pal.text_secondary,
+                                );
+                            }
 
                             if row_resp
                                 .on_hover_cursor(CursorIcon::PointingHand)
@@ -3902,9 +3962,12 @@ impl ZaloGuiApp {
         });
 
         // -------------------------------------------------------------------
-        // 3. COLLAPSIBLE RIGHT CONVERSATION INFO DRAWER (272px wide)
+        // 3. COLLAPSIBLE RIGHT CONVERSATION INFO DRAWER (responsive width)
         // -------------------------------------------------------------------
-        if self.info_drawer_open {
+        let show_info_drawer = self.info_drawer_open && !is_compact_w;
+        let drawer_w = (screen_w * 0.26).clamp(240.0, 310.0);
+
+        if show_info_drawer {
             if let Some((ref d_id, ref d_name, ref d_ava, d_is_group, d_msg_count)) = thread_meta {
                 let shared_photos: Vec<(String, String, String, String)> = self
                     .threads
@@ -3943,8 +4006,9 @@ impl ZaloGuiApp {
                     .unwrap_or_default();
 
                 egui::SidePanel::right("conversation_info_drawer")
-                    .resizable(false)
-                    .exact_width(272.0)
+                    .resizable(true)
+                    .default_width(drawer_w)
+                    .width_range(220.0..=340.0)
                     .frame(
                         egui::Frame::none()
                             .fill(pal.bg_sidebar)
@@ -3970,7 +4034,6 @@ impl ZaloGuiApp {
                                         &self.sticker_textures,
                                         &mut self.loading_stickers,
                                     );
-
                                     ui.add_space(10.0);
                                     ui.label(
                                         RichText::new(d_name)
@@ -5161,9 +5224,10 @@ impl ZaloGuiApp {
                                             [sep_r.center_top(), sep_r.center_bottom()],
                                             Stroke::new(1.0_f32, pal.border),
                                         );
-
-                                        // Spacious Borderless Input Field
-                                        let input_w = (ui.available_width() - 88.0).max(80.0);
+                                        // Responsive Borderless Input Field (shrinks gracefully down to 50px)
+                                        let send_btn_w = if is_narrow_w { 52.0 } else { 76.0 };
+                                        let input_w =
+                                            (ui.available_width() - send_btn_w - 12.0).max(50.0);
                                         let text_edit =
                                             egui::TextEdit::singleline(&mut self.input_message)
                                                 .frame(false)
@@ -5178,10 +5242,10 @@ impl ZaloGuiApp {
                                             (response.lost_focus() || response.has_focus())
                                                 && ui.input(|i| i.key_pressed(Key::Enter));
 
-                                        // Properly Padded Send Button (`Gửi` + Paper Plane)
+                                        // Responsive Padded Send Button (shows icon-only on very tight widths)
                                         let can_send = !self.input_message.trim().is_empty();
                                         let (send_rect, send_resp) = ui.allocate_exact_size(
-                                            Vec2::new(76.0, 34.0),
+                                            Vec2::new(send_btn_w, 34.0),
                                             Sense::click(),
                                         );
                                         let send_bg = if !can_send {
@@ -5196,16 +5260,34 @@ impl ZaloGuiApp {
                                             Rounding::same(8.0),
                                             send_bg,
                                         );
-                                        ui.painter().text(
-                                            Pos2::new(
-                                                send_rect.left() + 16.0,
-                                                send_rect.center().y,
-                                            ),
-                                            egui::Align2::LEFT_CENTER,
-                                            "Gửi",
-                                            FontId::proportional(13.0),
-                                            Color32::WHITE,
-                                        );
+                                        if !is_narrow_w {
+                                            ui.painter().text(
+                                                Pos2::new(
+                                                    send_rect.left() + 15.0,
+                                                    send_rect.center().y,
+                                                ),
+                                                egui::Align2::LEFT_CENTER,
+                                                "Gửi",
+                                                FontId::proportional(13.0),
+                                                Color32::WHITE,
+                                            );
+                                            draw_icon_send(
+                                                ui.painter(),
+                                                Pos2::new(
+                                                    send_rect.right() - 17.0,
+                                                    send_rect.center().y,
+                                                ),
+                                                14.0,
+                                                Color32::WHITE,
+                                            );
+                                        } else {
+                                            draw_icon_send(
+                                                ui.painter(),
+                                                send_rect.center(),
+                                                16.0,
+                                                Color32::WHITE,
+                                            );
+                                        }
                                         draw_icon_send(
                                             ui.painter(),
                                             Pos2::new(
@@ -5504,7 +5586,7 @@ impl ZaloGuiApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .default_width(390.0)
+            .default_width((ctx.screen_rect().width() * 0.78).clamp(280.0, 390.0))
             .frame(
                 egui::Frame::window(&ctx.style())
                     .fill(pal.bg_elevated)
@@ -5743,7 +5825,7 @@ impl ZaloGuiApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .default_width(380.0)
+            .default_width((ctx.screen_rect().width() * 0.76).clamp(280.0, 380.0))
             .frame(
                 egui::Frame::window(&ctx.style())
                     .fill(pal.bg_elevated)
@@ -6155,8 +6237,8 @@ impl ZaloGuiApp {
             .or_else(|| self.sticker_textures.get(&viewer.tex_key))
             .cloned();
 
-        let modal_w = (screen_rect.width() * 0.86).clamp(420.0, 1080.0);
-        let modal_h = (screen_rect.height() * 0.86).clamp(340.0, 820.0);
+        let modal_w = (screen_rect.width() * 0.92).clamp(260.0, 1080.0);
+        let modal_h = (screen_rect.height() * 0.9).clamp(240.0, 820.0);
 
         egui::Window::new("image_viewer_popup")
             .title_bar(false)
@@ -8062,8 +8144,8 @@ fn render_chat_bubble(
     idx: usize,
 ) -> Option<BubbleAction> {
     let avail_w = ui.available_width();
-    let max_bubble_width = (avail_w * 0.66).min(510.0).max(150.0);
-    let max_text_width = (max_bubble_width - 28.0).max(100.0);
+    let max_bubble_width = (avail_w * 0.72).clamp(140.0, 520.0);
+    let max_text_width = (max_bubble_width - 24.0).max(90.0);
     let has_sticker = is_sticker_message(msg).is_some();
     let call_card_opt = extract_call_card_view(msg);
     let is_call_card = call_card_opt.is_some();
