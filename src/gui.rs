@@ -274,314 +274,127 @@ fn paint_user_avatar(
     );
 }
 
+pub mod lucide {
+    pub const SEARCH: &str = "\u{e151}";
+    pub const REFRESH: &str = "\u{e145}";
+    pub const SMILE: &str = "\u{e164}";
+    pub const SEND: &str = "\u{e4f2}";
+    pub const SUN: &str = "\u{e178}";
+    pub const MOON: &str = "\u{e11e}";
+    pub const PHONE: &str = "\u{e133}";
+    pub const PHONE_CALL: &str = "\u{e134}";
+    pub const PHONE_OFF: &str = "\u{e138}";
+    pub const VIDEO: &str = "\u{e1a5}";
+    pub const VIDEO_OFF: &str = "\u{e1a6}";
+    pub const CAMERA: &str = "\u{e062}";
+    pub const IMAGE: &str = "\u{e0f6}";
+    pub const PAPERCLIP: &str = "\u{e12d}";
+    pub const CHECK: &str = "\u{e06c}";
+    pub const CHECK_CHECK: &str = "\u{e38e}";
+    pub const MESSAGE_SQUARE: &str = "\u{e117}";
+    pub const USERS: &str = "\u{e1a4}";
+    pub const USER_PLUS: &str = "\u{e1a2}";
+    pub const CLOUD: &str = "\u{e088}";
+    pub const SETTINGS: &str = "\u{e154}";
+    pub const PANEL_RIGHT: &str = "\u{e431}";
+    pub const PIN: &str = "\u{e259}";
+    pub const COPY: &str = "\u{e09e}";
+    pub const STAR: &str = "\u{e176}";
+    pub const GLOBE: &str = "\u{e0e8}";
+    pub const LINK: &str = "\u{e102}";
+    pub const EXTERNAL_LINK: &str = "\u{e0b9}";
+    pub const X: &str = "\u{e1b2}";
+    pub const PLUS: &str = "\u{e13d}";
+    pub const MINUS: &str = "\u{e11c}";
+    pub const STORE: &str = "\u{e3e4}";
+    pub const FLAME: &str = "\u{e0d2}";
+    pub const SPARKLES: &str = "\u{e412}";
+    pub const BAN: &str = "\u{e051}";
+    pub const MIC: &str = "\u{e118}";
+    pub const MIC_OFF: &str = "\u{e119}";
+    pub const LOG_OUT: &str = "\u{e10e}";
+    pub const FILE_TEXT: &str = "\u{e0cc}";
+    pub const FILM: &str = "\u{e0d0}";
+    pub const SHIELD_CHECK: &str = "\u{e15c}";
+}
+
+fn draw_lucide_icon(painter: &egui::Painter, center: Pos2, icon: &str, size: f32, color: Color32) {
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        icon,
+        FontId::proportional(size),
+        color,
+    );
+}
+
 fn draw_icon_search(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let r = size * 0.34;
-    let c = Pos2::new(center.x - size * 0.08, center.y - size * 0.08);
-    painter.circle_stroke(c, r, Stroke::new(1.6_f32, color));
-    let p1 = Pos2::new(c.x + r * 0.72, c.y + r * 0.72);
-    let p2 = Pos2::new(center.x + size * 0.38, center.y + size * 0.38);
-    painter.line_segment([p1, p2], Stroke::new(1.8_f32, color));
+    draw_lucide_icon(painter, center, lucide::SEARCH, size, color);
 }
 
 fn draw_icon_refresh(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let r = size * 0.36;
-    painter.circle_stroke(center, r, Stroke::new(1.6_f32, color));
-    let tip = Pos2::new(center.x + r * 0.85, center.y - r * 0.35);
-    painter.line_segment(
-        [tip, Pos2::new(tip.x - 4.0, tip.y - 1.5)],
-        Stroke::new(1.6_f32, color),
-    );
-    painter.line_segment(
-        [tip, Pos2::new(tip.x - 1.0, tip.y + 4.0)],
-        Stroke::new(1.6_f32, color),
-    );
+    draw_lucide_icon(painter, center, lucide::REFRESH, size, color);
 }
 
 fn draw_icon_sticker(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let r = size * 0.42;
-    painter.circle_stroke(center, r, Stroke::new(1.6_f32, color));
-    let eye_y = center.y - r * 0.22;
-    let eye_dx = r * 0.34;
-    painter.circle_filled(Pos2::new(center.x - eye_dx, eye_y), 1.5, color);
-    painter.circle_filled(Pos2::new(center.x + eye_dx, eye_y), 1.5, color);
-    // Smile curve approximated with 3 segments
-    let s1 = Pos2::new(center.x - r * 0.42, center.y + r * 0.14);
-    let s2 = Pos2::new(center.x - r * 0.16, center.y + r * 0.36);
-    let s3 = Pos2::new(center.x + r * 0.16, center.y + r * 0.36);
-    let s4 = Pos2::new(center.x + r * 0.42, center.y + r * 0.14);
-    painter.line_segment([s1, s2], Stroke::new(1.5_f32, color));
-    painter.line_segment([s2, s3], Stroke::new(1.5_f32, color));
-    painter.line_segment([s3, s4], Stroke::new(1.5_f32, color));
+    draw_lucide_icon(painter, center, lucide::SMILE, size, color);
 }
 
 fn draw_icon_send(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let r = size * 0.42;
-    let p_right = Pos2::new(center.x + r, center.y);
-    let p_top = Pos2::new(center.x - r * 0.85, center.y - r * 0.78);
-    let p_mid = Pos2::new(center.x - r * 0.35, center.y);
-    let p_bot = Pos2::new(center.x - r * 0.85, center.y + r * 0.78);
-    let stroke = Stroke::new(1.6_f32, color);
-    painter.line_segment([p_top, p_right], stroke);
-    painter.line_segment([p_right, p_bot], stroke);
-    painter.line_segment([p_bot, p_mid], stroke);
-    painter.line_segment([p_mid, p_top], stroke);
-    painter.line_segment([p_mid, p_right], stroke);
-}
-
-fn draw_icon_theme(painter: &egui::Painter, center: Pos2, size: f32, is_dark: bool, color: Color32) {
-    let r = size * 0.32;
-    if is_dark {
-        // Sun icon (switch to light)
-        painter.circle_stroke(center, r * 0.75, Stroke::new(1.6_f32, color));
-        for i in 0..8 {
-            let angle = (i as f32) * std::f32::consts::TAU / 8.0;
-            let (sin, cos) = angle.sin_cos();
-            let p1 = Pos2::new(center.x + cos * r * 1.05, center.y + sin * r * 1.05);
-            let p2 = Pos2::new(center.x + cos * r * 1.45, center.y + sin * r * 1.45);
-            painter.line_segment([p1, p2], Stroke::new(1.4_f32, color));
-        }
-    } else {
-        // Crescent indicator (switch to dark)
-        painter.circle_filled(center, r, color);
-        painter.circle_filled(
-            Pos2::new(center.x + r * 0.42, center.y - r * 0.32),
-            r * 0.82,
-            Color32::WHITE,
-        );
-    }
+    draw_lucide_icon(painter, center, lucide::SEND, size, color);
 }
 
 fn draw_icon_phone(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let r = size * 0.38;
-    let stroke = Stroke::new(1.7_f32, color);
-    // Handset ear & mouth caps
-    let top_ear = Pos2::new(center.x - r * 0.55, center.y - r * 0.55);
-    let bot_mouth = Pos2::new(center.x + r * 0.55, center.y + r * 0.55);
-    painter.circle_filled(top_ear, 2.2, color);
-    painter.circle_filled(bot_mouth, 2.2, color);
-    // Curved handset spine
-    let mid1 = Pos2::new(center.x - r * 0.62, center.y + r * 0.08);
-    let mid2 = Pos2::new(center.x - r * 0.08, center.y + r * 0.62);
-    painter.line_segment([top_ear, mid1], stroke);
-    painter.line_segment([mid1, mid2], stroke);
-    painter.line_segment([mid2, bot_mouth], stroke);
+    draw_lucide_icon(painter, center, lucide::PHONE, size, color);
 }
 
 fn draw_icon_video(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let w = size * 0.52;
-    let h = size * 0.40;
-    let body_rect = Rect::from_center_size(Pos2::new(center.x - size * 0.10, center.y), Vec2::new(w, h));
-    let stroke = Stroke::new(1.6_f32, color);
-    painter.rect_stroke(body_rect, Rounding::same(2.5), stroke);
-    // Camera lens triangle on the right
-    let right_x = body_rect.right();
-    let lens_x = center.x + size * 0.38;
-    let p_mid_top = Pos2::new(right_x, center.y - h * 0.22);
-    let p_mid_bot = Pos2::new(right_x, center.y + h * 0.22);
-    let p_far_top = Pos2::new(lens_x, center.y - h * 0.44);
-    let p_far_bot = Pos2::new(lens_x, center.y + h * 0.44);
-    painter.line_segment([p_mid_top, p_far_top], stroke);
-    painter.line_segment([p_far_top, p_far_bot], stroke);
-    painter.line_segment([p_far_bot, p_mid_bot], stroke);
+    draw_lucide_icon(painter, center, lucide::VIDEO, size, color);
 }
 
 fn draw_icon_image(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let rect = Rect::from_center_size(center, Vec2::new(size * 0.82, size * 0.68));
-    let stroke = Stroke::new(1.5_f32, color);
-    painter.rect_stroke(rect, Rounding::same(2.5), stroke);
-    // Sun dot in top-left
-    painter.circle_filled(
-        Pos2::new(rect.left() + rect.width() * 0.28, rect.top() + rect.height() * 0.30),
-        size * 0.08,
-        color,
-    );
-    // Mountain peak polyline
-    let p1 = Pos2::new(rect.left() + 2.0, rect.bottom() - 2.0);
-    let p2 = Pos2::new(rect.left() + rect.width() * 0.42, rect.top() + rect.height() * 0.45);
-    let p3 = Pos2::new(rect.left() + rect.width() * 0.65, rect.top() + rect.height() * 0.68);
-    let p4 = Pos2::new(rect.right() - 2.0, rect.top() + rect.height() * 0.38);
-    painter.line_segment([p1, p2], stroke);
-    painter.line_segment([p2, p3], stroke);
-    painter.line_segment([p3, p4], stroke);
+    draw_lucide_icon(painter, center, lucide::IMAGE, size, color);
 }
 
 fn draw_icon_attachment(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let stroke = Stroke::new(1.5_f32, color);
-    let w = size * 0.44;
-    let h = size * 0.72;
-    let outer = Rect::from_center_size(center, Vec2::new(w, h));
-    painter.rect_stroke(outer, Rounding::same(w * 0.48), stroke);
-    let inner_top = Pos2::new(center.x, center.y - h * 0.18);
-    let inner_bot = Pos2::new(center.x, center.y + h * 0.25);
-    painter.line_segment([inner_top, inner_bot], stroke);
+    draw_lucide_icon(painter, center, lucide::PAPERCLIP, size, color);
 }
 
 fn draw_icon_check_double(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let stroke = Stroke::new(1.65_f32, color);
-    let r = size * 0.42;
-    // First checkmark
-    let a1 = Pos2::new(center.x - r * 0.95, center.y + r * 0.02);
-    let a2 = Pos2::new(center.x - r * 0.45, center.y + r * 0.52);
-    let a3 = Pos2::new(center.x + r * 0.45, center.y - r * 0.48);
-    painter.line_segment([a1, a2], stroke);
-    painter.line_segment([a2, a3], stroke);
-    // Second checkmark shifted right
-    let b1 = Pos2::new(center.x - r * 0.20, center.y + r * 0.22);
-    let b2 = Pos2::new(center.x + r * 0.05, center.y + r * 0.52);
-    let b3 = Pos2::new(center.x + r * 0.95, center.y - r * 0.48);
-    painter.line_segment([b1, b2], stroke);
-    painter.line_segment([b2, b3], stroke);
+    draw_lucide_icon(painter, center, lucide::CHECK_CHECK, size, color);
 }
 
 fn draw_icon_chat_nav(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let stroke = Stroke::new(1.7_f32, color);
-    let w = size * 0.78;
-    let h = size * 0.62;
-    let rect = Rect::from_center_size(Pos2::new(center.x, center.y - size * 0.04), Vec2::new(w, h));
-    painter.rect_stroke(rect, Rounding::same(4.0), stroke);
-    let p1 = Pos2::new(rect.left() + w * 0.22, rect.bottom());
-    let p2 = Pos2::new(rect.left() + w * 0.12, rect.bottom() + size * 0.18);
-    let p3 = Pos2::new(rect.left() + w * 0.44, rect.bottom());
-    painter.line_segment([p1, p2], stroke);
-    painter.line_segment([p2, p3], stroke);
+    draw_lucide_icon(painter, center, lucide::MESSAGE_SQUARE, size, color);
 }
 
 fn draw_icon_contacts(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let stroke = Stroke::new(1.65_f32, color);
-    let head = Pos2::new(center.x - size * 0.08, center.y - size * 0.16);
-    painter.circle_stroke(head, size * 0.17, stroke);
-    let body_top = center.y + size * 0.08;
-    let body_bot = center.y + size * 0.34;
-    painter.line_segment(
-        [
-            Pos2::new(head.x - size * 0.28, body_bot),
-            Pos2::new(head.x - size * 0.18, body_top),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(head.x - size * 0.18, body_top),
-            Pos2::new(head.x + size * 0.18, body_top),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(head.x + size * 0.18, body_top),
-            Pos2::new(head.x + size * 0.28, body_bot),
-        ],
-        stroke,
-    );
-    // Second person silhouette on the right
-    let head2 = Pos2::new(center.x + size * 0.24, center.y - size * 0.12);
-    painter.circle_stroke(head2, size * 0.13, stroke);
+    draw_lucide_icon(painter, center, lucide::USERS, size, color);
 }
 
 fn draw_icon_cloud(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let stroke = Stroke::new(1.65_f32, color);
-    let base = Rect::from_center_size(
-        Pos2::new(center.x, center.y + size * 0.06),
-        Vec2::new(size * 0.78, size * 0.42),
-    );
-    painter.rect_stroke(base, Rounding::same(size * 0.20), stroke);
-    painter.circle_stroke(
-        Pos2::new(center.x - size * 0.10, center.y - size * 0.10),
-        size * 0.20,
-        stroke,
-    );
+    draw_lucide_icon(painter, center, lucide::CLOUD, size, color);
 }
 
 fn draw_icon_settings(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let stroke = Stroke::new(1.6_f32, color);
-    let r_in = size * 0.16;
-    let r_out = size * 0.34;
-    painter.circle_stroke(center, r_in, stroke);
-    painter.circle_stroke(center, r_out * 0.82, Stroke::new(1.3_f32, color));
-    for i in 0..6 {
-        let angle = (i as f32) * std::f32::consts::TAU / 6.0;
-        let (sin, cos) = angle.sin_cos();
-        let p1 = Pos2::new(center.x + cos * r_out * 0.75, center.y + sin * r_out * 0.75);
-        let p2 = Pos2::new(center.x + cos * r_out * 1.05, center.y + sin * r_out * 1.05);
-        painter.line_segment([p1, p2], Stroke::new(1.8_f32, color));
-    }
+    draw_lucide_icon(painter, center, lucide::SETTINGS, size, color);
 }
 
 fn draw_icon_drawer(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let stroke = Stroke::new(1.65_f32, color);
-    let rect = Rect::from_center_size(center, Vec2::new(size * 0.78, size * 0.66));
-    painter.rect_stroke(rect, Rounding::same(3.0), stroke);
-    let split_x = rect.right() - rect.width() * 0.32;
-    painter.line_segment(
-        [Pos2::new(split_x, rect.top()), Pos2::new(split_x, rect.bottom())],
-        stroke,
-    );
+    draw_lucide_icon(painter, center, lucide::PANEL_RIGHT, size, color);
 }
 
 fn draw_icon_pin(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let stroke = Stroke::new(1.5_f32, color);
-    let top_rect = Rect::from_center_size(
-        Pos2::new(center.x, center.y - size * 0.14),
-        Vec2::new(size * 0.44, size * 0.32),
-    );
-    painter.rect_stroke(top_rect, Rounding::same(2.0), stroke);
-    painter.line_segment(
-        [
-            Pos2::new(center.x, top_rect.bottom()),
-            Pos2::new(center.x, center.y + size * 0.38),
-        ],
-        stroke,
-    );
+    draw_lucide_icon(painter, center, lucide::PIN, size, color);
 }
 
 fn draw_icon_copy(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let stroke = Stroke::new(1.4_f32, color);
-    let r1 = Rect::from_center_size(
-        Pos2::new(center.x - size * 0.08, center.y - size * 0.08),
-        Vec2::new(size * 0.52, size * 0.58),
-    );
-    let r2 = Rect::from_center_size(
-        Pos2::new(center.x + size * 0.10, center.y + size * 0.10),
-        Vec2::new(size * 0.52, size * 0.58),
-    );
-    painter.rect_stroke(r1, Rounding::same(2.0), stroke);
-    painter.rect_stroke(r2, Rounding::same(2.0), stroke);
+    draw_lucide_icon(painter, center, lucide::COPY, size, color);
 }
 
 fn draw_icon_user_plus(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let stroke = Stroke::new(1.6_f32, color);
-    let head = Pos2::new(center.x - size * 0.12, center.y - size * 0.15);
-    painter.circle_stroke(head, size * 0.17, stroke);
-    let top_y = center.y + size * 0.09;
-    let bot_y = center.y + size * 0.34;
-    painter.line_segment(
-        [
-            Pos2::new(head.x - size * 0.26, bot_y),
-            Pos2::new(head.x - size * 0.16, top_y),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(head.x - size * 0.16, top_y),
-            Pos2::new(head.x + size * 0.16, top_y),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(head.x + size * 0.16, top_y),
-            Pos2::new(head.x + size * 0.26, bot_y),
-        ],
-        stroke,
-    );
-    // Plus sign on the right
-    let pc = Pos2::new(center.x + size * 0.26, center.y - size * 0.04);
-    let pr = size * 0.14;
-    painter.line_segment([Pos2::new(pc.x - pr, pc.y), Pos2::new(pc.x + pr, pc.y)], stroke);
-    painter.line_segment([Pos2::new(pc.x, pc.y - pr), Pos2::new(pc.x, pc.y + pr)], stroke);
+    draw_lucide_icon(painter, center, lucide::USER_PLUS, size, color);
 }
-
 // ---------------------------------------------------------------------------
 // Sticker Presets & State Types
 // ---------------------------------------------------------------------------
@@ -4734,7 +4547,7 @@ impl ZaloGuiApp {
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new("📌 Tin ghim:")
+                                        RichText::new(format!("{} Tin ghim:", lucide::PIN))
                                             .size(12.5)
                                             .color(pal.primary)
                                             .strong(),
@@ -4777,7 +4590,7 @@ impl ZaloGuiApp {
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new("⭐ Đang lọc tin nhắn đã đánh dấu sao")
+                                        RichText::new(format!("{} Đang lọc tin nhắn đã đánh dấu sao", lucide::STAR))
                                             .size(12.0)
                                             .color(Color32::from_rgb(234, 179, 8))
                                             .strong(),
@@ -5040,14 +4853,14 @@ impl ZaloGuiApp {
                                         if action == BubbleAction::TogglePin {
                                             real.is_pinned = !real.is_pinned;
                                             self.status_msg = if real.is_pinned {
-                                                "Đã ghim tin nhắn lên đầu hội thoại 📌".into()
+                                                "Đã ghim tin nhắn lên đầu hội thoại".into()
                                             } else {
                                                 "Đã bỏ ghim tin nhắn".into()
                                             };
                                         } else {
                                             real.is_starred = !real.is_starred;
                                             self.status_msg = if real.is_starred {
-                                                "Đã đánh dấu sao tin nhắn ⭐".into()
+                                                "Đã đánh dấu sao tin nhắn".into()
                                             } else {
                                                 "Đã bỏ đánh dấu sao".into()
                                             };
@@ -5534,9 +5347,9 @@ impl ZaloGuiApp {
                         }
 
                         let theme_lbl = if self.dark_mode {
-                            "☀  Chuyển giao diện Sáng"
+                            format!("{}  Chuyển giao diện Sáng", lucide::SUN)
                         } else {
-                            "🌙  Chuyển giao diện Tối"
+                            format!("{}  Chuyển giao diện Tối", lucide::MOON)
                         };
                         if ui
                             .add_sized(
@@ -5919,9 +5732,9 @@ impl ZaloGuiApp {
         let timer_str = format!("{mins:02}:{secs:02}");
 
         let title = if call.is_video {
-            "📹 Cuộc gọi Video Zalo (In-App + ZRTP)"
+            format!("{} Cuộc gọi Video Zalo (In-App + ZRTP)", lucide::VIDEO)
         } else {
-            "📞 Cuộc gọi Thoại Zalo (In-App + ZRTP)"
+            format!("{} Cuộc gọi Thoại Zalo (In-App + ZRTP)", lucide::PHONE)
         };
 
         let mut hangup_clicked = false;
@@ -6065,7 +5878,7 @@ impl ZaloGuiApp {
                             ui.add_space((avail - 210.0).max(0.0) * 0.5);
 
                             let accept_btn = egui::Button::new(
-                                RichText::new("📞 Nghe máy")
+                                RichText::new(format!("{} Nghe máy", lucide::PHONE_CALL))
                                     .size(13.0)
                                     .color(Color32::WHITE)
                                     .strong(),
@@ -6086,7 +5899,7 @@ impl ZaloGuiApp {
                             }
 
                             let decline_btn = egui::Button::new(
-                                RichText::new("📴 Từ chối")
+                                RichText::new(format!("{} Từ chối", lucide::PHONE_OFF))
                                     .size(13.0)
                                     .color(Color32::WHITE)
                                     .strong(),
@@ -6113,9 +5926,9 @@ impl ZaloGuiApp {
 
                             // Mic Toggle
                             let mic_label = if call.mic_muted {
-                                "🔇 Bật Mic"
+                                format!("{} Bật Mic", lucide::MIC_OFF)
                             } else {
-                                "🎙 Tắt Mic"
+                                format!("{} Tắt Mic", lucide::MIC)
                             };
                             let mic_btn = egui::Button::new(
                                 RichText::new(mic_label)
@@ -6146,9 +5959,9 @@ impl ZaloGuiApp {
 
                             // Camera Toggle
                             let cam_label = if call.cam_enabled {
-                                "📹 Tắt Cam"
+                                format!("{} Tắt Cam", lucide::VIDEO_OFF)
                             } else {
-                                "📷 Bật Cam"
+                                format!("{} Bật Cam", lucide::CAMERA)
                             };
                             let cam_btn = egui::Button::new(
                                 RichText::new(cam_label)
@@ -6180,9 +5993,9 @@ impl ZaloGuiApp {
 
                             // End Call / Close Button
                             let end_text = if call.error_reason.is_some() {
-                                "✖ Đóng"
+                                format!("{} Đóng", lucide::X)
                             } else {
-                                "📴 Kết thúc"
+                                format!("{} Kết thúc", lucide::PHONE_OFF)
                             };
                             let end_btn = egui::Button::new(
                                 RichText::new(end_text)
@@ -6204,7 +6017,7 @@ impl ZaloGuiApp {
                     }
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new("🦀 100% Pure-Rust VoIP Signaling (Không dùng tiến trình ZaloCall.exe)")
+                        RichText::new("100% Pure-Rust VoIP Signaling (Không dùng tiến trình ZaloCall.exe)")
                             .size(10.5)
                             .color(pal.text_muted),
                     );
@@ -6431,7 +6244,7 @@ impl ZaloGuiApp {
                                 // Optional: Open in browser if URL is available
                                 if !viewer.full_url.is_empty() {
                                     let ext_btn = egui::Button::new(
-                                        RichText::new("🌐 Mở ngoài ↗")
+                                        RichText::new(format!("{} Mở ngoài ↗", lucide::GLOBE))
                                             .size(12.0)
                                             .color(Color32::from_rgb(226, 232, 240)),
                                     )
@@ -6449,7 +6262,7 @@ impl ZaloGuiApp {
                                     }
 
                                     let copy_btn = egui::Button::new(
-                                        RichText::new("📋 Copy link")
+                                        RichText::new(format!("{} Copy link", lucide::COPY))
                                             .size(12.0)
                                             .color(Color32::from_rgb(226, 232, 240)),
                                     )
@@ -6622,15 +6435,15 @@ impl ZaloGuiApp {
                 // 1. Top Pack & Store Navigation Bar
                 ui.horizontal(|ui| {
                     let store_count_lbl = if !self.sticker_store_packs.is_empty() {
-                        format!("🏪 Kho Nhãn Dán ({})", self.sticker_store_packs.len())
+                        format!("{} Kho Nhãn Dán ({})", lucide::STORE, self.sticker_store_packs.len())
                     } else {
-                        "🏪 Kho Nhãn Dán".to_string()
+                        format!("{} Kho Nhãn Dán", lucide::STORE)
                     };
 
                     for (tab, title) in [
-                        (StickerTab::Popular, "🔥 Phổ biến".to_string()),
-                        (StickerTab::Onion, "🧅 Củ hành (30)".to_string()),
-                        (StickerTab::Search, "🔍 Tìm nhãn".to_string()),
+                        (StickerTab::Popular, format!("{} Phổ biến", lucide::FLAME)),
+                        (StickerTab::Onion, "Củ hành (30)".to_string()),
+                        (StickerTab::Search, format!("{} Tìm nhãn", lucide::SEARCH)),
                         (StickerTab::Store, store_count_lbl),
                     ] {
                         let active = self.sticker_tab == tab;
@@ -6911,7 +6724,7 @@ impl ZaloGuiApp {
                             let enter = (resp.lost_focus() || resp.has_focus())
                                 && ui.input(|i| i.key_pressed(Key::Enter));
                             if (ui
-                                .button("🔍 Tìm")
+                                .button(format!("{} Tìm", lucide::SEARCH))
                                 .on_hover_cursor(CursorIcon::PointingHand)
                                 .clicked()
                                 || enter)
@@ -7466,9 +7279,9 @@ fn render_call_card_widget(
         ui.add_space(6.0);
 
         let btn_label = if card.is_video {
-            "📹  Gọi video lại"
+            format!("{}  Gọi video lại", lucide::VIDEO)
         } else {
-            "📞  Gọi lại"
+            format!("{}  Gọi lại", lucide::PHONE)
         };
         let call_btn = egui::Button::new(
             RichText::new(btn_label)
@@ -7781,7 +7594,7 @@ fn render_system_notice_pill(ui: &mut egui::Ui, msg: &ChatMessage, pal: &ThemePa
             .inner_margin(Margin::symmetric(12.0, 4.0))
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new(format!("✨ {text}"))
+                    RichText::new(format!("{} {text}", lucide::SPARKLES))
                         .size(12.0)
                         .color(pal.text_secondary),
                 );
@@ -7828,7 +7641,7 @@ fn render_message_body(
     let trimmed_text = msg.text.trim();
     if trimmed_text == "[Tin nhắn đã thu hồi]" {
         ui.label(
-            RichText::new("🚫 Tin nhắn đã được thu hồi")
+            RichText::new(format!("{} Tin nhắn đã được thu hồi", lucide::BAN))
                 .color(meta_col)
                 .italics()
                 .size(13.8),
@@ -8184,7 +7997,7 @@ fn render_message_body(
                     ui.painter()
                         .rect_filled(bar_rect, Rounding::same(1.5), accent_col);
                     ui.label(
-                        RichText::new(format!("🌐 {header_badge}"))
+                        RichText::new(format!("{} {header_badge}", lucide::GLOBE))
                             .size(12.2)
                             .color(accent_col)
                             .strong(),
@@ -8195,7 +8008,7 @@ fn render_message_body(
                 let short_url = clean_display_url(&url, 38);
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("🔗 {short_url}"))
+                        RichText::new(format!("{} {short_url}", lucide::LINK))
                             .size(11.5)
                             .color(meta_col),
                     );
@@ -8745,7 +8558,7 @@ fn bubble_context_menu(
             })
             .filter(|u| !u.is_empty())
         {
-            if ui.button("🔍 Xem ảnh phóng to").clicked() {
+            if ui.button(format!("{} Xem ảnh phóng to", lucide::SEARCH)).clicked() {
                 action = Some(BubbleAction::OpenImagePopup {
                     tex_key: format!("thumb_{}", crate::crypto::md5_hex(thumb_url)),
                     full_url: msg
@@ -8881,7 +8694,7 @@ fn render_reactions(
                 .inner_margin(Margin::symmetric(5.0, 2.0))
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new("📌 Đã ghim")
+                        RichText::new(format!("{} Đã ghim", lucide::PIN))
                             .size(11.0)
                             .color(pal.primary)
                             .strong(),
@@ -8897,7 +8710,7 @@ fn render_reactions(
                 .inner_margin(Margin::symmetric(5.0, 2.0))
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new("⭐ Đã lưu")
+                        RichText::new(format!("{} Đã lưu", lucide::STAR))
                             .size(11.0)
                             .color(Color32::from_rgb(234, 179, 8))
                             .strong(),
@@ -8931,6 +8744,14 @@ fn render_reactions(
 fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
+    // 1. Embed official Lucide Icon Font (vector glyphs for all UI icons)
+    const LUCIDE_BYTES: &[u8] = include_bytes!("assets/fonts/lucide.ttf");
+    fonts.font_data.insert(
+        "lucide_font".to_owned(),
+        egui::FontData::from_static(LUCIDE_BYTES),
+    );
+
+    // 2. Load system Vietnamese sans-serif font
     let font_candidates = [
         "C:\\Windows\\Fonts\\segoeui.ttf",
         "C:\\Windows\\Fonts\\arial.ttf",
@@ -8943,21 +8764,24 @@ fn setup_custom_fonts(ctx: &egui::Context) {
                 "vietnamese_font".to_owned(),
                 egui::FontData::from_owned(font_data),
             );
-
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, "vietnamese_font".to_owned());
-
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .push("vietnamese_font".to_owned());
             break;
         }
     }
+
+    // Fallback order: Proportional text prefers Vietnamese sans, then Lucide for icon glyphs
+    let prop = fonts.families.entry(egui::FontFamily::Proportional).or_default();
+    if fonts.font_data.contains_key("vietnamese_font") {
+        prop.insert(0, "vietnamese_font".to_owned());
+        prop.push("lucide_font".to_owned());
+    } else {
+        prop.insert(0, "lucide_font".to_owned());
+    }
+
+    let mono = fonts.families.entry(egui::FontFamily::Monospace).or_default();
+    if fonts.font_data.contains_key("vietnamese_font") {
+        mono.push("vietnamese_font".to_owned());
+    }
+    mono.push("lucide_font".to_owned());
 
     ctx.set_fonts(fonts);
 }

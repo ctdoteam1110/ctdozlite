@@ -775,7 +775,7 @@ pub async fn send_attachment(
             is_outgoing: true,
             ts: client_id as i64,
             link_url: Some(final_url),
-            link_title: Some(format!("🖼 {file_name} ({width}×{height} · {})", format_file_size(total_size))),
+            link_title: Some(format!("{file_name} ({width}×{height} · {})", format_file_size(total_size))),
             link_desc: if caption.trim().is_empty() {
                 None
             } else {
@@ -923,7 +923,6 @@ pub async fn send_attachment(
         .get("data")
         .and_then(|d| pick_str(d, &["msgId", "cliMsgId"]))
         .unwrap_or_else(|| format!("out_{client_id}"));
-    let kind_icon = if is_video { "🎬" } else { "📄" };
     let kind_label = if is_video { "Video" } else { "Tập tin" };
     let display_text = if !caption.trim().is_empty() {
         caption.trim().to_string()
@@ -942,7 +941,7 @@ pub async fn send_attachment(
         } else {
             Some(final_url)
         },
-        link_title: Some(format!("{kind_icon} {file_name} ({})", format_file_size(total_size))),
+        link_title: Some(format!("{file_name} ({})", format_file_size(total_size))),
         link_desc: if caption.trim().is_empty() {
             None
         } else {
