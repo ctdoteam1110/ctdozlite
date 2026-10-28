@@ -4,15 +4,19 @@
 
 #![allow(dead_code)]
 
+mod audio;
+mod call;
 mod chat;
 mod crypto;
 mod endpoints;
 mod gui;
 mod logger;
 mod login;
+mod media;
 mod param_cipher;
 mod qr;
 mod session;
+mod socket;
 mod store;
 mod tui;
 mod ui;

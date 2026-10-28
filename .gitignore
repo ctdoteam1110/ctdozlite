@@ -19,6 +19,10 @@ stickers_cache/
 dump/
 qr.png
 *.flow
+call_relay.json
+
+# Generated graph/tooling output
+graphify-out/
 
 # Temporary and backup files
 *.tmp

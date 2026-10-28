@@ -53,6 +53,18 @@ pub struct Domains {
     /// `zpw_service_map_v3.group_cloud_message[0]` — `/api/cm/getoldv2`, `/api/cm/getrecentv2`.
     #[serde(default = "default_cloud_msg")]
     pub cloud_msg: String,
+    /// `zpw_service_map_v3.voice_call[0]` — `/api/voicecall/*` signaling endpoints.
+    #[serde(default = "default_voice_call")]
+    pub voice_call: String,
+    /// `zpw_service_map_v3.sticker[0]` — `/api/message/sticker/*` catalog & search endpoints.
+    #[serde(default = "default_sticker")]
+    pub sticker: String,
+    /// `zpw_ws[...]` — control websocket endpoints (`wss://wsN-msg.chat.zalo.me`).
+    ///
+    /// [O] The server hands back full `wss://` URLs in the login config; the client never
+    /// builds them from a literal. Real-time VoIP invites only arrive over this transport.
+    #[serde(default = "default_ws")]
+    pub ws: Vec<String>,
 }
 
 fn default_lp_chat() -> String {
@@ -65,6 +77,23 @@ fn default_lp_control() -> String {
 
 fn default_cloud_msg() -> String {
     "https://tt-group-cm.api.zaloapp.com".into()
+}
+
+fn default_voice_call() -> String {
+    "https://voicecall-wpa.chat.zalo.me".into()
+}
+
+fn default_sticker() -> String {
+    crate::endpoints::service("sticker")
+        .unwrap_or("https://tt-sticker-wpa.chat.zalo.me")
+        .into()
+}
+
+/// [O] `re-notes/02_chat_data.md`: `zpw_ws` = `wss://ws{1..8}-msg.chat.zalo.me`.
+fn default_ws() -> Vec<String> {
+    (1..=8)
+        .map(|n| format!("wss://ws{n}-msg.chat.zalo.me"))
+        .collect()
 }
 
 impl Default for Domains {
@@ -82,6 +111,9 @@ impl Default for Domains {
             group: "https://tt-group-wpa.zaloapp.com".into(),
             file: "https://tt-files-wpa.zaloapp.com".into(),
             cloud_msg: default_cloud_msg(),
+            voice_call: default_voice_call(),
+            sticker: default_sticker(),
+            ws: default_ws(),
         }
     }
 }
@@ -95,6 +127,8 @@ pub struct LoginInfo {
     pub zpw_sek: String,
     pub display_name: String,
     pub send2me_id: String,
+    #[serde(default)]
+    pub avatar: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +220,7 @@ impl Session {
             &self.domains.friend,
             &self.domains.group,
             &self.domains.cloud_msg,
+            &self.domains.voice_call,
         ];
         for host in hosts {
             if let Ok(url) = reqwest::Url::parse(host) {
@@ -204,7 +239,22 @@ impl Session {
         if self.login.is_none() || self.zpw_sek.is_none() {
             return false;
         }
-        let url = format!("{}/api/social/profile/me-v2?{}", self.domains.profile, self.common_params());
+        let body = serde_json::json!({
+            "avatar_size": 160,
+            "imei": self.imei,
+        });
+        let url = match self.encoded_params(&body) {
+            Ok(enc) => format!(
+                "{}/api/social/profile/me-v2?{}&params={enc}&os=8",
+                self.domains.profile,
+                self.common_params()
+            ),
+            Err(_) => format!(
+                "{}/api/social/profile/me-v2?{}",
+                self.domains.profile,
+                self.common_params()
+            ),
+        };
         match self.get(&url).await {
             Ok(resp) => {
                 let code = resp.get("error_code").and_then(serde_json::Value::as_i64).unwrap_or(-1);
@@ -212,6 +262,59 @@ impl Session {
             }
             Err(_) => false,
         }
+    }
+
+    /// Fetch the authenticated user's own numeric `userId` and `displayName` from `/api/social/profile/me-v2`.
+    pub async fn sync_profile_me(&mut self) -> Option<(String, String)> {
+        if self.login.is_none() || self.zpw_sek.is_none() {
+            return None;
+        }
+        let body = serde_json::json!({
+            "avatar_size": 160,
+            "imei": self.imei,
+        });
+        let enc = self.encoded_params(&body).ok()?;
+        let url = format!(
+            "{}/api/social/profile/me-v2?{}&params={enc}&os=8",
+            self.domains.profile,
+            self.common_params()
+        );
+        let resp = self.get(&url).await.ok()?;
+        let dec = self.maybe_decrypt(resp, self.session_key_bytes()).await;
+        let profile = dec
+            .get("data")
+            .and_then(|d| d.get("profile"))
+            .or_else(|| dec.get("profile"))?;
+        let uid = profile
+            .get("userId")
+            .or_else(|| profile.get("uid"))
+            .and_then(|v| match v {
+                Value::String(s) if !s.is_empty() => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })?;
+        let name = profile
+            .get("displayName")
+            .or_else(|| profile.get("zaloName"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let avatar = profile
+            .get("avatar")
+            .or_else(|| profile.get("avt"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if let Some(ref mut li) = self.login {
+            li.uin = uid.clone();
+            if !name.is_empty() {
+                li.display_name = name.clone();
+            }
+            if !avatar.is_empty() {
+                li.avatar = avatar;
+            }
+        }
+        Some((uid, name))
     }
 
     /// Clear all session credentials, tokens, keys, and cookies.
@@ -268,7 +371,11 @@ impl Session {
         let text = std::fs::read_to_string(path)?;
         let saved: SavedSession = serde_json::from_str(&text)?;
 
-        self.imei = saved.imei;
+        self.imei = if saved.imei.len() == 69 {
+            saved.imei
+        } else {
+            random_imei()
+        };
         self.computer_name = saved.computer_name;
         self.domains = saved.domains;
         // Auto-heal older session.json files where `zpw_chts_new` / `zpw_ctrs_new` overwrote REST domains
@@ -405,6 +512,17 @@ impl Session {
         if let Some(v) = data.get("zpw_ctrs_new").and_then(first) {
             self.domains.lp_control = v;
         }
+        if let Some(arr) = data.get("zpw_ws").and_then(|v| v.as_array()) {
+            let list: Vec<String> = arr
+                .iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.trim_end_matches('/').to_string())
+                .filter(|s| s.starts_with("wss://") || s.starts_with("ws://"))
+                .collect();
+            if !list.is_empty() {
+                self.domains.ws = list;
+            }
+        }
         if let Some(map) = data
             .get("zpw_service_map_v3")
             .or_else(|| data.get("zpw_service_map_new"))
@@ -417,6 +535,8 @@ impl Session {
                 ("group", &mut self.domains.group),
                 ("file", &mut self.domains.file),
                 ("group_cloud_message", &mut self.domains.cloud_msg),
+                ("voice_call", &mut self.domains.voice_call),
+                ("sticker", &mut self.domains.sticker),
             ] {
                 if let Some(v) = map.get(key).and_then(first) {
                     *slot = v;
@@ -434,6 +554,76 @@ impl Session {
 
     pub async fn post_form(&self, url: &str, body: String) -> Result<Value> {
         self.send(Method::POST, url, Some(body)).await
+    }
+
+    /// Send an RFC 7578 `multipart/form-data` binary upload (`chunkContent` or `fileContent`)
+    /// to Zalo's file/photo servers.
+    pub async fn post_multipart(
+        &self,
+        url: &str,
+        field_name: &str,
+        file_name: &str,
+        mime_type: &str,
+        file_bytes: &[u8],
+    ) -> Result<Value> {
+        let boundary = format!(
+            "----WebKitFormBoundary{}",
+            crate::param_cipher::random_hex(16)
+        );
+        let safe_name = file_name.replace(['"', '\r', '\n'], "_");
+        let head = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; filename=\"{safe_name}\"\r\nContent-Type: {mime_type}\r\n\r\n"
+        );
+        let tail = format!("\r\n--{boundary}--\r\n");
+        let mut body = Vec::with_capacity(head.len() + file_bytes.len() + tail.len());
+        body.extend_from_slice(head.as_bytes());
+        body.extend_from_slice(file_bytes);
+        body.extend_from_slice(tail.as_bytes());
+
+        let start = std::time::Instant::now();
+        let mut rb = self
+            .http
+            .request(Method::POST, url)
+            .timeout(std::time::Duration::from_secs(90))
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            );
+        if let Some(sek) = &self.zpw_sek {
+            if !sek.is_empty() {
+                rb = rb
+                    .header("Cookie", format!("zpw_sek={sek}; _zlang=vi"))
+                    .header("zpw_sek", sek)
+                    .header("Origin", "https://chat.zalo.me")
+                    .header("Referer", "https://chat.zalo.me/");
+            }
+        }
+        let resp = rb.body(body).send().await?;
+        let latency_ms = start.elapsed().as_millis();
+        let status = resp.status();
+        let text = resp.text().await?;
+        crate::logger::log_request(
+            "POST(multipart)",
+            url,
+            Some(status.as_u16()),
+            latency_ms,
+            &format!("[{field_name}: {safe_name} ({} bytes)]", file_bytes.len()),
+            Some(&text),
+            if status.is_success() {
+                None
+            } else {
+                Some("HTTP multipart error")
+            },
+        );
+        if !status.is_success() {
+            anyhow::bail!("HTTP {status} from {url}: {}", truncate(&text, 300));
+        }
+        if text.trim().is_empty() {
+            return Ok(serde_json::json!({ "error_code": 0, "data": null }));
+        }
+        let v: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|_| serde_json::json!({ "data": text.trim() }));
+        Ok(v)
     }
 
     async fn send(&self, m: Method, url: &str, body: Option<String>) -> Result<Value> {
@@ -650,14 +840,7 @@ pub fn truncate(s: &str, n: usize) -> String {
 
 /// Client-generated device id. Persisted only in memory for now — regenerate per run.
 fn random_imei() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let a = ns as u64;
-    let b = (ns >> 32) as u64 ^ std::process::id() as u64;
-    format!("{:016x}{:08x}", a, (b as u32))
+    crate::call::official_imei()
 }
 
 #[cfg(test)]

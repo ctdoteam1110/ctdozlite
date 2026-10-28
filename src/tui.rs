@@ -296,9 +296,7 @@ pub async fn run_tui(mut app: TuiApp<'_>) -> Result<()> {
                                         time: now.clone(),
                                         is_outgoing: true,
                                         ts: (crate::login::unix_now() * 1000) as i64,
-                                        sticker_id: None,
-                                        sticker_cate_id: None,
-                                        sticker_type: None,
+                                        ..Default::default()
                                     });
                                     app.threads[app.selected_thread].preview = text.clone();
                                     app.threads[app.selected_thread].time = now;

@@ -10,7 +10,7 @@ use zalo_rust::session::Session;
 async fn main() -> Result<()> {
     println!("=== ZALO REAL DATA FETCH TEST ===");
 
-    let mut s = Session::new(true, true, true)?;
+    let mut s = Session::new(false, false, false)?;
 
     if let Err(e) = s.load_from_file("session.json") {
         bail!("Không tìm thấy hoặc không đọc được session.json ({e}). Vui lòng quét QR đăng nhập trước!");
@@ -65,22 +65,16 @@ async fn main() -> Result<()> {
     };
 
     // 2. Test get-last-msgs
-    println!("\n--- [2] Thử gọi /api/preloadconvers/get-last-msgs (toàn bộ hội thoại) ---");
-    match zalo_rust::chat::get_last_msgs(&s, &[]).await {
-        Ok(resp) => {
-            println!("✓ get-last-msgs THÀNH CÔNG!");
-            zalo_rust::chat::merge_previews(&mut friends, &resp);
-            zalo_rust::chat::resolve_thread_names(&s, &mut friends).await;
-            println!("\n=== KẾT QUẢ ĐỒNG BỘ TIN NHẮN VÀO HỘI THOẠI ===");
-            for (i, f) in friends.iter().enumerate() {
-                println!("  [{i}] ID: {:<20} Tên: {:<25} Tin mới nhất: '{}' (Tổng tin: {})", f.id, f.name, f.preview, f.messages.len());
-                for (mi, m) in f.messages.iter().enumerate() {
-                    println!("      ({mi}) [{}] {}: {}", m.time, if m.is_outgoing { "Tôi" } else { &m.sender }, m.text);
-                }
-            }
-        }
-        Err(e) => {
-            println!("! get-last-msgs lỗi: {e}");
+    println!("\n--- [2] Thử gọi poll_new_messages (lp_chat + get-last-msgs + Cloud của tôi) ---");
+    let mut ps = zalo_rust::chat::PollState::default();
+    if let Err(e) = zalo_rust::chat::poll_new_messages(&s, &mut ps, &mut friends).await {
+        println!("! poll_new_messages lỗi: {e}");
+    }
+    println!("\n=== KẾT QUẢ ĐỒNG BỘ TIN NHẮN VÀO HỘI THOẠI ===");
+    for (i, f) in friends.iter().enumerate() {
+        println!("  [{i}] ID: {:<20} Tên: {:<25} Tin mới nhất: '{}' (Tổng tin: {})", f.id, f.name, f.preview, f.messages.len());
+        for (mi, m) in f.messages.iter().enumerate() {
+            println!("      ({mi}) [{}] {}: {}", m.time, if m.is_outgoing { "Tôi" } else { &m.sender }, m.text);
         }
     }
 

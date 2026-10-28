@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::session::{obj, Session};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
     pub id: String,
     pub sender: String,
@@ -21,6 +21,28 @@ pub struct ChatMessage {
     pub sticker_cate_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticker_type: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_sender: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<String>,
+    #[serde(default)]
+    pub is_pinned: bool,
+    #[serde(default)]
+    pub is_starred: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_desc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_thumb: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_src: Option<String>,
 }
 
 impl ChatMessage {
@@ -62,10 +84,219 @@ pub struct Thread {
     pub messages: Vec<ChatMessage>,
 }
 
+/// Return `true` if a thread name is empty or a generic placeholder (`"Người dùng ..."`, `"Nhóm ..."`).
+pub fn is_generic_thread_name(name: &str) -> bool {
+    let t = name.trim();
+    t.is_empty()
+        || t.starts_with("Người dùng ")
+        || t.starts_with("Nhóm ")
+        || t.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Extract the stable avatar filename (e.g. `"f18d1f0b7014a4b21657e0e970ce9a87.jpg"`) from a Zalo CDN URL.
+pub fn avatar_file_key(avatar: Option<&str>) -> Option<String> {
+    let url = avatar?.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let path = url.split('?').next()?;
+    let fname = path.rsplit('/').next()?.trim();
+    if fname.len() >= 12 && (fname.ends_with(".jpg") || fname.ends_with(".png") || fname.ends_with(".webp")) {
+        Some(fname.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Extract the `?time=...` expiry timestamp from a Zalo avatar URL so newer session avatars win.
+pub fn avatar_url_time(avatar: Option<&str>) -> i64 {
+    let Some(url) = avatar else {
+        return 0;
+    };
+    let Some(query) = url.split('?').nth(1) else {
+        return 0;
+    };
+    for pair in query.split('&') {
+        if let Some(val) = pair.strip_prefix("time=") {
+            if let Ok(ts) = val.parse::<i64>() {
+                return ts;
+            }
+        }
+    }
+    0
+}
+
+/// Return `true` if two `Thread` entries represent the same underlying contact or group,
+/// even if Zalo issued a new session-scoped `userId` after a QR re-login.
+pub fn threads_represent_same_contact(a: &Thread, b: &Thread) -> bool {
+    if !a.id.is_empty() && a.id == b.id {
+        return true;
+    }
+    if a.is_group != b.is_group {
+        return false;
+    }
+    if let (Some(ka), Some(kb)) = (
+        avatar_file_key(a.avatar.as_deref()),
+        avatar_file_key(b.avatar.as_deref()),
+    ) {
+        return ka == kb;
+    }
+    if !is_generic_thread_name(&a.name)
+        && !is_generic_thread_name(&b.name)
+        && a.name.trim() == b.name.trim()
+    {
+        return true;
+    }
+    false
+}
+
+/// Merge `incoming` thread into `target`. When `incoming_id_is_authoritative` is `true`,
+/// `target.id` is migrated to `incoming.id` so actions (chat/VoIP call) always target the active session's `userId`.
+pub fn merge_thread_into(
+    target: &mut Thread,
+    incoming: Thread,
+    incoming_id_is_authoritative: bool,
+) {
+    if incoming_id_is_authoritative && !incoming.id.is_empty() && incoming.id != "0" {
+        target.id = incoming.id;
+    }
+    if !incoming.name.is_empty()
+        && (!is_generic_thread_name(&incoming.name) || is_generic_thread_name(&target.name))
+    {
+        target.name = incoming.name;
+    }
+    if incoming.avatar.is_some()
+        && (target.avatar.is_none()
+            || incoming_id_is_authoritative
+            || avatar_url_time(incoming.avatar.as_deref()) >= avatar_url_time(target.avatar.as_deref()))
+    {
+        target.avatar = incoming.avatar;
+    }
+    target.is_group = target.is_group || incoming.is_group;
+
+    for msg in incoming.messages {
+        if msg.text == "sendBubbleMessage" {
+            continue;
+        }
+        if let Some(existing_msg) = target.messages.iter_mut().find(|m| {
+            (!m.id.is_empty() && !msg.id.is_empty() && m.id == msg.id)
+                || (m.text == msg.text
+                    && m.is_outgoing == msg.is_outgoing
+                    && (m.time == msg.time
+                        || (m.ts != 0 && msg.ts != 0 && (m.ts - msg.ts).abs() < 5000)))
+        }) {
+            if existing_msg.id.starts_with("out_")
+                && !msg.id.is_empty()
+                && !msg.id.starts_with("out_")
+            {
+                existing_msg.id = msg.id;
+            }
+            if msg.ts > 0 && existing_msg.ts != msg.ts {
+                existing_msg.ts = msg.ts;
+                existing_msg.time = msg.time;
+            }
+            if existing_msg.sticker_id.is_none() && msg.sticker_id.is_some() {
+                existing_msg.sticker_id = msg.sticker_id;
+                existing_msg.sticker_cate_id = msg.sticker_cate_id;
+                existing_msg.sticker_type = msg.sticker_type;
+            }
+            if existing_msg.reply_to_text.is_none() && msg.reply_to_text.is_some() {
+                existing_msg.reply_to_id = msg.reply_to_id;
+                existing_msg.reply_to_sender = msg.reply_to_sender;
+                existing_msg.reply_to_text = msg.reply_to_text;
+            }
+            if existing_msg.link_url.is_none() && msg.link_url.is_some() {
+                existing_msg.link_url = msg.link_url;
+                existing_msg.link_title = msg.link_title;
+                existing_msg.link_desc = msg.link_desc;
+                existing_msg.link_thumb = msg.link_thumb;
+                existing_msg.link_src = msg.link_src;
+                if !msg.text.is_empty() {
+                    existing_msg.text = msg.text;
+                }
+            }
+            if existing_msg.reactions.is_empty() && !msg.reactions.is_empty() {
+                existing_msg.reactions = msg.reactions;
+            }
+            existing_msg.is_pinned = existing_msg.is_pinned || msg.is_pinned;
+            existing_msg.is_starred = existing_msg.is_starred || msg.is_starred;
+        } else {
+            target.messages.push(msg);
+        }
+    }
+
+    target.messages.retain(|m| m.text != "sendBubbleMessage");
+    target.messages.sort_by_key(|m| m.ts);
+
+    if let Some(newest) = target.messages.last() {
+        if !newest.text.is_empty() {
+            target.preview = newest.text.replace('\n', " ");
+            target.time = newest.time.clone();
+        }
+    } else if !incoming.preview.is_empty() && target.preview.is_empty() {
+        target.preview = incoming.preview;
+        if !incoming.time.is_empty() {
+            target.time = incoming.time;
+        }
+    } else if target.time.is_empty() && !incoming.time.is_empty() {
+        target.time = incoming.time;
+    }
+}
+
+/// Deduplicate `threads` in-place, merging entries that represent the same contact/group
+/// (by `id`, avatar hash, or non-generic display name) and preserving the authoritative/newer `id`.
+pub fn deduplicate_threads(
+    threads: &mut Vec<Thread>,
+    authoritative_ids: Option<&std::collections::HashSet<String>>,
+) {
+    let mut merged: Vec<Thread> = Vec::with_capacity(threads.len());
+    for mut t in threads.drain(..) {
+        if t.id.is_empty() || t.id == "0" {
+            continue;
+        }
+        t.messages.retain(|m| m.text != "sendBubbleMessage");
+        if let Some(newest) = t.messages.last() {
+            if !newest.text.is_empty() && (t.preview.is_empty() || t.preview == "sendBubbleMessage") {
+                t.preview = newest.text.replace('\n', " ");
+                t.time = newest.time.clone();
+            }
+        }
+        if let Some(existing) = merged.iter_mut().find(|e| {
+            if e.id == t.id {
+                return true;
+            }
+            if let Some(auth) = authoritative_ids {
+                if auth.contains(&e.id) && auth.contains(&t.id) {
+                    return false;
+                }
+            }
+            threads_represent_same_contact(e, &t)
+        }) {
+            let incoming_auth = if let Some(auth) = authoritative_ids {
+                auth.contains(&t.id) && !auth.contains(&existing.id)
+            } else {
+                // In cache order, later entries or entries with newer avatar URL timestamps come from newer sessions
+                let t_time = avatar_url_time(t.avatar.as_deref());
+                let e_time = avatar_url_time(existing.avatar.as_deref());
+                if t_time != e_time {
+                    t_time > e_time
+                } else {
+                    true
+                }
+            };
+            merge_thread_into(existing, t, incoming_auth);
+        } else {
+            merged.push(t);
+        }
+    }
+    *threads = merged;
+}
+
 /// Load locally cached conversations and message history.
 pub fn load_threads_cache() -> Vec<Thread> {
     if let Ok(text) = std::fs::read_to_string("threads_cache.json") {
-        if let Ok(threads) = serde_json::from_str::<Vec<Thread>>(&text) {
+        if let Ok(mut threads) = serde_json::from_str::<Vec<Thread>>(&text) {
+            deduplicate_threads(&mut threads, None);
             return threads;
         }
     }
@@ -173,6 +404,7 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
 
     // Hydrate with locally persisted history from SQLite (`zalo_history.db`)
     crate::store::load_history_into_threads("zalo_history.db", &mut threads, 200);
+    resolve_thread_names(s, &mut threads).await;
 
     Ok(threads)
 }
@@ -305,6 +537,423 @@ pub async fn send_group_message(s: &Session, grid: &str, text: &str) -> Result<V
     Ok(resp)
 }
 
+/// Format a byte count into a human-readable size string (e.g. `"1.4 MB"`, `"320 KB"`).
+pub fn format_file_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn md5_hex_bytes(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    let mut h = Md5::new();
+    h.update(bytes);
+    let out = h.finalize();
+    out.iter().fold(String::with_capacity(32), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
+/// Upload and send a photo, video, or general file attachment to a 1-1 or group conversation.
+///
+/// Implements Zalo PC 26.10.11's two-stage chunked upload (`photo_original/upload` -> `photo_original/send`
+/// for images; `asyncfile/upload` -> `asyncfile/msg` for videos/files) with automatic fallback to
+/// single-shot `message/photo` (`11152`) and `message/sharefile_full` (`11146`).
+pub async fn send_attachment(
+    s: &Session,
+    to_id: &str,
+    is_group: bool,
+    file_path: &std::path::Path,
+    caption: &str,
+) -> Result<(Value, ChatMessage)> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let file_bytes = std::fs::read(file_path)?;
+    if file_bytes.is_empty() {
+        anyhow::bail!("Tập tin rỗng (0 byte)");
+    }
+    let file_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment.bin")
+        .to_string();
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let is_image = matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+    );
+    let is_video = matches!(ext.as_str(), "mp4" | "mov" | "mkv" | "webm" | "avi");
+
+    let file_host = if s.domains.file.is_empty() {
+        "https://tt-files-wpa.zaloapp.com"
+    } else {
+        s.domains.file.trim_end_matches('/')
+    };
+    let clean_target = if is_group {
+        to_id
+            .trim_start_matches("group_")
+            .trim_start_matches('g')
+            .trim_start_matches('G')
+    } else {
+        to_id
+    };
+    let client_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1793165000000);
+    let total_size = file_bytes.len() as u64;
+    let chunk_size: usize = 1_048_576; // 1 MiB chunks
+    let total_chunks = file_bytes.len().div_ceil(chunk_size).max(1);
+    let target_type = if is_group { 11 } else { 2 };
+
+    if is_image {
+        let (width, height) = image::load_from_memory(&file_bytes)
+            .map(|img| (img.width(), img.height()))
+            .unwrap_or((800, 600));
+        let mime = match ext.as_str() {
+            "png" => "image/png",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            "bmp" => "image/bmp",
+            _ => "image/jpeg",
+        };
+        let upload_ep = if is_group {
+            "/api/group/photo_original/upload"
+        } else {
+            "/api/message/photo_original/upload"
+        };
+
+        let mut last_up_dec = Value::Null;
+        for (idx, chunk) in file_bytes.chunks(chunk_size).enumerate() {
+            let chunk_id = idx + 1;
+            let mut m = serde_json::Map::new();
+            m.insert("totalChunk".into(), json!(total_chunks));
+            m.insert("fileName".into(), json!(file_name));
+            m.insert("clientId".into(), json!(client_id));
+            m.insert("totalSize".into(), json!(total_size));
+            m.insert("imei".into(), json!(s.imei));
+            m.insert("isE2EE".into(), json!(0));
+            m.insert("jxl".into(), json!(0));
+            m.insert("chunkId".into(), json!(chunk_id));
+            if is_group {
+                m.insert("grid".into(), json!(clean_target));
+            } else {
+                m.insert("toid".into(), json!(clean_target));
+            }
+            let params = s.encoded_params(&Value::Object(m))?;
+            let url = format!(
+                "{file_host}{upload_ep}?{}&params={params}&type={target_type}",
+                s.common_params()
+            );
+            let up_raw = s
+                .post_multipart(&url, "chunkContent", &file_name, mime, chunk)
+                .await?;
+            last_up_dec = s.maybe_decrypt(up_raw, s.session_key_bytes()).await;
+        }
+
+        let data_node = last_up_dec.get("data").unwrap_or(&last_up_dec);
+        let photo_id = pick_str(data_node, &["photoId", "clientFileId"]);
+        let normal_url = pick_str(data_node, &["normalUrl", "hdUrl", "oriUrl", "url"]).unwrap_or_default();
+        let hd_url = pick_str(data_node, &["hdUrl", "normalUrl", "oriUrl"]).unwrap_or_else(|| normal_url.clone());
+        let thumb_url = pick_str(data_node, &["thumbUrl", "normalUrl", "hdUrl"]).unwrap_or_else(|| normal_url.clone());
+
+        let send_resp = if let Some(pid) = photo_id.filter(|_| !normal_url.is_empty()) {
+            let send_ep = if is_group {
+                "/api/group/photo_original/send"
+            } else {
+                "/api/message/photo_original/send"
+            };
+            let pid_val = pid.parse::<u64>().map(|n| json!(n)).unwrap_or_else(|_| json!(pid));
+            let mut send_obj = serde_json::Map::new();
+            send_obj.insert("photoId".into(), pid_val);
+            send_obj.insert("clientId".into(), json!(client_id));
+            send_obj.insert("desc".into(), json!(caption));
+            send_obj.insert("width".into(), json!(width));
+            send_obj.insert("height".into(), json!(height));
+            send_obj.insert("rawUrl".into(), json!(normal_url));
+            send_obj.insert("hdUrl".into(), json!(hd_url));
+            send_obj.insert("thumbUrl".into(), json!(thumb_url));
+            send_obj.insert("oriUrl".into(), json!(normal_url));
+            send_obj.insert("normalUrl".into(), json!(normal_url));
+            send_obj.insert("hdSize".into(), json!(total_size));
+            send_obj.insert("zsource".into(), json!(-1));
+            send_obj.insert("jcp".into(), json!("{\"convertible\":true}"));
+            send_obj.insert("imei".into(), json!(s.imei));
+            if is_group {
+                send_obj.insert("grid".into(), json!(clean_target));
+                send_obj.insert("visibility".into(), json!(0));
+            } else {
+                send_obj.insert("toid".into(), json!(clean_target));
+            }
+            let params = s.encoded_params(&Value::Object(send_obj))?;
+            let url = format!("{file_host}{send_ep}?{}", s.common_params());
+            let r = s.post_form(&url, format!("params={params}")).await?;
+            s.maybe_decrypt(r, s.session_key_bytes()).await
+        } else {
+            // Fallback: single-shot `/api/message/photo` or `/api/group/sendpt`
+            let single_ep = if is_group {
+                "/api/group/sendpt"
+            } else {
+                "/api/message/photo"
+            };
+            let mut body_obj = serde_json::Map::new();
+            body_obj.insert("clientId".into(), json!(client_id));
+            body_obj.insert("desc".into(), json!(caption));
+            body_obj.insert("width".into(), json!(width));
+            body_obj.insert("height".into(), json!(height));
+            body_obj.insert("imei".into(), json!(s.imei));
+            if is_group {
+                body_obj.insert("grid".into(), json!(clean_target));
+                body_obj.insert("visibility".into(), json!(0));
+            } else {
+                body_obj.insert("toid".into(), json!(clean_target));
+            }
+            let params = s.encoded_params(&Value::Object(body_obj))?;
+            let url = format!(
+                "{file_host}{single_ep}?{}&params={params}&type={target_type}",
+                s.common_params()
+            );
+            let r = s
+                .post_multipart(&url, "fileContent", &file_name, mime, &file_bytes)
+                .await?;
+            s.maybe_decrypt(r, s.session_key_bytes()).await
+        };
+
+        if let Some(code) = send_resp.get("error_code").and_then(Value::as_i64) {
+            if code != 0 {
+                let msg = send_resp
+                    .get("error_message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                anyhow::bail!("server error {code}: {msg}");
+            }
+        }
+
+        let final_thumb = if !thumb_url.is_empty() {
+            thumb_url
+        } else {
+            format!("local://{}", file_path.display())
+        };
+        let final_url = if !hd_url.is_empty() {
+            hd_url
+        } else {
+            file_path.display().to_string()
+        };
+        // Pre-populate `stickers_cache/thumb_<md5>.png` with the local image bytes so the GUI
+        // renders the sent photo immediately without an extra network round-trip.
+        let _ = std::fs::create_dir_all("stickers_cache");
+        let cache_key = format!("thumb_{}", crate::crypto::md5_hex(&final_thumb));
+        let _ = std::fs::write(format!("stickers_cache/{cache_key}.png"), &file_bytes);
+
+        let msg_id = send_resp
+            .get("data")
+            .and_then(|d| pick_str(d, &["msgId", "cliMsgId"]))
+            .unwrap_or_else(|| format!("out_{client_id}"));
+        let now_str = crate::ui::clock();
+        let display_text = if !caption.trim().is_empty() {
+            caption.trim().to_string()
+        } else {
+            format!("[Hình ảnh] {file_name}")
+        };
+        let cm = ChatMessage {
+            id: msg_id,
+            sender: "Tôi".into(),
+            text: display_text.clone(),
+            time: now_str,
+            is_outgoing: true,
+            ts: client_id as i64,
+            link_url: Some(final_url),
+            link_title: Some(format!("🖼 {file_name} ({width}×{height} · {})", format_file_size(total_size))),
+            link_desc: if caption.trim().is_empty() {
+                None
+            } else {
+                Some(caption.trim().to_string())
+            },
+            link_thumb: Some(final_thumb),
+            link_src: Some("Hình ảnh Zalo".into()),
+            ..Default::default()
+        };
+        return Ok((send_resp, cm));
+    }
+
+    // Video / Audio / Document / Archive upload (`asyncfile/upload` -> `asyncfile/msg`, fallback `sharefile_full`)
+    let mime = match ext.as_str() {
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "txt" | "md" | "log" => "text/plain",
+        _ => "application/octet-stream",
+    };
+    let checksum = md5_hex_bytes(&file_bytes);
+    let upload_ep = if is_group {
+        "/api/group/asyncfile/upload"
+    } else {
+        "/api/message/asyncfile/upload"
+    };
+
+    let mut last_up_dec = Value::Null;
+    for (idx, chunk) in file_bytes.chunks(chunk_size).enumerate() {
+        let chunk_id = idx + 1;
+        let mut m = serde_json::Map::new();
+        m.insert("totalChunk".into(), json!(total_chunks));
+        m.insert("fileName".into(), json!(file_name));
+        m.insert("clientId".into(), json!(client_id));
+        m.insert("totalSize".into(), json!(total_size));
+        m.insert("imei".into(), json!(s.imei));
+        m.insert("isE2EE".into(), json!(0));
+        m.insert("chunkId".into(), json!(chunk_id));
+        if is_group {
+            m.insert("grid".into(), json!(clean_target));
+        } else {
+            m.insert("toid".into(), json!(clean_target));
+        }
+        let params = s.encoded_params(&Value::Object(m))?;
+        let url = format!(
+            "{file_host}{upload_ep}?{}&params={params}&type={target_type}",
+            s.common_params()
+        );
+        if let Ok(up_raw) = s
+            .post_multipart(&url, "chunkContent", &file_name, mime, chunk)
+            .await
+        {
+            last_up_dec = s.maybe_decrypt(up_raw, s.session_key_bytes()).await;
+        } else {
+            break;
+        }
+    }
+
+    let data_node = last_up_dec.get("data").unwrap_or(&last_up_dec);
+    let file_id = pick_str(data_node, &["fileId", "clientFileId"]);
+    let file_url = pick_str(data_node, &["fileUrl", "url", "normalUrl"]).unwrap_or_default();
+
+    let mut send_resp = if let Some(fid) = file_id {
+        let msg_ep = if is_group {
+            "/api/group/asyncfile/msg"
+        } else {
+            "/api/message/asyncfile/msg"
+        };
+        let fid_val = fid.parse::<u64>().map(|n| json!(n)).unwrap_or_else(|_| json!(fid));
+        let mut msg_obj = serde_json::Map::new();
+        msg_obj.insert("fileId".into(), fid_val);
+        if !file_url.is_empty() {
+            msg_obj.insert("fileUrl".into(), json!(file_url));
+        }
+        msg_obj.insert("checksum".into(), json!(checksum));
+        msg_obj.insert("checksumSha".into(), json!(""));
+        msg_obj.insert("extension".into(), json!(ext));
+        msg_obj.insert("totalSize".into(), json!(total_size));
+        msg_obj.insert("fileName".into(), json!(file_name));
+        msg_obj.insert("clientId".into(), json!(client_id));
+        msg_obj.insert("fType".into(), json!(if is_video { 2 } else { 1 }));
+        msg_obj.insert("fileCount".into(), json!(0));
+        msg_obj.insert("fdata".into(), json!("{}"));
+        msg_obj.insert("imei".into(), json!(s.imei));
+        if is_group {
+            msg_obj.insert("grid".into(), json!(clean_target));
+        } else {
+            msg_obj.insert("toid".into(), json!(clean_target));
+        }
+        let params = s.encoded_params(&Value::Object(msg_obj))?;
+        let url = format!("{file_host}{msg_ep}?{}", s.common_params());
+        let r = s.post_form(&url, format!("params={params}")).await?;
+        s.maybe_decrypt(r, s.session_key_bytes()).await
+    } else {
+        json!({ "error_code": -1 })
+    };
+
+    if send_resp.get("error_code").and_then(Value::as_i64).unwrap_or(-1) != 0 {
+        // Fallback to single-shot `/api/message/sharefile_full` or `/api/group/sharefile_full`
+        let share_ep = if is_group {
+            "/api/group/sharefile_full"
+        } else {
+            "/api/message/sharefile_full"
+        };
+        let body = if is_group {
+            obj(&[("grid", json!(clean_target)), ("clientId", json!(client_id))])
+        } else {
+            obj(&[("toid", json!(clean_target)), ("clientId", json!(client_id))])
+        };
+        let params = s.encoded_params(&body)?;
+        let url = format!(
+            "{file_host}{share_ep}?{}&params={params}&type={target_type}",
+            s.common_params()
+        );
+        let r = s
+            .post_multipart(&url, "fileContent", &file_name, mime, &file_bytes)
+            .await?;
+        send_resp = s.maybe_decrypt(r, s.session_key_bytes()).await;
+    }
+
+    if let Some(code) = send_resp.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = send_resp
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            anyhow::bail!("server error {code}: {msg}");
+        }
+    }
+
+    let final_url = if !file_url.is_empty() {
+        file_url
+    } else {
+        send_resp
+            .get("data")
+            .and_then(|d| pick_str(d, &["fileUrl", "url", "href"]))
+            .unwrap_or_default()
+    };
+    let msg_id = send_resp
+        .get("data")
+        .and_then(|d| pick_str(d, &["msgId", "cliMsgId"]))
+        .unwrap_or_else(|| format!("out_{client_id}"));
+    let kind_icon = if is_video { "🎬" } else { "📄" };
+    let kind_label = if is_video { "Video" } else { "Tập tin" };
+    let display_text = if !caption.trim().is_empty() {
+        caption.trim().to_string()
+    } else {
+        format!("[{kind_label}] {file_name}")
+    };
+    let cm = ChatMessage {
+        id: msg_id,
+        sender: "Tôi".into(),
+        text: display_text,
+        time: crate::ui::clock(),
+        is_outgoing: true,
+        ts: client_id as i64,
+        link_url: if final_url.is_empty() {
+            None
+        } else {
+            Some(final_url)
+        },
+        link_title: Some(format!("{kind_icon} {file_name} ({})", format_file_size(total_size))),
+        link_desc: if caption.trim().is_empty() {
+            None
+        } else {
+            Some(caption.trim().to_string())
+        },
+        link_src: Some(format!("{kind_label} Zalo")),
+        ..Default::default()
+    };
+    Ok((send_resp, cm))
+}
+
 /// Send a sticker (`sendSticker` in `compact-app-pc.b7bec208c4c8f73e09f8.js:14325410`):
 /// - 1-1 (`cmd 11154`): `POST {domains.chat}/api/message/sticker?{common}`
 /// - Group (`cmd 11165`): `POST {domains.group}/api/group/sticker?{common}`
@@ -390,6 +1039,607 @@ pub async fn send_sticker(
     Ok(resp)
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StickerPackInfo {
+    pub id: u64,
+    pub name: String,
+    pub total_image: u32,
+    pub icon_url: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StickerItem {
+    pub sticker_id: u64,
+    pub cate_id: u64,
+    pub sticker_type: u32,
+    pub label: String,
+}
+
+/// Fetch the complete Zalo Sticker Store catalog (`getStickerCatsV2` -> `getAllCate` in `compact-app-pc.js:14288962`).
+///
+/// Returns ~390 official Zalo sticker packs sorted by newest/featured first and caches them to
+/// `stickers_cache/store_packs.json`.
+pub async fn fetch_sticker_store_packs(s: &Session) -> Result<Vec<StickerPackInfo>> {
+    let cache_dir = std::path::Path::new("stickers_cache");
+    let _ = std::fs::create_dir_all(cache_dir);
+    let cache_path = cache_dir.join("store_packs.json");
+    if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
+        if let Ok(cached) = serde_json::from_str::<Vec<StickerPackInfo>>(&raw_cache) {
+            if cached.len() >= 20 {
+                return Ok(cached);
+            }
+        }
+    }
+
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let sticker_host = if s.domains.sticker.is_empty() {
+        "https://tt-sticker-wpa.chat.zalo.me"
+    } else {
+        s.domains.sticker.trim_end_matches('/')
+    };
+    let key = s.session_key_bytes();
+    if key.is_empty() {
+        anyhow::bail!("thiếu session key để tải kho nhãn dán");
+    }
+    let enc_empty = crate::crypto::encode_aes(key, "")?;
+    let mut encoded_param = String::with_capacity(enc_empty.len() + 16);
+    for b in enc_empty.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded_param.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(encoded_param, "%{b:02X}");
+            }
+        }
+    }
+
+    let list_url = format!(
+        "{sticker_host}/api/message/sticker/category/list/v2?{}&params={encoded_param}",
+        s.common_params()
+    );
+    let resp = s.get(&list_url).await?;
+    let dec = s.maybe_decrypt(resp, key).await;
+    let data = dec.get("data").unwrap_or(&dec);
+
+    let ex_ids: std::collections::HashSet<u64> = data
+        .get("exCateIds")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+
+    let data_url = data
+        .get("dataUrl")
+        .and_then(Value::as_str)
+        .unwrap_or("https://zalo-api.zadn.vn/api/emoticon/pcweb/getAllCate")
+        .replace("http://", "https://");
+
+    let cdn_resp = s.http.get(&data_url).send().await?;
+    let raw_bytes = cdn_resp.bytes().await?;
+    let json_text = if raw_bytes.len() >= 2 && raw_bytes[0] == 0x1f && raw_bytes[1] == 0x8b {
+        use std::io::Read;
+        let mut gz = flate2::read::GzDecoder::new(&raw_bytes[..]);
+        let mut out = String::new();
+        gz.read_to_string(&mut out)?;
+        out
+    } else {
+        String::from_utf8_lossy(&raw_bytes).into_owned()
+    };
+
+    let arr: Vec<Value> = serde_json::from_str(&json_text)?;
+    let mut packs = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Some(id) = item.get("id").and_then(Value::as_u64) else {
+            continue;
+        };
+        if id == 0 || ex_ids.contains(&id) {
+            continue;
+        }
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if name.is_empty() || name.to_lowercase().contains("test") {
+            continue;
+        }
+        let total_image = item
+            .get("totalImage")
+            .and_then(Value::as_u64)
+            .unwrap_or(16) as u32;
+        let icon_url = item
+            .get("iconUrl")
+            .or_else(|| item.get("thumbImg"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .replace("http://", "https://");
+        packs.push(StickerPackInfo {
+            id,
+            name,
+            total_image,
+            icon_url,
+        });
+    }
+
+    // Sort newest packs first (`id` descending) so modern Zalo packs appear at the top of the store
+    packs.sort_by(|a, b| b.id.cmp(&a.id));
+    if let Ok(txt) = serde_json::to_string(&packs) {
+        let _ = std::fs::write(&cache_path, txt);
+    }
+    Ok(packs)
+}
+
+/// Fetch all stickers belonging to a specific category (`getStickerCategoryDetail` — `cmd 11284`).
+pub async fn fetch_sticker_pack_items(
+    s: &Session,
+    cate_id: u64,
+    pack_name: &str,
+) -> Result<Vec<StickerItem>> {
+    if cate_id == 0 {
+        return Ok((1..=30)
+            .map(|id| StickerItem {
+                sticker_id: id,
+                cate_id: 0,
+                sticker_type: 7,
+                label: format!("Củ hành #{id}"),
+            })
+            .collect());
+    }
+
+    let cache_dir = std::path::Path::new("stickers_cache");
+    let _ = std::fs::create_dir_all(cache_dir);
+    let cache_path = cache_dir.join(format!("pack_{cate_id}.json"));
+    if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
+        if let Ok(cached) = serde_json::from_str::<Vec<StickerItem>>(&raw_cache) {
+            if !cached.is_empty() {
+                return Ok(cached);
+            }
+        }
+    }
+
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let sticker_host = if s.domains.sticker.is_empty() {
+        "https://tt-sticker-wpa.chat.zalo.me"
+    } else {
+        s.domains.sticker.trim_end_matches('/')
+    };
+    let params = s.encoded_params(&json!({ "cid": cate_id.to_string() }))?;
+    let url = format!(
+        "{sticker_host}/api/message/sticker/category/sticker_detail?{}&params={params}",
+        s.common_params()
+    );
+    let resp = s.get(&url).await?;
+    let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    let arr = dec
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| dec.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut items = Vec::with_capacity(arr.len());
+    for (idx, it) in arr.iter().enumerate() {
+        let Some(sid) = it
+            .get("id")
+            .or_else(|| it.get("stickerId"))
+            .and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        let cid = it.get("cateId").and_then(Value::as_u64).unwrap_or(cate_id);
+        let stype = it.get("type").and_then(Value::as_u64).unwrap_or(7) as u32;
+        items.push(StickerItem {
+            sticker_id: sid,
+            cate_id: cid,
+            sticker_type: stype,
+            label: format!("{pack_name} #{}", idx + 1),
+        });
+    }
+
+    if !items.is_empty() {
+        if let Ok(txt) = serde_json::to_string(&items) {
+            let _ = std::fs::write(&cache_path, txt);
+        }
+    }
+    Ok(items)
+}
+
+/// Search Zalo stickers by Vietnamese or English keyword (`getStickerSuggestion` — `cmd 11741`).
+pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Vec<StickerItem>> {
+    let kw = keyword.trim();
+    if kw.is_empty() {
+        return Ok(Vec::new());
+    }
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let sticker_host = if s.domains.sticker.is_empty() {
+        "https://tt-sticker-wpa.chat.zalo.me"
+    } else {
+        s.domains.sticker.trim_end_matches('/')
+    };
+    let body = obj(&[
+        ("keyword", json!(kw)),
+        ("gif", json!(1)),
+        ("guggy", json!(0)),
+        ("imei", json!(s.imei)),
+    ]);
+    let params = s.encoded_params(&body)?;
+    let url = format!(
+        "{sticker_host}/api/message/sticker/suggest/stickers?{}&params={params}",
+        s.common_params()
+    );
+    let resp = s.get(&url).await?;
+    let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    let arr = dec
+        .get("data")
+        .and_then(|d| d.get("sugg_sticker"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, it) in arr.iter().enumerate() {
+        let Some(sid) = it
+            .get("sticker_id")
+            .or_else(|| it.get("id"))
+            .and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        let cid = it
+            .get("cate_id")
+            .or_else(|| it.get("cateId"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let stype = it.get("type").and_then(Value::as_u64).unwrap_or(7) as u32;
+        out.push(StickerItem {
+            sticker_id: sid,
+            cate_id: cid,
+            sticker_type: stype,
+            label: format!("{kw} #{}", idx + 1),
+        });
+    }
+    Ok(out)
+}
+
+/// Send a quote/reply message (`sendQuoteMessage` / `sendGroupQuoteMessage` in `compact-app-pc.b7bec208c4c8f73e09f8.js:14317494`):
+/// - 1-1 (`cmd 11771`): `POST {domains.chat}/api/message/quote?{common}`
+/// - Group (`cmd 11197`): `POST {domains.group}/api/group/quote?{common}`
+/// Automatically falls back to `send_message` / `send_group_message` if the quoted message lacks a server ID.
+pub async fn send_quote_message(
+    s: &Session,
+    to_id: &str,
+    text: &str,
+    quoted: &ChatMessage,
+    is_group: bool,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let my_uid = s
+        .login
+        .as_ref()
+        .map(|l| l.uin.clone())
+        .unwrap_or_else(|| "0".into());
+
+    let qmsg_owner = if quoted.is_outgoing {
+        my_uid.as_str()
+    } else if !quoted.sender.is_empty() && quoted.sender.chars().all(|c| c.is_ascii_digit()) {
+        quoted.sender.as_str()
+    } else if !is_group {
+        to_id
+    } else {
+        "0"
+    };
+
+    let qmsg_id_num = quoted.id.parse::<u64>().unwrap_or(now.saturating_sub(1000));
+    let qmsg_ts = if quoted.ts > 0 {
+        quoted.ts as u64
+    } else {
+        now.saturating_sub(1000)
+    };
+    let qmsg_cli_id = qmsg_ts;
+
+    let quote_res: Result<Value> = async {
+        if quoted.id.starts_with("out_") || quoted.id.starts_with("local_") || quoted.id.is_empty()
+        {
+            anyhow::bail!("local quote id");
+        }
+        if is_group {
+            let clean_grid = to_id
+                .trim_start_matches("group_")
+                .trim_start_matches('g')
+                .trim_start_matches('G');
+            let body = obj(&[
+                ("grid", json!(clean_grid)),
+                ("message", json!(text)),
+                ("clientId", json!(now)),
+                ("language", json!("vi")),
+                ("qmsgOwner", json!(qmsg_owner)),
+                ("qmsgId", json!(qmsg_id_num)),
+                ("qmsgCliId", json!(qmsg_cli_id)),
+                ("qmsgType", json!(1)),
+                ("qmsg", json!(quoted.text)),
+                ("qmsgTs", json!(qmsg_ts)),
+                ("visibility", json!(0)),
+                ("ttl", json!(0)),
+                ("imei", json!(s.imei)),
+                ("zsource", json!(101)),
+            ]);
+            let params = s.encoded_params(&body)?;
+            let url = format!("{}/api/group/quote?{}", s.domains.group, s.common_params());
+            let resp = s.post_form(&url, format!("params={params}")).await?;
+            let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+            if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
+                if code != 0 {
+                    anyhow::bail!("quote error {code}");
+                }
+            }
+            Ok(resp)
+        } else {
+            let host = if s.domains.chat.contains("-msg-chat.")
+                || s.domains.chat.contains("tt-chat2-wpa")
+                || s.domains.chat.is_empty()
+            {
+                "https://tt-chat3-wpa.api.zaloapp.com"
+            } else {
+                &s.domains.chat
+            };
+            let body = obj(&[
+                ("toid", json!(to_id)),
+                ("message", json!(text)),
+                ("clientId", json!(now)),
+                ("qmsgOwner", json!(qmsg_owner)),
+                ("qmsgId", json!(qmsg_id_num)),
+                ("qmsgCliId", json!(qmsg_cli_id)),
+                ("qmsgType", json!(1)),
+                ("qmsgTs", json!(qmsg_ts)),
+                ("qmsg", json!(quoted.text)),
+                ("imei", json!(s.imei)),
+                ("ttl", json!(0)),
+                ("zsource", json!(101)),
+            ]);
+            let params = s.encoded_params(&body)?;
+            let url = format!("{host}/api/message/quote?{}", s.common_params());
+            let resp = s.post_form(&url, format!("params={params}")).await?;
+            let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+            if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
+                if code != 0 {
+                    anyhow::bail!("quote error {code}");
+                }
+            }
+            Ok(resp)
+        }
+    }
+    .await;
+
+    match quote_res {
+        Ok(r) => Ok(r),
+        Err(_) => {
+            if is_group {
+                send_group_message(s, to_id, text).await
+            } else {
+                send_message(s, to_id, text).await
+            }
+        }
+    }
+}
+
+/// Forward a message or sticker to another conversation (`forwardMultiMessage` @ `compact-app-pc.js:14323900`).
+pub async fn forward_message(
+    s: &Session,
+    target_id: &str,
+    target_is_group: bool,
+    msg: &ChatMessage,
+) -> Result<Value> {
+    if let Some(sid) = msg.sticker_id {
+        if sid > 0 {
+            let cid = msg.sticker_cate_id.unwrap_or(0);
+            let stype = msg.sticker_type.unwrap_or(7);
+            return send_sticker(s, target_id, sid, cid, stype, target_is_group).await;
+        }
+    }
+    if target_is_group {
+        send_group_message(s, target_id, &msg.text).await
+    } else {
+        send_message(s, target_id, &msg.text).await
+    }
+}
+
+/// Convert Zalo reaction icon code to visual emoji.
+pub fn icon_to_emoji(icon: &str) -> &'static str {
+    match icon {
+        "/-strong" => "👍",
+        "/-heart" => "❤️",
+        ":>" => "😆",
+        ":o" => "😮",
+        ":-((" | ":-(( " => "😢",
+        ":-h" => "😠",
+        _ => "❤️",
+    }
+}
+
+/// Map a visual reaction emoji or Zalo reaction code to `(rIcon, rType)` (`compact-app-pc.js:10848900`).
+pub fn reaction_code_and_type(emoji_or_code: &str) -> (&'static str, i32) {
+    match emoji_or_code {
+        "👍" | "/-strong" => ("/-strong", 3),
+        "❤️" | "❤" | "/-heart" => ("/-heart", 5),
+        "😆" | ":>" => (":>", 0),
+        "😮" | ":o" => (":o", 32),
+        "😢" | ":-(( " | ":-((" => (":-((", 2),
+        "😠" | ":-h" => (":-h", 20),
+        _ => ("/-heart", 5),
+    }
+}
+
+/// Send a message reaction (`sendReactionMessage` in `compact-app-pc.b7bec208c4c8f73e09f8.js:14317097`, cmd `12410` / `12411`).
+pub async fn send_reaction(
+    s: &Session,
+    to_id: &str,
+    is_group: bool,
+    msg: &ChatMessage,
+    reaction: &str,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let (r_icon, r_type) = reaction_code_and_type(reaction);
+    let is_local_id = msg.id.is_empty()
+        || msg.id.starts_with("out_")
+        || msg.id.starts_with("local_");
+    let g_msg_id_val = if is_local_id {
+        json!("")
+    } else {
+        json!(msg.id)
+    };
+    let c_msg_id = if msg.ts > 0 {
+        msg.ts as u64
+    } else {
+        msg.id.parse::<u64>().unwrap_or(now)
+    };
+
+    let inner_msg = json!({
+        "rMsg": [{
+            "gMsgID": g_msg_id_val,
+            "cMsgID": c_msg_id,
+            "msgType": if msg.sticker_id.is_some() { 5 } else { 1 }
+        }],
+        "rIcon": r_icon,
+        "rType": r_type,
+        "source": 6
+    })
+    .to_string();
+
+    let react_list = json!([{
+        "message": inner_msg,
+        "clientId": now
+    }]);
+
+    let (url, body) = if is_group {
+        let clean_grid = to_id
+            .trim_start_matches("group_")
+            .trim_start_matches('g')
+            .trim_start_matches('G');
+        (
+            format!(
+                "https://reaction.api.zaloapp.com/api/group/reaction?{}",
+                s.common_params()
+            ),
+            obj(&[
+                ("react_list", react_list),
+                ("grid", json!(clean_grid)),
+                ("imei", json!(s.imei)),
+            ]),
+        )
+    } else {
+        (
+            format!(
+                "https://reaction.api.zaloapp.com/api/message/reaction?{}",
+                s.common_params()
+            ),
+            obj(&[("react_list", react_list), ("toid", json!(to_id))]),
+        )
+    };
+
+    let params = s.encoded_params(&body)?;
+    let resp = s.post_form(&url, format!("params={params}")).await?;
+    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+}
+
+/// Delete a message for me (`deleteOneOneMessageV2` / `deleteGroupMessageV2` @ `compact-app-pc.js:14373319`, cmd `11779` / `11834`).
+pub async fn delete_message_for_me(
+    s: &Session,
+    to_id: &str,
+    is_group: bool,
+    msg: &ChatMessage,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let my_uid = s
+        .login
+        .as_ref()
+        .map(|l| l.uin.clone())
+        .unwrap_or_else(|| "0".into());
+    let owner_id = if msg.is_outgoing {
+        my_uid.as_str()
+    } else if !is_group {
+        to_id
+    } else {
+        &msg.sender
+    };
+    let cli_id = if msg.ts > 0 {
+        msg.ts.to_string()
+    } else {
+        now.to_string()
+    };
+
+    let msgs_arr = json!([{
+        "cliMsgId": cli_id,
+        "globalMsgId": msg.id,
+        "ownerId": owner_id,
+        "destId": to_id
+    }]);
+
+    if is_group {
+        let clean_grid = to_id
+            .trim_start_matches("group_")
+            .trim_start_matches('g')
+            .trim_start_matches('G');
+        let body = obj(&[
+            ("grid", json!(clean_grid)),
+            ("cliMsgId", json!(now)),
+            ("msgs", msgs_arr),
+            ("onlyMe", json!(1)),
+        ]);
+        let params = s.encoded_params(&body)?;
+        let url = format!("{}/api/group/deletemsg?{}", s.domains.group, s.common_params());
+        let resp = s.post_form(&url, format!("params={params}")).await?;
+        Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    } else {
+        let host = if s.domains.chat.contains("-msg-chat.")
+            || s.domains.chat.contains("tt-chat2-wpa")
+            || s.domains.chat.is_empty()
+        {
+            "https://tt-chat3-wpa.api.zaloapp.com"
+        } else {
+            &s.domains.chat
+        };
+        let body = obj(&[
+            ("toid", json!(to_id)),
+            ("cliMsgId", json!(now)),
+            ("msgs", msgs_arr),
+            ("onlyMe", json!(1)),
+            ("imei", json!(s.imei)),
+        ]);
+        let params = s.encoded_params(&body)?;
+        let url = format!("{host}/api/message/delete?{}", s.common_params());
+        let resp = s.post_form(&url, format!("params={params}")).await?;
+        Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    }
+}
+
 /// `GET /api/preloadconvers/get-last-msgs` (cmd 10053).
 ///
 /// [O] request: GET `{convers_api}/api/preloadconvers/get-last-msgs?{common}&params={encodeAES(json)}`
@@ -403,7 +1653,13 @@ pub async fn get_last_msgs(s: &Session, thread_ids: &[String]) -> Result<Value> 
     // to fetch all recent conversation previews without overflowing URL length.
     if thread_ids.len() <= 25 {
         for id in thread_ids {
-            map.insert(id.clone(), json!(0));
+            let clean = id.trim_start_matches("group_").trim_start_matches('g');
+            let key = if id.starts_with("group_") || id.starts_with('g') {
+                format!("{clean}_1")
+            } else {
+                format!("{clean}_0")
+            };
+            map.insert(key, json!("1"));
         }
     }
     let map_str = serde_json::to_string(&map).unwrap_or_else(|_| "{}".into());
@@ -535,6 +1791,34 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
                     messages: Vec::new(),
                 });
             }
+            if !groups.is_empty() {
+                if let Ok(gv_str) = serde_json::to_string(map) {
+                    let body = obj(&[("gridVerMap", json!(gv_str))]);
+                    if let Ok(params) = s.encoded_params(&body) {
+                        let mg_url = format!("{}/api/group/getmg-v2?{}", s.domains.group, s.common_params());
+                        if let Ok(mg_resp) = s.post_form(&mg_url, format!("params={params}")).await {
+                            let mg_dec = s.maybe_decrypt(mg_resp, s.session_key_bytes()).await;
+                            if let Some(info_map) = mg_dec.pointer("/data/gridInfoMap").and_then(Value::as_object) {
+                                for g in &mut groups {
+                                    if let Some(info) = info_map.get(&g.id) {
+                                        if let Some(name) = pick_str(info, &["name", "groupName", "displayName"]) {
+                                            g.name = name;
+                                        }
+                                        if let Some(avt) = pick_str(info, &["avt", "fullAvt", "avatar"]) {
+                                            g.avatar = Some(avt);
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(removed) = mg_dec.pointer("/data/removedsGroup").and_then(Value::as_array) {
+                                let rem_ids: std::collections::HashSet<&str> =
+                                    removed.iter().filter_map(Value::as_str).collect();
+                                groups.retain(|g| !rem_ids.contains(g.id.as_str()));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(groups)
@@ -566,7 +1850,13 @@ pub async fn get_mini_profiles(s: &Session, user_ids: &[String]) -> Result<serde
 pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
     let unknown_ids: Vec<String> = threads
         .iter()
-        .filter(|t| !t.is_group && (t.name.starts_with("Người dùng ") || t.name.is_empty()))
+        .filter(|t| {
+            !t.is_group
+                && !t.name.contains("Cloud của tôi")
+                && (t.name.starts_with("Người dùng ")
+                    || t.name.is_empty()
+                    || t.avatar.as_deref().unwrap_or("").is_empty())
+        })
         .map(|t| t.id.clone())
         .collect();
 
@@ -575,9 +1865,13 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
             if let Ok(profiles) = get_mini_profiles(s, chunk).await {
                 for t in threads.iter_mut() {
                     if let Some(p) = profiles.get(&t.id) {
-                        if let Some(name) = pick_str(p, &["zaloName", "displayName", "name", "display_name"]) {
-                            if !name.is_empty() {
-                                t.name = name;
+                        if t.name.starts_with("Người dùng ") || t.name.is_empty() {
+                            if let Some(name) =
+                                pick_str(p, &["zaloName", "displayName", "name", "display_name"])
+                            {
+                                if !name.is_empty() {
+                                    t.name = name;
+                                }
                             }
                         }
                         if let Some(ava) = pick_str(p, &["avatar", "avt", "profile_avatar"]) {
@@ -752,7 +2046,11 @@ pub async fn get_cloud_messages(
     map.insert(
         "globalMsgId".into(),
         json!(if global_msg_id.is_empty() {
-            "10000000000000000"
+            if is_old {
+                "10000000000000000"
+            } else {
+                "0"
+            }
         } else {
             global_msg_id
         }),
@@ -783,7 +2081,18 @@ pub async fn get_cloud_messages(
         s.common_params()
     );
     let resp = s.get(&url).await?;
-    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    let mut dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(d_str) = dec.get("data").and_then(Value::as_str) {
+        let trimmed = d_str.trim();
+        if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+            || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        {
+            if let Ok(parsed_data) = serde_json::from_str::<Value>(trimmed) {
+                dec["data"] = parsed_data;
+            }
+        }
+    }
+    Ok(dec)
 }
 
 /// Call Zalo's native HTTP long-polling message endpoint (`getChatFromPolling`, cmd `99100`).
@@ -856,9 +2165,37 @@ pub async fn poll_new_messages(
     if let Ok(preview_resp) = get_last_msgs(s, &[]).await {
         merge_previews(threads, &preview_resp);
     }
+    // 2b. Sync Cloud của tôi (`send2me_id`) and group conversations via `/api/cm/getrecentv2`
+    let send2me_id = s
+        .login
+        .as_ref()
+        .map(|l| l.send2me_id.clone())
+        .unwrap_or_default();
+    if !send2me_id.is_empty() {
+        if let Ok(cm_resp) = get_cloud_messages(s, &send2me_id, "0", false, 50).await {
+            if let Some(t) = threads.iter_mut().find(|t| t.id == send2me_id) {
+                merge_group_history(t, &cm_resp);
+            } else {
+                merge_previews(threads, &cm_resp);
+            }
+        }
+    }
+    let group_ids: Vec<String> = threads
+        .iter()
+        .filter(|t| t.is_group && !t.id.is_empty())
+        .map(|t| t.id.clone())
+        .collect();
+    for gid in group_ids {
+        if let Ok(cm_resp) = get_cloud_messages(s, &gid, "0", false, 50).await {
+            if let Some(t) = threads.iter_mut().find(|t| t.id == gid) {
+                merge_group_history(t, &cm_resp);
+            }
+        }
+    }
     // 3. Resolve display names for any newly discovered threads
     resolve_thread_names(s, threads).await;
-    // 4. Persist to SQLite and JSON cache
+    threads.retain(|t| !t.messages.is_empty() || !t.name.starts_with("Người dùng "));
+    deduplicate_threads(threads, None);
     if let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") {
         let _ = crate::store::persist_threads(&mut store, threads);
     }
@@ -870,6 +2207,9 @@ fn extract_content_text(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => {
             let trimmed = s.trim();
+            if trimmed == "sendBubbleMessage" {
+                return None;
+            }
             if trimmed.starts_with('{') && trimmed.ends_with('}') {
                 if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
                     if let Some(inner) = extract_content_text(&parsed) {
@@ -886,9 +2226,15 @@ fn extract_content_text(v: &Value) -> Option<String> {
             Some(s.clone())
         }
         Value::Object(o) => {
-            for k in ["title", "description", "caption", "text", "msg"] {
+            let href = o
+                .get("href")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|h| !h.is_empty() && (h.starts_with("http://") || h.starts_with("https://")));
+            for k in ["description", "caption", "text", "msg", "title"] {
                 if let Some(Value::String(s)) = o.get(k) {
-                    if !s.trim().is_empty() {
+                    let t = s.trim();
+                    if !t.is_empty() && t != "sendBubbleMessage" {
                         return Some(s.clone());
                     }
                 }
@@ -897,6 +2243,9 @@ fn extract_content_text(v: &Value) -> Option<String> {
                 if !s.trim().is_empty() {
                     return Some(format!("[Tập tin] {s}"));
                 }
+            }
+            if let Some(link) = href {
+                return Some(link.to_string());
             }
             None
         }
@@ -970,6 +2319,90 @@ fn extract_sticker_info(v: &Value) -> Option<(u64, u64, u32)> {
     }
 }
 
+
+/// Extract rich link/media card metadata (`link_url`, `link_title`, `link_desc`, `link_thumb`, `link_src`)
+/// from a Zalo `chat.recommended` (`recommened.link`) or rich-object `content`.
+fn extract_link_info(
+    v: &Value,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    match v {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                    return extract_link_info(&parsed);
+                }
+            }
+            (None, None, None, None, None)
+        }
+        Value::Object(o) => {
+            let href = o
+                .get("href")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|h| !h.is_empty() && (h.starts_with("http://") || h.starts_with("https://")))
+                .map(str::to_string);
+            let Some(url) = href else {
+                return (None, None, None, None, None);
+            };
+            let thumb = o
+                .get("thumb")
+                .or_else(|| o.get("hd"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty() && (t.starts_with("http://") || t.starts_with("https://")))
+                .map(str::to_string);
+            let mut title = o
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            let desc = o
+                .get("description")
+                .or_else(|| o.get("caption"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(str::to_string);
+            let mut src = None;
+            if let Some(params_str) = o.get("params").and_then(Value::as_str) {
+                if let Ok(p_json) = serde_json::from_str::<Value>(params_str.trim()) {
+                    if title.is_none() {
+                        title = p_json
+                            .get("mediaTitle")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                    }
+                    src = p_json
+                        .get("src")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                }
+            }
+            if src.is_none() {
+                src = url
+                    .split("://")
+                    .nth(1)
+                    .and_then(|rest| rest.split('/').next())
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_string);
+            }
+            (Some(url), title, desc, thumb, src)
+        }
+        _ => (None, None, None, None, None),
+    }
+}
 fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     let msg_type = normalize_msg_type(it);
 
@@ -982,11 +2415,13 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     if sticker_meta.is_none() && (msg_type == "chat.sticker" || msg_type == "sticker" || msg_type == "5") {
         sticker_meta = extract_sticker_info(it);
     }
+    let (link_url, link_title, link_desc, link_thumb, link_src) = raw_content_val
+        .map(extract_link_info)
+        .unwrap_or((None, None, None, None, None));
 
     let mut content = raw_content_val
         .and_then(extract_content_text)
         .unwrap_or_default();
-
     if sticker_meta.is_some() && (content.is_empty() || content.starts_with('{')) {
         content = "[Nhãn dán]".to_string();
     }
@@ -1068,6 +2503,7 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
 
     let ts = it
         .get("ts")
+        .or_else(|| it.get("cliMsgId"))
         .or_else(|| it.get("sendTime"))
         .or_else(|| it.get("serverTime"))
         .or_else(|| it.get("time"))
@@ -1085,6 +2521,17 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         crate::ui::clock()
     };
 
+    let (reply_to_id, reply_to_sender, reply_to_text) = if let Some(q) = it.get("quote").filter(|v| v.is_object()) {
+        let q_id = pick_str(q, &["cliMsgId", "globalMsgId", "msgId"]);
+        let q_sender = pick_str(q, &["fromD", "dName", "ownerId", "fromUid", "uidFrom"]);
+        let q_text = pick_str(q, &["msg", "message", "content"]).or_else(|| {
+            q.get("msg").or_else(|| q.get("content")).and_then(extract_content_text)
+        });
+        (q_id, q_sender, q_text)
+    } else {
+        (None, None, None)
+    };
+
     Some(ChatMessage {
         id: msg_id,
         sender: display_sender,
@@ -1095,7 +2542,35 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         sticker_id: sticker_meta.map(|(sid, _, _)| sid),
         sticker_cate_id: sticker_meta.map(|(_, cid, _)| cid),
         sticker_type: sticker_meta.map(|(_, _, st)| st),
+        reply_to_id,
+        reply_to_sender,
+        reply_to_text,
+        reactions: extract_reactions(it),
+        is_pinned: false,
+        is_starred: false,
+        link_url,
+        link_title,
+        link_desc,
+        link_thumb,
+        link_src,
     })
+}
+
+fn extract_reactions(it: &Value) -> Vec<String> {
+    let mut res = Vec::new();
+    if let Some(r) = it.get("reacts").or_else(|| it.get("reactions")) {
+        if let Some(arr) = r.get("reactions").and_then(Value::as_array) {
+            for item in arr {
+                if let Some(icon) = item.get("rIcon").and_then(Value::as_str) {
+                    let em = icon_to_emoji(icon);
+                    if !res.contains(&em.to_string()) {
+                        res.push(em.to_string());
+                    }
+                }
+            }
+        }
+    }
+    res
 }
 
 fn is_group_flag(v: &Value) -> bool {
@@ -1171,11 +2646,16 @@ fn extract_message_thread_id_ext(
 /// Fold a `get-last-msgs` or `getChatFromPolling` response into thread previews and conversation messages.
 pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
     let mut entries: Vec<(&Value, bool)> = Vec::new();
-    let mut data_node = resp.get("data").unwrap_or(resp);
+    let parsed_str_data: Option<Value> = resp
+        .get("data")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok());
+    let mut data_node = parsed_str_data
+        .as_ref()
+        .unwrap_or_else(|| resp.get("data").unwrap_or(resp));
     if let Some(inner_data) = data_node.get("data").filter(|v| v.is_object() || v.is_array()) {
         data_node = inner_data;
     }
-
     let cloud_tid: Option<String> = threads
         .iter()
         .find(|t| t.name.contains("Cloud"))
@@ -1201,6 +2681,31 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 }
                 found_list = true;
             }
+        }
+        if let Some(cu_arr) = obj.get("clearUnreads").and_then(Value::as_array) {
+            for cu in cu_arr {
+                let Some(tid) = pick_str(cu, &["idTo", "threadId", "userId"]) else {
+                    continue;
+                };
+                if tid.is_empty() || tid == "0" {
+                    continue;
+                }
+                let is_grp = is_group_flag(cu);
+                // Only auto-create 1-1 conversation threads from `clearUnreads`; disbanded groups
+                // may linger in `clearUnreads` after removal, whereas active groups come from `get_groups`.
+                if !is_grp && !threads.iter().any(|t| t.id == tid) {
+                    threads.push(Thread {
+                        id: tid.clone(),
+                        name: format!("Người dùng {tid}"),
+                        preview: String::new(),
+                        time: String::new(),
+                        avatar: None,
+                        is_group: false,
+                        messages: Vec::new(),
+                    });
+                }
+            }
+            found_list = true;
         }
         if !found_list {
             for (_, val) in obj {
@@ -1274,6 +2779,26 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                         existing.sticker_cate_id = parsed.sticker_cate_id;
                         existing.sticker_type = parsed.sticker_type;
                     }
+                    if existing.reply_to_text.is_none() && parsed.reply_to_text.is_some() {
+                        existing.reply_to_id = parsed.reply_to_id;
+                        existing.reply_to_sender = parsed.reply_to_sender;
+                        existing.reply_to_text = parsed.reply_to_text;
+                    }
+                    if existing.link_url.is_none() && parsed.link_url.is_some() {
+                        existing.link_url = parsed.link_url;
+                        existing.link_title = parsed.link_title;
+                        existing.link_desc = parsed.link_desc;
+                        existing.link_thumb = parsed.link_thumb;
+                        existing.link_src = parsed.link_src;
+                        if !parsed.text.is_empty() {
+                            existing.text = parsed.text;
+                        }
+                    }
+                    if !parsed.reactions.is_empty() {
+                        existing.reactions = parsed.reactions;
+                    }
+                    existing.is_pinned = existing.is_pinned || parsed.is_pinned;
+                    existing.is_starred = existing.is_starred || parsed.is_starred;
                 } else {
                     t.messages.push(parsed);
                 }
@@ -1313,7 +2838,13 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
 /// Merge group history response into a thread's messages, sorted by timestamp and deduplicated by msg_id.
 pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
     let mut raw_msgs: Vec<&Value> = Vec::new();
-    let mut data_node = resp.get("data").unwrap_or(resp);
+    let parsed_str_data: Option<Value> = resp
+        .get("data")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok());
+    let mut data_node = parsed_str_data
+        .as_ref()
+        .unwrap_or_else(|| resp.get("data").unwrap_or(resp));
     if let Some(inner_data) = data_node.get("data").filter(|v| v.is_object() || v.is_array()) {
         data_node = inner_data;
     }
@@ -1330,10 +2861,21 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
 
     for it in raw_msgs {
         if let Some(m) = parse_chat_message(it) {
-            if !thread.messages.iter().any(|existing| {
+            if let Some(existing) = thread.messages.iter_mut().find(|existing| {
                 (!existing.id.is_empty() && !m.id.is_empty() && existing.id == m.id)
                     || (existing.text == m.text && existing.ts != 0 && existing.ts == m.ts)
             }) {
+                if existing.link_url.is_none() && m.link_url.is_some() {
+                    existing.link_url = m.link_url;
+                    existing.link_title = m.link_title;
+                    existing.link_desc = m.link_desc;
+                    existing.link_thumb = m.link_thumb;
+                    existing.link_src = m.link_src;
+                    if !m.text.is_empty() {
+                        existing.text = m.text;
+                    }
+                }
+            } else {
                 thread.messages.push(m);
             }
         }
@@ -1347,6 +2889,189 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
             thread.time = newest.time.clone();
         }
     }
+}
+
+/// Check friend request status with a target user (`/api/friend/reqstatus`, cmd `11430`).
+pub async fn get_friend_request_status(s: &Session, fid: &str) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let body = obj(&[
+        ("fid", json!(fid)),
+        ("imei", json!(s.imei)),
+    ]);
+    let enc = s.encoded_params(&body)?;
+    let host = if s.domains.friend.is_empty() {
+        "https://tt-friend-wpa.chat.zalo.me"
+    } else {
+        &s.domains.friend
+    };
+    let url = format!(
+        "{}/api/friend/reqstatus?{}&params={enc}",
+        host.trim_end_matches('/'),
+        s.common_params()
+    );
+    let resp = s.get(&url).await?;
+    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+}
+
+/// Send a friend request to a target user (`/api/friend/sendreq`, cmd `11424`).
+pub async fn send_friend_request(s: &Session, to_id: &str, msg: &str) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let body = obj(&[
+        ("toid", json!(to_id)),
+        ("msg", json!(msg)),
+        ("reqsrc", json!(30)),
+        ("imei", json!(s.imei)),
+        ("language", json!("vi")),
+    ]);
+    let enc = s.encoded_params(&body)?;
+    let host = if s.domains.friend.is_empty() {
+        "https://tt-friend-wpa.chat.zalo.me"
+    } else {
+        &s.domains.friend
+    };
+    let url = format!(
+        "{}/api/friend/sendreq?{}",
+        host.trim_end_matches('/'),
+        s.common_params()
+    );
+    let resp = s.post_form(&url, format!("params={enc}")).await?;
+    let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(code) = dec.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let err_msg = dec
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            anyhow::bail!("sendreq error {code}: {err_msg}");
+        }
+    }
+    Ok(dec)
+}
+
+/// Accept a pending incoming friend request (`/api/friend/accept`, cmd `11427`).
+pub async fn accept_friend_request(s: &Session, fid: &str) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let body = obj(&[
+        ("fid", json!(fid)),
+        ("language", json!("vi")),
+    ]);
+    let enc = s.encoded_params(&body)?;
+    let host = if s.domains.friend.is_empty() {
+        "https://tt-friend-wpa.chat.zalo.me"
+    } else {
+        &s.domains.friend
+    };
+    let url = format!(
+        "{}/api/friend/accept?{}",
+        host.trim_end_matches('/'),
+        s.common_params()
+    );
+    let resp = s.post_form(&url, format!("params={enc}")).await?;
+    let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(code) = dec.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let err_msg = dec
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            anyhow::bail!("accept error {code}: {err_msg}");
+        }
+    }
+    Ok(dec)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PhoneLookupResult {
+    pub user_id: String,
+    pub display_name: String,
+    pub zalo_name: String,
+    pub phone: String,
+    pub avatar: String,
+    pub status: String,
+}
+
+/// Normalize a Vietnamese or international phone string for Zalo's `/api/friend/profile/get`.
+///
+/// Converts leading `0` to `84` (e.g. `0912345678` -> `84912345678`), strips `+`, spaces, dots, and dashes.
+pub fn normalize_phone_for_lookup(raw: &str) -> String {
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if let Some(rest) = digits.strip_prefix('0') {
+        format!("84{rest}")
+    } else {
+        digits
+    }
+}
+
+/// Look up a Zalo user profile by phone number (`getUserByPhone` in `compact-app-pc.js:14306443`, cmd `11420`).
+///
+/// Endpoint: `GET {domains.friend}/api/friend/profile/get?{common}&params={encodeAES({ phone, avatar_size: 240, language: "vi", imei, reqSrc: 40 })}`
+pub async fn find_user_by_phone(s: &Session, raw_phone: &str) -> Result<PhoneLookupResult> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let normalized = normalize_phone_for_lookup(raw_phone);
+    if normalized.len() < 8 {
+        anyhow::bail!("Số điện thoại không hợp lệ (cần ít nhất 9 chữ số)");
+    }
+    let body = obj(&[
+        ("phone", json!(normalized)),
+        ("avatar_size", json!(240)),
+        ("language", json!("vi")),
+        ("imei", json!(s.imei)),
+        ("reqSrc", json!(40)),
+    ]);
+    let enc = s.encoded_params(&body)?;
+    let host = if s.domains.friend.is_empty() {
+        "https://tt-friend-wpa.chat.zalo.me"
+    } else {
+        s.domains.friend.trim_end_matches('/')
+    };
+    let url = format!(
+        "{host}/api/friend/profile/get?{}&params={enc}",
+        s.common_params()
+    );
+    let resp = s.get(&url).await?;
+    let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(code) = dec.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            if code == 216 {
+                anyhow::bail!(
+                    "Số điện thoại chưa đăng ký Zalo hoặc người dùng đã chặn tìm kiếm qua SĐT (mã 216)"
+                );
+            }
+            let err_msg = dec
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("Không tìm thấy tài khoản");
+            anyhow::bail!("{err_msg} (mã {code})");
+        }
+    }
+
+    let data = dec.get("data").unwrap_or(&dec);
+    let Some(uid) = pick_str(data, &["uid", "userId", "id", "globalId"]) else {
+        anyhow::bail!("Không tìm thấy tài khoản Zalo ứng với số điện thoại này");
+    };
+    let display_name = pick_str(data, &["display_name", "displayName", "zalo_name", "zaloName"])
+        .unwrap_or_else(|| raw_phone.trim().to_string());
+    let zalo_name = pick_str(data, &["zalo_name", "zaloName", "display_name", "displayName"])
+        .unwrap_or_else(|| display_name.clone());
+    let avatar = pick_str(data, &["avatar", "avt"]).unwrap_or_default();
+    let status = pick_str(data, &["status"]).unwrap_or_default();
+
+    Ok(PhoneLookupResult {
+        user_id: uid,
+        display_name,
+        zalo_name,
+        phone: raw_phone.trim().to_string(),
+        avatar,
+        status,
+    })
 }
 
 #[cfg(test)]
@@ -1730,5 +3455,65 @@ mod tests {
         assert!(thread.is_group);
         assert_eq!(thread.name, "Nhom Chem Gio");
         assert!(!thread.time.is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_threads_migrates_session_scoped_ids() {
+        let old_dtc = Thread {
+            id: "7602591761395115371".into(),
+            name: "Đtc".into(),
+            preview: "Hi".into(),
+            time: "10:21".into(),
+            avatar: Some("https://s120-26-ava-talk.zadn.vn/5/f18d1f0b7014a4b21657e0e970ce9a87.jpg?key=abc&time=1797763127".into()),
+            is_group: false,
+            messages: vec![ChatMessage {
+                id: "m1".into(),
+                sender: "Đtc".into(),
+                text: "Hi".into(),
+                time: "10:21".into(),
+                is_outgoing: false,
+                ts: 1792578088952,
+                ..Default::default()
+            }],
+        };
+        let new_dtc = Thread {
+            id: "3226508141940973766".into(),
+            name: "Đtc".into(),
+            preview: "".into(),
+            time: "16:48".into(),
+            avatar: Some("https://s160-26-ava-talk.zadn.vn/5/f18d1f0b7014a4b21657e0e970ce9a87.jpg?key=xyz&time=1797876325".into()),
+            is_group: false,
+            messages: Vec::new(),
+        };
+        let mut threads = vec![old_dtc, new_dtc];
+        deduplicate_threads(&mut threads, None);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, "3226508141940973766");
+        assert_eq!(threads[0].messages.len(), 1);
+        assert_eq!(threads[0].preview, "Hi");
+    }
+
+    #[test]
+    fn test_merge_group_history_parses_stringified_cloud_data() {
+        let mut cloud_thread = Thread {
+            id: "2379961596042963975".into(),
+            name: "Cloud của tôi (Lưu trữ)".into(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            is_group: false,
+            messages: Vec::new(),
+        };
+        let raw_cloud_resp = json!({
+            "error_code": 0,
+            "data": r#"{"error":0,"groupMsgs":[{"msgId":"6535716960416","cliMsgId":"1745456005456","msgType":"chat.recommended","uidFrom":"0","idTo":"2379961596042963975","dName":"Đỗ Thành","ts":"1745456005783","content":{"title":"","description":"Ghi chú đám mây","href":"https://zalo.me/test","action":"recommened.link"}}]}"#
+        });
+        merge_group_history(&mut cloud_thread, &raw_cloud_resp);
+        assert_eq!(cloud_thread.messages.len(), 1);
+        assert!(cloud_thread.messages[0].text.contains("Ghi chú đám mây"));
+        assert_eq!(
+            cloud_thread.messages[0].link_url.as_deref(),
+            Some("https://zalo.me/test")
+        );
     }
 }

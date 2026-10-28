@@ -20,6 +20,7 @@ pub const SERVICE_MAP_V3: &[(&str, &str)] = &[
     ("emoji_status", "https://emoji-status.chat.zalo.me"),
     ("zcloud", "https://zcld.chat.zalo.me"),
     ("file", "https://tt-files-wpa.zaloapp.com"),
+    ("voice_call", "https://voicecall-wpa.chat.zalo.me"),
 ];
 
 /// `zpw_ctrs_new[0]` — conversation control plane.

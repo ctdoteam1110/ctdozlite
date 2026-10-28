@@ -85,11 +85,28 @@ impl MessageStore {
         )?;
         if rows == 0 && !msg.raw_json.is_empty() {
             let _ = self.conn.execute(
-                "UPDATE messages SET raw_json = ?1, msg_type = ?2 WHERE msg_id = ?3 AND (raw_json IS NULL OR raw_json = '')",
-                params![msg.raw_json, msg.msg_type, msg.msg_id],
+                "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3",
+                params![msg.raw_json, msg.msg_type, msg.msg_id, msg.text],
             );
         }
         Ok(rows > 0)
+    }
+
+    /// Delete a message from local SQLite store when user selects "Xóa chỉ ở phía tôi".
+    pub fn delete_message(&mut self, thread_id: &str, msg_id: &str, ts: i64) -> Result<()> {
+        if !msg_id.is_empty() {
+            let _ = self.conn.execute(
+                "DELETE FROM messages WHERE msg_id = ?1",
+                params![msg_id],
+            );
+        }
+        if ts > 0 && !thread_id.is_empty() {
+            let _ = self.conn.execute(
+                "DELETE FROM messages WHERE thread_id = ?1 AND ts = ?2",
+                params![thread_id, ts],
+            );
+        }
+        Ok(())
     }
 
     /// Insert or update thread metadata.
@@ -169,18 +186,44 @@ impl MessageStore {
     /// Hydrate `threads` with persisted threads and message history from SQLite.
     /// Returns the total number of messages loaded into `threads`.
     pub fn hydrate_threads(&self, threads: &mut Vec<Thread>, limit_per_thread: usize) -> Result<usize> {
+        let _ = self.conn.execute(
+            "DELETE FROM messages WHERE text = 'sendBubbleMessage'",
+            [],
+        );
+        crate::chat::deduplicate_threads(threads, None);
+
         let stored_threads = self.all_threads().unwrap_or_default();
         for st in stored_threads {
             if st.thread_id.is_empty() || st.thread_id == "0" {
                 continue;
             }
             if let Some(existing) = threads.iter_mut().find(|t| t.id == st.thread_id) {
-                if (existing.name.is_empty() || existing.name.starts_with("Người dùng ") || existing.name.starts_with("Nhóm "))
+                if crate::chat::is_generic_thread_name(&existing.name)
                     && !st.name.is_empty()
                 {
                     existing.name = st.name;
                 }
                 existing.is_group = existing.is_group || st.is_group;
+            } else if !crate::chat::is_generic_thread_name(&st.name)
+                && threads
+                    .iter()
+                    .any(|t| t.is_group == st.is_group && t.name.trim() == st.name.trim())
+            {
+                // Migrate stale session-scoped `thread_id` in SQLite to the active contact's `id`
+                if let Some(live_id) = threads
+                    .iter()
+                    .find(|t| t.is_group == st.is_group && t.name.trim() == st.name.trim())
+                    .map(|t| t.id.clone())
+                {
+                    let _ = self.conn.execute(
+                        "UPDATE messages SET thread_id = ?1 WHERE thread_id = ?2",
+                        params![live_id, st.thread_id],
+                    );
+                    let _ = self.conn.execute(
+                        "DELETE FROM threads WHERE thread_id = ?1",
+                        params![st.thread_id],
+                    );
+                }
             } else {
                 threads.push(Thread {
                     id: st.thread_id.clone(),
@@ -211,6 +254,17 @@ impl MessageStore {
                 let mut sticker_id = None;
                 let mut sticker_cate_id = None;
                 let mut sticker_type = None;
+                let mut reply_to_id = None;
+                let mut reply_to_sender = None;
+                let mut reply_to_text = None;
+                let mut reactions = Vec::new();
+                let mut is_pinned = false;
+                let mut is_starred = false;
+                let mut link_url = None;
+                let mut link_title = None;
+                let mut link_desc = None;
+                let mut link_thumb = None;
+                let mut link_src = None;
                 if !sm.raw_json.is_empty() {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sm.raw_json) {
                         sticker_id = val
@@ -225,6 +279,52 @@ impl MessageStore {
                             .get("type")
                             .and_then(|v| v.as_u64())
                             .map(|n| n as u32);
+                        reply_to_id = val
+                            .get("reply_to_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        reply_to_sender = val
+                            .get("reply_to_sender")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        reply_to_text = val
+                            .get("reply_to_text")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        if let Some(arr) = val.get("reactions").and_then(|v| v.as_array()) {
+                            reactions = arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect();
+                        }
+                        is_pinned = val
+                            .get("is_pinned")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        is_starred = val
+                            .get("is_starred")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        link_url = val
+                            .get("link_url")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        link_title = val
+                            .get("link_title")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        link_desc = val
+                            .get("link_desc")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        link_thumb = val
+                            .get("link_thumb")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        link_src = val
+                            .get("link_src")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
                     }
                 }
                 let cm = ChatMessage {
@@ -241,6 +341,17 @@ impl MessageStore {
                     sticker_id,
                     sticker_cate_id,
                     sticker_type,
+                    reply_to_id,
+                    reply_to_sender,
+                    reply_to_text,
+                    reactions,
+                    is_pinned,
+                    is_starred,
+                    link_url,
+                    link_title,
+                    link_desc,
+                    link_thumb,
+                    link_src,
                 };
                 if let Some(existing) = t.messages.iter_mut().find(|existing| {
                     (!existing.id.is_empty() && existing.id == cm.id)
@@ -253,6 +364,26 @@ impl MessageStore {
                         existing.sticker_cate_id = cm.sticker_cate_id;
                         existing.sticker_type = cm.sticker_type;
                     }
+                    if existing.reply_to_text.is_none() && cm.reply_to_text.is_some() {
+                        existing.reply_to_id = cm.reply_to_id;
+                        existing.reply_to_sender = cm.reply_to_sender;
+                        existing.reply_to_text = cm.reply_to_text;
+                    }
+                    if existing.link_url.is_none() && cm.link_url.is_some() {
+                        existing.link_url = cm.link_url;
+                        existing.link_title = cm.link_title;
+                        existing.link_desc = cm.link_desc;
+                        existing.link_thumb = cm.link_thumb;
+                        existing.link_src = cm.link_src;
+                        if !cm.text.is_empty() {
+                            existing.text = cm.text;
+                        }
+                    }
+                    if existing.reactions.is_empty() && !cm.reactions.is_empty() {
+                        existing.reactions = cm.reactions;
+                    }
+                    existing.is_pinned = existing.is_pinned || cm.is_pinned;
+                    existing.is_starred = existing.is_starred || cm.is_starred;
                 } else {
                     t.messages.push(cm);
                     loaded_count += 1;
@@ -268,26 +399,61 @@ impl MessageStore {
                 }
             }
         }
+        crate::chat::deduplicate_threads(threads, None);
         Ok(loaded_count)
     }
 }
 
 impl From<&ChatMessage> for StoredMessage {
     fn from(m: &ChatMessage) -> Self {
-        let (msg_type, raw_json) = if let Some(sid) = m.sticker_id {
+        let mut meta = serde_json::Map::new();
+        let msg_type = if let Some(sid) = m.sticker_id {
             let cid = m.sticker_cate_id.unwrap_or(0);
             let st = m.sticker_type.unwrap_or(7);
-            (
-                "chat.sticker".to_string(),
-                serde_json::json!({
-                    "stickerId": sid,
-                    "cateId": cid,
-                    "type": st
-                })
-                .to_string(),
-            )
+            meta.insert("stickerId".into(), serde_json::json!(sid));
+            meta.insert("cateId".into(), serde_json::json!(cid));
+            meta.insert("type".into(), serde_json::json!(st));
+            "chat.sticker".to_string()
         } else {
-            ("chat.text".to_string(), String::new())
+            "chat.text".to_string()
+        };
+        if let Some(ref rid) = m.reply_to_id {
+            meta.insert("reply_to_id".into(), serde_json::json!(rid));
+        }
+        if let Some(ref rsender) = m.reply_to_sender {
+            meta.insert("reply_to_sender".into(), serde_json::json!(rsender));
+        }
+        if let Some(ref rtext) = m.reply_to_text {
+            meta.insert("reply_to_text".into(), serde_json::json!(rtext));
+        }
+        if !m.reactions.is_empty() {
+            meta.insert("reactions".into(), serde_json::json!(m.reactions));
+        }
+        if m.is_pinned {
+            meta.insert("is_pinned".into(), serde_json::json!(true));
+        }
+        if m.is_starred {
+            meta.insert("is_starred".into(), serde_json::json!(true));
+        }
+        if let Some(lurl) = &m.link_url {
+            meta.insert("link_url".into(), serde_json::json!(lurl));
+        }
+        if let Some(ltitle) = &m.link_title {
+            meta.insert("link_title".into(), serde_json::json!(ltitle));
+        }
+        if let Some(ldesc) = &m.link_desc {
+            meta.insert("link_desc".into(), serde_json::json!(ldesc));
+        }
+        if let Some(lthumb) = &m.link_thumb {
+            meta.insert("link_thumb".into(), serde_json::json!(lthumb));
+        }
+        if let Some(lsrc) = &m.link_src {
+            meta.insert("link_src".into(), serde_json::json!(lsrc));
+        }
+        let raw_json = if meta.is_empty() {
+            String::new()
+        } else {
+            serde_json::Value::Object(meta).to_string()
         };
         Self {
             msg_id: if !m.id.is_empty() {
@@ -435,9 +601,7 @@ mod tests {
                     time: "10:00".into(),
                     is_outgoing: false,
                     ts: 1000,
-                    sticker_id: None,
-                    sticker_cate_id: None,
-                    sticker_type: None,
+                    ..Default::default()
                 },
                 ChatMessage {
                     id: "pt_m2".into(),
@@ -446,9 +610,7 @@ mod tests {
                     time: "10:01".into(),
                     is_outgoing: true,
                     ts: 2000,
-                    sticker_id: None,
-                    sticker_cate_id: None,
-                    sticker_type: None,
+                    ..Default::default()
                 },
             ],
         };

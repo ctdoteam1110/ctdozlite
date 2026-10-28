@@ -261,10 +261,10 @@ pub async fn get_login_info(s: &Session) -> Result<Value> {
 /// Preserves already established session credentials if the new payload only contains partial fields.
 pub fn apply_login_config(s: &mut Session, cfg: &Value) {
     let new_dkey = cfg
-        .get("dkey")
-        .or_else(|| cfg.get("uid"))
+        .get("uid")
         .or_else(|| cfg.get("userId"))
         .or_else(|| cfg.get("account").and_then(|a| a.get("userId").or_else(|| a.get("uid"))))
+        .or_else(|| cfg.get("dkey"))
         .and_then(as_str)
         .unwrap_or_default();
 
