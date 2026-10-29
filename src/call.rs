@@ -2996,8 +2996,8 @@ mod tests {
     fn zrtp_udp_binary_packets_match_zalocall_layout() {
         assert_eq!(uid_str_to_u32("1000000000000000005"), 2808348677);
 
-        let sess = "588635749-588635749@1269925995";
-        let caller_init = build_zrtp_init_packet(true, 100000001, 100000003, 792612942, 2, sess);
+        let sess = "100000001-100000001@100000002";
+        let caller_init = build_zrtp_init_packet(true, 100000001, 100000003, 100000010, 2, sess);
         assert_eq!(caller_init[0], 0x01);
         assert_eq!(caller_init[1], 0x7E);
         assert_eq!(
@@ -3011,7 +3011,7 @@ mod tests {
         assert_eq!(caller_init[20], 2);
         assert_eq!(
             u32::from_le_bytes(caller_init[21..25].try_into().unwrap()),
-            792612942
+            100000010
         );
         assert_eq!(
             u32::from_le_bytes(caller_init[25..29].try_into().unwrap()),
@@ -3023,12 +3023,12 @@ mod tests {
         );
         assert_eq!(&caller_init[31..], sess.as_bytes());
 
-        let callee_init = build_zrtp_init_packet(false, 100000001, 100000002, 792612942, 2, sess);
+        let callee_init = build_zrtp_init_packet(false, 100000001, 100000002, 100000010, 2, sess);
         assert_eq!(
             u16::from_le_bytes(callee_init[18..20].try_into().unwrap()),
             0x000C
         );
-        let ping = build_zrtp_ping_packet(100000001, 792612942, sess);
+        let ping = build_zrtp_ping_packet(100000001, 100000010, sess);
         assert_eq!(ping[1], 0x01);
         assert_eq!(
             u16::from_le_bytes(ping[18..20].try_into().unwrap()),
@@ -3055,7 +3055,7 @@ mod tests {
             0x0005
         );
 
-        let end_pkt = build_zrtp_end_packet(100000001, 792612942, sess);
+        let end_pkt = build_zrtp_end_packet(100000001, 100000010, sess);
         assert_eq!(
             u16::from_le_bytes(end_pkt[18..20].try_into().unwrap()),
             0x0020
@@ -3204,24 +3204,24 @@ mod tests {
         pkt[1] = 0x7E;
         pkt[18..20].copy_from_slice(&0x000Bu16.to_le_bytes());
         pkt.extend_from_slice(&0i32.to_le_bytes());
-        pkt.extend_from_slice(&463477714u32.to_le_bytes());
+        pkt.extend_from_slice(&100000010u32.to_le_bytes());
         pkt.extend_from_slice(&0xCAFE_BABEu32.to_le_bytes());
-        let pub_addr = b"117.5.147.0|9849";
+        let pub_addr = b"203.0.113.10|9849";
         pkt.extend_from_slice(&(pub_addr.len() as u16).to_le_bytes());
         pkt.extend_from_slice(pub_addr);
 
         let parsed = parse_zrtp_init_response(&pkt).expect("valid InitZRTP response");
         assert_eq!(parsed.0, 0);
-        assert_eq!(parsed.1, 463477714);
+        assert_eq!(parsed.1, 100000010);
         assert_eq!(parsed.2, 0xCAFE_BABE);
-        assert_eq!(parsed.3, Some(("117.5.147.0".to_string(), 9849)));
+        assert_eq!(parsed.3, Some(("203.0.113.10".to_string(), 9849)));
     }
 
     #[test]
     fn build_callee_extend_data_includes_select2side_and_public_p2p() {
         let mut probe = ZrtpProbeResult {
             local_port: 61234,
-            public_p2p: Some(("116.109.185.174".into(), 61234)),
+            public_p2p: Some(("203.0.113.20".into(), 61234)),
             ..Default::default()
         };
         probe.echo_stats.insert("42.113.206.4:10490".into(), (14, 18));
@@ -3239,6 +3239,6 @@ mod tests {
         assert!(p2p.iter().any(|e| e["type"] == 0 && e["port"] == 61234));
         assert!(p2p
             .iter()
-            .any(|e| e["type"] == 1 && e["ip"] == "116.109.185.174" && e["port"] == 61234));
+            .any(|e| e["type"] == 1 && e["ip"] == "203.0.113.20" && e["port"] == 61234));
     }
 }

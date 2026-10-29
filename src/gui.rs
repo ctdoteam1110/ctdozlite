@@ -191,7 +191,7 @@ fn truncate_chars<'a>(s: &'a str, max_chars: usize) -> std::borrow::Cow<'a, str>
     }
 }
 
-/// Extract up to 2 uppercase initials from a display name (e.g. `"Đỗ Thành"` -> `"ĐT"`, `"Hoang"` -> `"H"`).
+/// Extract up to 2 uppercase initials from a display name (e.g. `"Nguyễn An"` -> `"NA"`, `"Hoang"` -> `"H"`).
 fn avatar_initials(name: &str) -> String {
     let words: Vec<&str> = name.split_whitespace().filter(|w| !w.is_empty()).collect();
     if words.len() >= 2 {
@@ -212,7 +212,7 @@ fn avatar_initials(name: &str) -> String {
 }
 
 /// Fold Vietnamese text to lowercase ASCII for diacritic-insensitive search
-/// (e.g. `"Đỗ Trung Thành"` -> `"do trung thanh"`).
+/// (e.g. `"Nguyễn Văn An"` -> `"nguyen van an"`).
 fn fold_vn_search(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for raw in s.chars() {
@@ -2816,7 +2816,9 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                         &mut t_list,
                                         500,
                                     );
-                                    let Some(mut t) = t_list.pop() else {
+                                    let Some(mut t) =
+                                        t_list.into_iter().find(|x| x.id == group_id)
+                                    else {
                                         return;
                                     };
                                     if is_group && !is_send2me {
@@ -4232,7 +4234,7 @@ impl ZaloGuiApp {
                     let (av_rect, av_resp) =
                         ui.allocate_exact_size(Vec2::new(40.0, 40.0), Sense::click());
                     let user_disp = if self.user_name.is_empty() {
-                        "Đỗ Thành"
+                        "Người dùng Zalo"
                     } else {
                         &self.user_name
                     };

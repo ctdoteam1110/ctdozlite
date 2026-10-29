@@ -241,8 +241,36 @@ impl MessageStore {
             }
         }
 
+        let mut msg_owner: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if let Ok(mut stmt) = self.conn.prepare("SELECT msg_id, thread_id FROM messages") {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }) {
+                for r in rows.flatten() {
+                    msg_owner.insert(r.0, r.1);
+                }
+            }
+        }
+
         let mut loaded_count = 0;
         for t in threads.iter_mut() {
+            let before = t.messages.len();
+            t.messages.retain(|m| {
+                if let Some(owner_tid) = msg_owner.get(&m.id) {
+                    owner_tid == &t.id
+                } else {
+                    true
+                }
+            });
+            if t.messages.len() != before && t.messages.is_empty() {
+                t.preview.clear();
+                t.time.clear();
+                let _ = self.conn.execute(
+                    "UPDATE threads SET last_ts = 0 WHERE thread_id = ?1",
+                    params![t.id],
+                );
+            }
             let saved_msgs = self.messages_for(&t.id, limit_per_thread)?;
             for sm in saved_msgs {
                 let time = if sm.ts > 0 {

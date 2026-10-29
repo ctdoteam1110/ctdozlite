@@ -93,7 +93,7 @@ pub fn is_generic_thread_name(name: &str) -> bool {
         || t.chars().all(|c| c.is_ascii_digit())
 }
 
-/// Extract the stable avatar filename (e.g. `"f18d1f0b7014a4b21657e0e970ce9a87.jpg"`) from a Zalo CDN URL.
+/// Extract the stable avatar filename (e.g. `"00000000000000000000000000000001.jpg"`) from a Zalo CDN URL.
 pub fn avatar_file_key(avatar: Option<&str>) -> Option<String> {
     let url = avatar?.trim();
     if url.is_empty() {
@@ -293,6 +293,35 @@ pub fn deduplicate_threads(
             merge_thread_into(existing, t, incoming_auth);
         } else {
             merged.push(t);
+        }
+    }
+    let cloud_msg_ids: std::collections::HashSet<String> = merged
+        .iter()
+        .filter(|t| t.name.contains("Cloud của tôi"))
+        .flat_map(|t| t.messages.iter())
+        .filter_map(|m| {
+            if !m.id.is_empty() && !m.id.starts_with("out_") && !m.id.starts_with("local_") {
+                Some(m.id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !cloud_msg_ids.is_empty() {
+        for t in merged.iter_mut() {
+            if !t.name.contains("Cloud của tôi") {
+                let before = t.messages.len();
+                t.messages.retain(|m| !cloud_msg_ids.contains(&m.id));
+                if t.messages.len() != before {
+                    if let Some(newest) = t.messages.last() {
+                        t.preview = newest.text.replace('\n', " ");
+                        t.time = newest.time.clone();
+                    } else {
+                        t.preview.clear();
+                        t.time.clear();
+                    }
+                }
+            }
         }
     }
     *threads = merged;
@@ -3235,7 +3264,7 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
     }
     let cloud_tid: Option<String> = threads
         .iter()
-        .find(|t| t.name.contains("Cloud"))
+        .find(|t| t.name.contains("Cloud của tôi"))
         .map(|t| t.id.clone());
 
     if let Some(arr) = data_node.as_array() {
@@ -3442,7 +3471,25 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
         }
     }
 
+    let clean_thread_id = thread
+        .id
+        .trim_start_matches("group_")
+        .trim_start_matches('g')
+        .trim_start_matches('G')
+        .to_string();
+
     for it in raw_msgs {
+        if !clean_thread_id.is_empty() {
+            if let Some(id_to) = pick_str(it, &["idTo", "toId", "grid", "groupId"]) {
+                let clean_to = id_to
+                    .trim_start_matches("group_")
+                    .trim_start_matches('g')
+                    .trim_start_matches('G');
+                if !clean_to.is_empty() && clean_to != "0" && clean_to != clean_thread_id {
+                    continue;
+                }
+            }
+        }
         if let Some(m) = parse_chat_message(it) {
             if let Some(existing) = thread.messages.iter_mut().find(|existing| {
                 (!existing.id.is_empty() && !m.id.is_empty() && existing.id == m.id)
@@ -4188,7 +4235,7 @@ mod tests {
         };
         let raw_cloud_resp = json!({
             "error_code": 0,
-            "data": r#"{"error":0,"groupMsgs":[{"msgId":"6535716960416","cliMsgId":"1745456005456","msgType":"chat.recommended","uidFrom":"0","idTo":"9000000000000000002","dName":"User Test","ts":"1745456005783","content":{"title":"","description":"Ghi chú đám mây","href":"https://zalo.me/test","action":"recommened.link"}}]}"#
+            "data": r#"{"error":0,"groupMsgs":[{"msgId":"1000000000001","cliMsgId":"1700000000001","msgType":"chat.recommended","uidFrom":"0","idTo":"9000000000000000002","dName":"User Test","ts":"1700000000001","content":{"title":"","description":"Ghi chú đám mây","href":"https://zalo.me/test","action":"recommened.link"}}]}"#
         });
         merge_group_history(&mut cloud_thread, &raw_cloud_resp);
         assert_eq!(cloud_thread.messages.len(), 1);
@@ -4204,7 +4251,7 @@ mod tests {
         assert_eq!(strip_vn_for_sticker_kw("Xin chào"), "xin chao");
         assert_eq!(strip_vn_for_sticker_kw("Cảm ơn nhiều"), "cam on nhieu");
         assert_eq!(strip_vn_for_sticker_kw("Ngủ ngon nhé"), "ngu ngon nhe");
-        assert_eq!(strip_vn_for_sticker_kw("Đỗ Trung Thành"), "do trung thanh");
+        assert_eq!(strip_vn_for_sticker_kw("Nguyễn Văn An"), "nguyen van an");
     }
 
     #[test]
@@ -4220,5 +4267,74 @@ mod tests {
 
         let r_stranger = json!({"error_code": 0, "data": {"is_friend": 0, "is_requested": 0, "is_requesting": 0}});
         assert_eq!(parse_friendship_status_response(&r_stranger), FriendshipStatus::Stranger);
+    }
+
+    #[test]
+    fn test_prevent_cloud_message_pollution_across_threads() {
+        let mut contact = Thread {
+            id: "1000000000000000009".into(),
+            name: "Người dùng Test".into(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            is_group: false,
+            messages: Vec::new(),
+        };
+        let raw_cloud_resp = json!({
+            "error_code": 0,
+            "data": {
+                "groupMsgs": [{
+                    "msgId": "1000000000002",
+                    "msgType": "webchat",
+                    "uidFrom": "0",
+                    "idTo": "9000000000000000001",
+                    "dName": "User Test",
+                    "ts": "1700000000002",
+                    "content": "Ghi chú Cloud của tôi"
+                }]
+            }
+        });
+        merge_group_history(&mut contact, &raw_cloud_resp);
+        assert!(contact.messages.is_empty());
+
+        let cloud = Thread {
+            id: "9000000000000000001".into(),
+            name: "Cloud của tôi (Lưu trữ)".into(),
+            preview: "Ghi chú Cloud của tôi".into(),
+            time: "12:00".into(),
+            avatar: None,
+            is_group: false,
+            messages: vec![ChatMessage {
+                id: "1000000000002".into(),
+                sender: "Tôi".into(),
+                text: "Ghi chú Cloud của tôi".into(),
+                time: "12:00".into(),
+                is_outgoing: true,
+                ts: 1700000000002,
+                ..Default::default()
+            }],
+        };
+        let polluted_contact = Thread {
+            id: "1000000000000000009".into(),
+            name: "Người dùng Test".into(),
+            preview: "Ghi chú Cloud của tôi".into(),
+            time: "12:00".into(),
+            avatar: None,
+            is_group: false,
+            messages: vec![ChatMessage {
+                id: "1000000000002".into(),
+                sender: "Tôi".into(),
+                text: "Ghi chú Cloud của tôi".into(),
+                time: "12:00".into(),
+                is_outgoing: true,
+                ts: 1700000000002,
+                ..Default::default()
+            }],
+        };
+        let mut list = vec![cloud, polluted_contact];
+        deduplicate_threads(&mut list, None);
+        assert_eq!(list[0].messages.len(), 1);
+        assert!(list[1].messages.is_empty());
+        assert!(list[1].preview.is_empty());
     }
 }
