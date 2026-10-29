@@ -1242,6 +1242,7 @@ pub enum GuiEvent {
         keyword: String,
         items: Vec<crate::chat::StickerItem>,
     },
+    LinkPreviewReady(crate::chat::LinkMetadata),
     PhoneLookupSuccess(crate::chat::PhoneLookupResult),
     PhoneLookupFailed(String),
     QuoteSent {
@@ -1388,6 +1389,9 @@ pub struct ZaloGuiApp {
     composer_focus_pending: bool,
     pending_clipboard_image: Option<(std::path::PathBuf, u32, u32, TextureHandle)>,
     unread_counts: HashMap<String, usize>,
+    link_metadata_cache: HashMap<String, crate::chat::LinkMetadata>,
+    loading_link_previews: HashSet<String>,
+    dismissed_link_preview_for: String,
     allow_quit: bool,
 
     // Dev Inspector state
@@ -1553,6 +1557,9 @@ impl ZaloGuiApp {
             composer_focus_pending: false,
             pending_clipboard_image: None,
             unread_counts: HashMap::new(),
+            link_metadata_cache: HashMap::new(),
+            loading_link_previews: HashSet::new(),
+            dismissed_link_preview_for: String::new(),
             allow_quit: false,
             dev_mode,
             dev_panel_open: false,
@@ -1933,6 +1940,71 @@ impl ZaloGuiApp {
                         self.composer_sticker_cache.insert(keyword, items);
                     }
                 }
+                GuiEvent::LinkPreviewReady(meta) => {
+                    self.loading_link_previews.remove(&meta.url);
+                    if !meta.thumb.is_empty() {
+                        let key = format!("thumb_{}", crate::crypto::md5_hex(&meta.thumb));
+                        if !self.sticker_textures.contains_key(&key)
+                            && self.loading_stickers.insert(key.clone())
+                        {
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(WorkerCmd::FetchStickerImage {
+                                    key,
+                                    url: meta.thumb.clone(),
+                                });
+                            }
+                        }
+                    }
+                    let mut updated_any = false;
+                    for t in &mut self.threads {
+                        for m in &mut t.messages {
+                            let matches_url = m.link_url.as_deref() == Some(meta.url.as_str())
+                                || crate::chat::extract_first_url(&m.text).as_deref()
+                                    == Some(meta.url.as_str());
+                            if matches_url {
+                                if m.link_url.is_none() {
+                                    m.link_url = Some(meta.url.clone());
+                                    updated_any = true;
+                                }
+                                if (m.link_title.is_none()
+                                    || m.link_title.as_deref() == Some(meta.url.as_str()))
+                                    && !meta.title.is_empty()
+                                {
+                                    m.link_title = Some(meta.title.clone());
+                                    updated_any = true;
+                                }
+                                if m.link_desc.is_none() && !meta.desc.is_empty() {
+                                    m.link_desc = Some(meta.desc.clone());
+                                    updated_any = true;
+                                }
+                                let old_thumb_expired = m
+                                    .link_thumb
+                                    .as_deref()
+                                    .map(|th| {
+                                        th.is_empty()
+                                            || (th.contains("zpcloud.zdn.vn")
+                                                && !self.sticker_textures.contains_key(&format!(
+                                                    "thumb_{}",
+                                                    crate::crypto::md5_hex(th)
+                                                )))
+                                    })
+                                    .unwrap_or(true);
+                                if old_thumb_expired && !meta.thumb.is_empty() {
+                                    m.link_thumb = Some(meta.thumb.clone());
+                                    updated_any = true;
+                                }
+                                if m.link_src.is_none() && !meta.src.is_empty() {
+                                    m.link_src = Some(meta.src.clone());
+                                    updated_any = true;
+                                }
+                            }
+                        }
+                    }
+                    self.link_metadata_cache.insert(meta.url.clone(), meta);
+                    if updated_any {
+                        self.persist_threads_async();
+                    }
+                }
                 GuiEvent::PhoneLookupSuccess(res) => {
                     self.phone_lookup_loading = false;
                     self.phone_lookup_error = None;
@@ -2106,6 +2178,9 @@ pub enum WorkerCmd {
     },
     SuggestComposerStickers {
         keyword: String,
+    },
+    ParseLinkPreview {
+        url: String,
     },
     LookupPhone {
         phone: String,
@@ -2762,6 +2837,82 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
+                                if let Some(found_url) = crate::chat::extract_first_url(&text) {
+                                    let meta = crate::chat::parse_link_metadata(&s, &found_url)
+                                        .await
+                                        .unwrap_or_else(|_| crate::chat::LinkMetadata {
+                                            url: found_url.clone(),
+                                            title: found_url.clone(),
+                                            desc: String::new(),
+                                            thumb: String::new(),
+                                            src: "Liên kết".into(),
+                                        });
+                                    let _ =
+                                        gui_tx_clone.send(GuiEvent::LinkPreviewReady(meta.clone()));
+                                    match crate::chat::send_link_message(
+                                        &s, &to_id, &text, &meta, is_group,
+                                    )
+                                    .await
+                                    {
+                                        Ok(resp) => {
+                                            let msg_id = extract_msg_id(&resp);
+                                            let now = crate::ui::clock();
+                                            let final_id = if msg_id.is_empty() {
+                                                format!("out_{}", crate::login::unix_now())
+                                            } else {
+                                                msg_id
+                                            };
+                                            let msg = ChatMessage {
+                                                id: final_id,
+                                                sender: "Tôi".into(),
+                                                text,
+                                                time: now,
+                                                is_outgoing: true,
+                                                ts: (crate::login::unix_now() * 1000) as i64,
+                                                link_url: Some(meta.url),
+                                                link_title: if meta.title.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(meta.title)
+                                                },
+                                                link_desc: if meta.desc.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(meta.desc)
+                                                },
+                                                link_thumb: if meta.thumb.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(meta.thumb)
+                                                },
+                                                link_src: if meta.src.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(meta.src)
+                                                },
+                                                ..Default::default()
+                                            };
+                                            let _ = gui_tx_clone.send(GuiEvent::AttachmentSent {
+                                                thread_id: to_id,
+                                                msg,
+                                            });
+                                            ctx_clone.request_repaint();
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            let err_s = e.to_string();
+                                            crate::logger::log_error("gui::send_link", &err_s);
+                                            let _ = gui_tx_clone.send(GuiEvent::SendFailed {
+                                                thread_id: to_id,
+                                                text,
+                                                error: err_s,
+                                            });
+                                            ctx_clone.request_repaint();
+                                            return;
+                                        }
+                                    }
+                                }
+
                                 let res = if is_group {
                                     crate::chat::send_group_message(&s, &to_id, &text).await
                                 } else {
@@ -2769,15 +2920,7 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                 };
                                 match res {
                                     Ok(resp) => {
-                                        let msg_id = resp
-                                            .get("data")
-                                            .and_then(|d| d.get("msgId"))
-                                            .and_then(|v| match v {
-                                                serde_json::Value::String(s) => Some(s.clone()),
-                                                serde_json::Value::Number(n) => Some(n.to_string()),
-                                                _ => None,
-                                            })
-                                            .unwrap_or_default();
+                                        let msg_id = extract_msg_id(&resp);
                                         let _ = gui_tx_clone.send(GuiEvent::MessageSent {
                                             thread_id: to_id,
                                             text,
@@ -3317,6 +3460,18 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                         items,
                                     });
                                 ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::ParseLinkPreview { url } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                if let Ok(meta) = crate::chat::parse_link_metadata(&s, &url).await {
+                                    let _ = gui_tx_clone.send(GuiEvent::LinkPreviewReady(meta));
+                                    ctx_clone.request_repaint();
+                                }
                             });
                         }
                         WorkerCmd::PickAndSendAttachment {
@@ -5893,6 +6048,7 @@ impl ZaloGuiApp {
 
                     // 2. Scrollable Messages Area
                     let contextual_stickers = self.resolve_contextual_sticker_suggestions(ctx);
+                    let composer_link_preview = self.resolve_composer_link_preview(ctx);
                     // Do NOT subtract `contextual_stickers` height from `picker_reserve`!
                     // The sticker strip is a true floating overlay (`egui::Area`) above the composer bar
                     // (matching Zalo PC's `PopoverIdentitiesDefine.STICKER_SUGGESTION`), so the message scroll
@@ -6748,6 +6904,16 @@ impl ZaloGuiApp {
                             is_group,
                             pal,
                         );
+                    }
+                    if let Some(ref link_meta) = composer_link_preview {
+                        if contextual_stickers.is_empty() && !self.sticker_picker_open {
+                            self.render_composer_link_preview_popover(
+                                ctx,
+                                composer_frame.response.rect,
+                                link_meta,
+                                pal,
+                            );
+                        }
                     }
                 } else {
                     ui.vertical_centered(|ui| {
@@ -9015,6 +9181,150 @@ impl ZaloGuiApp {
         }
     }
 
+    /// Detect an `http://` or `https://` URL in `self.input_message` and asynchronously fetch its
+    /// OpenGraph / Zalo `parselink` metadata (`title`, `desc`, `thumb`, `src`).
+    fn resolve_composer_link_preview(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<crate::chat::LinkMetadata> {
+        let Some(url) = crate::chat::extract_first_url(&self.input_message) else {
+            self.dismissed_link_preview_for.clear();
+            return None;
+        };
+        if self.dismissed_link_preview_for == url {
+            return None;
+        }
+        let elapsed = self.last_composer_edit_at.elapsed();
+        let debounce = Duration::from_millis(200);
+        if elapsed < debounce {
+            ctx.request_repaint_after(debounce - elapsed + Duration::from_millis(15));
+            return self.link_metadata_cache.get(&url).cloned();
+        }
+        if let Some(cached) = self.link_metadata_cache.get(&url).cloned() {
+            return Some(cached);
+        }
+        if self.loading_link_previews.insert(url.clone()) {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::ParseLinkPreview { url: url.clone() });
+            }
+        }
+        let domain = url
+            .split("://")
+            .nth(1)
+            .and_then(|r| r.split('/').next())
+            .unwrap_or("Liên kết")
+            .to_string();
+        Some(crate::chat::LinkMetadata {
+            url,
+            title: "Đang tải thông tin liên kết…".into(),
+            desc: String::new(),
+            thumb: String::new(),
+            src: domain,
+        })
+    }
+
+    /// Render a floating Link Preview card (`egui::Area`) anchored directly above `composer_rect`
+    /// when the user types or pastes a URL into the composer input.
+    fn render_composer_link_preview_popover(
+        &mut self,
+        ctx: &egui::Context,
+        composer_rect: Rect,
+        meta: &crate::chat::LinkMetadata,
+        pal: &ThemePalette,
+    ) {
+        let strip_h = 72.0_f32;
+        let strip_w = composer_rect.width().max(220.0);
+        let pos = Pos2::new(composer_rect.left(), (composer_rect.top() - strip_h).max(48.0));
+        let mut dismiss_clicked = false;
+
+        egui::Area::new(Id::new("zalo_composer_link_preview_popover"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(if pal.is_dark {
+                        Color32::from_rgba_unmultiplied(17, 24, 39, 248)
+                    } else {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 250)
+                    })
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding {
+                        nw: 12.0,
+                        ne: 12.0,
+                        sw: 0.0,
+                        se: 0.0,
+                    })
+                    .shadow(egui::epaint::Shadow {
+                        offset: Vec2::new(0.0, -3.0),
+                        blur: 12.0,
+                        spread: 0.0,
+                        color: Color32::from_black_alpha(if pal.is_dark { 85 } else { 24 }),
+                    })
+                    .inner_margin(Margin::symmetric(14.0, 8.0))
+                    .show(ui, |ui| {
+                        let inner_w = (strip_w - 28.0).max(160.0);
+                        ui.set_min_width(inner_w);
+                        ui.set_max_width(inner_w);
+                        ui.set_max_height(54.0);
+                        ui.horizontal(|ui| {
+                            let thumb_key = if !meta.thumb.is_empty() {
+                                Some(format!("thumb_{}", crate::crypto::md5_hex(&meta.thumb)))
+                            } else {
+                                None
+                            };
+                            if let Some(tkey) = thumb_key.as_deref() {
+                                if let Some(tex) = self.sticker_textures.get(tkey) {
+                                    ui.add(
+                                        egui::Image::new(tex)
+                                            .fit_to_exact_size(Vec2::new(48.0, 48.0))
+                                            .rounding(Rounding::same(7.0)),
+                                    );
+                                    ui.add_space(6.0);
+                                }
+                            }
+                            let text_w = (inner_w - 94.0).max(100.0);
+                            ui.vertical(|ui| {
+                                ui.set_max_width(text_w);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} {}",
+                                        lucide::GLOBE,
+                                        truncate_chars(&meta.title, 54)
+                                    ))
+                                    .size(12.5)
+                                    .color(pal.primary_hover)
+                                    .strong(),
+                                );
+                                let sub = if !meta.desc.is_empty() {
+                                    truncate_chars(&meta.desc, 68).into_owned()
+                                } else {
+                                    clean_display_url(&meta.url, 48)
+                                };
+                                ui.label(
+                                    RichText::new(sub)
+                                        .size(11.3)
+                                        .color(pal.text_secondary),
+                                );
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .small_button(lucide::X)
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("Ẩn xem trước liên kết")
+                                    .clicked()
+                                {
+                                    dismiss_clicked = true;
+                                }
+                            });
+                        });
+                    });
+            });
+
+        if dismiss_clicked {
+            self.dismissed_link_preview_for = meta.url.clone();
+        }
+    }
+
     fn sticker_tab_salt(&self) -> u64 {
         match self.sticker_tab {
             StickerTab::Popular => 1,
@@ -10217,6 +10527,26 @@ fn render_message_body(
                 ui.set_max_width(card_inner_w);
 
                 // 1. Optional link thumbnail preview (loaded asynchronously via `FetchStickerImage`)
+                // Auto-enrich link metadata if title or thumbnail is missing/expired
+                let needs_meta_enrich = msg.link_title.is_none()
+                    || msg.link_thumb.is_none()
+                    || msg
+                        .link_thumb
+                        .as_deref()
+                        .map(|th| {
+                            th.contains("zpcloud.zdn.vn")
+                                && !sticker_textures
+                                    .contains_key(&format!("thumb_{}", crate::crypto::md5_hex(th)))
+                        })
+                        .unwrap_or(false);
+                if needs_meta_enrich {
+                    let meta_key = format!("linkmeta_{}", crate::crypto::md5_hex(&url));
+                    if loading_stickers.insert(meta_key) {
+                        if let Some(tx) = WORKER_TX.get() {
+                            let _ = tx.send(WorkerCmd::ParseLinkPreview { url: url.clone() });
+                        }
+                    }
+                }
                 if let Some(thumb_url) = msg.link_thumb.as_deref().filter(|u| !u.is_empty()) {
                     let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
                     if !sticker_textures.contains_key(&key)

@@ -959,6 +959,368 @@ pub async fn send_attachment(
     Ok((send_resp, cm))
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct LinkMetadata {
+    pub url: String,
+    pub title: String,
+    pub desc: String,
+    pub thumb: String,
+    pub src: String,
+}
+
+/// Extract the first `https://` or `http://` URL from a message text string.
+pub fn extract_first_url(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let pos = trimmed.find("https://").or_else(|| trimmed.find("http://"))?;
+    let after = &trimmed[pos..];
+    let end = after.find(char::is_whitespace).unwrap_or(after.len());
+    let url = after[..end].trim_end_matches(|c: char| matches!(c, ')' | ']' | ',' | ';'));
+    if url.len() >= 10 {
+        Some(url.to_string())
+    } else {
+        None
+    }
+}
+
+fn unescape_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .trim()
+        .to_string()
+}
+
+fn extract_meta_attr(tag: &str, attr_name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    for pat in [
+        format!("{attr_name}=\""),
+        format!("{attr_name}='"),
+        format!("{attr_name} = \""),
+    ] {
+        if let Some(idx) = lower.find(&pat) {
+            let quote_char = pat.chars().last().unwrap_or('"');
+            let rest = &tag[idx + pat.len()..];
+            if let Some(end) = rest.find(quote_char) {
+                let val = unescape_html_entities(&rest[..end]);
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Scrape OpenGraph / Twitter Card / HTML `<meta>` tags directly from a webpage URL.
+pub async fn scrape_opengraph_metadata(url: &str) -> Option<LinkMetadata> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(3800))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
+        )
+        .header("Accept-Language", "vi-VN,vi;q=0.9,en-US;q=0.8")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().await.ok()?;
+    let take_len = bytes.len().min(131_072);
+    let html = String::from_utf8_lossy(&bytes[..take_len]);
+
+    let mut og_title = String::new();
+    let mut og_desc = String::new();
+    let mut og_thumb = String::new();
+    let mut og_site = String::new();
+
+    let mut cursor = html.as_ref();
+    while let Some(start) = cursor.find('<') {
+        let after = &cursor[start..];
+        let Some(end) = after.find('>') else {
+            break;
+        };
+        let tag = &after[..=end];
+        cursor = &after[end + 1..];
+
+        if tag.len() >= 5 && tag[1..5].eq_ignore_ascii_case("meta") {
+            let key = extract_meta_attr(tag, "property")
+                .or_else(|| extract_meta_attr(tag, "name"))
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let Some(content) = extract_meta_attr(tag, "content") else {
+                continue;
+            };
+            match key.as_str() {
+                "og:title" | "twitter:title" | "lark:url:video_title" if og_title.is_empty() => {
+                    og_title = content;
+                }
+                "og:description" | "twitter:description" | "description" if og_desc.is_empty() => {
+                    og_desc = content;
+                }
+                "og:image" | "twitter:image" | "lark:url:video_cover_image_url"
+                    if og_thumb.is_empty() && content.starts_with("http") =>
+                {
+                    og_thumb = content;
+                }
+                "og:site_name" if og_site.is_empty() => {
+                    og_site = content;
+                }
+                _ => {}
+            }
+        } else if og_title.is_empty()
+            && tag.len() >= 6
+            && tag[1..6].eq_ignore_ascii_case("title")
+        {
+            if let Some(close) = cursor.find("</") {
+                let raw_t = unescape_html_entities(&cursor[..close]);
+                if !raw_t.is_empty() {
+                    og_title = raw_t;
+                }
+            }
+        }
+    }
+
+    let domain = url
+        .split("://")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("Liên kết")
+        .to_string();
+    Some(LinkMetadata {
+        url: url.to_string(),
+        title: og_title,
+        desc: og_desc,
+        thumb: og_thumb,
+        src: if !og_site.is_empty() { og_site } else { domain },
+    })
+}
+
+fn is_placeholder_zalo_thumb(thumb: &str) -> bool {
+    thumb.is_empty()
+        || thumb.contains("feed_thumb_link")
+        || thumb.contains("im_parselink")
+        || thumb.contains("aHR0cHM6Ly9yZXMtemFsby56YWRuLnZuL3VwbG9hZC9tZWRpYS8yMDE5LzEwLzE1L2ZlZWRfdGh1bWJfbGlua19fMV9fMTU3MTEzMzEyMjc3OF85Mzc4MC5wbmc=")
+}
+
+/// Parse rich link metadata (`title`, `desc`, `thumb`, `src`) via Zalo's `/api/message/parselink`
+/// (`cmd 11285`) combined with direct OpenGraph HTML scraping fallback.
+pub async fn parse_link_metadata(s: &Session, raw_url: &str) -> Result<LinkMetadata> {
+    let url = raw_url.trim().to_string();
+    let domain = url
+        .split("://")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("Liên kết")
+        .to_string();
+    let mut meta = LinkMetadata {
+        url: url.clone(),
+        title: String::new(),
+        desc: String::new(),
+        thumb: String::new(),
+        src: domain.clone(),
+    };
+
+    if s.login.is_some() {
+        let file_host = if s.domains.file.is_empty() {
+            "https://tt-files-wpa.chat.zalo.me"
+        } else {
+            s.domains.file.trim_end_matches('/')
+        };
+        let body = obj(&[
+            ("link", json!(url)),
+            ("version", json!(1)),
+            ("imei", json!(s.imei)),
+        ]);
+        if let Ok(params) = s.encoded_params(&body) {
+            let parse_url = format!(
+                "{file_host}/api/message/parselink?{}&params={params}",
+                s.common_params()
+            );
+            if let Ok(resp) = s.get(&parse_url).await {
+                let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+                let d = dec
+                    .get("data")
+                    .and_then(|x| x.get("data").or(Some(x)))
+                    .unwrap_or(&dec);
+                if let Some(t) = d.get("title").and_then(Value::as_str).map(str::trim) {
+                    if !t.is_empty() && t != url {
+                        meta.title = t.to_string();
+                    }
+                }
+                if let Some(ds) = d.get("desc").and_then(Value::as_str).map(str::trim) {
+                    if !ds.is_empty() && ds != url {
+                        meta.desc = ds.to_string();
+                    }
+                }
+                if let Some(th) = d.get("thumb").and_then(Value::as_str).map(str::trim) {
+                    if !is_placeholder_zalo_thumb(th) {
+                        meta.thumb = th.to_string();
+                    }
+                }
+                if let Some(sr) = d.get("src").and_then(Value::as_str).map(str::trim) {
+                    if !sr.is_empty() {
+                        meta.src = sr.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    if meta.title.is_empty() || meta.thumb.is_empty() || meta.desc.is_empty() {
+        if let Some(og) = scrape_opengraph_metadata(&url).await {
+            if meta.title.is_empty() && !og.title.is_empty() {
+                meta.title = og.title;
+            }
+            if meta.desc.is_empty() && !og.desc.is_empty() {
+                meta.desc = og.desc;
+            }
+            if meta.thumb.is_empty() && !og.thumb.is_empty() {
+                meta.thumb = og.thumb;
+            }
+            if (meta.src.is_empty() || meta.src == domain) && !og.src.is_empty() {
+                meta.src = og.src;
+            }
+        }
+    }
+
+    if meta.title.is_empty() {
+        meta.title = domain;
+    }
+    Ok(meta)
+}
+
+/// Send a rich link message (`sendLinkMessage` @ `compact-app-pc.js:14319196`):
+/// - 1-1 (`cmd 11286`): `POST {domains.chat}/api/message/link?{common}`
+/// - Group (`cmd 11193`): `POST {domains.group}/api/group/sendlink?{common}`
+pub async fn send_link_message(
+    s: &Session,
+    to_id: &str,
+    text: &str,
+    meta: &LinkMetadata,
+    is_group: bool,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let msg_str = if text.trim().is_empty() {
+        meta.url.as_str()
+    } else {
+        text.trim()
+    };
+    let title_str = if meta.title.trim().is_empty() {
+        meta.url.as_str()
+    } else {
+        meta.title.trim()
+    };
+    let media_json = json!({
+        "type": 0,
+        "count": 0,
+        "mediaTitle": "",
+        "artist": "",
+        "streamUrl": "",
+        "stream_icon": ""
+    })
+    .to_string();
+
+    let res: Result<Value> = async {
+        if is_group {
+            let clean_grid = to_id
+                .trim_start_matches("group_")
+                .trim_start_matches('g')
+                .trim_start_matches('G');
+            let body = obj(&[
+                ("grid", json!(clean_grid)),
+                ("msg", json!(msg_str)),
+                ("href", json!(meta.url)),
+                ("src", json!(meta.src)),
+                ("title", json!(title_str)),
+                ("desc", json!(meta.desc)),
+                ("thumb", json!(meta.thumb)),
+                ("type", json!(0)),
+                ("media", json!(media_json)),
+                ("clientId", json!(now)),
+                ("mentionInfo", json!("[]")),
+                ("language", json!("vi")),
+                ("ttl", json!(0)),
+                ("imei", json!(s.imei)),
+            ]);
+            let params = s.encoded_params(&body)?;
+            let url = format!("{}/api/group/sendlink?{}", s.domains.group, s.common_params());
+            let resp = s.post_form(&url, format!("params={params}")).await?;
+            let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+            if let Some(code) = dec.get("error_code").and_then(Value::as_i64) {
+                if code != 0 {
+                    anyhow::bail!("sendlink group error {code}");
+                }
+            }
+            Ok(dec)
+        } else {
+            let host = if s.domains.chat.contains("-msg-chat.")
+                || s.domains.chat.contains("tt-chat2-wpa")
+                || s.domains.chat.is_empty()
+            {
+                "https://tt-chat3-wpa.api.zaloapp.com"
+            } else {
+                &s.domains.chat
+            };
+            let body = obj(&[
+                ("toId", json!(to_id)),
+                ("msg", json!(msg_str)),
+                ("href", json!(meta.url)),
+                ("src", json!(meta.src)),
+                ("title", json!(title_str)),
+                ("desc", json!(meta.desc)),
+                ("thumb", json!(meta.thumb)),
+                ("type", json!(0)),
+                ("media", json!(media_json)),
+                ("clientId", json!(now)),
+                ("mentionInfo", json!("")),
+                ("language", json!("vi")),
+                ("ttl", json!(0)),
+                ("imei", json!(s.imei)),
+            ]);
+            let params = s.encoded_params(&body)?;
+            let url = format!("{host}/api/message/link?{}", s.common_params());
+            let resp = s.post_form(&url, format!("params={params}")).await?;
+            let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+            if let Some(code) = dec.get("error_code").and_then(Value::as_i64) {
+                if code != 0 {
+                    anyhow::bail!("sendlink error {code}");
+                }
+            }
+            Ok(dec)
+        }
+    }
+    .await;
+
+    match res {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            if is_group {
+                send_group_message(s, to_id, msg_str).await
+            } else {
+                send_message(s, to_id, msg_str).await
+            }
+        }
+    }
+}
+
 /// Send a sticker (`sendSticker` in `compact-app-pc.b7bec208c4c8f73e09f8.js:14325410`):
 /// - 1-1 (`cmd 11154`): `POST {domains.chat}/api/message/sticker?{common}`
 /// - Group (`cmd 11165`): `POST {domains.group}/api/group/sticker?{common}`
