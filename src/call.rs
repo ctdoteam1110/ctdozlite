@@ -2233,17 +2233,8 @@ impl CallBridge {
                             if accept {
                                 st.is_connected = true;
                                 st.started_at = std::time::Instant::now();
-                                // Phase 1: start local mic->speaker pass-through as proof of audio pipeline.
-                                // TODO Phase 2: replace with Opus/RTP media over the call UDP socket.
-                                match crate::audio::AudioHandle::start() {
-                                    Ok(sess) => {
-                                        st.audio = Some(sess);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("audio start failed: {e}");
-                                    }
-                                }
-                                // Phase 2: start Opus/RTP media over the registered ZRTP UDP relay sockets.
+                                // Start Opus/RTP media over the registered ZRTP UDP relay sockets
+                                // (falling back to local audio pass-through only if RTP media fails).
                                 match crate::media::MediaHandle::start_with_sockets(
                                     st.rtp_ip.clone(),
                                     st.rtcp_ip.clone(),
@@ -2258,6 +2249,9 @@ impl CallBridge {
                                     }
                                     Err(e) => {
                                         eprintln!("media start failed: {e}");
+                                        if let Ok(sess) = crate::audio::AudioHandle::start() {
+                                            st.audio = Some(sess);
+                                        }
                                     }
                                 }
                                 let _ = gui_tx.send(GuiEvent::CallStateChanged("connected".into()));
@@ -2471,16 +2465,8 @@ impl CallBridge {
                                     if let Some(ref mut st) = *guard {
                                         st.is_connected = true;
                                         st.started_at = std::time::Instant::now();
-                                        // Phase 1: start local mic->speaker pass-through.
-                                        match crate::audio::AudioHandle::start() {
-                                            Ok(sess) => {
-                                                st.audio = Some(sess);
-                                            }
-                                            Err(e) => {
-                                                eprintln!("audio start failed: {e}");
-                                            }
-                                        }
-                                        // Phase 2: start Opus/RTP media over the registered ZRTP UDP relay sockets.
+                                        // Start Opus/RTP media over the registered ZRTP UDP relay sockets
+                                        // (falling back to local audio pass-through only if RTP media fails).
                                         match crate::media::MediaHandle::start_with_sockets(
                                             st.rtp_ip.clone(),
                                             st.rtcp_ip.clone(),
@@ -2495,6 +2481,10 @@ impl CallBridge {
                                             }
                                             Err(e) => {
                                                 eprintln!("media start failed: {e}");
+                                                if let Ok(sess) = crate::audio::AudioHandle::start()
+                                                {
+                                                    st.audio = Some(sess);
+                                                }
                                             }
                                         }
                                         let call_id = st.call_id;

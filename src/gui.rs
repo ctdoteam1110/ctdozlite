@@ -2698,6 +2698,15 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                         is_group: !is_send2me,
                                         messages: Vec::new(),
                                     };
+                                    let mut t_list = vec![t];
+                                    crate::store::load_history_into_threads(
+                                        "zalo_history.db",
+                                        &mut t_list,
+                                        500,
+                                    );
+                                    let Some(mut t) = t_list.pop() else {
+                                        return;
+                                    };
                                     if !is_send2me {
                                         if let Ok(resp) =
                                             crate::chat::get_group_history(&s, &group_id, 50).await
@@ -2716,8 +2725,23 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                     {
                                         crate::chat::merge_group_history(&mut t, &cm_resp);
                                     }
+                                    if let Ok(cm_old) = crate::chat::get_cloud_messages(
+                                        &s,
+                                        &group_id,
+                                        "",
+                                        true,
+                                        50,
+                                    )
+                                    .await
+                                    {
+                                        crate::chat::merge_group_history(&mut t, &cm_old);
+                                    }
                                     if !t.messages.is_empty() {
+                                        let cnt = t.messages.len();
                                         let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(vec![t]));
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                            "Đã đồng bộ {cnt} tin nhắn lịch sử"
+                                        )));
                                         ctx_clone.request_repaint();
                                     }
                                 }
