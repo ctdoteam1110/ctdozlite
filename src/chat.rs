@@ -1403,7 +1403,7 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
 
     // Prioritize modern illustrated Zalo character packs (`cate_id` descending, matching Zalo PC's
     // `pointCate` ranking) and exclude legacy round-emoji/photo-meme packs when character packs exist.
-    const LEGACY_NON_CHAR_PACKS: &[u64] = &[0, 50, 10788, 11190, 11984, 11998, 12002, 12003, 12024];
+    const LEGACY_NON_CHAR_PACKS: &[u64] = &[0, 50, 10788, 11190, 11984, 11998, 12002, 12003, 12024, 12658];
     let has_modern_char = raw_items
         .iter()
         .any(|(cid, _, _)| *cid >= 10000 && !LEGACY_NON_CHAR_PACKS.contains(cid));

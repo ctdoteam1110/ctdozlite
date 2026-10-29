@@ -595,15 +595,19 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
 fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec<crate::chat::StickerItem>)> {
     let low = trimmed.to_lowercase();
     let folded = fold_vn_search(trimmed);
-    let f = folded.as_str();
+    let has_vn_diacritics = low != folded;
 
+    // Match Zalo PC's `getSuggestionFromSentencesV2`:
+    // - If input contains Vietnamese diacritics (`has_vn_diacritics == true`), only match exact accented
+    //   Vietnamese phrases (`low`) so unfinished Telex states like `"buôn"` (before pressing `f` -> `"buồn"`)
+    //   never prematurely trigger `"buon"`.
+    // - If input is plain ASCII (`has_vn_diacritics == false`), match unaccented ASCII keywords (`low`).
     let (api_kw, label_prefix, pairs): (&'static str, &'static str, &[(u64, u64)]) = match low.as_str() {
         "🙂" | "😊" | "☺️" | "🙃" | ":)" | ":-)" | ":3" | "^^" | ":>" => (
             ":)",
             "Mỉm cười",
             &[
                 (12685, 98981),
-                (12658, 50615),
                 (12815, 101002),
                 (12748, 99980),
                 (12705, 99279),
@@ -628,7 +632,6 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                 (12334, 49778),
                 (12238, 49500),
                 (12013, 47156),
-                (12003, 46983),
                 (11978, 46576),
                 (11955, 46210),
                 (11938, 45902),
@@ -641,7 +644,7 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
             "Haha",
             &[
                 (12686, 99001),
-                (12658, 50622),
+                (12685, 98981),
                 (12334, 49787),
                 (12244, 49561),
                 (12059, 47856),
@@ -659,12 +662,10 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
             "yêu",
             "Yêu thương",
             &[
-                (12658, 50616),
                 (12556, 50344),
                 (12334, 49774),
                 (12017, 47227),
                 (12013, 47147),
-                (12003, 46973),
                 (11986, 46709),
                 (10939, 30474),
                 (10751, 27695),
@@ -680,7 +681,6 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                 (12778, 100425),
                 (12748, 99981),
                 (12676, 50745),
-                (12658, 50620),
                 (12646, 50589),
                 (12556, 50345),
                 (12334, 49789),
@@ -695,9 +695,7 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
             &[
                 (61900, 98933),
                 (12686, 98993),
-                (12658, 50623),
                 (12052, 47748),
-                (12003, 46967),
                 (11917, 45599),
                 (11906, 45422),
                 (11454, 38359),
@@ -710,9 +708,7 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
             &[
                 (12740, 99857),
                 (12334, 49777),
-                (12003, 46970),
                 (12013, 47155),
-                (11998, 46895),
                 (11917, 45601),
                 (11788, 43550),
                 (10398, 23044),
@@ -727,7 +723,6 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                 (12738, 99830),
                 (12686, 98999),
                 (12676, 50751),
-                (12658, 50626),
                 (12616, 50519),
                 (12334, 49780),
                 (12238, 49515),
@@ -740,7 +735,6 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
             "Ngủ ngon",
             &[
                 (12778, 100431),
-                (12658, 50624),
                 (11986, 46713),
                 (11962, 46332),
                 (11956, 46226),
@@ -756,11 +750,9 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
             &[
                 (12778, 100433),
                 (12694, 99120),
-                (12658, 50625),
                 (61900, 98932),
                 (12238, 49507),
                 (12013, 47153),
-                (12003, 46975),
                 (11986, 46706),
                 (10302, 21464),
             ],
@@ -773,11 +765,9 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                 (12778, 100421),
                 (12713, 99407),
                 (12676, 50746),
-                (12658, 50629),
                 (12238, 49510),
                 (12045, 47621),
                 (12013, 47160),
-                (12003, 46984),
                 (10302, 21458),
             ],
         ),
@@ -795,10 +785,9 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                 (10233, 19787),
             ],
         ),
-        _ => match f {
-            "hi" | "hii" | "hiii" | "hello" | "helo" | "he lo" | "chao" | "xin chao"
-            | "chao ban" | "hi ban" | "hi anh" | "hi chi" | "hi em" | "hello anh"
-            | "hello chi" | "hello em" | "alo" | "2" => (
+        _ if has_vn_diacritics => match low.as_str() {
+            "chào" | "xin chào" | "chào bạn" | "chào anh" | "chào chị" | "chào em"
+            | "hế lô" => (
                 "hi",
                 "Xin chào",
                 &[
@@ -806,12 +795,205 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                     (12778, 100421),
                     (12713, 99407),
                     (12676, 50746),
-                    (12658, 50629),
                     (12646, 50594),
                     (12238, 49510),
                     (12045, 47621),
                     (12013, 47160),
-                    (12003, 46984),
+                    (10302, 21458),
+                    (10130, 18009),
+                ],
+            ),
+            "cười" | "vui quá" | "mắc cười" | "buồn cười" => (
+                "haha",
+                "Haha",
+                &[
+                    (12686, 99001),
+                    (12685, 98981),
+                    (12334, 49787),
+                    (12244, 49561),
+                    (12059, 47856),
+                    (12048, 47668),
+                    (12045, 47617),
+                    (12017, 47228),
+                    (12013, 47154),
+                    (10302, 21461),
+                    (10183, 18910),
+                ],
+            ),
+            "ừ" | "ờ" | "vâng" | "dạ" | "ok chị" | "oke chị" | "tuyệt" | "chuẩn"
+            | "được" => (
+                "ok",
+                "OK",
+                &[
+                    (61900, 98936),
+                    (12778, 100425),
+                    (12748, 99981),
+                    (12676, 50745),
+                    (12646, 50589),
+                    (12556, 50345),
+                    (12334, 49789),
+                    (12238, 49497),
+                    (10233, 19773),
+                    (10177, 18869),
+                ],
+            ),
+            "cảm ơn" | "cám ơn" | "cảm ơn bạn" | "cảm ơn anh" | "cảm ơn chị"
+            | "cảm ơn em" | "cảm ơn nhiều" => (
+                "cam on",
+                "Cảm ơn",
+                &[
+                    (12778, 100433),
+                    (12694, 99120),
+                    (61900, 98932),
+                    (12238, 49507),
+                    (12017, 47226),
+                    (12013, 47153),
+                    (11986, 46706),
+                    (10302, 21464),
+                ],
+            ),
+            "yêu" | "thương" | "nhớ" | "nhớ quá" | "thả tim" => (
+                "yêu",
+                "Yêu thương",
+                &[
+                    (12556, 50344),
+                    (12334, 49774),
+                    (12017, 47227),
+                    (12013, 47147),
+                    (11986, 46709),
+                    (10939, 30474),
+                    (10751, 27695),
+                    (10302, 21460),
+                    (10117, 17751),
+                ],
+            ),
+            "buồn" | "buồn quá" | "khóc" | "chán" | "chán quá" | "tủi thân" => (
+                "buon",
+                "Buồn",
+                &[
+                    (12815, 101012),
+                    (12748, 99985),
+                    (12556, 50348),
+                    (12334, 49778),
+                    (12238, 49500),
+                    (12013, 47156),
+                    (11978, 46576),
+                    (11955, 46210),
+                    (11938, 45902),
+                    (10302, 21456),
+                ],
+            ),
+            "xin lỗi" => (
+                "xin loi",
+                "Xin lỗi",
+                &[
+                    (61900, 98931),
+                    (10601, 25586),
+                    (10398, 23046),
+                    (10233, 19779),
+                ],
+            ),
+            "giận" | "tức" | "bực" | "bực mình" | "giận dỗi" => (
+                "giận",
+                "Giận",
+                &[
+                    (61900, 98933),
+                    (12686, 98993),
+                    (12052, 47748),
+                    (11917, 45599),
+                    (11454, 38359),
+                ],
+            ),
+            "ngủ" | "ngủ ngon" | "ngủ ngon nha" | "ngủ ngon nhé" | "buồn ngủ"
+            | "đi ngủ" => (
+                "ngu ngon",
+                "Ngủ ngon",
+                &[
+                    (12778, 100431),
+                    (11986, 46713),
+                    (11962, 46332),
+                    (11956, 46226),
+                    (11949, 46092),
+                    (11819, 44048),
+                    (11659, 41263),
+                    (10233, 19792),
+                ],
+            ),
+            "tạm biệt" | "tạm biệt nhé" => (
+                "tam biet",
+                "Tạm biệt",
+                &[
+                    (12045, 47622),
+                    (11986, 46710),
+                    (11969, 46452),
+                    (11960, 46294),
+                    (11956, 46225),
+                    (11949, 46100),
+                    (11901, 45345),
+                    (10233, 19791),
+                ],
+            ),
+            "ngạc nhiên" | "hóng" | "ảo thật" => (
+                "wow",
+                "Ngạc nhiên",
+                &[
+                    (11786, 43523),
+                    (11482, 38578),
+                    (11150, 34109),
+                    (10939, 30474),
+                    (10606, 25682),
+                    (10302, 21462),
+                    (10302, 21463),
+                    (10117, 17757),
+                ],
+            ),
+            "chúc mừng" | "sinh nhật" | "tết" => (
+                "chuc mung",
+                "Chúc mừng",
+                &[
+                    (12713, 99406),
+                    (12694, 99113),
+                    (12238, 49511),
+                    (12048, 47666),
+                    (12013, 47161),
+                    (11978, 46570),
+                    (11954, 46193),
+                    (10233, 19787),
+                ],
+            ),
+            "đói" | "đói bụng" | "đói quá" | "ăn" | "ăn cơm" | "nhậu" | "đi nhậu"
+            | "cà phê" => (
+                "đói",
+                "Ăn uống",
+                &[
+                    (12778, 100422),
+                    (11819, 44039),
+                    (11454, 38361),
+                    (10939, 30489),
+                    (10799, 28642),
+                    (10786, 28362),
+                    (10655, 26307),
+                    (10653, 26271),
+                    (10242, 20065),
+                ],
+            ),
+            _ => return None,
+        },
+        _ => match low.as_str() {
+            "hi" | "hii" | "hiii" | "hello" | "helo" | "he lo" | "chao" | "xin chao"
+            | "chao ban" | "hi ban" | "hi anh" | "hi chi" | "hi em" | "hello anh"
+            | "hello chi" | "hello em" | "alo" => (
+                "hi",
+                "Xin chào",
+                &[
+                    (61900, 98930),
+                    (12778, 100421),
+                    (12713, 99407),
+                    (12676, 50746),
+                    (12646, 50594),
+                    (12238, 49510),
+                    (12045, 47621),
+                    (12013, 47160),
                     (10302, 21458),
                     (10130, 18009),
                 ],
@@ -823,7 +1005,6 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                 &[
                     (12686, 99001),
                     (12685, 98981),
-                    (12658, 50622),
                     (12334, 49787),
                     (12244, 49561),
                     (12059, 47856),
@@ -845,7 +1026,6 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                     (12778, 100425),
                     (12748, 99981),
                     (12676, 50745),
-                    (12658, 50620),
                     (12646, 50589),
                     (12556, 50345),
                     (12334, 49789),
@@ -862,12 +1042,10 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                 &[
                     (12778, 100433),
                     (12694, 99120),
-                    (12658, 50625),
                     (61900, 98932),
                     (12238, 49507),
                     (12017, 47226),
                     (12013, 47153),
-                    (12003, 46975),
                     (11986, 46706),
                     (10302, 21464),
                 ],
@@ -877,12 +1055,10 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                 "yêu",
                 "Yêu thương",
                 &[
-                    (12658, 50616),
                     (12556, 50344),
                     (12334, 49774),
                     (12017, 47227),
                     (12013, 47147),
-                    (12003, 46973),
                     (11986, 46709),
                     (10939, 30474),
                     (10751, 27695),
@@ -900,7 +1076,6 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                     (12334, 49778),
                     (12238, 49500),
                     (12013, 47156),
-                    (12003, 46983),
                     (11978, 46576),
                     (11955, 46210),
                     (11938, 45902),
@@ -923,9 +1098,7 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                 &[
                     (61900, 98933),
                     (12686, 98993),
-                    (12658, 50623),
                     (12052, 47748),
-                    (12003, 46967),
                     (11917, 45599),
                     (11454, 38359),
                 ],
@@ -936,7 +1109,6 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                 "Ngủ ngon",
                 &[
                     (12778, 100431),
-                    (12658, 50624),
                     (11986, 46713),
                     (11962, 46332),
                     (11956, 46226),
@@ -965,7 +1137,6 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
                 "wow",
                 "Ngạc nhiên",
                 &[
-                    (12658, 50632),
                     (11786, 43523),
                     (11482, 38578),
                     (11150, 34109),
@@ -1009,7 +1180,6 @@ fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec
             _ => return None,
         },
     };
-
     let items = pairs
         .iter()
         .enumerate()
@@ -1207,6 +1377,10 @@ pub struct ZaloGuiApp {
     composer_sticker_cache: HashMap<String, Vec<crate::chat::StickerItem>>,
     composer_sticker_loading: HashSet<String>,
     dismissed_sticker_suggest_for: String,
+    last_composer_text: String,
+    last_composer_edit_at: std::time::Instant,
+    composer_sticker_selected: Option<usize>,
+    composer_focus_pending: bool,
 
     // Dev Inspector state
     dev_mode: bool,
@@ -1365,6 +1539,10 @@ impl ZaloGuiApp {
             composer_sticker_cache: HashMap::new(),
             composer_sticker_loading: HashSet::new(),
             dismissed_sticker_suggest_for: String::new(),
+            last_composer_text: String::new(),
+            last_composer_edit_at: std::time::Instant::now(),
+            composer_sticker_selected: None,
+            composer_focus_pending: false,
             dev_mode,
             dev_panel_open: false,
             dev_tab: DevTab::Logs,
@@ -5489,14 +5667,13 @@ impl ZaloGuiApp {
                     }
 
                     // 2. Scrollable Messages Area
-                    let contextual_stickers = self.resolve_contextual_sticker_suggestions();
+                    let contextual_stickers = self.resolve_contextual_sticker_suggestions(ctx);
+                    // Do NOT subtract `contextual_stickers` height from `picker_reserve`!
+                    // The sticker strip is a true floating overlay (`egui::Area`) above the composer bar
+                    // (matching Zalo PC's `PopoverIdentitiesDefine.STICKER_SUGGESTION`), so the message scroll
+                    // area and composer input box never shift or lose IME focus while typing.
                     let picker_reserve = (if self.sticker_picker_open { 268.0 } else { 0.0 })
-                        + (if self.replying_to.is_some() { 48.0 } else { 0.0 })
-                        + (if !contextual_stickers.is_empty() {
-                            86.0
-                        } else {
-                            0.0
-                        });
+                        + (if self.replying_to.is_some() { 48.0 } else { 0.0 });
                     let mut pending_action: Option<(usize, BubbleAction)> = None;
                     let msg_area_height =
                         (ui.available_height() - 66.0 - picker_reserve).max(100.0);
@@ -5854,21 +6031,8 @@ impl ZaloGuiApp {
                         }
                     }
 
-                    // 3c. Contextual Sticker Suggestion Strip (auto-appears when typing hi/chào, haha, 🙂, 🙁, ...)
-                    if !contextual_stickers.is_empty() {
-                        ui.push_id("contextual_sticker_bar_scope", |ui| {
-                            self.render_contextual_sticker_bar(
-                                ui,
-                                &contextual_stickers,
-                                &thread_id,
-                                is_group,
-                                pal,
-                            );
-                        });
-                    }
-
                     // 4. Bottom Message Composer Bar (Compact Icon Actions + Spacious Input + Padded Send Button)
-                    egui::Frame::none()
+                    let composer_frame = egui::Frame::none()
                         .fill(pal.bg_sidebar)
                         .inner_margin(Margin::symmetric(14.0, 10.0))
                         .stroke(Stroke::new(1.0_f32, pal.border))
@@ -6037,10 +6201,53 @@ impl ZaloGuiApp {
                                                 .desired_width(input_w);
 
                                         let response = ui.add(text_edit);
+                                        if self.composer_focus_pending {
+                                            response.request_focus();
+                                            self.composer_focus_pending = false;
+                                        }
+
+                                        // Keyboard navigation for contextual sticker popover (Zalo PC `changeSelectedIndex`):
+                                        // - ArrowUp selects the first suggested sticker
+                                        // - ArrowLeft / ArrowRight cycles through suggested stickers
+                                        // - ArrowDown / Escape deselects or hides the popover
+                                        // - Enter sends the selected sticker if one is highlighted, otherwise sends text!
+                                        let mut send_selected_sticker: Option<
+                                            crate::chat::StickerItem,
+                                        > = None;
+                                        if !contextual_stickers.is_empty() && response.has_focus() {
+                                            let len = contextual_stickers.len();
+                                            if ui.input(|i| i.key_pressed(Key::ArrowUp)) {
+                                                self.composer_sticker_selected = Some(0);
+                                            } else if let Some(sel) = self.composer_sticker_selected
+                                            {
+                                                if ui.input(|i| i.key_pressed(Key::ArrowRight)) {
+                                                    self.composer_sticker_selected =
+                                                        Some((sel + 1) % len);
+                                                } else if ui
+                                                    .input(|i| i.key_pressed(Key::ArrowLeft))
+                                                {
+                                                    self.composer_sticker_selected =
+                                                        Some((sel + len - 1) % len);
+                                                } else if ui
+                                                    .input(|i| i.key_pressed(Key::ArrowDown))
+                                                {
+                                                    self.composer_sticker_selected = None;
+                                                }
+                                            }
+                                        } else {
+                                            self.composer_sticker_selected = None;
+                                        }
+
                                         let enter_pressed =
                                             (response.lost_focus() || response.has_focus())
                                                 && ui.input(|i| i.key_pressed(Key::Enter));
-
+                                        if enter_pressed {
+                                            if let Some(sel) = self.composer_sticker_selected {
+                                                if let Some(st) = contextual_stickers.get(sel) {
+                                                    send_selected_sticker = Some(st.clone());
+                                                }
+                                            }
+                                        }
                                         // Responsive Padded Send Button (shows icon-only on very tight widths)
                                         let can_send = !self.input_message.trim().is_empty();
                                         let (send_rect, send_resp) = ui.allocate_exact_size(
@@ -6097,22 +6304,38 @@ impl ZaloGuiApp {
                                             })
                                             .clicked();
 
-                                        if (send_clicked || enter_pressed) && can_send {
+                                        if let Some(chosen) = send_selected_sticker {
+                                            self.input_message.clear();
+                                            self.dismissed_sticker_suggest_for.clear();
+                                            self.composer_sticker_selected = None;
+                                            response.request_focus();
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                let _ = tx.send(WorkerCmd::SendSticker {
+                                                    to_id: thread_id.clone(),
+                                                    sticker_id: chosen.sticker_id,
+                                                    cate_id: chosen.cate_id,
+                                                    sticker_type: chosen.sticker_type,
+                                                    is_group,
+                                                });
+                                            }
+                                        } else if (send_clicked || enter_pressed) && can_send {
                                             let text = self.input_message.trim().to_string();
                                             self.input_message.clear();
+                                            self.dismissed_sticker_suggest_for.clear();
+                                            self.composer_sticker_selected = None;
                                             response.request_focus();
                                             let quoted = self.replying_to.take();
                                             if let Some(tx) = WORKER_TX.get() {
                                                 if let Some(quoted) = quoted {
                                                     let _ = tx.send(WorkerCmd::SendQuote {
-                                                        to_id: thread_id,
+                                                        to_id: thread_id.clone(),
                                                         text,
                                                         quoted,
                                                         is_group,
                                                     });
                                                 } else {
                                                     let _ = tx.send(WorkerCmd::SendMessage {
-                                                        to_id: thread_id,
+                                                        to_id: thread_id.clone(),
                                                         text,
                                                         is_group,
                                                     });
@@ -6124,6 +6347,18 @@ impl ZaloGuiApp {
                                     });
                                 });
                         });
+
+                    // 4b. Floating Contextual Sticker Suggestion Popover (`egui::Area`, rendered AFTER composer bar)
+                    if !contextual_stickers.is_empty() && !self.sticker_picker_open {
+                        self.render_contextual_sticker_popover(
+                            ctx,
+                            composer_frame.response.rect,
+                            &contextual_stickers,
+                            &thread_id,
+                            is_group,
+                            pal,
+                        );
+                    }
                 } else {
                     ui.vertical_centered(|ui| {
                         ui.add_space(120.0);
@@ -8039,38 +8274,67 @@ impl ZaloGuiApp {
 
     /// Resolve contextual sticker suggestions for the current `self.input_message` (like Zalo PC's
     /// inline suggestion bar above the composer when typing `"hi"`, `"chào"`, `"haha"`, `"🙂"`, `"🙁"`, `"...."`).
-    fn resolve_contextual_sticker_suggestions(&mut self) -> Vec<crate::chat::StickerItem> {
+    fn resolve_contextual_sticker_suggestions(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Vec<crate::chat::StickerItem> {
+        if self.input_message != self.last_composer_text {
+            self.last_composer_text = self.input_message.clone();
+            self.last_composer_edit_at = std::time::Instant::now();
+            self.composer_sticker_selected = None;
+        }
+
         let trimmed = self.input_message.trim();
         if trimmed.is_empty() {
             self.dismissed_sticker_suggest_for.clear();
+            self.composer_sticker_selected = None;
             return Vec::new();
         }
         if trimmed.contains('\n')
             || trimmed.starts_with('#')
             || trimmed.starts_with('@')
-            || trimmed.split_whitespace().count() > 6
+            || trimmed.split_whitespace().count() > 5
         {
+            self.composer_sticker_selected = None;
             return Vec::new();
         }
         if self.dismissed_sticker_suggest_for == trimmed {
             return Vec::new();
         }
 
+        // Debounce alphabetic typing by 180ms (matching Zalo PC's `sticker_post_typing.debounce`)
+        // so Vietnamese Telex/VNI composition (`b-u-o-o-n-f` -> `"buồn"`) completes cleanly before
+        // evaluating suggestions, while pure emojis/emoticons (`:)`, `🙂`, `....`) trigger at 0ms.
+        let has_alpha = trimmed.chars().any(|c| c.is_alphabetic());
+        if has_alpha {
+            let elapsed = self.last_composer_edit_at.elapsed();
+            let debounce = Duration::from_millis(180);
+            if elapsed < debounce {
+                ctx.request_repaint_after(debounce - elapsed + Duration::from_millis(10));
+                return Vec::new();
+            }
+        }
+
         let low = trimmed.to_lowercase();
         let folded = fold_vn_search(trimmed);
+        let has_vn_diacritics = low != folded;
         let instant_match = instant_contextual_stickers(trimmed);
 
         let query_kw = if let Some((api_kw, _)) = &instant_match {
             Some((*api_kw).to_string())
         } else if self.sticker_suggest_keywords.contains(&low) {
             Some(low)
-        } else if !folded.is_empty() && self.sticker_suggest_keywords.contains(&folded) {
+        } else if !has_vn_diacritics
+            && !folded.is_empty()
+            && self.sticker_suggest_keywords.contains(&folded)
+        {
             Some(folded)
         } else {
             None
         };
 
         let Some(kw) = query_kw else {
+            self.composer_sticker_selected = None;
             return Vec::new();
         };
 
@@ -8084,196 +8348,249 @@ impl ZaloGuiApp {
             }
         }
 
+        const EXCLUDED_PACKS: &[u64] = &[0, 50, 10788, 11190, 11984, 11998, 12002, 12003, 12024, 12658];
         let mut out: Vec<crate::chat::StickerItem> = Vec::new();
         let mut seen = HashSet::new();
 
         if let Some((_, preset_items)) = instant_match {
             for it in preset_items {
-                if it.cate_id != 12003 && it.cate_id != 11998 && seen.insert(it.sticker_id) {
+                if !EXCLUDED_PACKS.contains(&it.cate_id) && seen.insert(it.sticker_id) {
                     out.push(it);
                 }
             }
         }
         if let Some(api_items) = self.composer_sticker_cache.get(&kw) {
             for it in api_items.iter().take(18) {
-                if it.cate_id != 12003 && it.cate_id != 11998 && seen.insert(it.sticker_id) {
+                if !EXCLUDED_PACKS.contains(&it.cate_id) && seen.insert(it.sticker_id) {
                     out.push(it.clone());
                 }
             }
         }
-        out.truncate(18);
+        out.truncate(16);
         out
     }
 
-    /// Render the horizontal scrollable contextual sticker strip directly above the composer bar.
-    fn render_contextual_sticker_bar(
+    /// Render the floating contextual sticker suggestion popover (`egui::Area`) anchored directly
+    /// above `composer_rect` (matching Zalo PC's `PopoverIdentitiesDefine.STICKER_SUGGESTION`).
+    fn render_contextual_sticker_popover(
         &mut self,
-        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        composer_rect: Rect,
         items: &[crate::chat::StickerItem],
         thread_id: &str,
         is_group: bool,
         pal: &ThemePalette,
     ) {
-        if ui.input(|i| i.key_pressed(Key::Escape)) {
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.dismissed_sticker_suggest_for = self.input_message.trim().to_string();
+            self.composer_sticker_selected = None;
+            self.composer_focus_pending = true;
             return;
         }
 
+        let strip_h = 80.0_f32;
+        let strip_w = composer_rect.width().max(200.0);
+        let pos = Pos2::new(composer_rect.left(), (composer_rect.top() - strip_h).max(48.0));
+
         let mut send_item: Option<crate::chat::StickerItem> = None;
         let mut dismiss_clicked = false;
+        let selected_idx = self.composer_sticker_selected;
 
-        egui::Frame::none()
-            .fill(pal.bg_sidebar)
-            .stroke(Stroke::new(1.0_f32, pal.border))
-            .inner_margin(Margin::symmetric(16.0, 8.0))
-            .show(ui, |ui| {
-                ui.set_max_height(68.0);
-                let row_avail_w = ui.available_width();
-                ui.horizontal_top(|ui| {
-                    let scroll_w = (row_avail_w - 34.0).max(120.0);
-                    let wheel_y = ui.input(|i| i.smooth_scroll_delta.y);
-                    egui::ScrollArea::horizontal()
-                        .id_salt("contextual_sticker_suggest_scroll")
-                        .max_width(scroll_w)
-                        .max_height(68.0)
-                        .scroll_bar_visibility(
-                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                        )
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            if wheel_y.abs() > 0.1
-                                && ui.rect_contains_pointer(ui.max_rect())
-                            {
-                                ui.scroll_with_delta(Vec2::new(wheel_y, 0.0));
-                            }
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 14.0;
-                                for item in items {
-                                    let key =
-                                        format!("stk_{}_{}", item.cate_id, item.sticker_id);
-                                    let url = if item.cate_id == 0
-                                        && (1..=30).contains(&item.sticker_id)
+        egui::Area::new(Id::new("zalo_contextual_sticker_popover"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(if pal.is_dark {
+                        Color32::from_rgba_unmultiplied(17, 24, 39, 248)
+                    } else {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 250)
+                    })
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding {
+                        nw: 12.0,
+                        ne: 12.0,
+                        sw: 0.0,
+                        se: 0.0,
+                    })
+                    .shadow(egui::epaint::Shadow {
+                        offset: Vec2::new(0.0, -4.0),
+                        blur: 14.0,
+                        spread: 0.0,
+                        color: Color32::from_black_alpha(if pal.is_dark { 95 } else { 28 }),
+                    })
+                    .inner_margin(Margin::symmetric(14.0, 7.0))
+                    .show(ui, |ui| {
+                        let inner_w = (strip_w - 28.0).max(160.0);
+                        ui.set_width(inner_w);
+                        ui.set_max_height(64.0);
+                        ui.horizontal_top(|ui| {
+                            let scroll_w = (inner_w - 32.0).max(120.0);
+                            let wheel_y = ui.input(|i| i.smooth_scroll_delta.y);
+                            egui::ScrollArea::horizontal()
+                                .id_salt("contextual_sticker_suggest_scroll")
+                                .max_width(scroll_w)
+                                .max_height(64.0)
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                )
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    if wheel_y.abs() > 0.1
+                                        && ui.rect_contains_pointer(ui.max_rect())
                                     {
-                                        format!(
-                                            "https://stc-chat.zdn.vn/images/stickers/default/thumb/{}.png",
-                                            item.sticker_id
-                                        )
-                                    } else {
-                                        format!(
-                                            "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={}&size=130",
-                                            item.sticker_id
-                                        )
-                                    };
+                                        ui.scroll_with_delta(Vec2::new(wheel_y, 0.0));
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        for (idx, item) in items.iter().enumerate() {
+                                            let key = format!(
+                                                "stk_{}_{}",
+                                                item.cate_id, item.sticker_id
+                                            );
+                                            let url = if item.cate_id == 0
+                                                && (1..=30).contains(&item.sticker_id)
+                                            {
+                                                format!(
+                                                    "https://stc-chat.zdn.vn/images/stickers/default/thumb/{}.png",
+                                                    item.sticker_id
+                                                )
+                                            } else {
+                                                format!(
+                                                    "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={}&size=130",
+                                                    item.sticker_id
+                                                )
+                                            };
 
-                                    if !self.sticker_textures.contains_key(&key)
-                                        && self.loading_stickers.insert(key.clone())
-                                    {
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                                key: key.clone(),
-                                                url,
-                                            });
+                                            if !self.sticker_textures.contains_key(&key)
+                                                && self.loading_stickers.insert(key.clone())
+                                            {
+                                                if let Some(tx) = WORKER_TX.get() {
+                                                    let _ = tx.send(WorkerCmd::FetchStickerImage {
+                                                        key: key.clone(),
+                                                        url,
+                                                    });
+                                                }
+                                            }
+
+                                            let (cell_rect, cell_resp) = ui.allocate_exact_size(
+                                                Vec2::new(62.0, 62.0),
+                                                Sense::click(),
+                                            );
+                                            let hovered = cell_resp.hovered();
+                                            let is_kb_sel = selected_idx == Some(idx);
+                                            if hovered || is_kb_sel {
+                                                ui.painter().rect_filled(
+                                                    cell_rect,
+                                                    Rounding::same(10.0),
+                                                    if is_kb_sel {
+                                                        pal.primary.linear_multiply(0.18)
+                                                    } else {
+                                                        pal.bg_hover
+                                                    },
+                                                );
+                                                ui.painter().rect_stroke(
+                                                    cell_rect,
+                                                    Rounding::same(10.0),
+                                                    Stroke::new(1.3_f32, pal.primary),
+                                                );
+                                            }
+
+                                            if let Some(tex) = self.sticker_textures.get(&key) {
+                                                let [tw, th] = tex.size();
+                                                let tw_f = (tw.max(1)) as f32;
+                                                let th_f = (th.max(1)) as f32;
+                                                let box_side = if hovered || is_kb_sel {
+                                                    58.0_f32
+                                                } else {
+                                                    54.0_f32
+                                                };
+                                                let scale =
+                                                    (box_side / tw_f).min(box_side / th_f);
+                                                let draw_size =
+                                                    Vec2::new(tw_f * scale, th_f * scale);
+                                                let img_rect = Rect::from_center_size(
+                                                    cell_rect.center(),
+                                                    draw_size,
+                                                );
+                                                ui.painter().image(
+                                                    tex.id(),
+                                                    img_rect,
+                                                    Rect::from_min_max(
+                                                        Pos2::ZERO,
+                                                        Pos2::new(1.0, 1.0),
+                                                    ),
+                                                    Color32::WHITE,
+                                                );
+                                            } else {
+                                                ui.painter().rect_filled(
+                                                    cell_rect.shrink(6.0),
+                                                    Rounding::same(8.0),
+                                                    pal.bg_elevated,
+                                                );
+                                                ui.painter().text(
+                                                    cell_rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    truncate_chars(&item.label, 8),
+                                                    FontId::proportional(9.5),
+                                                    pal.text_muted,
+                                                );
+                                            }
+
+                                            if cell_resp
+                                                .on_hover_cursor(CursorIcon::PointingHand)
+                                                .on_hover_text(
+                                                    "Bấm để gửi nhãn dán (hoặc dùng phím ↑ ← → Enter)",
+                                                )
+                                                .clicked()
+                                            {
+                                                send_item = Some(item.clone());
+                                            }
                                         }
-                                    }
+                                    });
+                                });
 
-                                    let (cell_rect, cell_resp) = ui.allocate_exact_size(
-                                        Vec2::new(68.0, 68.0),
-                                        Sense::click(),
-                                    );
-                                    let hovered = cell_resp.hovered();
-                                    if hovered {
-                                        ui.painter().rect_filled(
-                                            cell_rect,
-                                            Rounding::same(10.0),
-                                            pal.bg_hover,
-                                        );
-                                        ui.painter().rect_stroke(
-                                            cell_rect,
-                                            Rounding::same(10.0),
-                                            Stroke::new(1.2_f32, pal.primary),
-                                        );
-                                    }
-
-                                    if let Some(tex) = self.sticker_textures.get(&key) {
-                                        let [tw, th] = tex.size();
-                                        let tw_f = (tw.max(1)) as f32;
-                                        let th_f = (th.max(1)) as f32;
-                                        let box_side = if hovered { 64.0_f32 } else { 60.0_f32 };
-                                        let scale = (box_side / tw_f).min(box_side / th_f);
-                                        let draw_size = Vec2::new(tw_f * scale, th_f * scale);
-                                        let img_rect =
-                                            Rect::from_center_size(cell_rect.center(), draw_size);
-                                        ui.painter().image(
-                                            tex.id(),
-                                            img_rect,
-                                            Rect::from_min_max(
-                                                Pos2::ZERO,
-                                                Pos2::new(1.0, 1.0),
-                                            ),
-                                            Color32::WHITE,
-                                        );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let (close_slot, close_resp) =
+                                    ui.allocate_exact_size(Vec2::new(26.0, 62.0), Sense::click());
+                                let close_center = close_slot.center();
+                                if close_resp.hovered() {
+                                    ui.painter()
+                                        .circle_filled(close_center, 12.0, pal.bg_hover);
+                                }
+                                draw_lucide_icon(
+                                    ui.painter(),
+                                    close_center,
+                                    lucide::X,
+                                    13.5,
+                                    if close_resp.hovered() {
+                                        pal.text_primary
                                     } else {
-                                        ui.painter().rect_filled(
-                                            cell_rect.shrink(6.0),
-                                            Rounding::same(8.0),
-                                            pal.bg_elevated,
-                                        );
-                                        ui.painter().text(
-                                            cell_rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            truncate_chars(&item.label, 9),
-                                            FontId::proportional(10.0),
-                                            pal.text_muted,
-                                        );
-                                    }
-
-                                    if cell_resp
-                                        .on_hover_cursor(CursorIcon::PointingHand)
-                                        .on_hover_text("Bấm để gửi nhãn dán ngay")
-                                        .clicked()
-                                    {
-                                        send_item = Some(item.clone());
-                                    }
+                                        pal.text_muted
+                                    },
+                                );
+                                if close_resp
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("Ẩn thanh gợi ý nhãn dán (Esc)")
+                                    .clicked()
+                                {
+                                    dismiss_clicked = true;
                                 }
                             });
                         });
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (close_slot, close_resp) =
-                            ui.allocate_exact_size(Vec2::new(26.0, 68.0), Sense::click());
-                        let close_center = close_slot.center();
-                        if close_resp.hovered() {
-                            ui.painter()
-                                .circle_filled(close_center, 12.0, pal.bg_hover);
-                        }
-                        draw_lucide_icon(
-                            ui.painter(),
-                            close_center,
-                            lucide::X,
-                            13.5,
-                            if close_resp.hovered() {
-                                pal.text_primary
-                            } else {
-                                pal.text_muted
-                            },
-                        );
-                        if close_resp
-                            .on_hover_cursor(CursorIcon::PointingHand)
-                            .on_hover_text("Ẩn thanh gợi ý nhãn dán (Esc)")
-                            .clicked()
-                        {
-                            dismiss_clicked = true;
-                        }
                     });
-                });
             });
 
         if dismiss_clicked {
             self.dismissed_sticker_suggest_for = self.input_message.trim().to_string();
+            self.composer_sticker_selected = None;
+            self.composer_focus_pending = true;
         }
         if let Some(chosen) = send_item {
             self.input_message.clear();
             self.dismissed_sticker_suggest_for.clear();
+            self.composer_sticker_selected = None;
+            self.composer_focus_pending = true;
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::SendSticker {
                     to_id: thread_id.to_string(),
