@@ -561,6 +561,429 @@ const ONION_STICKERS: &[PresetSticker] = &[
     PresetSticker { sticker_id: 29, cate_id: 0, sticker_type: 7, label: "Củ hành #29" },
     PresetSticker { sticker_id: 30, cate_id: 0, sticker_type: 7, label: "Củ hành #30" },
 ];
+
+/// Instant contextual sticker suggestions mapped from Vietnamese/English keywords, emoticons, and emojis.
+/// Returns `(canonical_api_keyword, instant_preset_stickers)`.
+fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<crate::chat::StickerItem>)> {
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+    let low = trimmed.to_lowercase();
+    let folded = fold_vn_search(trimmed);
+    let f = folded.as_str();
+
+    let (api_kw, label_prefix, pairs): (&'static str, &'static str, &[(u64, u64)]) = match low.as_str() {
+        "🙂" | "😊" | "☺️" | "🙃" | ":)" | ":-)" | ":3" | "^^" | ":>" => (
+            ":)",
+            "Mỉm cười",
+            &[
+                (11190, 34843),
+                (11984, 46684),
+                (12002, 46953),
+                (10788, 28408),
+                (12003, 46964),
+                (11978, 46575),
+                (10302, 21459),
+                (10242, 19949),
+            ],
+        ),
+        "🙁" | "☹️" | "☹" | "😢" | "😭" | "😞" | "😔" | "🥺" | "🥹" | ":(" | ":((" | ":-(( "
+        | ":-(" | "t_t" => (
+            "buon",
+            "Buồn",
+            &[
+                (11190, 34851),
+                (10788, 28401),
+                (12002, 46954),
+                (12003, 46983),
+                (10302, 21456),
+                (11786, 43517),
+                (11901, 45347),
+                (50, 1097),
+                (10752, 27710),
+                (11190, 34847),
+                (50, 1112),
+                (0, 2),
+            ],
+        ),
+        "😂" | "🤣" | "😆" | "😄" | "😁" | "=))" | "=)))" | ":))" | ":)))" | ":v" => (
+            "haha",
+            "Haha",
+            &[
+                (11190, 34840),
+                (50, 1111),
+                (10726, 27182),
+                (10739, 27449),
+                (50, 1105),
+                (12002, 46953),
+                (10183, 18910),
+                (10302, 21461),
+                (10302, 21459),
+                (10340, 22148),
+                (10788, 28408),
+                (12013, 47154),
+            ],
+        ),
+        "❤️" | "❤" | "💕" | "💖" | "💘" | "💗" | "💓" | "😍" | "🥰" | "😘" | "<3" | ":*"
+        | ":-*" => (
+            "yêu",
+            "Yêu thương",
+            &[
+                (10939, 30474),
+                (12003, 46973),
+                (11190, 34841),
+                (10751, 27695),
+                (10483, 24110),
+                (11031, 32052),
+                (10129, 17994),
+                (10117, 17751),
+                (10302, 21460),
+                (65, 1497),
+                (10623, 25865),
+            ],
+        ),
+        "👍" | "👌" | "✅" | "💯" | "🤝" | "/-strong" => (
+            "ok",
+            "OK",
+            &[
+                (11786, 43519),
+                (10291, 21237),
+                (11190, 34842),
+                (10047, 16715),
+                (10177, 18869),
+                (10233, 19773),
+                (10939, 30485),
+                (10610, 25724),
+                (10739, 27451),
+                (12556, 50364),
+                (61900, 98934),
+            ],
+        ),
+        "😠" | "😡" | "🤬" | "😤" | ":-h" => (
+            "giận",
+            "Giận",
+            &[
+                (11190, 34856),
+                (12003, 46983),
+                (11454, 38359),
+                (61900, 98933),
+                (50, 1101),
+                (11834, 44254),
+                (14, 390),
+                (10291, 21252),
+            ],
+        ),
+        "..." | "...." | "....." | "......" | "-_-" | "==" | "=.=" | "😐" | "😑" | "🙄"
+        | "😒" => (
+            "....",
+            "Cạn lời",
+            &[
+                (12003, 46970),
+                (12013, 47155),
+                (10313, 21646),
+                (10398, 23044),
+                (11788, 43550),
+                (11984, 46677),
+                (10799, 28632),
+                (10302, 21462),
+            ],
+        ),
+        "?" | "??" | "???" | "🤔" | "😮" | "😲" | "😯" | "@@" | "👀" => (
+            "??",
+            "Thắc mắc",
+            &[
+                (10434, 23466),
+                (11031, 32055),
+                (11482, 38578),
+                (10682, 26599),
+                (11984, 46677),
+                (10799, 28632),
+                (12013, 47158),
+                (10302, 21463),
+            ],
+        ),
+        "😴" | "😪" | "🥱" | "💤" => (
+            "ngu ngon",
+            "Ngủ ngon",
+            &[
+                (10233, 19792),
+                (11956, 46226),
+                (11659, 41263),
+                (44, 996),
+                (14, 386),
+                (10786, 28367),
+                (12658, 50624),
+                (12778, 100431),
+            ],
+        ),
+        "🙏" => (
+            "cam on",
+            "Cảm ơn",
+            &[
+                (10291, 21239),
+                (14, 387),
+                (12658, 50625),
+                (11135, 33879),
+                (11726, 42430),
+                (12013, 47153),
+                (10610, 25709),
+                (10302, 21464),
+            ],
+        ),
+        "👋" => (
+            "hi",
+            "Xin chào",
+            &[
+                (10233, 19773),
+                (10398, 23037),
+                (10882, 29557),
+                (10130, 18009),
+                (10726, 27179),
+                (12676, 50746),
+                (11984, 46684),
+                (10302, 21458),
+            ],
+        ),
+        "🥳" | "🎉" | "🎊" | "🎂" => (
+            "chuc mung",
+            "Chúc mừng",
+            &[
+                (10233, 19787),
+                (11020, 31798),
+                (12013, 47161),
+                (11954, 46193),
+                (10939, 30479),
+                (10285, 21154),
+                (10726, 27183),
+            ],
+        ),
+        _ => match f {
+            "hi" | "hii" | "hiii" | "hello" | "helo" | "he lo" | "chao" | "xin chao"
+            | "chao ban" | "hi ban" | "hi anh" | "hi chi" | "hi em" | "hello anh"
+            | "hello chi" | "hello em" | "alo" | "2" => (
+                "hi",
+                "Xin chào",
+                &[
+                    (10233, 19773),
+                    (10398, 23037),
+                    (10882, 29557),
+                    (10130, 18009),
+                    (10256, 20619),
+                    (12003, 46984),
+                    (10302, 21458),
+                    (10047, 16713),
+                    (14, 394),
+                    (61900, 98930),
+                    (12658, 50629),
+                    (12778, 100421),
+                ],
+            ),
+            "haha" | "hahaha" | "hihi" | "hihihi" | "hehe" | "hoho" | "kaka" | "cuoi"
+            | "vui" | "vui qua" | "mac cuoi" | "buon cuoi" => (
+                "haha",
+                "Haha",
+                &[
+                    (11190, 34840),
+                    (50, 1111),
+                    (10726, 27182),
+                    (10739, 27449),
+                    (50, 1105),
+                    (12002, 46953),
+                    (10183, 18910),
+                    (10302, 21461),
+                    (10302, 21459),
+                    (10340, 22148),
+                    (10788, 28408),
+                    (12013, 47154),
+                ],
+            ),
+            "ok" | "oke" | "okay" | "oki" | "okie" | "uk" | "uh" | "uhm" | "um" | "vang"
+            | "da" | "ok anh" | "ok chi" | "ok em" | "oke anh" | "oke em" | "tuyet"
+            | "chuan" | "duoc" => (
+                "ok",
+                "OK",
+                &[
+                    (11786, 43519),
+                    (10291, 21237),
+                    (11190, 34842),
+                    (10047, 16715),
+                    (10177, 18869),
+                    (10233, 19773),
+                    (10939, 30485),
+                    (10610, 25724),
+                    (10739, 27451),
+                    (12556, 50364),
+                    (61900, 98934),
+                ],
+            ),
+            "cam on" | "cam on ban" | "cam on anh" | "cam on chi" | "cam on em"
+            | "cam on nhieu" | "thank" | "thanks" | "thank you" | "tks" | "tkss"
+            | "thank kiu" => (
+                "cam on",
+                "Cảm ơn",
+                &[
+                    (10291, 21239),
+                    (14, 387),
+                    (12658, 50625),
+                    (11135, 33879),
+                    (12778, 100433),
+                    (12694, 99120),
+                    (61900, 98932),
+                    (10302, 21464),
+                    (11726, 42430),
+                    (12013, 47153),
+                ],
+            ),
+            "yeu" | "iu" | "love" | "love u" | "love you" | "thuong" | "nho" | "nho qua"
+            | "tha tim" | "tim" => (
+                "yêu",
+                "Yêu thương",
+                &[
+                    (10939, 30474),
+                    (12003, 46973),
+                    (11190, 34841),
+                    (10751, 27695),
+                    (10483, 24110),
+                    (11031, 32052),
+                    (10129, 17994),
+                    (10117, 17751),
+                    (10302, 21460),
+                    (65, 1497),
+                    (10623, 25865),
+                ],
+            ),
+            "buon" | "buon qua" | "khoc" | "huhu" | "hic" | "chan" | "chan qua" | "tui than" => (
+                "buon",
+                "Buồn",
+                &[
+                    (12002, 46954),
+                    (12003, 46983),
+                    (10302, 21456),
+                    (11786, 43517),
+                    (11901, 45347),
+                    (50, 1097),
+                    (10752, 27710),
+                    (11190, 34847),
+                    (11190, 34851),
+                    (10788, 28401),
+                    (50, 1112),
+                    (0, 2),
+                ],
+            ),
+            "xin loi" | "sorry" | "sr" | "so ry" => (
+                "xin loi",
+                "Xin lỗi",
+                &[
+                    (10398, 23046),
+                    (10233, 19779),
+                    (10601, 25586),
+                    (61900, 98931),
+                ],
+            ),
+            "gian" | "tuc" | "buc" | "buc minh" | "gian doi" | "cay" => (
+                "giận",
+                "Giận",
+                &[
+                    (12003, 46983),
+                    (11454, 38359),
+                    (61900, 98933),
+                    (50, 1101),
+                    (11190, 34856),
+                    (11834, 44254),
+                    (14, 390),
+                ],
+            ),
+            "ngu" | "ngu ngon" | "ngu ngon nha" | "ngu ngon nhe" | "good night" | "gn"
+            | "buon ngu" | "di ngu" => (
+                "ngu ngon",
+                "Ngủ ngon",
+                &[
+                    (10233, 19792),
+                    (11956, 46226),
+                    (11659, 41263),
+                    (44, 996),
+                    (14, 386),
+                    (10786, 28367),
+                    (12658, 50624),
+                    (12778, 100431),
+                ],
+            ),
+            "bye" | "byebye" | "good bye" | "goodbye" | "tam biet" | "tam biet nhe"
+            | "bibi" | "pp" => (
+                "tam biet",
+                "Tạm biệt",
+                &[
+                    (10726, 27179),
+                    (10233, 19791),
+                    (11901, 45345),
+                    (11960, 46294),
+                    (10112, 17631),
+                ],
+            ),
+            "wow" | "ngac nhien" | "hong" | "ao that" => (
+                "wow",
+                "Ngạc nhiên",
+                &[
+                    (10939, 30474),
+                    (10788, 28398),
+                    (11482, 38578),
+                    (11786, 43523),
+                    (11150, 34109),
+                    (10117, 17757),
+                    (10606, 25682),
+                    (12658, 50632),
+                    (10302, 21462),
+                    (10302, 21463),
+                    (0, 3),
+                ],
+            ),
+            "chuc mung" | "hpbd" | "sinh nhat" | "happy birthday" | "tet" => (
+                "chuc mung",
+                "Chúc mừng",
+                &[
+                    (10233, 19787),
+                    (11020, 31798),
+                    (12013, 47161),
+                    (11954, 46193),
+                    (10233, 19788),
+                    (10604, 25644),
+                    (10051, 16778),
+                    (12713, 99407),
+                ],
+            ),
+            "doi" | "doi bung" | "doi qua" | "an" | "an com" | "nhau" | "di nhau" | "cf"
+            | "cafe" | "ca phe" => (
+                "đói",
+                "Ăn uống",
+                &[
+                    (10030, 16504),
+                    (10655, 26307),
+                    (10653, 26271),
+                    (10343, 22197),
+                    (10786, 28362),
+                    (10383, 22855),
+                    (11454, 38361),
+                    (10242, 20065),
+                    (12778, 100422),
+                ],
+            ),
+            _ => return None,
+        },
+    };
+
+    let items = pairs
+        .iter()
+        .enumerate()
+        .map(|(idx, &(cate_id, sticker_id))| crate::chat::StickerItem {
+            sticker_id,
+            cate_id,
+            sticker_type: 7,
+            label: format!("{label_prefix} #{}", idx + 1),
+        })
+        .collect();
+    Some((api_kw, items))
+}
 pub enum GuiEvent {
     QrReady {
         qr_login: QrLogin,
@@ -603,6 +1026,11 @@ pub enum GuiEvent {
         items: Vec<crate::chat::StickerItem>,
     },
     StickerSearchResults {
+        keyword: String,
+        items: Vec<crate::chat::StickerItem>,
+    },
+    StickerSuggestKeywordsLoaded(Vec<String>),
+    ComposerStickerSuggestions {
         keyword: String,
         items: Vec<crate::chat::StickerItem>,
     },
@@ -737,6 +1165,10 @@ pub struct ZaloGuiApp {
     sticker_search_query: String,
     sticker_search_results: Vec<crate::chat::StickerItem>,
     sticker_search_loading: bool,
+    sticker_suggest_keywords: HashSet<String>,
+    composer_sticker_cache: HashMap<String, Vec<crate::chat::StickerItem>>,
+    composer_sticker_loading: HashSet<String>,
+    dismissed_sticker_suggest_for: String,
 
     // Dev Inspector state
     dev_mode: bool,
@@ -891,6 +1323,10 @@ impl ZaloGuiApp {
             sticker_search_query: String::new(),
             sticker_search_results: Vec::new(),
             sticker_search_loading: false,
+            sticker_suggest_keywords: HashSet::new(),
+            composer_sticker_cache: HashMap::new(),
+            composer_sticker_loading: HashSet::new(),
+            dismissed_sticker_suggest_for: String::new(),
             dev_mode,
             dev_panel_open: false,
             dev_tab: DevTab::Logs,
@@ -1195,6 +1631,17 @@ impl ZaloGuiApp {
                     self.status_msg =
                         format!("Tìm thấy {count} nhãn dán cho từ khóa \"{keyword}\"");
                 }
+                GuiEvent::StickerSuggestKeywordsLoaded(kws) => {
+                    for k in kws {
+                        self.sticker_suggest_keywords.insert(k);
+                    }
+                }
+                GuiEvent::ComposerStickerSuggestions { keyword, items } => {
+                    self.composer_sticker_loading.remove(&keyword);
+                    if !items.is_empty() {
+                        self.composer_sticker_cache.insert(keyword, items);
+                    }
+                }
                 GuiEvent::PhoneLookupSuccess(res) => {
                     self.phone_lookup_loading = false;
                     self.phone_lookup_error = None;
@@ -1360,6 +1807,9 @@ pub enum WorkerCmd {
     SearchStickers {
         keyword: String,
     },
+    SuggestComposerStickers {
+        keyword: String,
+    },
     LookupPhone {
         phone: String,
     },
@@ -1437,6 +1887,23 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                 {
                     let s = session.lock().await.clone();
                     let _ = crate::login::get_server_info(&s).await;
+                }
+                {
+                    let s_kw = session.clone();
+                    let gui_tx_kw = gui_tx.clone();
+                    let ctx_kw = egui_ctx.clone();
+                    tokio::spawn(async move {
+                        let s = s_kw.lock().await.clone();
+                        if s.login.is_some() {
+                            if let Ok(kws) = crate::chat::fetch_sticker_suggest_keywords(&s).await {
+                                if !kws.is_empty() {
+                                    let _ = gui_tx_kw
+                                        .send(GuiEvent::StickerSuggestKeywordsLoaded(kws));
+                                    ctx_kw.request_repaint();
+                                }
+                            }
+                        }
+                    });
                 }
 
                 let call_bridge = std::sync::Arc::new(crate::call::CallBridge::spawn(
@@ -2450,6 +2917,23 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                         });
                                     }
                                 }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::SuggestComposerStickers { keyword } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let items = crate::chat::search_stickers_by_keyword(&s, &keyword)
+                                    .await
+                                    .unwrap_or_default();
+                                let _ =
+                                    gui_tx_clone.send(GuiEvent::ComposerStickerSuggestions {
+                                        keyword,
+                                        items,
+                                    });
                                 ctx_clone.request_repaint();
                             });
                         }
@@ -4962,8 +5446,14 @@ impl ZaloGuiApp {
                     }
 
                     // 2. Scrollable Messages Area
+                    let contextual_stickers = self.resolve_contextual_sticker_suggestions();
                     let picker_reserve = (if self.sticker_picker_open { 268.0 } else { 0.0 })
-                        + (if self.replying_to.is_some() { 48.0 } else { 0.0 });
+                        + (if self.replying_to.is_some() { 48.0 } else { 0.0 })
+                        + (if !contextual_stickers.is_empty() {
+                            92.0
+                        } else {
+                            0.0
+                        });
                     let mut pending_action: Option<(usize, BubbleAction)> = None;
                     let msg_area_height =
                         (ui.available_height() - 66.0 - picker_reserve).max(100.0);
@@ -5319,6 +5809,17 @@ impl ZaloGuiApp {
                         if cancel {
                             self.replying_to = None;
                         }
+                    }
+
+                    // 3c. Contextual Sticker Suggestion Strip (auto-appears when typing hi/chào, haha, 🙂, 🙁, ...)
+                    if !contextual_stickers.is_empty() {
+                        self.render_contextual_sticker_bar(
+                            ui,
+                            &contextual_stickers,
+                            &thread_id,
+                            is_group,
+                            pal,
+                        );
                     }
 
                     // 4. Bottom Message Composer Bar (Compact Icon Actions + Spacious Input + Padded Send Button)
@@ -7488,6 +7989,241 @@ impl ZaloGuiApp {
                     }
                 });
             });
+    }
+
+    /// Resolve contextual sticker suggestions for the current `self.input_message` (like Zalo PC's
+    /// inline suggestion bar above the composer when typing `"hi"`, `"chào"`, `"haha"`, `"🙂"`, `"🙁"`, `"...."`).
+    fn resolve_contextual_sticker_suggestions(&mut self) -> Vec<crate::chat::StickerItem> {
+        let trimmed = self.input_message.trim();
+        if trimmed.is_empty() {
+            self.dismissed_sticker_suggest_for.clear();
+            return Vec::new();
+        }
+        if trimmed.contains('\n')
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('@')
+            || trimmed.split_whitespace().count() > 4
+        {
+            return Vec::new();
+        }
+        if self.dismissed_sticker_suggest_for == trimmed {
+            return Vec::new();
+        }
+
+        let low = trimmed.to_lowercase();
+        let folded = fold_vn_search(trimmed);
+        let instant_match = instant_contextual_stickers(trimmed);
+
+        let query_kw = if let Some((api_kw, _)) = &instant_match {
+            Some((*api_kw).to_string())
+        } else if self.sticker_suggest_keywords.contains(&low) {
+            Some(low)
+        } else if !folded.is_empty() && self.sticker_suggest_keywords.contains(&folded) {
+            Some(folded)
+        } else {
+            None
+        };
+
+        let Some(kw) = query_kw else {
+            return Vec::new();
+        };
+
+        if !self.composer_sticker_cache.contains_key(&kw)
+            && self.composer_sticker_loading.insert(kw.clone())
+        {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::SuggestComposerStickers {
+                    keyword: kw.clone(),
+                });
+            }
+        }
+
+        let mut out: Vec<crate::chat::StickerItem> = Vec::new();
+        let mut seen = HashSet::new();
+
+        if let Some(api_items) = self.composer_sticker_cache.get(&kw) {
+            for it in api_items.iter().take(18) {
+                if seen.insert(it.sticker_id) {
+                    out.push(it.clone());
+                }
+            }
+        }
+        if let Some((_, preset_items)) = instant_match {
+            for it in preset_items {
+                if seen.insert(it.sticker_id) {
+                    out.push(it);
+                }
+            }
+        }
+        out.truncate(18);
+        out
+    }
+
+    /// Render the horizontal scrollable contextual sticker strip directly above the composer bar.
+    fn render_contextual_sticker_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        items: &[crate::chat::StickerItem],
+        thread_id: &str,
+        is_group: bool,
+        pal: &ThemePalette,
+    ) {
+        if ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.dismissed_sticker_suggest_for = self.input_message.trim().to_string();
+            return;
+        }
+
+        let mut send_item: Option<crate::chat::StickerItem> = None;
+        let mut dismiss_clicked = false;
+
+        egui::Frame::none()
+            .fill(pal.bg_sidebar)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .inner_margin(Margin::symmetric(14.0, 6.0))
+            .show(ui, |ui| {
+                ui.set_height(78.0);
+                let row_avail_w = ui.available_width();
+                ui.horizontal(|ui| {
+                    let scroll_w = (row_avail_w - 34.0).max(120.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(scroll_w, 78.0),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            egui::ScrollArea::horizontal()
+                                .id_salt("contextual_sticker_suggest_scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        for item in items {
+                                            let key =
+                                                format!("stk_{}_{}", item.cate_id, item.sticker_id);
+                                            let url = if item.cate_id == 0
+                                                && (1..=30).contains(&item.sticker_id)
+                                            {
+                                                format!(
+                                                    "https://stc-chat.zdn.vn/images/stickers/default/thumb/{}.png",
+                                                    item.sticker_id
+                                                )
+                                            } else {
+                                                format!(
+                                                    "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={}&size=130",
+                                                    item.sticker_id
+                                                )
+                                            };
+
+                                            if !self.sticker_textures.contains_key(&key)
+                                                && self.loading_stickers.insert(key.clone())
+                                            {
+                                                if let Some(tx) = WORKER_TX.get() {
+                                                    let _ = tx.send(WorkerCmd::FetchStickerImage {
+                                                        key: key.clone(),
+                                                        url,
+                                                    });
+                                                }
+                                            }
+
+                                            let (cell_rect, cell_resp) = ui.allocate_exact_size(
+                                                Vec2::new(72.0, 72.0),
+                                                Sense::click(),
+                                            );
+                                            if cell_resp.hovered() {
+                                                ui.painter().rect_filled(
+                                                    cell_rect,
+                                                    Rounding::same(10.0),
+                                                    pal.bg_hover,
+                                                );
+                                                ui.painter().rect_stroke(
+                                                    cell_rect,
+                                                    Rounding::same(10.0),
+                                                    Stroke::new(1.2_f32, pal.primary),
+                                                );
+                                            }
+
+                                            if let Some(tex) = self.sticker_textures.get(&key) {
+                                                let img_rect = cell_rect.shrink(3.0);
+                                                ui.painter().image(
+                                                    tex.id(),
+                                                    img_rect,
+                                                    Rect::from_min_max(
+                                                        Pos2::ZERO,
+                                                        Pos2::new(1.0, 1.0),
+                                                    ),
+                                                    Color32::WHITE,
+                                                );
+                                            } else {
+                                                ui.painter().rect_filled(
+                                                    cell_rect.shrink(6.0),
+                                                    Rounding::same(8.0),
+                                                    pal.bg_elevated,
+                                                );
+                                                ui.painter().text(
+                                                    cell_rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    truncate_chars(&item.label, 9),
+                                                    FontId::proportional(10.0),
+                                                    pal.text_muted,
+                                                );
+                                            }
+
+                                            if cell_resp
+                                                .on_hover_cursor(CursorIcon::PointingHand)
+                                                .on_hover_text("Bấm để gửi nhãn dán ngay")
+                                                .clicked()
+                                            {
+                                                send_item = Some(item.clone());
+                                            }
+                                        }
+                                    });
+                                });
+                        },
+                    );
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let (close_r, close_resp) =
+                            ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
+                        if close_resp.hovered() {
+                            ui.painter()
+                                .circle_filled(close_r.center(), 12.0, pal.bg_hover);
+                        }
+                        draw_lucide_icon(
+                            ui.painter(),
+                            close_r.center(),
+                            lucide::X,
+                            13.0,
+                            if close_resp.hovered() {
+                                pal.text_primary
+                            } else {
+                                pal.text_muted
+                            },
+                        );
+                        if close_resp
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text("Ẩn thanh gợi ý nhãn dán (Esc)")
+                            .clicked()
+                        {
+                            dismiss_clicked = true;
+                        }
+                    });
+                });
+            });
+
+        if dismiss_clicked {
+            self.dismissed_sticker_suggest_for = self.input_message.trim().to_string();
+        }
+        if let Some(chosen) = send_item {
+            self.input_message.clear();
+            self.dismissed_sticker_suggest_for.clear();
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::SendSticker {
+                    to_id: thread_id.to_string(),
+                    sticker_id: chosen.sticker_id,
+                    cate_id: chosen.cate_id,
+                    sticker_type: chosen.sticker_type,
+                    is_group,
+                });
+            }
+        }
     }
 
     fn sticker_tab_salt(&self) -> u64 {
