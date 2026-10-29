@@ -2044,6 +2044,7 @@ pub enum WorkerCmd {
     },
     LoadGroupHistory {
         group_id: String,
+        is_group: bool,
     },
     SendMessage {
         to_id: String,
@@ -2679,7 +2680,7 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                 IS_POLLING.store(false, std::sync::atomic::Ordering::SeqCst);
                             });
                         }
-                        WorkerCmd::LoadGroupHistory { group_id } => {
+                        WorkerCmd::LoadGroupHistory { group_id, is_group } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -2697,7 +2698,7 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                         preview: String::new(),
                                         time: String::new(),
                                         avatar: None,
-                                        is_group: !is_send2me,
+                                        is_group: is_group && !is_send2me,
                                         messages: Vec::new(),
                                     };
                                     let mut t_list = vec![t];
@@ -2709,34 +2710,36 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                     let Some(mut t) = t_list.pop() else {
                                         return;
                                     };
-                                    if !is_send2me {
+                                    if is_group && !is_send2me {
                                         if let Ok(resp) =
                                             crate::chat::get_group_history(&s, &group_id, 50).await
                                         {
                                             crate::chat::merge_group_history(&mut t, &resp);
                                         }
                                     }
-                                    if let Ok(cm_resp) = crate::chat::get_cloud_messages(
-                                        &s,
-                                        &group_id,
-                                        "0",
-                                        false,
-                                        50,
-                                    )
-                                    .await
-                                    {
-                                        crate::chat::merge_group_history(&mut t, &cm_resp);
-                                    }
-                                    if let Ok(cm_old) = crate::chat::get_cloud_messages(
-                                        &s,
-                                        &group_id,
-                                        "",
-                                        true,
-                                        50,
-                                    )
-                                    .await
-                                    {
-                                        crate::chat::merge_group_history(&mut t, &cm_old);
+                                    if is_group || is_send2me {
+                                        if let Ok(cm_resp) = crate::chat::get_cloud_messages(
+                                            &s,
+                                            &group_id,
+                                            "0",
+                                            false,
+                                            50,
+                                        )
+                                        .await
+                                        {
+                                            crate::chat::merge_group_history(&mut t, &cm_resp);
+                                        }
+                                        if let Ok(cm_old) = crate::chat::get_cloud_messages(
+                                            &s,
+                                            &group_id,
+                                            "",
+                                            true,
+                                            50,
+                                        )
+                                        .await
+                                        {
+                                            crate::chat::merge_group_history(&mut t, &cm_old);
+                                        }
                                     }
                                     if !t.messages.is_empty() {
                                         let cnt = t.messages.len();
@@ -3129,16 +3132,29 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                 let cache_path = cache_dir.join(format!("{key}.png"));
 
                                 let bytes_opt = if let Ok(disk_bytes) = std::fs::read(&cache_path) {
-                                    Some(disk_bytes)
+                                    if image::load_from_memory(&disk_bytes).is_ok() {
+                                        Some(disk_bytes)
+                                    } else {
+                                        let _ = std::fs::remove_file(&cache_path);
+                                        None
+                                    }
                                 } else if !url.starts_with("http://") && !url.starts_with("https://") {
                                     std::fs::read(&url).ok()
                                 } else {
                                     let client = { session_clone.lock().await.clone().http };
                                     if let Ok(resp) = client.get(&url).send().await {
-                                        if let Ok(b) = resp.bytes().await {
-                                            let vec = b.to_vec();
-                                            let _ = std::fs::write(&cache_path, &vec);
-                                            Some(vec)
+                                        if resp.status().is_success() {
+                                            if let Ok(b) = resp.bytes().await {
+                                                let vec = b.to_vec();
+                                                if image::load_from_memory(&vec).is_ok() {
+                                                    let _ = std::fs::write(&cache_path, &vec);
+                                                    Some(vec)
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            }
                                         } else {
                                             None
                                         }
@@ -4109,7 +4125,10 @@ impl ZaloGuiApp {
                             let cid = cthread.id.clone();
                             self.selected_thread_index = cidx;
                             if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::LoadGroupHistory { group_id: cid });
+                                let _ = tx.send(WorkerCmd::LoadGroupHistory {
+                                    group_id: cid,
+                                    is_group: false,
+                                });
                             }
                         }
                     }
@@ -4949,7 +4968,10 @@ impl ZaloGuiApp {
                         .unwrap_or(false);
                     if is_group || is_cloud {
                         if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::LoadGroupHistory { group_id: tid });
+                            let _ = tx.send(WorkerCmd::LoadGroupHistory {
+                                group_id: tid,
+                                is_group,
+                            });
                         }
                     }
                 }
@@ -5080,6 +5102,7 @@ impl ZaloGuiApp {
                                                 if d_is_group || d_name.contains("Cloud của tôi") {
                                                     let _ = tx.send(WorkerCmd::LoadGroupHistory {
                                                         group_id: d_id.clone(),
+                                                        is_group: d_is_group,
                                                     });
                                                 }
                                             }
@@ -5937,6 +5960,7 @@ impl ZaloGuiApp {
                                                             let _ = tx.send(
                                                                 WorkerCmd::LoadGroupHistory {
                                                                     group_id: thread_id.clone(),
+                                                                    is_group,
                                                                 },
                                                             );
                                                         }
@@ -9604,18 +9628,36 @@ fn clean_display_url(url: &str, max_chars: usize) -> String {
     truncate_chars(base, max_chars).into_owned()
 }
 
-/// Extract `(clean_caption, url, domain)` from a message when `msg.link_url` is set or when
+/// Extract `(user_comment, url, domain)` from a message when `msg.link_url` is set or when
 /// `msg.text` contains an embedded `http://` / `https://` URL.
+///
+/// Note: `user_comment` only contains extra text typed by the sender *outside* the link's own
+/// `link_title` / `link_desc` (so `link_desc` is rendered inside the Link Preview Card rather than
+/// duplicated as a large paragraph above the card).
 fn extract_message_link_view(msg: &ChatMessage) -> Option<(String, String, String)> {
     if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-        let mut caption = msg.link_desc.clone().unwrap_or_else(|| msg.text.clone());
-        if let Some(pos) = caption.find("http://").or_else(|| caption.find("https://")) {
-            let after = &caption[pos..];
+        let mut user_comment = msg.text.trim().to_string();
+        if let Some(pos) = user_comment
+            .find("http://")
+            .or_else(|| user_comment.find("https://"))
+        {
+            let after = &user_comment[pos..];
             let end = after.find(char::is_whitespace).unwrap_or(after.len());
             let found = &after[..end];
             if found == url || found.starts_with(url.split('?').next().unwrap_or(url)) {
-                caption = format!("{}{}", &caption[..pos], &after[end..]).trim().to_string();
+                user_comment =
+                    format!("{}{}", &user_comment[..pos], &after[end..]).trim().to_string();
             }
+        }
+        let desc_trim = msg.link_desc.as_deref().unwrap_or("").trim();
+        let title_trim = msg.link_title.as_deref().unwrap_or("").trim();
+        if user_comment == desc_trim
+            || user_comment == title_trim
+            || user_comment == url
+            || user_comment == "[Chia sẻ]"
+            || user_comment == "[Liên kết]"
+        {
+            user_comment.clear();
         }
         let domain = msg
             .link_src
@@ -9627,7 +9669,7 @@ fn extract_message_link_view(msg: &ChatMessage) -> Option<(String, String, Strin
                     .map(str::to_string)
             })
             .unwrap_or_else(|| "Liên kết".into());
-        return Some((caption, url.to_string(), domain));
+        return Some((user_comment, url.to_string(), domain));
     }
     let text = msg.text.trim();
     let pos = text.find("https://").or_else(|| text.find("http://"))?;
@@ -10019,20 +10061,20 @@ fn render_message_body(
     if is_zalo_file_or_video {
         let is_vid = msg.link_src.as_deref() == Some("Video Zalo")
             || trimmed_text.starts_with("[Video]");
-        let card_w = (max_text_width - 20.0).clamp(185.0, 260.0);
+        let card_inner_w = (max_text_width - 22.0).max(165.0);
         let card_bg = if outgoing {
             if pal.is_dark {
-                Color32::from_rgba_unmultiplied(0, 0, 0, 48)
+                Color32::from_rgba_unmultiplied(8, 22, 52, 118)
             } else {
-                Color32::from_rgba_unmultiplied(255, 255, 255, 175)
+                Color32::from_rgba_unmultiplied(255, 255, 255, 195)
             }
         } else if pal.is_dark {
-            pal.bg_app.linear_multiply(0.85)
+            pal.bg_app
         } else {
             Color32::from_rgb(241, 245, 249)
         };
         let card_border = if outgoing && pal.is_dark {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 42)
+            Color32::from_rgba_unmultiplied(147, 197, 253, 64)
         } else {
             pal.border
         };
@@ -10049,10 +10091,11 @@ fn render_message_body(
         egui::Frame::none()
             .fill(card_bg)
             .stroke(Stroke::new(1.0_f32, card_border))
-            .rounding(Rounding::same(10.0))
-            .inner_margin(Margin::symmetric(10.0, 8.0))
+            .rounding(Rounding::same(11.0))
+            .inner_margin(Margin::symmetric(11.0, 9.0))
             .show(ui, |ui| {
-                ui.set_width(card_w);
+                ui.set_min_width(card_inner_w);
+                ui.set_max_width(card_inner_w);
                 ui.horizontal(|ui| {
                     let (badge_rect, _) =
                         ui.allocate_exact_size(Vec2::new(36.0, 36.0), Sense::hover());
@@ -10079,7 +10122,7 @@ fn render_message_body(
                         .map(|u| !u.is_empty())
                         .unwrap_or(false);
                     let file_text_w =
-                        (card_w - if has_open_url { 104.0 } else { 46.0 }).max(88.0);
+                        (card_inner_w - if has_open_url { 104.0 } else { 46.0 }).max(88.0);
                     ui.vertical(|ui| {
                         ui.set_width(file_text_w);
                         ui.add(
@@ -10134,12 +10177,14 @@ fn render_message_body(
         ui.add_space(6.0);
     }
 
-    let card_w = (max_text_width - 20.0).clamp(195.0, 286.0);
+    // Strict inner width so `card_inner_w + 2 * 11.0 == max_text_width == content_width`,
+    // ensuring left and right margins inside the outer chat bubble are 100% symmetrical!
+    let card_inner_w = (max_text_width - 22.0).max(175.0);
     let card_bg = if outgoing {
         if pal.is_dark {
-            Color32::from_rgba_unmultiplied(0, 0, 0, 45)
+            Color32::from_rgba_unmultiplied(8, 22, 52, 122)
         } else {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 185)
+            Color32::from_rgba_unmultiplied(255, 255, 255, 210)
         }
     } else if pal.is_dark {
         pal.bg_elevated
@@ -10147,7 +10192,9 @@ fn render_message_body(
         Color32::from_rgb(244, 247, 252)
     };
     let card_border = if outgoing && pal.is_dark {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 42)
+        Color32::from_rgba_unmultiplied(147, 197, 253, 68)
+    } else if outgoing {
+        Color32::from_rgb(172, 206, 255)
     } else {
         pal.border
     };
@@ -10160,12 +10207,16 @@ fn render_message_body(
     let card_frame = egui::Frame::none()
         .fill(card_bg)
         .stroke(Stroke::new(1.0_f32, card_border))
-        .rounding(Rounding::same(10.0))
-        .inner_margin(Margin::symmetric(10.0, 8.0))
+        .rounding(Rounding::same(11.0))
+        .inner_margin(Margin::symmetric(11.0, 9.0))
         .show(ui, |ui| {
-            ui.set_width(card_w);
+            ui.set_min_width(card_inner_w);
+            ui.set_max_width(card_inner_w);
             ui.vertical(|ui| {
-                // Optional link thumbnail preview (loaded asynchronously via `FetchStickerImage`)
+                ui.set_min_width(card_inner_w);
+                ui.set_max_width(card_inner_w);
+
+                // 1. Optional link thumbnail preview (loaded asynchronously via `FetchStickerImage`)
                 if let Some(thumb_url) = msg.link_thumb.as_deref().filter(|u| !u.is_empty()) {
                     let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
                     if !sticker_textures.contains_key(&key)
@@ -10182,14 +10233,14 @@ fn render_message_body(
                     if let Some(tex) = sticker_textures.get(&key) {
                         let [tw, th] = tex.size();
                         let aspect = if tw > 0 && th > 0 {
-                            (th as f32 / tw as f32).clamp(0.45, 1.1)
+                            (th as f32 / tw as f32).clamp(0.45, 0.95)
                         } else {
                             0.56
                         };
-                        let img_h = (card_w * aspect).min(175.0);
+                        let img_h = (card_inner_w * aspect).min(170.0);
                         let img = egui::Image::new(tex)
-                            .fit_to_exact_size(Vec2::new(card_w, img_h))
-                            .rounding(Rounding::same(7.0))
+                            .fit_to_exact_size(Vec2::new(card_inner_w, img_h))
+                            .rounding(Rounding::same(8.0))
                             .sense(Sense::click());
                         if ui
                             .add(img)
@@ -10199,36 +10250,82 @@ fn render_message_body(
                         {
                             open_external_url(&url);
                         }
-                        ui.add_space(6.0);
+                        ui.add_space(7.0);
                     }
                 }
 
-                // Source / Media Title badge with left accent bar
-                let header_badge = msg
+                // 2. Source / Media Title with left accent bar
+                let header_title = msg
                     .link_title
                     .as_deref()
+                    .map(str::trim)
                     .filter(|t| !t.is_empty())
                     .unwrap_or(&domain);
-                ui.horizontal(|ui| {
+                ui.horizontal_top(|ui| {
+                    ui.set_max_width(card_inner_w);
                     let (bar_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(3.0, 15.0), Sense::hover());
+                        ui.allocate_exact_size(Vec2::new(3.5, 16.0), Sense::hover());
                     ui.painter()
-                        .rect_filled(bar_rect, Rounding::same(1.5), accent_col);
-                    ui.label(
-                        RichText::new(format!("{} {header_badge}", lucide::GLOBE))
-                            .size(12.2)
-                            .color(accent_col)
-                            .strong(),
-                    );
+                        .rect_filled(bar_rect, Rounding::same(1.75), accent_col);
+                    ui.vertical(|ui| {
+                        ui.set_max_width((card_inner_w - 12.0).max(100.0));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{} {header_title}", lucide::GLOBE))
+                                    .size(13.2)
+                                    .color(if outgoing && pal.is_dark {
+                                        Color32::WHITE
+                                    } else {
+                                        text_col
+                                    })
+                                    .strong(),
+                            )
+                            .wrap(),
+                        );
+                    });
                 });
 
-                ui.add_space(3.0);
-                let short_url = clean_display_url(&url, 38);
+                // 3. Link Description inside the card (e.g. TikTok/article summary)
+                let desc_opt = msg
+                    .link_desc
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty() && *d != header_title && *d != url);
+                if let Some(desc) = desc_opt {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(truncate_chars(desc, 160))
+                                .size(12.4)
+                                .color(if outgoing && pal.is_dark {
+                                    Color32::from_rgb(219, 234, 254)
+                                } else {
+                                    meta_col
+                                }),
+                        )
+                        .wrap(),
+                    );
+                }
+
+                ui.add_space(6.0);
+                // Subtle horizontal divider above the link footer row
+                let (sep_r, _) =
+                    ui.allocate_exact_size(Vec2::new(card_inner_w, 1.0), Sense::hover());
+                ui.painter().line_segment(
+                    [sep_r.left_center(), sep_r.right_center()],
+                    Stroke::new(1.0_f32, card_border),
+                );
+                ui.add_space(5.0);
+
+                // 4. Footer Row: Clean Domain/URL on left + "Mở ↗" pill button on right
+                let short_url = clean_display_url(&url, 30);
                 ui.horizontal(|ui| {
+                    ui.set_min_width(card_inner_w);
+                    ui.set_max_width(card_inner_w);
                     ui.label(
                         RichText::new(format!("{} {short_url}", lucide::LINK))
-                            .size(11.5)
-                            .color(meta_col),
+                            .size(11.4)
+                            .color(accent_col),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let open_btn = egui::Button::new(
@@ -10242,12 +10339,20 @@ fn render_message_body(
                                 .strong(),
                         )
                         .fill(if outgoing && pal.is_dark {
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 42)
+                            Color32::from_rgba_unmultiplied(59, 130, 246, 95)
                         } else {
                             pal.primary.linear_multiply(0.14)
                         })
+                        .stroke(Stroke::new(
+                            1.0_f32,
+                            if outgoing && pal.is_dark {
+                                Color32::from_rgba_unmultiplied(147, 197, 253, 90)
+                            } else {
+                                pal.primary.linear_multiply(0.35)
+                            },
+                        ))
                         .rounding(Rounding::same(6.0))
-                        .min_size(Vec2::new(56.0, 24.0));
+                        .min_size(Vec2::new(54.0, 24.0));
                         if ui
                             .add(open_btn)
                             .on_hover_cursor(CursorIcon::PointingHand)
@@ -10369,7 +10474,7 @@ fn render_chat_bubble(
     } else if is_file_card {
         max_text_width.min(280.0)
     } else if has_link_card {
-        max_text_width.min(306.0)
+        max_text_width.min(316.0)
     } else {
         let display_str = if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
             "  Tin nhắn đã được thu hồi"
@@ -10444,13 +10549,24 @@ fn render_chat_bubble(
             + 4.0
     };
 
+    let is_compact_card_only = (has_link_card
+        && extract_message_link_view(msg)
+            .map(|(cap, _, _)| cap.is_empty())
+            .unwrap_or(false)
+        && msg.reply_to_text.is_none()
+        && !show_group_sender)
+        || (is_file_card && msg.reply_to_text.is_none() && !show_group_sender);
     let h_margin = if has_sticker || is_frameless_photo {
         2.0_f32
+    } else if is_compact_card_only {
+        7.0_f32
     } else {
-        13.0_f32
+        12.0_f32
     };
     let v_margin = if has_sticker || is_frameless_photo {
         2.0_f32
+    } else if is_compact_card_only {
+        7.0_f32
     } else {
         8.5_f32
     };
@@ -10511,7 +10627,8 @@ fn render_chat_bubble(
                     .rounding(rounding)
                     .inner_margin(Margin::symmetric(h_margin, v_margin))
                     .show(ui, |ui| {
-                        ui.set_width(content_width);
+                        ui.set_min_width(content_width);
+                        ui.set_max_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             render_quote_block(ui, msg, pal, true, content_width);
                             if let Some(card) = &call_card_opt {
@@ -10656,7 +10773,8 @@ fn render_chat_bubble(
                     .rounding(rounding)
                     .inner_margin(Margin::symmetric(h_margin, v_margin))
                     .show(ui, |ui| {
-                        ui.set_width(content_width);
+                        ui.set_min_width(content_width);
+                        ui.set_max_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             if show_group_sender {
                                 ui.label(
