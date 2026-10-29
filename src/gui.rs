@@ -1245,6 +1245,10 @@ pub enum GuiEvent {
     LinkPreviewReady(crate::chat::LinkMetadata),
     PhoneLookupSuccess(crate::chat::PhoneLookupResult),
     PhoneLookupFailed(String),
+    FriendStatusChecked {
+        user_id: String,
+        status: crate::chat::FriendshipStatus,
+    },
     QuoteSent {
         thread_id: String,
         text: String,
@@ -1392,6 +1396,8 @@ pub struct ZaloGuiApp {
     link_metadata_cache: HashMap<String, crate::chat::LinkMetadata>,
     loading_link_previews: HashSet<String>,
     dismissed_link_preview_for: String,
+    friend_status_map: HashMap<String, crate::chat::FriendshipStatus>,
+    checking_friend_status: HashSet<String>,
     allow_quit: bool,
 
     // Dev Inspector state
@@ -1560,6 +1566,8 @@ impl ZaloGuiApp {
             link_metadata_cache: HashMap::new(),
             loading_link_previews: HashSet::new(),
             dismissed_link_preview_for: String::new(),
+            friend_status_map: HashMap::new(),
+            checking_friend_status: HashSet::new(),
             allow_quit: false,
             dev_mode,
             dev_panel_open: false,
@@ -2005,6 +2013,15 @@ impl ZaloGuiApp {
                         self.persist_threads_async();
                     }
                 }
+                GuiEvent::FriendStatusChecked { user_id, status } => {
+                    self.checking_friend_status.remove(&user_id);
+                    self.friend_status_map.insert(user_id.clone(), status);
+                    if let Some(ref mut prof) = self.phone_lookup_result {
+                        if prof.user_id == user_id {
+                            prof.friendship = status;
+                        }
+                    }
+                }
                 GuiEvent::PhoneLookupSuccess(res) => {
                     self.phone_lookup_loading = false;
                     self.phone_lookup_error = None;
@@ -2013,6 +2030,8 @@ impl ZaloGuiApp {
                         "Đã tìm thấy tài khoản: {}",
                         res.display_name
                     ));
+                    self.friend_status_map
+                        .insert(res.user_id.clone(), res.friendship);
                     self.phone_lookup_result = Some(res);
                 }
                 GuiEvent::PhoneLookupFailed(err) => {
@@ -2201,6 +2220,21 @@ pub enum WorkerCmd {
     },
     EndCall,
     AddFriend {
+        user_id: String,
+        user_name: String,
+    },
+    CheckFriendStatus {
+        user_id: String,
+    },
+    AcceptFriend {
+        user_id: String,
+        user_name: String,
+    },
+    RejectFriend {
+        user_id: String,
+        user_name: String,
+    },
+    UndoFriend {
         user_id: String,
         user_name: String,
     },
@@ -3574,6 +3608,85 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                             ));
                             egui_ctx.request_repaint();
                         }
+                        WorkerCmd::CheckFriendStatus { user_id } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                if let Ok(status) =
+                                    crate::chat::check_friendship_status(&s, &user_id).await
+                                {
+                                    let _ = gui_tx_clone
+                                        .send(GuiEvent::FriendStatusChecked { user_id, status });
+                                    ctx_clone.request_repaint();
+                                }
+                            });
+                        }
+                        WorkerCmd::AcceptFriend { user_id, user_name } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                match crate::chat::accept_friend_request(&s, &user_id).await {
+                                    Ok(_) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
+                                            user_id,
+                                            status: crate::chat::FriendshipStatus::Friend,
+                                        });
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                            "Đã đồng ý kết bạn với {user_name}!"
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                            "Không thể đồng ý kết bạn với {user_name}: {e}"
+                                        )));
+                                    }
+                                }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::RejectFriend { user_id, user_name } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                if crate::chat::reject_friend_request(&s, &user_id)
+                                    .await
+                                    .is_ok()
+                                {
+                                    let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
+                                        user_id,
+                                        status: crate::chat::FriendshipStatus::Stranger,
+                                    });
+                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                        "Đã từ chối lời mời kết bạn của {user_name}."
+                                    )));
+                                    ctx_clone.request_repaint();
+                                }
+                            });
+                        }
+                        WorkerCmd::UndoFriend { user_id, user_name } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                if crate::chat::undo_friend_request(&s, &user_id).await.is_ok() {
+                                    let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
+                                        user_id,
+                                        status: crate::chat::FriendshipStatus::Stranger,
+                                    });
+                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                        "Đã hủy lời mời kết bạn tới {user_name}."
+                                    )));
+                                    ctx_clone.request_repaint();
+                                }
+                            });
+                        }
                         WorkerCmd::AddFriend { user_id, user_name } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -3582,6 +3695,10 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                 let s = session_clone.lock().await.clone();
                                 // Check if there is an incoming request we can accept directly
                                 if crate::chat::accept_friend_request(&s, &user_id).await.is_ok() {
+                                    let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
+                                        user_id,
+                                        status: crate::chat::FriendshipStatus::Friend,
+                                    });
                                     let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                         "Đã đồng ý kết bạn với {user_name}! Bạn có thể gọi lại ngay."
                                     )));
@@ -3591,13 +3708,17 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                 match crate::chat::send_friend_request(
                                     &s,
                                     &user_id,
-                                    "Xin chào, kết bạn với mình để gọi điện nhé!",
+                                    "Xin chào, kết bạn với mình nhé!",
                                 )
                                 .await
                                 {
                                     Ok(_) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
+                                            user_id: user_id.clone(),
+                                            status: crate::chat::FriendshipStatus::OutgoingPending,
+                                        });
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Đã gửi lời mời kết bạn tới {user_name} ({user_id}). Đợi người nhận đồng ý để gọi."
+                                            "Đã gửi lời mời kết bạn tới {user_name} ({user_id})."
                                         )));
                                     }
                                     Err(e) => {
@@ -5224,15 +5345,41 @@ impl ZaloGuiApp {
                                             .strong(),
                                     );
                                     ui.add_space(2.0);
-                                    ui.label(
-                                        RichText::new(if d_is_group {
-                                            "Nhóm đang hoạt động"
-                                        } else {
-                                            "Đang trực tuyến"
-                                        })
-                                        .size(12.0)
-                                        .color(pal.accent_online),
-                                    );
+                                    let d_is_cloud = d_name.contains("Cloud của tôi");
+                                    let d_fr_status = if d_is_group || d_is_cloud {
+                                        crate::chat::FriendshipStatus::Friend
+                                    } else {
+                                        self.friend_status_map
+                                            .get(d_id)
+                                            .copied()
+                                            .unwrap_or(crate::chat::FriendshipStatus::Unknown)
+                                    };
+                                    let (sub_txt, sub_col) = if d_is_group {
+                                        ("Nhóm đang hoạt động", pal.accent_online)
+                                    } else if d_is_cloud {
+                                        ("Lưu trữ đám mây cá nhân", pal.primary_hover)
+                                    } else {
+                                        match d_fr_status {
+                                            crate::chat::FriendshipStatus::Friend => {
+                                                ("✓ Đã kết bạn · Trực tuyến", pal.accent_online)
+                                            }
+                                            crate::chat::FriendshipStatus::IncomingPending => (
+                                                "📩 Đã gửi lời mời kết bạn cho bạn",
+                                                pal.primary_hover,
+                                            ),
+                                            crate::chat::FriendshipStatus::OutgoingPending => {
+                                                ("⏳ Đã gửi lời mời kết bạn", pal.warning)
+                                            }
+                                            crate::chat::FriendshipStatus::Stranger => (
+                                                "Người lạ · Chưa kết bạn",
+                                                Color32::from_rgb(249, 115, 22),
+                                            ),
+                                            crate::chat::FriendshipStatus::Unknown => {
+                                                ("Đang kiểm tra kết bạn…", pal.text_muted)
+                                            }
+                                        }
+                                    };
+                                    ui.label(RichText::new(sub_txt).size(12.0).color(sub_col));
 
                                     ui.add_space(14.0);
                                     // Quick Action Buttons (Sync & Pin/Star Filter)
@@ -5498,6 +5645,26 @@ impl ZaloGuiApp {
                 if let Some((thread_id, thread_name, thread_avatar, is_group, _msg_count)) =
                     thread_meta
                 {
+                    let is_cloud_thread = thread_name.contains("Cloud của tôi");
+                    if !is_group
+                        && !is_cloud_thread
+                        && !self.friend_status_map.contains_key(&thread_id)
+                        && self.checking_friend_status.insert(thread_id.clone())
+                    {
+                        if let Some(tx) = WORKER_TX.get() {
+                            let _ = tx.send(WorkerCmd::CheckFriendStatus {
+                                user_id: thread_id.clone(),
+                            });
+                        }
+                    }
+                    let cur_friendship = if is_group || is_cloud_thread {
+                        crate::chat::FriendshipStatus::Friend
+                    } else {
+                        self.friend_status_map
+                            .get(&thread_id)
+                            .copied()
+                            .unwrap_or(crate::chat::FriendshipStatus::Unknown)
+                    };
                     // 1. Clean Conversation Header Bar (No raw 19-digit ID, no bulky sync button)
                     egui::Frame::none()
                         .fill(pal.bg_sidebar)
@@ -5548,36 +5715,90 @@ impl ZaloGuiApp {
                                                 )
                                                 .truncate(),
                                             );
-                                            if !is_compact_w && left_info_w > 190.0 {
-                                                let tag_lbl =
-                                                    if thread_name.contains("Cloud của tôi") {
-                                                        "Đám mây"
+                                            if !is_compact_w && left_info_w > 170.0 {
+                                                let (tag_lbl, tag_fg, tag_bg) =
+                                                    if is_cloud_thread {
+                                                        (
+                                                            "Đám mây",
+                                                            pal.primary_hover,
+                                                            pal.primary.linear_multiply(0.14),
+                                                        )
                                                     } else if is_group {
-                                                        "Nhóm"
+                                                        ("Nhóm", pal.text_secondary, pal.bg_elevated)
                                                     } else {
-                                                        "Bạn bè"
+                                                        match cur_friendship {
+                                                            crate::chat::FriendshipStatus::Friend => (
+                                                                "✓ Bạn bè",
+                                                                pal.accent_online,
+                                                                pal.accent_online.linear_multiply(0.14),
+                                                            ),
+                                                            crate::chat::FriendshipStatus::IncomingPending => (
+                                                                "Chờ đồng ý kết bạn",
+                                                                pal.primary_hover,
+                                                                pal.primary.linear_multiply(0.16),
+                                                            ),
+                                                            crate::chat::FriendshipStatus::OutgoingPending => (
+                                                                "Đã gửi lời mời",
+                                                                pal.warning,
+                                                                pal.warning.linear_multiply(0.15),
+                                                            ),
+                                                            crate::chat::FriendshipStatus::Stranger => (
+                                                                "Người lạ",
+                                                                Color32::from_rgb(249, 115, 22),
+                                                                Color32::from_rgb(249, 115, 22)
+                                                                    .linear_multiply(0.15),
+                                                            ),
+                                                            crate::chat::FriendshipStatus::Unknown => (
+                                                                "Đang kiểm tra…",
+                                                                pal.text_muted,
+                                                                pal.bg_elevated,
+                                                            ),
+                                                        }
                                                     };
                                                 egui::Frame::none()
-                                                    .fill(pal.bg_elevated)
+                                                    .fill(tag_bg)
                                                     .rounding(Rounding::same(4.0))
                                                     .inner_margin(Margin::symmetric(6.0, 1.5))
                                                     .show(ui, |ui| {
                                                         ui.label(
                                                             RichText::new(tag_lbl)
                                                                 .size(10.2)
-                                                                .color(pal.text_secondary),
+                                                                .color(tag_fg)
+                                                                .strong(),
                                                         );
                                                     });
                                             }
                                         });
+                                        let (sub_status_lbl, sub_status_col) = if is_group {
+                                            ("Đang hoạt động", pal.accent_online)
+                                        } else if is_cloud_thread {
+                                            ("Lưu trữ đám mây cá nhân", pal.text_secondary)
+                                        } else {
+                                            match cur_friendship {
+                                                crate::chat::FriendshipStatus::Friend => {
+                                                    ("Đã kết bạn · Vừa mới truy cập", pal.accent_online)
+                                                }
+                                                crate::chat::FriendshipStatus::IncomingPending => (
+                                                    "Đã gửi lời mời kết bạn cho bạn",
+                                                    pal.primary_hover,
+                                                ),
+                                                crate::chat::FriendshipStatus::OutgoingPending => (
+                                                    "Đã gửi lời mời kết bạn · Chờ đồng ý",
+                                                    pal.warning,
+                                                ),
+                                                crate::chat::FriendshipStatus::Stranger => (
+                                                    "Người lạ · Chưa kết bạn trên Zalo",
+                                                    Color32::from_rgb(249, 115, 22),
+                                                ),
+                                                crate::chat::FriendshipStatus::Unknown => {
+                                                    ("Vừa mới truy cập", pal.text_secondary)
+                                                }
+                                            }
+                                        };
                                         ui.label(
-                                            RichText::new(if is_group {
-                                                "Đang hoạt động"
-                                            } else {
-                                                "Vừa mới truy cập"
-                                            })
-                                            .size(11.8)
-                                            .color(pal.accent_online),
+                                            RichText::new(sub_status_lbl)
+                                                .size(11.6)
+                                                .color(sub_status_col),
                                         );
                                     },
                                 );
@@ -5779,6 +6000,175 @@ impl ZaloGuiApp {
                                 });
                             });
                         });
+                    // 1a. Stranger / Pending Friend Request Banner (matching Zalo PC's top relationship bar)
+                    if !is_group
+                        && !is_cloud_thread
+                        && matches!(
+                            cur_friendship,
+                            crate::chat::FriendshipStatus::Stranger
+                                | crate::chat::FriendshipStatus::IncomingPending
+                                | crate::chat::FriendshipStatus::OutgoingPending
+                        )
+                    {
+                        egui::Frame::none()
+                            .fill(pal.bg_elevated)
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .inner_margin(Margin::symmetric(18.0, 7.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    match cur_friendship {
+                                        crate::chat::FriendshipStatus::IncomingPending => {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{}  {} đã gửi lời mời kết bạn cho bạn",
+                                                    lucide::USER_PLUS,
+                                                    truncate_chars(&thread_name, 26)
+                                                ))
+                                                .size(12.2)
+                                                .color(pal.primary_hover)
+                                                .strong(),
+                                            );
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                                    let rej_btn = egui::Button::new(
+                                                        RichText::new("Từ chối")
+                                                            .size(11.5)
+                                                            .color(pal.text_secondary),
+                                                    )
+                                                    .fill(pal.bg_input)
+                                                    .stroke(Stroke::new(1.0_f32, pal.border))
+                                                    .rounding(Rounding::same(6.0))
+                                                    .min_size(Vec2::new(68.0, 26.0));
+                                                    if ui
+                                                        .add(rej_btn)
+                                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                                        .clicked()
+                                                    {
+                                                        if let Some(tx) = WORKER_TX.get() {
+                                                            let _ = tx.send(
+                                                                WorkerCmd::RejectFriend {
+                                                                    user_id: thread_id.clone(),
+                                                                    user_name: thread_name.clone(),
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+
+                                                    let acc_btn = egui::Button::new(
+                                                        RichText::new(format!(
+                                                            "{} Đồng ý kết bạn",
+                                                            lucide::CHECK
+                                                        ))
+                                                        .size(11.8)
+                                                        .color(Color32::WHITE)
+                                                        .strong(),
+                                                    )
+                                                    .fill(pal.accent_online)
+                                                    .rounding(Rounding::same(6.0))
+                                                    .min_size(Vec2::new(124.0, 26.0));
+                                                    if ui
+                                                        .add(acc_btn)
+                                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                                        .clicked()
+                                                    {
+                                                        if let Some(tx) = WORKER_TX.get() {
+                                                            let _ = tx.send(
+                                                                WorkerCmd::AcceptFriend {
+                                                                    user_id: thread_id.clone(),
+                                                                    user_name: thread_name.clone(),
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        }
+                                        crate::chat::FriendshipStatus::OutgoingPending => {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Đã gửi lời mời kết bạn tới {} · Đang chờ đồng ý",
+                                                    truncate_chars(&thread_name, 24)
+                                                ))
+                                                .size(12.0)
+                                                .color(pal.warning),
+                                            );
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    let undo_btn = egui::Button::new(
+                                                        RichText::new("Hủy lời mời")
+                                                            .size(11.5)
+                                                            .color(pal.text_secondary),
+                                                    )
+                                                    .fill(pal.bg_input)
+                                                    .stroke(Stroke::new(1.0_f32, pal.border))
+                                                    .rounding(Rounding::same(6.0))
+                                                    .min_size(Vec2::new(86.0, 26.0));
+                                                    if ui
+                                                        .add(undo_btn)
+                                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                                        .clicked()
+                                                    {
+                                                        if let Some(tx) = WORKER_TX.get() {
+                                                            let _ = tx.send(WorkerCmd::UndoFriend {
+                                                                user_id: thread_id.clone(),
+                                                                user_name: thread_name.clone(),
+                                                            });
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        }
+                                        crate::chat::FriendshipStatus::Stranger => {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Bạn và {} chưa là bạn bè trên Zalo",
+                                                    truncate_chars(&thread_name, 26)
+                                                ))
+                                                .size(12.0)
+                                                .color(pal.text_secondary),
+                                            );
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    let add_btn = egui::Button::new(
+                                                        RichText::new(format!(
+                                                            "{} Kết bạn",
+                                                            lucide::USER_PLUS
+                                                        ))
+                                                        .size(11.8)
+                                                        .color(Color32::WHITE)
+                                                        .strong(),
+                                                    )
+                                                    .fill(pal.primary)
+                                                    .rounding(Rounding::same(6.0))
+                                                    .min_size(Vec2::new(92.0, 26.0));
+                                                    if ui
+                                                        .add(add_btn)
+                                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                                        .clicked()
+                                                    {
+                                                        if let Some(tx) = WORKER_TX.get() {
+                                                            let _ = tx.send(WorkerCmd::AddFriend {
+                                                                user_id: thread_id.clone(),
+                                                                user_name: thread_name.clone(),
+                                                            });
+                                                        }
+                                                        self.show_toast(format!(
+                                                            "Đã gửi lời mời kết bạn tới {}",
+                                                            thread_name
+                                                        ));
+                                                    }
+                                                },
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                });
+                            });
+                    }
                     // 1b. Pinned Message Banner (if any message is pinned in this thread)
                     let pinned_msg_info = self
                         .threads
@@ -7287,12 +7677,44 @@ impl ZaloGuiApp {
 
                                 ui.add_space(6.0);
                                 ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new(&prof.display_name)
-                                            .size(15.0)
-                                            .color(pal.text_primary)
-                                            .strong(),
-                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(&prof.display_name)
+                                                .size(15.0)
+                                                .color(pal.text_primary)
+                                                .strong(),
+                                        );
+                                        let (f_lbl, f_col) = match prof.friendship {
+                                            crate::chat::FriendshipStatus::Friend => {
+                                                ("✓ Bạn bè", pal.accent_online)
+                                            }
+                                            crate::chat::FriendshipStatus::IncomingPending => {
+                                                ("Chờ bạn đồng ý", pal.primary_hover)
+                                            }
+                                            crate::chat::FriendshipStatus::OutgoingPending => {
+                                                ("Đã gửi lời mời", pal.warning)
+                                            }
+                                            crate::chat::FriendshipStatus::Stranger => (
+                                                "Chưa kết bạn",
+                                                Color32::from_rgb(249, 115, 22),
+                                            ),
+                                            crate::chat::FriendshipStatus::Unknown => {
+                                                ("Đang kiểm tra…", pal.text_muted)
+                                            }
+                                        };
+                                        egui::Frame::none()
+                                            .fill(f_col.linear_multiply(0.15))
+                                            .rounding(Rounding::same(5.0))
+                                            .inner_margin(Margin::symmetric(6.0, 2.0))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    RichText::new(f_lbl)
+                                                        .size(10.5)
+                                                        .color(f_col)
+                                                        .strong(),
+                                                );
+                                            });
+                                    });
                                     ui.label(
                                         RichText::new(format!(
                                             "SĐT: {} · UID: {}",
@@ -7330,23 +7752,85 @@ impl ZaloGuiApp {
                                     open_chat_user = Some(prof.clone());
                                 }
 
-                                let friend_btn = egui::Button::new(
-                                    RichText::new("Kết bạn Zalo")
-                                        .size(12.5)
-                                        .color(pal.accent_online)
-                                        .strong(),
-                                )
-                                .fill(pal.accent_online.linear_multiply(0.15))
-                                .stroke(Stroke::new(1.0_f32, pal.accent_online))
-                                .rounding(Rounding::same(8.0))
-                                .min_size(Vec2::new(155.0, 32.0));
-                                if ui
-                                    .add(friend_btn)
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .clicked()
-                                {
-                                    add_friend_user =
-                                        Some((prof.user_id.clone(), prof.display_name.clone()));
+                                match prof.friendship {
+                                    crate::chat::FriendshipStatus::Friend => {
+                                        let badge_btn = egui::Button::new(
+                                            RichText::new(format!(
+                                                "{} Đã là bạn bè",
+                                                lucide::CHECK
+                                            ))
+                                            .size(12.2)
+                                            .color(pal.accent_online)
+                                            .strong(),
+                                        )
+                                        .fill(pal.accent_online.linear_multiply(0.14))
+                                        .stroke(Stroke::new(1.0_f32, pal.accent_online))
+                                        .rounding(Rounding::same(8.0))
+                                        .min_size(Vec2::new(155.0, 32.0));
+                                        ui.add_enabled(false, badge_btn);
+                                    }
+                                    crate::chat::FriendshipStatus::OutgoingPending => {
+                                        let pending_btn = egui::Button::new(
+                                            RichText::new("Đã gửi lời mời")
+                                                .size(12.2)
+                                                .color(pal.warning)
+                                                .strong(),
+                                        )
+                                        .fill(pal.warning.linear_multiply(0.14))
+                                        .stroke(Stroke::new(1.0_f32, pal.warning))
+                                        .rounding(Rounding::same(8.0))
+                                        .min_size(Vec2::new(155.0, 32.0));
+                                        ui.add_enabled(false, pending_btn);
+                                    }
+                                    crate::chat::FriendshipStatus::IncomingPending => {
+                                        let accept_btn = egui::Button::new(
+                                            RichText::new(format!(
+                                                "{} Đồng ý kết bạn",
+                                                lucide::CHECK
+                                            ))
+                                            .size(12.5)
+                                            .color(Color32::WHITE)
+                                            .strong(),
+                                        )
+                                        .fill(pal.accent_online)
+                                        .rounding(Rounding::same(8.0))
+                                        .min_size(Vec2::new(155.0, 32.0));
+                                        if ui
+                                            .add(accept_btn)
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .clicked()
+                                        {
+                                            add_friend_user = Some((
+                                                prof.user_id.clone(),
+                                                prof.display_name.clone(),
+                                            ));
+                                        }
+                                    }
+                                    _ => {
+                                        let friend_btn = egui::Button::new(
+                                            RichText::new(format!(
+                                                "{} Kết bạn Zalo",
+                                                lucide::USER_PLUS
+                                            ))
+                                            .size(12.5)
+                                            .color(pal.accent_online)
+                                            .strong(),
+                                        )
+                                        .fill(pal.accent_online.linear_multiply(0.15))
+                                        .stroke(Stroke::new(1.0_f32, pal.accent_online))
+                                        .rounding(Rounding::same(8.0))
+                                        .min_size(Vec2::new(155.0, 32.0));
+                                        if ui
+                                            .add(friend_btn)
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .clicked()
+                                        {
+                                            add_friend_user = Some((
+                                                prof.user_id.clone(),
+                                                prof.display_name.clone(),
+                                            ));
+                                        }
+                                    }
                                 }
                             });
                         });

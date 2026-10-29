@@ -3474,6 +3474,56 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
     }
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum FriendshipStatus {
+    #[default]
+    Unknown,
+    Friend,
+    OutgoingPending,
+    IncomingPending,
+    Stranger,
+}
+
+/// Parse `/api/friend/reqstatus` (`cmd 11430`) JSON into `FriendshipStatus`
+/// (`compact-app-pc.js:8351970`: `is_friend`, `is_requested` = I requested you, `is_requesting` = you requested me).
+pub fn parse_friendship_status_response(resp: &Value) -> FriendshipStatus {
+    let d = resp
+        .get("data")
+        .and_then(|x| x.get("data").or(Some(x)))
+        .unwrap_or(resp);
+    let is_friend = d
+        .get("is_friend")
+        .or_else(|| d.get("isFriend"))
+        .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 })))
+        .unwrap_or(0);
+    if is_friend == 1 {
+        return FriendshipStatus::Friend;
+    }
+    let is_requesting = d
+        .get("is_requesting")
+        .or_else(|| d.get("isRequesting"))
+        .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 })))
+        .unwrap_or(0);
+    if is_requesting == 1 {
+        return FriendshipStatus::IncomingPending;
+    }
+    let is_requested = d
+        .get("is_requested")
+        .or_else(|| d.get("isRequested"))
+        .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 })))
+        .unwrap_or(0);
+    if is_requested == 1 {
+        return FriendshipStatus::OutgoingPending;
+    }
+    FriendshipStatus::Stranger
+}
+
+/// Query `/api/friend/reqstatus` (`cmd 11430`) and return the typed `FriendshipStatus`.
+pub async fn check_friendship_status(s: &Session, fid: &str) -> Result<FriendshipStatus> {
+    let resp = get_friend_request_status(s, fid).await?;
+    Ok(parse_friendship_status_response(&resp))
+}
 /// Check friend request status with a target user (`/api/friend/reqstatus`, cmd `11430`).
 pub async fn get_friend_request_status(s: &Session, fid: &str) -> Result<Value> {
     if s.login.is_none() {
@@ -3569,6 +3619,48 @@ pub async fn accept_friend_request(s: &Session, fid: &str) -> Result<Value> {
     Ok(dec)
 }
 
+/// Cancel / undo a pending outgoing friend request (`/api/friend/undo`, cmd `11441`).
+pub async fn undo_friend_request(s: &Session, fid: &str) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let body = obj(&[("fid", json!(fid)), ("imei", json!(s.imei))]);
+    let enc = s.encoded_params(&body)?;
+    let host = if s.domains.friend.is_empty() {
+        "https://tt-friend-wpa.chat.zalo.me"
+    } else {
+        &s.domains.friend
+    };
+    let url = format!(
+        "{}/api/friend/undo?{}",
+        host.trim_end_matches('/'),
+        s.common_params()
+    );
+    let resp = s.post_form(&url, format!("params={enc}")).await?;
+    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+}
+
+/// Reject a pending incoming friend request (`/api/friend/reject`, cmd `11428`).
+pub async fn reject_friend_request(s: &Session, fid: &str) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let body = obj(&[("fid", json!(fid)), ("imei", json!(s.imei))]);
+    let enc = s.encoded_params(&body)?;
+    let host = if s.domains.friend.is_empty() {
+        "https://tt-friend-wpa.chat.zalo.me"
+    } else {
+        &s.domains.friend
+    };
+    let url = format!(
+        "{}/api/friend/reject?{}",
+        host.trim_end_matches('/'),
+        s.common_params()
+    );
+    let resp = s.post_form(&url, format!("params={enc}")).await?;
+    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PhoneLookupResult {
     pub user_id: String,
@@ -3577,6 +3669,8 @@ pub struct PhoneLookupResult {
     pub phone: String,
     pub avatar: String,
     pub status: String,
+    #[serde(default)]
+    pub friendship: FriendshipStatus,
 }
 
 /// Normalize a Vietnamese or international phone string for Zalo's `/api/friend/profile/get`.
@@ -3647,6 +3741,10 @@ pub async fn find_user_by_phone(s: &Session, raw_phone: &str) -> Result<PhoneLoo
     let avatar = pick_str(data, &["avatar", "avt"]).unwrap_or_default();
     let status = pick_str(data, &["status"]).unwrap_or_default();
 
+    let friendship = check_friendship_status(s, &uid)
+        .await
+        .unwrap_or(FriendshipStatus::Unknown);
+
     Ok(PhoneLookupResult {
         user_id: uid,
         display_name,
@@ -3654,6 +3752,7 @@ pub async fn find_user_by_phone(s: &Session, raw_phone: &str) -> Result<PhoneLoo
         phone: raw_phone.trim().to_string(),
         avatar,
         status,
+        friendship,
     })
 }
 
@@ -4106,5 +4205,20 @@ mod tests {
         assert_eq!(strip_vn_for_sticker_kw("Cảm ơn nhiều"), "cam on nhieu");
         assert_eq!(strip_vn_for_sticker_kw("Ngủ ngon nhé"), "ngu ngon nhe");
         assert_eq!(strip_vn_for_sticker_kw("Đỗ Trung Thành"), "do trung thanh");
+    }
+
+    #[test]
+    fn test_parse_friendship_status_response() {
+        let r_friend = json!({"error_code": 0, "data": {"is_friend": 1, "is_requested": 0, "is_requesting": 0}});
+        assert_eq!(parse_friendship_status_response(&r_friend), FriendshipStatus::Friend);
+
+        let r_inc = json!({"error_code": 0, "data": {"is_friend": 0, "is_requested": 0, "is_requesting": 1}});
+        assert_eq!(parse_friendship_status_response(&r_inc), FriendshipStatus::IncomingPending);
+
+        let r_out = json!({"error_code": 0, "data": {"is_friend": 0, "is_requested": 1, "is_requesting": 0}});
+        assert_eq!(parse_friendship_status_response(&r_out), FriendshipStatus::OutgoingPending);
+
+        let r_stranger = json!({"error_code": 0, "data": {"is_friend": 0, "is_requested": 0, "is_requesting": 0}});
+        assert_eq!(parse_friendship_status_response(&r_stranger), FriendshipStatus::Stranger);
     }
 }
