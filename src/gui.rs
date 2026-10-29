@@ -578,14 +578,18 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
             ":)",
             "Mỉm cười",
             &[
-                (11190, 34843),
-                (11984, 46684),
-                (12002, 46953),
-                (10788, 28408),
+                (12685, 98981),
+                (12658, 50615),
                 (12003, 46964),
+                (11998, 46891),
                 (11978, 46575),
+                (11954, 46182),
+                (11934, 45835),
+                (11870, 44809),
+                (11807, 43863),
+                (11659, 41251),
+                (11150, 34827),
                 (10302, 21459),
-                (10242, 19949),
             ],
         ),
         "🙁" | "☹️" | "☹" | "😢" | "😭" | "😞" | "😔" | "🥺" | "🥹" | ":(" | ":((" | ":-(( "
@@ -593,36 +597,36 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
             "buon",
             "Buồn",
             &[
-                (11190, 34851),
-                (10788, 28401),
-                (12002, 46954),
+                (12658, 50619),
+                (12556, 50348),
+                (12334, 49778),
+                (12238, 49500),
+                (12017, 47239),
+                (12013, 47156),
                 (12003, 46983),
+                (11978, 46576),
+                (11955, 46210),
+                (11938, 45902),
+                (11917, 45594),
                 (10302, 21456),
-                (11786, 43517),
-                (11901, 45347),
-                (50, 1097),
-                (10752, 27710),
-                (11190, 34847),
-                (50, 1112),
-                (0, 2),
             ],
         ),
         "😂" | "🤣" | "😆" | "😄" | "😁" | "=))" | "=)))" | ":))" | ":)))" | ":v" => (
             "haha",
             "Haha",
             &[
-                (11190, 34840),
-                (50, 1111),
-                (10726, 27182),
-                (10739, 27449),
-                (50, 1105),
-                (12002, 46953),
-                (10183, 18910),
-                (10302, 21461),
-                (10302, 21459),
-                (10340, 22148),
-                (10788, 28408),
+                (12686, 99001),
+                (12658, 50622),
+                (12334, 49787),
+                (12244, 49561),
+                (12059, 47856),
+                (12048, 47668),
+                (12045, 47617),
+                (12022, 47275),
+                (12017, 47228),
                 (12013, 47154),
+                (10302, 21461),
+                (10183, 18910),
             ],
         ),
         "❤️" | "❤" | "💕" | "💖" | "💘" | "💗" | "💓" | "😍" | "🥰" | "😘" | "<3" | ":*"
@@ -630,48 +634,48 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
             "yêu",
             "Yêu thương",
             &[
-                (10939, 30474),
+                (12658, 50616),
+                (12556, 50344),
+                (12334, 49774),
+                (12017, 47227),
+                (12013, 47147),
                 (12003, 46973),
-                (11190, 34841),
+                (11986, 46709),
+                (10939, 30474),
                 (10751, 27695),
-                (10483, 24110),
-                (11031, 32052),
-                (10129, 17994),
-                (10117, 17751),
                 (10302, 21460),
-                (65, 1497),
-                (10623, 25865),
+                (10117, 17751),
             ],
         ),
         "👍" | "👌" | "✅" | "💯" | "🤝" | "/-strong" => (
             "ok",
             "OK",
             &[
-                (11786, 43519),
-                (10291, 21237),
-                (11190, 34842),
-                (10047, 16715),
-                (10177, 18869),
+                (61900, 98936),
+                (12778, 100425),
+                (12748, 99981),
+                (12676, 50745),
+                (12658, 50620),
+                (12646, 50589),
+                (12556, 50345),
+                (12334, 49789),
+                (12238, 49497),
                 (10233, 19773),
-                (10939, 30485),
-                (10610, 25724),
-                (10739, 27451),
-                (12556, 50364),
-                (61900, 98934),
+                (10177, 18869),
             ],
         ),
         "😠" | "😡" | "🤬" | "😤" | ":-h" => (
             "giận",
             "Giận",
             &[
-                (11190, 34856),
-                (12003, 46983),
-                (11454, 38359),
                 (61900, 98933),
-                (50, 1101),
-                (11834, 44254),
-                (14, 390),
-                (10291, 21252),
+                (12686, 98993),
+                (12658, 50623),
+                (12052, 47748),
+                (12003, 46967),
+                (11917, 45599),
+                (11906, 45422),
+                (11454, 38359),
             ],
         ),
         "..." | "...." | "....." | "......" | "-_-" | "==" | "=.=" | "😐" | "😑" | "🙄"
@@ -679,26 +683,29 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
             "....",
             "Cạn lời",
             &[
+                (12740, 99857),
+                (12334, 49777),
                 (12003, 46970),
                 (12013, 47155),
-                (10313, 21646),
-                (10398, 23044),
+                (11998, 46895),
+                (11917, 45601),
                 (11788, 43550),
-                (11984, 46677),
-                (10799, 28632),
-                (10302, 21462),
+                (10398, 23044),
+                (10313, 21646),
             ],
         ),
         "?" | "??" | "???" | "🤔" | "😮" | "😲" | "😯" | "@@" | "👀" => (
             "??",
             "Thắc mắc",
             &[
-                (10434, 23466),
-                (11031, 32055),
-                (11482, 38578),
-                (10682, 26599),
-                (11984, 46677),
-                (10799, 28632),
+                (12748, 99990),
+                (12738, 99830),
+                (12686, 98999),
+                (12676, 50751),
+                (12658, 50626),
+                (12616, 50519),
+                (12334, 49780),
+                (12238, 49515),
                 (12013, 47158),
                 (10302, 21463),
             ],
@@ -707,27 +714,29 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
             "ngu ngon",
             "Ngủ ngon",
             &[
-                (10233, 19792),
-                (11956, 46226),
-                (11659, 41263),
-                (44, 996),
-                (14, 386),
-                (10786, 28367),
-                (12658, 50624),
                 (12778, 100431),
+                (12658, 50624),
+                (11986, 46713),
+                (11962, 46332),
+                (11956, 46226),
+                (11949, 46092),
+                (11819, 44048),
+                (11659, 41263),
+                (10233, 19792),
             ],
         ),
         "🙏" => (
             "cam on",
             "Cảm ơn",
             &[
-                (10291, 21239),
-                (14, 387),
+                (12778, 100433),
+                (12694, 99120),
                 (12658, 50625),
-                (11135, 33879),
-                (11726, 42430),
+                (61900, 98932),
+                (12238, 49507),
                 (12013, 47153),
-                (10610, 25709),
+                (12003, 46975),
+                (11986, 46706),
                 (10302, 21464),
             ],
         ),
@@ -735,13 +744,15 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
             "hi",
             "Xin chào",
             &[
-                (10233, 19773),
-                (10398, 23037),
-                (10882, 29557),
-                (10130, 18009),
-                (10726, 27179),
+                (61900, 98930),
+                (12778, 100421),
+                (12713, 99407),
                 (12676, 50746),
-                (11984, 46684),
+                (12658, 50629),
+                (12238, 49510),
+                (12045, 47621),
+                (12013, 47160),
+                (12003, 46984),
                 (10302, 21458),
             ],
         ),
@@ -749,13 +760,14 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
             "chuc mung",
             "Chúc mừng",
             &[
-                (10233, 19787),
-                (11020, 31798),
+                (12713, 99406),
+                (12694, 99113),
+                (12238, 49511),
+                (12048, 47666),
                 (12013, 47161),
+                (11978, 46570),
                 (11954, 46193),
-                (10939, 30479),
-                (10285, 21154),
-                (10726, 27183),
+                (10233, 19787),
             ],
         ),
         _ => match f {
@@ -765,18 +777,18 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
                 "hi",
                 "Xin chào",
                 &[
-                    (10233, 19773),
-                    (10398, 23037),
-                    (10882, 29557),
-                    (10130, 18009),
-                    (10256, 20619),
+                    (61900, 98930),
+                    (12778, 100421),
+                    (12713, 99407),
+                    (12676, 50746),
+                    (12658, 50629),
+                    (12646, 50594),
+                    (12238, 49510),
+                    (12045, 47621),
+                    (12013, 47160),
                     (12003, 46984),
                     (10302, 21458),
-                    (10047, 16713),
-                    (14, 394),
-                    (61900, 98930),
-                    (12658, 50629),
-                    (12778, 100421),
+                    (10130, 18009),
                 ],
             ),
             "haha" | "hahaha" | "hihi" | "hihihi" | "hehe" | "hoho" | "kaka" | "cuoi"
@@ -784,18 +796,18 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
                 "haha",
                 "Haha",
                 &[
-                    (11190, 34840),
-                    (50, 1111),
-                    (10726, 27182),
-                    (10739, 27449),
-                    (50, 1105),
-                    (12002, 46953),
-                    (10183, 18910),
-                    (10302, 21461),
-                    (10302, 21459),
-                    (10340, 22148),
-                    (10788, 28408),
+                    (12686, 99001),
+                    (12685, 98981),
+                    (12658, 50622),
+                    (12334, 49787),
+                    (12244, 49561),
+                    (12059, 47856),
+                    (12048, 47668),
+                    (12045, 47617),
+                    (12017, 47228),
                     (12013, 47154),
+                    (10302, 21461),
+                    (10183, 18910),
                 ],
             ),
             "ok" | "oke" | "okay" | "oki" | "okie" | "uk" | "uh" | "uhm" | "um" | "vang"
@@ -804,17 +816,17 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
                 "ok",
                 "OK",
                 &[
-                    (11786, 43519),
-                    (10291, 21237),
-                    (11190, 34842),
-                    (10047, 16715),
-                    (10177, 18869),
+                    (61900, 98936),
+                    (12778, 100425),
+                    (12748, 99981),
+                    (12676, 50745),
+                    (12658, 50620),
+                    (12646, 50589),
+                    (12556, 50345),
+                    (12334, 49789),
+                    (12238, 49497),
                     (10233, 19773),
-                    (10939, 30485),
-                    (10610, 25724),
-                    (10739, 27451),
-                    (12556, 50364),
-                    (61900, 98934),
+                    (10177, 18869),
                 ],
             ),
             "cam on" | "cam on ban" | "cam on anh" | "cam on chi" | "cam on em"
@@ -823,16 +835,16 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
                 "cam on",
                 "Cảm ơn",
                 &[
-                    (10291, 21239),
-                    (14, 387),
-                    (12658, 50625),
-                    (11135, 33879),
                     (12778, 100433),
                     (12694, 99120),
+                    (12658, 50625),
                     (61900, 98932),
-                    (10302, 21464),
-                    (11726, 42430),
+                    (12238, 49507),
+                    (12017, 47226),
                     (12013, 47153),
+                    (12003, 46975),
+                    (11986, 46706),
+                    (10302, 21464),
                 ],
             ),
             "yeu" | "iu" | "love" | "love u" | "love you" | "thuong" | "nho" | "nho qua"
@@ -840,58 +852,57 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
                 "yêu",
                 "Yêu thương",
                 &[
-                    (10939, 30474),
+                    (12658, 50616),
+                    (12556, 50344),
+                    (12334, 49774),
+                    (12017, 47227),
+                    (12013, 47147),
                     (12003, 46973),
-                    (11190, 34841),
+                    (11986, 46709),
+                    (10939, 30474),
                     (10751, 27695),
-                    (10483, 24110),
-                    (11031, 32052),
-                    (10129, 17994),
-                    (10117, 17751),
                     (10302, 21460),
-                    (65, 1497),
-                    (10623, 25865),
+                    (10117, 17751),
                 ],
             ),
             "buon" | "buon qua" | "khoc" | "huhu" | "hic" | "chan" | "chan qua" | "tui than" => (
                 "buon",
                 "Buồn",
                 &[
-                    (12002, 46954),
+                    (12658, 50619),
+                    (12556, 50348),
+                    (12334, 49778),
+                    (12238, 49500),
+                    (12017, 47239),
+                    (12013, 47156),
                     (12003, 46983),
+                    (11978, 46576),
+                    (11955, 46210),
+                    (11938, 45902),
                     (10302, 21456),
-                    (11786, 43517),
-                    (11901, 45347),
-                    (50, 1097),
-                    (10752, 27710),
-                    (11190, 34847),
-                    (11190, 34851),
-                    (10788, 28401),
-                    (50, 1112),
-                    (0, 2),
                 ],
             ),
             "xin loi" | "sorry" | "sr" | "so ry" => (
                 "xin loi",
                 "Xin lỗi",
                 &[
+                    (61900, 98931),
+                    (10601, 25586),
                     (10398, 23046),
                     (10233, 19779),
-                    (10601, 25586),
-                    (61900, 98931),
                 ],
             ),
             "gian" | "tuc" | "buc" | "buc minh" | "gian doi" | "cay" => (
                 "giận",
                 "Giận",
                 &[
-                    (12003, 46983),
-                    (11454, 38359),
                     (61900, 98933),
-                    (50, 1101),
-                    (11190, 34856),
-                    (11834, 44254),
-                    (14, 390),
+                    (12686, 98993),
+                    (12658, 50623),
+                    (12052, 47748),
+                    (12003, 46967),
+                    (11917, 45599),
+                    (11454, 38359),
                 ],
             ),
             "ngu" | "ngu ngon" | "ngu ngon nha" | "ngu ngon nhe" | "good night" | "gn"
@@ -899,14 +910,15 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
                 "ngu ngon",
                 "Ngủ ngon",
                 &[
-                    (10233, 19792),
-                    (11956, 46226),
-                    (11659, 41263),
-                    (44, 996),
-                    (14, 386),
-                    (10786, 28367),
-                    (12658, 50624),
                     (12778, 100431),
+                    (12658, 50624),
+                    (11986, 46713),
+                    (11962, 46332),
+                    (11956, 46226),
+                    (11949, 46092),
+                    (11819, 44048),
+                    (11659, 41263),
+                    (10233, 19792),
                 ],
             ),
             "bye" | "byebye" | "good bye" | "goodbye" | "tam biet" | "tam biet nhe"
@@ -914,42 +926,43 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
                 "tam biet",
                 "Tạm biệt",
                 &[
-                    (10726, 27179),
-                    (10233, 19791),
-                    (11901, 45345),
+                    (12045, 47622),
+                    (11986, 46710),
+                    (11969, 46452),
                     (11960, 46294),
-                    (10112, 17631),
+                    (11956, 46225),
+                    (11949, 46100),
+                    (11901, 45345),
+                    (10233, 19791),
                 ],
             ),
             "wow" | "ngac nhien" | "hong" | "ao that" => (
                 "wow",
                 "Ngạc nhiên",
                 &[
-                    (10939, 30474),
-                    (10788, 28398),
-                    (11482, 38578),
-                    (11786, 43523),
-                    (11150, 34109),
-                    (10117, 17757),
-                    (10606, 25682),
                     (12658, 50632),
+                    (11786, 43523),
+                    (11482, 38578),
+                    (11150, 34109),
+                    (10939, 30474),
+                    (10606, 25682),
                     (10302, 21462),
                     (10302, 21463),
-                    (0, 3),
+                    (10117, 17757),
                 ],
             ),
             "chuc mung" | "hpbd" | "sinh nhat" | "happy birthday" | "tet" => (
                 "chuc mung",
                 "Chúc mừng",
                 &[
-                    (10233, 19787),
-                    (11020, 31798),
+                    (12713, 99406),
+                    (12694, 99113),
+                    (12238, 49511),
+                    (12048, 47666),
                     (12013, 47161),
+                    (11978, 46570),
                     (11954, 46193),
-                    (10233, 19788),
-                    (10604, 25644),
-                    (10051, 16778),
-                    (12713, 99407),
+                    (10233, 19787),
                 ],
             ),
             "doi" | "doi bung" | "doi qua" | "an" | "an com" | "nhau" | "di nhau" | "cf"
@@ -957,15 +970,15 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
                 "đói",
                 "Ăn uống",
                 &[
-                    (10030, 16504),
+                    (12778, 100422),
+                    (11819, 44039),
+                    (11454, 38361),
+                    (10939, 30489),
+                    (10799, 28642),
+                    (10786, 28362),
                     (10655, 26307),
                     (10653, 26271),
-                    (10343, 22197),
-                    (10786, 28362),
-                    (10383, 22855),
-                    (11454, 38361),
                     (10242, 20065),
-                    (12778, 100422),
                 ],
             ),
             _ => return None,
@@ -5450,7 +5463,7 @@ impl ZaloGuiApp {
                     let picker_reserve = (if self.sticker_picker_open { 268.0 } else { 0.0 })
                         + (if self.replying_to.is_some() { 48.0 } else { 0.0 })
                         + (if !contextual_stickers.is_empty() {
-                            92.0
+                            86.0
                         } else {
                             0.0
                         });
@@ -8079,118 +8092,131 @@ impl ZaloGuiApp {
         egui::Frame::none()
             .fill(pal.bg_sidebar)
             .stroke(Stroke::new(1.0_f32, pal.border))
-            .inner_margin(Margin::symmetric(14.0, 6.0))
+            .inner_margin(Margin::symmetric(16.0, 8.0))
             .show(ui, |ui| {
-                ui.set_height(78.0);
                 let row_avail_w = ui.available_width();
-                ui.horizontal(|ui| {
+                ui.horizontal_top(|ui| {
                     let scroll_w = (row_avail_w - 34.0).max(120.0);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(scroll_w, 78.0),
-                        Layout::left_to_right(Align::Center),
-                        |ui| {
-                            egui::ScrollArea::horizontal()
-                                .id_salt("contextual_sticker_suggest_scroll")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 10.0;
-                                        for item in items {
-                                            let key =
-                                                format!("stk_{}_{}", item.cate_id, item.sticker_id);
-                                            let url = if item.cate_id == 0
-                                                && (1..=30).contains(&item.sticker_id)
-                                            {
-                                                format!(
-                                                    "https://stc-chat.zdn.vn/images/stickers/default/thumb/{}.png",
-                                                    item.sticker_id
-                                                )
-                                            } else {
-                                                format!(
-                                                    "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={}&size=130",
-                                                    item.sticker_id
-                                                )
-                                            };
+                    let wheel_y = ui.input(|i| i.smooth_scroll_delta.y);
+                    egui::ScrollArea::horizontal()
+                        .id_salt("contextual_sticker_suggest_scroll")
+                        .max_width(scroll_w)
+                        .max_height(68.0)
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                        )
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if wheel_y.abs() > 0.1
+                                && ui.rect_contains_pointer(ui.max_rect())
+                            {
+                                ui.scroll_with_delta(Vec2::new(wheel_y, 0.0));
+                            }
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 14.0;
+                                for item in items {
+                                    let key =
+                                        format!("stk_{}_{}", item.cate_id, item.sticker_id);
+                                    let url = if item.cate_id == 0
+                                        && (1..=30).contains(&item.sticker_id)
+                                    {
+                                        format!(
+                                            "https://stc-chat.zdn.vn/images/stickers/default/thumb/{}.png",
+                                            item.sticker_id
+                                        )
+                                    } else {
+                                        format!(
+                                            "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={}&size=130",
+                                            item.sticker_id
+                                        )
+                                    };
 
-                                            if !self.sticker_textures.contains_key(&key)
-                                                && self.loading_stickers.insert(key.clone())
-                                            {
-                                                if let Some(tx) = WORKER_TX.get() {
-                                                    let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                                        key: key.clone(),
-                                                        url,
-                                                    });
-                                                }
-                                            }
-
-                                            let (cell_rect, cell_resp) = ui.allocate_exact_size(
-                                                Vec2::new(72.0, 72.0),
-                                                Sense::click(),
-                                            );
-                                            if cell_resp.hovered() {
-                                                ui.painter().rect_filled(
-                                                    cell_rect,
-                                                    Rounding::same(10.0),
-                                                    pal.bg_hover,
-                                                );
-                                                ui.painter().rect_stroke(
-                                                    cell_rect,
-                                                    Rounding::same(10.0),
-                                                    Stroke::new(1.2_f32, pal.primary),
-                                                );
-                                            }
-
-                                            if let Some(tex) = self.sticker_textures.get(&key) {
-                                                let img_rect = cell_rect.shrink(3.0);
-                                                ui.painter().image(
-                                                    tex.id(),
-                                                    img_rect,
-                                                    Rect::from_min_max(
-                                                        Pos2::ZERO,
-                                                        Pos2::new(1.0, 1.0),
-                                                    ),
-                                                    Color32::WHITE,
-                                                );
-                                            } else {
-                                                ui.painter().rect_filled(
-                                                    cell_rect.shrink(6.0),
-                                                    Rounding::same(8.0),
-                                                    pal.bg_elevated,
-                                                );
-                                                ui.painter().text(
-                                                    cell_rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    truncate_chars(&item.label, 9),
-                                                    FontId::proportional(10.0),
-                                                    pal.text_muted,
-                                                );
-                                            }
-
-                                            if cell_resp
-                                                .on_hover_cursor(CursorIcon::PointingHand)
-                                                .on_hover_text("Bấm để gửi nhãn dán ngay")
-                                                .clicked()
-                                            {
-                                                send_item = Some(item.clone());
-                                            }
+                                    if !self.sticker_textures.contains_key(&key)
+                                        && self.loading_stickers.insert(key.clone())
+                                    {
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let _ = tx.send(WorkerCmd::FetchStickerImage {
+                                                key: key.clone(),
+                                                url,
+                                            });
                                         }
-                                    });
-                                });
-                        },
-                    );
+                                    }
+
+                                    let (cell_rect, cell_resp) = ui.allocate_exact_size(
+                                        Vec2::new(68.0, 68.0),
+                                        Sense::click(),
+                                    );
+                                    let hovered = cell_resp.hovered();
+                                    if hovered {
+                                        ui.painter().rect_filled(
+                                            cell_rect,
+                                            Rounding::same(10.0),
+                                            pal.bg_hover,
+                                        );
+                                        ui.painter().rect_stroke(
+                                            cell_rect,
+                                            Rounding::same(10.0),
+                                            Stroke::new(1.2_f32, pal.primary),
+                                        );
+                                    }
+
+                                    if let Some(tex) = self.sticker_textures.get(&key) {
+                                        let [tw, th] = tex.size();
+                                        let tw_f = (tw.max(1)) as f32;
+                                        let th_f = (th.max(1)) as f32;
+                                        let box_side = if hovered { 64.0_f32 } else { 60.0_f32 };
+                                        let scale = (box_side / tw_f).min(box_side / th_f);
+                                        let draw_size = Vec2::new(tw_f * scale, th_f * scale);
+                                        let img_rect =
+                                            Rect::from_center_size(cell_rect.center(), draw_size);
+                                        ui.painter().image(
+                                            tex.id(),
+                                            img_rect,
+                                            Rect::from_min_max(
+                                                Pos2::ZERO,
+                                                Pos2::new(1.0, 1.0),
+                                            ),
+                                            Color32::WHITE,
+                                        );
+                                    } else {
+                                        ui.painter().rect_filled(
+                                            cell_rect.shrink(6.0),
+                                            Rounding::same(8.0),
+                                            pal.bg_elevated,
+                                        );
+                                        ui.painter().text(
+                                            cell_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            truncate_chars(&item.label, 9),
+                                            FontId::proportional(10.0),
+                                            pal.text_muted,
+                                        );
+                                    }
+
+                                    if cell_resp
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .on_hover_text("Bấm để gửi nhãn dán ngay")
+                                        .clicked()
+                                    {
+                                        send_item = Some(item.clone());
+                                    }
+                                }
+                            });
+                        });
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (close_r, close_resp) =
-                            ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
+                        let (close_slot, close_resp) =
+                            ui.allocate_exact_size(Vec2::new(26.0, 68.0), Sense::click());
+                        let close_center = close_slot.center();
                         if close_resp.hovered() {
                             ui.painter()
-                                .circle_filled(close_r.center(), 12.0, pal.bg_hover);
+                                .circle_filled(close_center, 12.0, pal.bg_hover);
                         }
                         draw_lucide_icon(
                             ui.painter(),
-                            close_r.center(),
+                            close_center,
                             lucide::X,
-                            13.0,
+                            13.5,
                             if close_resp.hovered() {
                                 pal.text_primary
                             } else {

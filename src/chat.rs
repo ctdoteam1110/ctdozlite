@@ -1351,7 +1351,7 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
         queries.push(stripped);
     }
 
-    let mut out: Vec<StickerItem> = Vec::new();
+    let mut raw_items: Vec<(u64, u64, u32)> = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
 
     for q in queries {
@@ -1397,14 +1397,37 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             let stype = it.get("type").and_then(Value::as_u64).unwrap_or(7) as u32;
-            let idx = out.len() + 1;
-            out.push(StickerItem {
-                sticker_id: sid,
-                cate_id: cid,
-                sticker_type: stype,
-                label: format!("{kw} #{idx}"),
-            });
+            raw_items.push((cid, sid, stype));
         }
+    }
+
+    // Prioritize modern illustrated Zalo character packs (`cate_id` descending, matching Zalo PC's
+    // `pointCate` ranking) and exclude legacy round-emoji/photo-meme packs when character packs exist.
+    const LEGACY_NON_CHAR_PACKS: &[u64] = &[0, 50, 10788, 11190, 11984, 12002, 12024];
+    let has_modern_char = raw_items
+        .iter()
+        .any(|(cid, _, _)| *cid >= 10000 && !LEGACY_NON_CHAR_PACKS.contains(cid));
+    if has_modern_char {
+        raw_items.retain(|(cid, _, _)| *cid >= 10000 && !LEGACY_NON_CHAR_PACKS.contains(cid));
+    }
+    raw_items.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // Keep at most 2 stickers from the same pack in the top strip so suggestions show diverse characters
+    let mut pack_counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(18);
+    for &(cid, sid, stype) in &raw_items {
+        let cnt = pack_counts.entry(cid).or_insert(0);
+        if *cnt >= 2 {
+            continue;
+        }
+        *cnt += 1;
+        let idx = out.len() + 1;
+        out.push(StickerItem {
+            sticker_id: sid,
+            cate_id: cid,
+            sticker_type: stype,
+            label: format!("{kw} #{idx}"),
+        });
         if out.len() >= 18 {
             break;
         }
