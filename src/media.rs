@@ -23,14 +23,27 @@ pub struct MediaHandle {
 
 impl MediaHandle {
     pub fn start(rtp_addr: String, local_port: u16) -> Result<Self> {
-        Self::start_with_sockets(rtp_addr, String::new(), 0, 0, None, None, local_port)
+        Self::start_with_sockets(
+            rtp_addr,
+            String::new(),
+            0,
+            0,
+            true,
+            0,
+            None,
+            None,
+            local_port,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start_with_sockets(
         rtp_addr: String,
         rtcp_addr: String,
         from_uid_u32: u32,
         partner_uid_u32: u32,
+        is_caller: bool,
+        relay_token: u32,
         udp_rtp_sock: Option<Arc<tokio::net::UdpSocket>>,
         udp_rtcp_sock: Option<Arc<tokio::net::UdpSocket>>,
         local_port: u16,
@@ -60,6 +73,8 @@ impl MediaHandle {
                 rtcp_addr,
                 from_uid_u32,
                 partner_uid_u32,
+                is_caller,
+                relay_token,
             );
         });
         threads.push(t);
@@ -85,6 +100,71 @@ impl Drop for MediaHandle {
     }
 }
 
+/// Unwrap a Zalo UDP relay packet (`0x00893524..0x008936D1` in `ZaloCall.exe`) into its inner RTP slice.
+pub fn unwrap_zalo_relay_rtp(pkt: &[u8]) -> Option<&[u8]> {
+    if pkt.len() < 12 {
+        return None;
+    }
+    let inner = match pkt[0] {
+        // 1-byte relay media header (`0x04` = incoming RTP, `0x07` = P2P RTP, `0x0E` = incoming RTCP)
+        0x04 | 0x07 => pkt.get(1..)?,
+        // 5-byte relay media header (`0x03` / `0x05` + `token: u32 LE`)
+        0x03 | 0x05 => pkt.get(5..)?,
+        // 9-byte `0x7F` relay media header (`0x7F, 0x00, role, call_id: u32 LE, cmd: u16 LE`)
+        0x7F if pkt.len() > 9 => {
+            let cmd = u16::from_le_bytes([pkt[7], pkt[8]]);
+            if (6..=10).contains(&cmd) {
+                pkt.get(9..)?
+            } else {
+                return None;
+            }
+        }
+        // 25-byte `0x02` relay media header (`cmd == 0x0032` at `0x008937C8`)
+        0x02 if pkt.len() > 25 && u16::from_le_bytes([pkt[18], pkt[19]]) == 0x0032 => {
+            pkt.get(25..)?
+        }
+        // Standard raw RTP v2 (`V=2` in top 2 bits)
+        b if (b & 0xC0) == 0x80 => pkt,
+        _ => return None,
+    };
+    if inner.len() >= 12 && (inner[0] & 0xC0) == 0x80 {
+        Some(inner)
+    } else {
+        None
+    }
+}
+
+/// Extract the Opus payload slice from a standard RFC 3550 RTP v2 packet (handling CSRC & header extensions).
+fn extract_rtp_opus_payload(rtp: &[u8]) -> Option<&[u8]> {
+    if rtp.len() < 12 || (rtp[0] & 0xC0) != 0x80 {
+        return None;
+    }
+    let cc = (rtp[0] & 0x0F) as usize;
+    let has_ext = (rtp[0] & 0x10) != 0;
+    let has_pad = (rtp[0] & 0x20) != 0;
+    let mut offset = 12 + cc * 4;
+    if has_ext {
+        if rtp.len() < offset + 4 {
+            return None;
+        }
+        let ext_words = u16::from_be_bytes([rtp[offset + 2], rtp[offset + 3]]) as usize;
+        offset += 4 + ext_words * 4;
+    }
+    let mut end = rtp.len();
+    if has_pad && end > offset {
+        let pad_len = rtp[end - 1] as usize;
+        if pad_len > 0 && pad_len <= end - offset {
+            end -= pad_len;
+        }
+    }
+    if offset < end {
+        Some(&rtp[offset..end])
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_media_loop(
     stop: Arc<AtomicBool>,
     mic_muted: Arc<AtomicBool>,
@@ -95,6 +175,8 @@ fn run_media_loop(
     rtcp_addr: String,
     from_uid_u32: u32,
     partner_uid_u32: u32,
+    is_caller: bool,
+    relay_token: u32,
 ) {
     let host = cpal::default_host();
     let input_dev = match host.default_input_device() {
@@ -195,18 +277,30 @@ fn run_media_loop(
             let mut out = vec![0u8; 4000];
             match encoder.encode_float(&frame, &mut out) {
                 Ok(n) => {
-                    // Build RTP header (12 bytes, PT=112 matching Zalo's opus/16000/1 codec)
-                    let mut pkt = Vec::with_capacity(12 + n);
-                    pkt.push(0x80); // V=2, P=0, X=0, CC=0
-                    pkt.push(112); // payload type 112 (opus/16000/1)
-                    pkt.extend_from_slice(&seq.to_be_bytes());
-                    pkt.extend_from_slice(&ts.to_be_bytes());
-                    pkt.extend_from_slice(&ssrc.to_be_bytes());
-                    pkt.extend_from_slice(&out[..n]);
+                    // Build inner RTP header (12 bytes, PT=112 matching Zalo's opus/16000/1 codec)
+                    let mut rtp_pkt = Vec::with_capacity(12 + n);
+                    rtp_pkt.push(0x80); // V=2, P=0, X=0, CC=0
+                    rtp_pkt.push(112); // payload type 112 (opus/16000/1)
+                    rtp_pkt.extend_from_slice(&seq.to_be_bytes());
+                    rtp_pkt.extend_from_slice(&ts.to_be_bytes());
+                    rtp_pkt.extend_from_slice(&ssrc.to_be_bytes());
+                    rtp_pkt.extend_from_slice(&out[..n]);
+
                     if let (Some(ref tsock), Some(target)) = (&udp_rtp_sock, rtp_sock_addr) {
-                        let _ = tsock.try_send_to(&pkt, target);
+                        if relay_token != 0 {
+                            // Wrap in Zalo's 5-byte relay media header (`0x00893355` / `0x00893E02` in `ZaloCall.exe`):
+                            // `[type_byte (0x03 caller / 0x05 callee), token: u32 LE, rtp_pkt..]`
+                            let type_byte: u8 = if is_caller { 0x03 } else { 0x05 };
+                            let mut wire = Vec::with_capacity(5 + rtp_pkt.len());
+                            wire.push(type_byte);
+                            wire.extend_from_slice(&relay_token.to_le_bytes());
+                            wire.extend_from_slice(&rtp_pkt);
+                            let _ = tsock.try_send_to(&wire, target);
+                        } else {
+                            let _ = tsock.try_send_to(&rtp_pkt, target);
+                        }
                     } else if let Some(ref fsock) = fallback_sock {
-                        let _ = fsock.send_to(&pkt, &rtp_addr);
+                        let _ = fsock.send_to(&rtp_pkt, &rtp_addr);
                     }
                     seq = seq.wrapping_add(1);
                     ts = ts.wrapping_add(FRAME_SAMPLES as u32);
@@ -215,7 +309,7 @@ fn run_media_loop(
             }
         }
 
-        // Periodic RTCP Receiver Report (PT=201) over `udp_rtcp_sock` so the relay keeps the RTCP leg warm
+        // Periodic RTCP Receiver Report (PT=201) over `udp_rtcp_sock` (`0x00894418` in `ZaloCall.exe`)
         if last_rtcp.elapsed() >= Duration::from_secs(2) {
             last_rtcp = std::time::Instant::now();
             if let (Some(ref rtcp_s), Some(target)) = (&udp_rtcp_sock, rtcp_sock_addr) {
@@ -225,11 +319,20 @@ fn run_media_loop(
                 rtcp_pkt[2..4].copy_from_slice(&7u16.to_be_bytes());
                 rtcp_pkt[4..8].copy_from_slice(&ssrc.to_be_bytes());
                 rtcp_pkt[8..12].copy_from_slice(&partner_uid_u32.to_be_bytes());
-                let _ = rtcp_s.try_send_to(&rtcp_pkt, target);
+                if relay_token != 0 {
+                    let rtcp_type: u8 = if is_caller { 0x0D } else { 0x0F };
+                    let mut wire = Vec::with_capacity(5 + rtcp_pkt.len());
+                    wire.push(rtcp_type);
+                    wire.extend_from_slice(&relay_token.to_le_bytes());
+                    wire.extend_from_slice(&rtcp_pkt);
+                    let _ = rtcp_s.try_send_to(&wire, target);
+                } else {
+                    let _ = rtcp_s.try_send_to(&rtcp_pkt, target);
+                }
             }
         }
 
-        // --- Receive: parse RTP, decode, play ---
+        // --- Receive: unwrap Zalo relay framing, parse RTP, decode Opus, play ---
         let mut buf = [0u8; 4000];
         let recv_len = if let Some(ref tsock) = udp_rtp_sock {
             tsock.try_recv_from(&mut buf).ok().map(|(n, _)| n)
@@ -239,21 +342,53 @@ fn run_media_loop(
             None
         };
         if let Some(n) = recv_len {
-            // Skip 21-byte Zalo ZRTP control packets (`buf[0] == 0x01 || buf[0] == 0x02`)
-            if n > 12 && (buf[0] & 0xC0) == 0x80 {
-                let payload = &buf[12..n];
-                let mut pcm = vec![0f32; FRAME_SAMPLES];
-                if decoder.decode_float(payload, &mut pcm, false).is_ok() {
-                    if let Ok(mut b) = output_buf.lock() {
-                        b.extend_from_slice(&pcm);
+            if let Some(inner_rtp) = unwrap_zalo_relay_rtp(&buf[..n]) {
+                if let Some(payload) = extract_rtp_opus_payload(inner_rtp) {
+                    let mut pcm = vec![0f32; FRAME_SAMPLES];
+                    if decoder.decode_float(payload, &mut pcm, false).is_ok() {
+                        if let Ok(mut b) = output_buf.lock() {
+                            b.extend_from_slice(&pcm);
+                        }
                     }
                 }
             }
         }
-
         thread::sleep(Duration::from_millis(5));
     }
 
     drop(input_stream);
     drop(output_stream);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unwrap_zalo_relay_rtp_all_formats() {
+        let mut sample_rtp = vec![0x80, 112, 0x00, 0x01, 0x00, 0x00, 0x01, 0x40, 0x12, 0x34, 0x56, 0x78];
+        sample_rtp.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        // 1. Raw RTP (0x80)
+        let r1 = unwrap_zalo_relay_rtp(&sample_rtp).expect("raw rtp");
+        assert_eq!(extract_rtp_opus_payload(r1), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+
+        // 2. 1-byte relay header (0x04 incoming RTP)
+        let mut p4 = vec![0x04];
+        p4.extend_from_slice(&sample_rtp);
+        let r2 = unwrap_zalo_relay_rtp(&p4).expect("0x04 relay rtp");
+        assert_eq!(extract_rtp_opus_payload(r2), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+
+        // 3. 5-byte relay header (0x03 caller / 0x05 callee + 4-byte token LE)
+        let mut p5 = vec![0x03, 0x78, 0x56, 0x34, 0x12];
+        p5.extend_from_slice(&sample_rtp);
+        let r3 = unwrap_zalo_relay_rtp(&p5).expect("0x03 relay rtp");
+        assert_eq!(extract_rtp_opus_payload(r3), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+
+        // 4. 9-byte 0x7F relay header (cmd = 6)
+        let mut p9 = vec![0x7F, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x06, 0x00];
+        p9.extend_from_slice(&sample_rtp);
+        let r4 = unwrap_zalo_relay_rtp(&p9).expect("0x7F relay rtp");
+        assert_eq!(extract_rtp_opus_payload(r4), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+    }
 }

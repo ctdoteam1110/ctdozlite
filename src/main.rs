@@ -79,6 +79,23 @@ async fn main() -> Result<()> {
     // Background worker in `gui.rs` handles `get_server_info`, `get_friends`, and `poll_new_messages`.
     if force_gui || (!force_tui && !force_qr && !args.iter().any(|a| a.starts_with("--phone"))) {
         println!("🚀 Đang khởi chạy giao diện đồ họa Zalo GUI (egui)…");
+        #[cfg(target_os = "windows")]
+        if !dev_mode {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetConsoleWindow() -> *mut std::ffi::c_void;
+            }
+            #[link(name = "user32")]
+            extern "system" {
+                fn ShowWindow(hwnd: *mut std::ffi::c_void, n_cmd_show: i32) -> i32;
+            }
+            unsafe {
+                let hwnd = GetConsoleWindow();
+                if !hwnd.is_null() {
+                    ShowWindow(hwnd, 0); // SW_HIDE
+                }
+            }
+        }
         let native_options = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_inner_size([1020.0, 700.0])

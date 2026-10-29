@@ -195,6 +195,12 @@ pub fn merge_thread_into(
                 existing_msg.ts = msg.ts;
                 existing_msg.time = msg.time;
             }
+            if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
+                existing_msg.text = "[Tin nhắn đã thu hồi]".to_string();
+                existing_msg.sticker_id = None;
+                existing_msg.link_url = None;
+                existing_msg.link_thumb = None;
+            }
             if existing_msg.sticker_id.is_none() && msg.sticker_id.is_some() {
                 existing_msg.sticker_id = msg.sticker_id;
                 existing_msg.sticker_cate_id = msg.sticker_cate_id;
@@ -2613,7 +2619,11 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     let mut content = raw_content_val
         .and_then(extract_content_text)
         .unwrap_or_default();
-    if sticker_meta.is_some() && (content.is_empty() || content.starts_with('{')) {
+    let is_undo_type = matches!(msg_type.as_str(), "chat.undo" | "undo" | "31");
+    if is_undo_type {
+        content = "[Tin nhắn đã thu hồi]".to_string();
+        sticker_meta = None;
+    } else if sticker_meta.is_some() && (content.is_empty() || content.starts_with('{')) {
         content = "[Nhãn dán]".to_string();
     }
 
@@ -2647,16 +2657,30 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         };
     }
 
-    let msg_id = it
-        .get("msgId")
-        .or_else(|| it.get("cliMsgId"))
-        .or_else(|| it.get("globalMsgId"))
-        .or_else(|| it.get("lastMsgId"))
-        .or_else(|| it.get("id"))
-        .and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            Value::Number(n) => Some(n.to_string()),
+    let undo_target_id = if is_undo_type {
+        raw_content_val.and_then(|rv| match rv {
+            Value::Object(_) => pick_str(rv, &["globalMsgId", "msgId", "cliMsgId"]),
+            Value::String(s) if s.trim().starts_with('{') => serde_json::from_str::<Value>(s.trim())
+                .ok()
+                .and_then(|parsed| pick_str(&parsed, &["globalMsgId", "msgId", "cliMsgId"])),
             _ => None,
+        })
+    } else {
+        None
+    };
+
+    let msg_id = undo_target_id
+        .or_else(|| {
+            it.get("msgId")
+                .or_else(|| it.get("cliMsgId"))
+                .or_else(|| it.get("globalMsgId"))
+                .or_else(|| it.get("lastMsgId"))
+                .or_else(|| it.get("id"))
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                })
         })
         .unwrap_or_default();
 
@@ -2964,6 +2988,12 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                     if parsed.ts > 0 && existing.ts != parsed.ts {
                         existing.ts = parsed.ts;
                         existing.time = parsed.time;
+                    }
+                    if parsed.text.trim() == "[Tin nhắn đã thu hồi]" {
+                        existing.text = "[Tin nhắn đã thu hồi]".to_string();
+                        existing.sticker_id = None;
+                        existing.link_url = None;
+                        existing.link_thumb = None;
                     }
                     if existing.sticker_id.is_none() && parsed.sticker_id.is_some() {
                         existing.sticker_id = parsed.sticker_id;

@@ -1388,6 +1388,7 @@ pub struct ZaloGuiApp {
     composer_focus_pending: bool,
     pending_clipboard_image: Option<(std::path::PathBuf, u32, u32, TextureHandle)>,
     unread_counts: HashMap<String, usize>,
+    allow_quit: bool,
 
     // Dev Inspector state
     dev_mode: bool,
@@ -1552,6 +1553,7 @@ impl ZaloGuiApp {
             composer_focus_pending: false,
             pending_clipboard_image: None,
             unread_counts: HashMap::new(),
+            allow_quit: false,
             dev_mode,
             dev_panel_open: false,
             dev_tab: DevTab::Logs,
@@ -2689,7 +2691,7 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                         .as_ref()
                                         .map(|l| !l.send2me_id.is_empty() && l.send2me_id == group_id)
                                         .unwrap_or(false);
-                                    let mut t = Thread {
+                                    let t = Thread {
                                         id: group_id.clone(),
                                         name: String::new(),
                                         preview: String::new(),
@@ -3541,6 +3543,14 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q)) {
+            self.allow_quit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
         if self.theme_dirty {
             self.palette().apply_to_ctx(ctx);
             self.theme_dirty = false;
@@ -6877,6 +6887,28 @@ impl ZaloGuiApp {
                         {
                             do_logout = true;
                             close_menu = true;
+                        }
+                        ui.add_space(4.0);
+                        if ui
+                            .add_sized(
+                                [200.0, 28.0],
+                                egui::Button::new(
+                                    RichText::new(format!(
+                                        "{}  Thoát hoàn toàn (Ctrl+Q)",
+                                        lucide::X
+                                    ))
+                                    .size(12.0)
+                                    .color(pal.text_secondary),
+                                )
+                                .fill(pal.bg_input)
+                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .rounding(Rounding::same(7.0)),
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            self.allow_quit = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
             });

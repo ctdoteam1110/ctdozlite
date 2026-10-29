@@ -1109,6 +1109,7 @@ struct PureRustCallState {
     extend_data: String,
     from_uid_u32: u32,
     partner_uid_u32: u32,
+    relay_token: u32,
     udp_rtp_sock: Option<Arc<tokio::net::UdpSocket>>,
     udp_rtcp_sock: Option<Arc<tokio::net::UdpSocket>>,
     keepalive_abort: Option<tokio::sync::watch::Sender<bool>>,
@@ -1506,13 +1507,11 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
                         }
                     }
                 }
-                Ok((n, peer)) = rtp_loop.recv_from(&mut buf_rtp) => {
+                Ok((n, peer)) = rtp_loop.recv_from(&mut buf_rtp), if cur_token == 0 => {
                     if let Some((0, _, token, pub_addr)) = parse_zrtp_init_response(&buf_rtp[..n]) {
                         server_tokens.insert(peer.to_string(), token);
-                        if cur_token == 0 {
-                            cur_token = token;
-                            trace_line("ZRTP", format!("late RTP init ack from {peer}: token={token} pub={pub_addr:?}"));
-                        }
+                        cur_token = token;
+                        trace_line("ZRTP", format!("late RTP init ack from {peer}: token={token} pub={pub_addr:?}"));
                     }
                 }
                 Ok((n, peer)) = rtcp_loop.recv_from(&mut buf_rtcp) => {
@@ -1769,7 +1768,7 @@ pub fn build_pure_rust_invite_fields_with_probe(
         "serverResult": server_result,
         "spTcp": 1,
         "srtcp": 0,
-        "srtpMode": 1,
+        "srtpMode": 0,
         "supportCallBusy": 1,
         "supportHevcDecode": 1,
         "tpType": 0,
@@ -1843,7 +1842,7 @@ pub fn build_callee_extend_data(
         ],
         "spTcp": 1,
         "srtcp": 0,
-        "srtpMode": 1,
+        "srtpMode": 0,
         "supportCallBusy": 1,
         "supportHevcDecode": 1,
         "tpType": 0,
@@ -2008,6 +2007,7 @@ impl CallBridge {
                                             extend_data: String::new(),
                                             from_uid_u32: 0,
                                             partner_uid_u32: 0,
+                                            relay_token: 0,
                                             udp_rtp_sock: None,
                                             udp_rtcp_sock: None,
                                             keepalive_abort: None,
@@ -2156,6 +2156,7 @@ impl CallBridge {
                                 extend_data: extend_str.clone(),
                                 from_uid_u32,
                                 partner_uid_u32,
+                                relay_token: zrtp_probe.token,
                                 udp_rtp_sock,
                                 udp_rtcp_sock,
                                 keepalive_abort,
@@ -2240,6 +2241,8 @@ impl CallBridge {
                                     st.rtcp_ip.clone(),
                                     st.from_uid_u32,
                                     st.partner_uid_u32,
+                                    st.is_caller,
+                                    st.relay_token,
                                     st.udp_rtp_sock.clone(),
                                     st.udp_rtcp_sock.clone(),
                                     0,
@@ -2472,6 +2475,8 @@ impl CallBridge {
                                             st.rtcp_ip.clone(),
                                             st.from_uid_u32,
                                             st.partner_uid_u32,
+                                            st.is_caller,
+                                            st.relay_token,
                                             st.udp_rtp_sock.clone(),
                                             st.udp_rtcp_sock.clone(),
                                             0,
@@ -2735,6 +2740,7 @@ impl CallBridge {
                                         extend_data: extend_str,
                                         from_uid_u32,
                                         partner_uid_u32,
+                                        relay_token: zrtp_probe.token,
                                         udp_rtp_sock,
                                         udp_rtcp_sock,
                                         keepalive_abort,
