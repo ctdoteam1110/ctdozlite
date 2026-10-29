@@ -4831,7 +4831,12 @@ impl ZaloGuiApp {
                                 ui.set_width(bar_avail_w);
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 8.0;
-                                    let pill_w = (bar_avail_w - 210.0).clamp(150.0, 420.0);
+                                    let right_reserve = if q_low.is_empty() {
+                                        86.0
+                                    } else {
+                                        174.0
+                                    };
+                                    let pill_w = (bar_avail_w - right_reserve).max(140.0);
                                     egui::Frame::none()
                                         .fill(pal.bg_input)
                                         .rounding(Rounding::same(8.0))
@@ -4841,7 +4846,8 @@ impl ZaloGuiApp {
                                         ))
                                         .inner_margin(Margin::symmetric(10.0, 5.0))
                                         .show(ui, |ui| {
-                                            ui.set_width(pill_w);
+                                            let inner_w = (pill_w - 20.0).max(110.0);
+                                            ui.set_width(inner_w);
                                             ui.horizontal(|ui| {
                                                 ui.spacing_mut().item_spacing.x = 6.0;
                                                 let (ir, _) = ui.allocate_exact_size(
@@ -4857,9 +4863,9 @@ impl ZaloGuiApp {
                                                 let has_txt =
                                                     !self.in_chat_search_query.is_empty();
                                                 let te_w = if has_txt {
-                                                    (pill_w - 44.0).max(60.0)
+                                                    (inner_w - 44.0).max(60.0)
                                                 } else {
-                                                    (pill_w - 22.0).max(80.0)
+                                                    (inner_w - 22.0).max(80.0)
                                                 };
                                                 let te_resp = ui.add(
                                                     egui::TextEdit::singleline(
@@ -4957,11 +4963,10 @@ impl ZaloGuiApp {
 
                     // 2. Scrollable Messages Area
                     let picker_reserve = (if self.sticker_picker_open { 268.0 } else { 0.0 })
-                        + (if self.replying_to.is_some() { 48.0 } else { 0.0 })
-                        + (if self.in_chat_search_open { 42.0 } else { 0.0 });
+                        + (if self.replying_to.is_some() { 48.0 } else { 0.0 });
                     let mut pending_action: Option<(usize, BubbleAction)> = None;
                     let msg_area_height =
-                        (ui.available_height() - 62.0 - picker_reserve).max(100.0);
+                        (ui.available_height() - 66.0 - picker_reserve).max(100.0);
 
                     egui::ScrollArea::vertical()
                         .id_salt(Id::new(("chat_scroll", &thread_id)))
@@ -5535,15 +5540,7 @@ impl ZaloGuiApp {
                                                 Color32::WHITE,
                                             );
                                         }
-                                        draw_icon_send(
-                                            ui.painter(),
-                                            Pos2::new(
-                                                send_rect.right() - 18.0,
-                                                send_rect.center().y,
-                                            ),
-                                            14.0,
-                                            Color32::WHITE,
-                                        );
+
 
                                         let send_clicked = send_resp
                                             .on_hover_cursor(if can_send {
