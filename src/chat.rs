@@ -1772,6 +1772,65 @@ pub async fn delete_message_for_me(
     }
 }
 
+/// Recall / undo an outgoing message for everyone (`undoMessage` @ `compact-app-pc.js:14376599`, cmd `11281` / `11192`).
+pub async fn recall_message(
+    s: &Session,
+    to_id: &str,
+    is_group: bool,
+    msg: &ChatMessage,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let cli_id = if msg.ts > 0 {
+        msg.ts.to_string()
+    } else {
+        now.to_string()
+    };
+
+    if is_group {
+        let clean_grid = to_id
+            .trim_start_matches("group_")
+            .trim_start_matches('g')
+            .trim_start_matches('G');
+        let body = obj(&[
+            ("msgId", json!(msg.id)),
+            ("grid", json!(clean_grid)),
+            ("clientId", json!(now)),
+            ("visibility", json!(0)),
+            ("cliMsgIdUndo", json!(cli_id)),
+            ("imei", json!(s.imei)),
+        ]);
+        let params = s.encoded_params(&body)?;
+        let url = format!("{}/api/group/undomsg?{}", s.domains.group, s.common_params());
+        let resp = s.post_form(&url, format!("params={params}")).await?;
+        Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    } else {
+        let host = if s.domains.chat.contains("-msg-chat.")
+            || s.domains.chat.contains("tt-chat2-wpa")
+            || s.domains.chat.is_empty()
+        {
+            "https://tt-chat3-wpa.api.zaloapp.com"
+        } else {
+            &s.domains.chat
+        };
+        let body = obj(&[
+            ("msgId", json!(msg.id)),
+            ("toid", json!(to_id)),
+            ("clientId", json!(now)),
+            ("cliMsgIdUndo", json!(cli_id)),
+        ]);
+        let params = s.encoded_params(&body)?;
+        let url = format!("{host}/api/message/undo?{}", s.common_params());
+        let resp = s.post_form(&url, format!("params={params}")).await?;
+        Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    }
+}
+
 /// `GET /api/preloadconvers/get-last-msgs` (cmd 10053).
 ///
 /// [O] request: GET `{convers_api}/api/preloadconvers/get-last-msgs?{common}&params={encodeAES(json)}`

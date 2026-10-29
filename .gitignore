@@ -20,6 +20,7 @@ dump/
 qr.png
 *.flow
 call_relay.json
+call_trace.log
 
 # Generated graph/tooling output
 graphify-out/

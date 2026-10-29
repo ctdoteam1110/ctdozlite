@@ -1261,6 +1261,11 @@ pub enum GuiEvent {
         msg_id: String,
         ts: i64,
     },
+    MessageRecalled {
+        thread_id: String,
+        msg_id: String,
+        ts: i64,
+    },
     SendFailed {
         thread_id: String,
         text: String,
@@ -1381,6 +1386,8 @@ pub struct ZaloGuiApp {
     last_composer_edit_at: std::time::Instant,
     composer_sticker_selected: Option<usize>,
     composer_focus_pending: bool,
+    pending_clipboard_image: Option<(std::path::PathBuf, u32, u32, TextureHandle)>,
+    unread_counts: HashMap<String, usize>,
 
     // Dev Inspector state
     dev_mode: bool,
@@ -1543,6 +1550,8 @@ impl ZaloGuiApp {
             last_composer_edit_at: std::time::Instant::now(),
             composer_sticker_selected: None,
             composer_focus_pending: false,
+            pending_clipboard_image: None,
+            unread_counts: HashMap::new(),
             dev_mode,
             dev_panel_open: false,
             dev_tab: DevTab::Logs,
@@ -1623,10 +1632,36 @@ impl ZaloGuiApp {
                             .map(|u| u.id.clone())
                             .collect();
 
+                        let active_tid = self
+                            .threads
+                            .get(self.selected_thread_index)
+                            .map(|t| t.id.clone())
+                            .unwrap_or_default();
+                        let is_focused = ctx.input(|i| i.focused);
+                        let mut new_incoming_alert = false;
+
                         for nt in updates {
                             if let Some(existing) = self.threads.iter_mut().find(|t| t.id == nt.id)
                             {
+                                let old_len = existing.messages.len();
                                 crate::chat::merge_thread_into(existing, nt, true);
+                                let added = existing.messages.len().saturating_sub(old_len);
+                                if added > 0 {
+                                    let inc_cnt = existing
+                                        .messages
+                                        .iter()
+                                        .rev()
+                                        .take(added)
+                                        .filter(|m| !m.is_outgoing)
+                                        .count();
+                                    if inc_cnt > 0 && (existing.id != active_tid || !is_focused) {
+                                        *self
+                                            .unread_counts
+                                            .entry(existing.id.clone())
+                                            .or_insert(0) += inc_cnt;
+                                        new_incoming_alert = true;
+                                    }
+                                }
                             } else if let Some(existing) = self.threads.iter_mut().find(|t| {
                                 !live_ids.contains(&t.id)
                                     && crate::chat::threads_represent_same_contact(t, &nt)
@@ -1637,6 +1672,22 @@ impl ZaloGuiApp {
                             }
                         }
 
+                        if new_incoming_alert {
+                            let total_unread: usize = self.unread_counts.values().sum();
+                            let title = if total_unread > 0 {
+                                format!("({total_unread}) Zalo Lite — Native Rust Client")
+                            } else {
+                                "Zalo Lite — Native Rust Client".to_string()
+                            };
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+                            if !is_focused {
+                                ctx.send_viewport_cmd(
+                                    egui::ViewportCommand::RequestUserAttention(
+                                        egui::UserAttentionType::Informational,
+                                    ),
+                                );
+                            }
+                        }
                         crate::chat::deduplicate_threads(&mut self.threads, Some(&live_ids));
 
                         if let Some((sel_name, sel_grp)) = prev_selected_name {
@@ -1817,6 +1868,28 @@ impl ZaloGuiApp {
                     }
                     self.status_msg = "Đã xóa tin nhắn ở phía bạn".into();
                 }
+                GuiEvent::MessageRecalled {
+                    thread_id,
+                    msg_id,
+                    ts,
+                } => {
+                    if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
+                        if let Some(m) = t.messages.iter_mut().find(|m| {
+                            (!msg_id.is_empty() && m.id == msg_id)
+                                || (msg_id.is_empty() && m.ts == ts)
+                        }) {
+                            m.text = "[Tin nhắn đã thu hồi]".into();
+                            m.sticker_id = None;
+                            m.link_url = None;
+                            m.link_thumb = None;
+                        }
+                        if let Some(last) = t.messages.last() {
+                            t.preview = last.text.clone();
+                        }
+                        self.persist_threads_async();
+                    }
+                    self.status_msg = "Đã thu hồi tin nhắn với mọi người".into();
+                }
                 GuiEvent::StickerImageReady { key, image } => {
                     let tex = ctx.load_texture(&key, image, TextureOptions::LINEAR);
                     self.sticker_textures.insert(key, tex);
@@ -1993,6 +2066,11 @@ pub enum WorkerCmd {
         reaction: String,
     },
     DeleteForMe {
+        to_id: String,
+        is_group: bool,
+        msg: ChatMessage,
+    },
+    RecallMessage {
         to_id: String,
         is_group: bool,
         msg: ChatMessage,
@@ -2895,6 +2973,52 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                         crate::logger::log_error("gui::delete", &e.to_string());
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                             "Xóa tin nhắn thất bại: {e}"
+                                        )));
+                                    }
+                                }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::RecallMessage {
+                            to_id,
+                            is_group,
+                            msg,
+                        } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let local_only = msg.id.is_empty()
+                                    || msg.id.starts_with("out_")
+                                    || msg.id.starts_with("local_");
+                                let res: anyhow::Result<serde_json::Value> = if local_only {
+                                    Ok(serde_json::json!({}))
+                                } else {
+                                    crate::chat::recall_message(&s, &to_id, is_group, &msg).await
+                                };
+                                match res {
+                                    Ok(resp) if resp_error_code(&resp).is_none() => {
+                                        let _ = gui_tx_clone.send(GuiEvent::MessageRecalled {
+                                            thread_id: to_id,
+                                            msg_id: msg.id.clone(),
+                                            ts: msg.ts,
+                                        });
+                                    }
+                                    Ok(resp) => {
+                                        let err_s = format!(
+                                            "server error {}",
+                                            resp_error_code(&resp).unwrap_or(0)
+                                        );
+                                        crate::logger::log_error("gui::recall", &err_s);
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                            "Đã thu hồi cục bộ (Máy chủ: {err_s})"
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        crate::logger::log_error("gui::recall", &e.to_string());
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                            "Không thể thu hồi trên máy chủ: {e}"
                                         )));
                                     }
                                 }
@@ -4615,15 +4739,50 @@ impl ZaloGuiApp {
                                 } else {
                                     t.preview.clone()
                                 };
-                                let max_snip_chars = if is_compact_w { 18 } else { 28 };
+                                let unread_n = self.unread_counts.get(&t.id).copied().unwrap_or(0);
+                                let max_snip_chars = if is_compact_w {
+                                    16
+                                } else if unread_n > 0 {
+                                    23
+                                } else {
+                                    28
+                                };
                                 let snippet = truncate_chars(&raw_preview, max_snip_chars);
                                 ui.painter().text(
                                     Pos2::new(text_left, row_rect.top() + 33.5),
                                     egui::Align2::LEFT_TOP,
                                     snippet,
                                     FontId::proportional(12.0),
-                                    pal.text_secondary,
+                                    if unread_n > 0 {
+                                        pal.text_primary
+                                    } else {
+                                        pal.text_secondary
+                                    },
                                 );
+                                if unread_n > 0 {
+                                    let badge_txt = if unread_n > 99 {
+                                        "99+".to_string()
+                                    } else {
+                                        unread_n.to_string()
+                                    };
+                                    let bw = if unread_n >= 10 { 22.0 } else { 18.0 };
+                                    let b_rect = Rect::from_min_size(
+                                        Pos2::new(row_rect.right() - bw - 8.0, row_rect.top() + 31.5),
+                                        Vec2::new(bw, 17.0),
+                                    );
+                                    ui.painter().rect_filled(
+                                        b_rect,
+                                        Rounding::same(8.5),
+                                        pal.danger,
+                                    );
+                                    ui.painter().text(
+                                        b_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        badge_txt,
+                                        FontId::proportional(10.2),
+                                        Color32::WHITE,
+                                    );
+                                }
                             }
 
                             let row_resp = row_resp.on_hover_cursor(CursorIcon::PointingHand);
@@ -4740,6 +4899,15 @@ impl ZaloGuiApp {
                         self.filter_starred_only = false;
                     }
                     self.selected_thread_index = idx;
+                    if self.unread_counts.remove(&tid).is_some() {
+                        let total_unread: usize = self.unread_counts.values().sum();
+                        let title = if total_unread > 0 {
+                            format!("({total_unread}) Zalo Lite — Native Rust Client")
+                        } else {
+                            "Zalo Lite — Native Rust Client".to_string()
+                        };
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+                    }
                     let is_cloud = self
                         .threads
                         .get(idx)
@@ -5673,8 +5841,14 @@ impl ZaloGuiApp {
                     // (matching Zalo PC's `PopoverIdentitiesDefine.STICKER_SUGGESTION`), so the message scroll
                     // area and composer input box never shift or lose IME focus while typing.
                     let picker_reserve = (if self.sticker_picker_open { 268.0 } else { 0.0 })
-                        + (if self.replying_to.is_some() { 48.0 } else { 0.0 });
+                        + (if self.replying_to.is_some() { 48.0 } else { 0.0 })
+                        + (if self.pending_clipboard_image.is_some() {
+                            64.0
+                        } else {
+                            0.0
+                        });
                     let mut pending_action: Option<(usize, BubbleAction)> = None;
+                    let mut load_older_clicked = false;
                     let msg_area_height =
                         (ui.available_height() - 66.0 - picker_reserve).max(100.0);
 
@@ -5702,6 +5876,41 @@ impl ZaloGuiApp {
                                                 );
                                             });
                                         } else {
+                                            if !self.in_chat_search_open
+                                                && !self.filter_starred_only
+                                            {
+                                                ui.vertical_centered(|ui| {
+                                                    let hist_btn = egui::Button::new(
+                                                        RichText::new(format!(
+                                                            "{} Tải thêm tin nhắn cũ",
+                                                            lucide::REFRESH
+                                                        ))
+                                                        .size(11.5)
+                                                        .color(pal.text_secondary),
+                                                    )
+                                                    .fill(pal.bg_elevated)
+                                                    .stroke(Stroke::new(1.0_f32, pal.border))
+                                                    .rounding(Rounding::same(12.0));
+                                                    if ui
+                                                        .add(hist_btn)
+                                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                                        .on_hover_text(
+                                                            "Đồng bộ thêm lịch sử tin nhắn cũ từ máy chủ Zalo",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        if let Some(tx) = WORKER_TX.get() {
+                                                            let _ = tx.send(
+                                                                WorkerCmd::LoadGroupHistory {
+                                                                    group_id: thread_id.clone(),
+                                                                },
+                                                            );
+                                                        }
+                                                        load_older_clicked = true;
+                                                    }
+                                                    ui.add_space(6.0);
+                                                });
+                                            }
                                             let only_starred = self.filter_starred_only;
                                             let in_chat_q = if self.in_chat_search_open {
                                                 self.in_chat_search_query.trim().to_lowercase()
@@ -5820,6 +6029,9 @@ impl ZaloGuiApp {
                                     }
                                 });
                         });
+                    if load_older_clicked {
+                        self.show_toast("Đang tải thêm tin nhắn cũ từ máy chủ Zalo…");
+                    }
 
                     if let Some((idx, action)) = pending_action {
                         let target = self
@@ -5913,6 +6125,26 @@ impl ZaloGuiApp {
                                 BubbleAction::DeleteForMe => {
                                     if let Some(tx) = WORKER_TX.get() {
                                         let _ = tx.send(WorkerCmd::DeleteForMe {
+                                            to_id: thread_id.clone(),
+                                            is_group,
+                                            msg: m,
+                                        });
+                                    }
+                                }
+                                BubbleAction::RecallForEveryone => {
+                                    if let Some(real) = self
+                                        .threads
+                                        .get_mut(self.selected_thread_index)
+                                        .and_then(|t| t.messages.get_mut(idx))
+                                    {
+                                        real.text = "[Tin nhắn đã thu hồi]".into();
+                                        real.sticker_id = None;
+                                        real.link_url = None;
+                                        real.link_thumb = None;
+                                    }
+                                    self.persist_threads_async();
+                                    if let Some(tx) = WORKER_TX.get() {
+                                        let _ = tx.send(WorkerCmd::RecallMessage {
                                             to_id: thread_id.clone(),
                                             is_group,
                                             msg: m,
@@ -6028,6 +6260,81 @@ impl ZaloGuiApp {
                         }
                         if cancel {
                             self.replying_to = None;
+                        }
+                    }
+                    // 3c. Clipboard Image Preview Banner (`Ctrl+V` screenshot paste)
+                    if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::V)) {
+                        if let Some((path, w, h, col_img)) = read_clipboard_image_to_png() {
+                            let tex = ctx.load_texture(
+                                format!("clip_preview_{}", crate::login::unix_now()),
+                                col_img,
+                                TextureOptions::LINEAR,
+                            );
+                            self.pending_clipboard_image = Some((path, w, h, tex));
+                            self.composer_focus_pending = true;
+                        }
+                    }
+                    if self.pending_clipboard_image.is_some() {
+                        let mut clear_clip = false;
+                        if ui.input(|i| i.key_pressed(Key::Escape)) {
+                            clear_clip = true;
+                        }
+                        if let Some((ref path, w, h, ref tex)) = self.pending_clipboard_image {
+                            egui::Frame::none()
+                                .fill(pal.bg_elevated)
+                                .inner_margin(Margin::symmetric(14.0, 6.0))
+                                .stroke(Stroke::new(
+                                    1.0_f32,
+                                    pal.primary.linear_multiply(0.55),
+                                ))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::Image::new(tex)
+                                                .fit_to_exact_size(Vec2::new(48.0, 48.0))
+                                                .rounding(Rounding::same(6.0)),
+                                        );
+                                        ui.add_space(6.0);
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} Ảnh chụp từ bộ nhớ tạm (Ctrl+V)",
+                                                    lucide::IMAGE
+                                                ))
+                                                .size(12.2)
+                                                .color(pal.primary)
+                                                .strong(),
+                                            );
+                                            let fname = path
+                                                .file_name()
+                                                .and_then(|n| n.to_str())
+                                                .unwrap_or("clipboard.png");
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{fname} · {w}×{h} px — Nhập chú thích bên dưới rồi nhấn Enter để gửi"
+                                                ))
+                                                .size(11.3)
+                                                .color(pal.text_secondary),
+                                            );
+                                        });
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .small_button(format!("{} Hủy", lucide::X))
+                                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                                    .on_hover_text("Hủy ảnh dán (Esc)")
+                                                    .clicked()
+                                                {
+                                                    clear_clip = true;
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+                        }
+                        if clear_clip {
+                            self.pending_clipboard_image = None;
                         }
                     }
 
@@ -6249,7 +6556,8 @@ impl ZaloGuiApp {
                                             }
                                         }
                                         // Responsive Padded Send Button (shows icon-only on very tight widths)
-                                        let can_send = !self.input_message.trim().is_empty();
+                                        let can_send = !self.input_message.trim().is_empty()
+                                            || self.pending_clipboard_image.is_some();
                                         let (send_rect, send_resp) = ui.allocate_exact_size(
                                             Vec2::new(send_btn_w, 34.0),
                                             Sense::click(),
@@ -6317,6 +6625,30 @@ impl ZaloGuiApp {
                                                     sticker_type: chosen.sticker_type,
                                                     is_group,
                                                 });
+                                            }
+                                        } else if (send_clicked || enter_pressed)
+                                            && self.pending_clipboard_image.is_some()
+                                        {
+                                            if let Some((clip_path, _, _, _)) =
+                                                self.pending_clipboard_image.take()
+                                            {
+                                                let cap =
+                                                    self.input_message.trim().to_string();
+                                                self.input_message.clear();
+                                                self.dismissed_sticker_suggest_for.clear();
+                                                self.composer_sticker_selected = None;
+                                                response.request_focus();
+                                                if let Some(tx) = WORKER_TX.get() {
+                                                    let _ = tx.send(
+                                                        WorkerCmd::PickAndSendAttachment {
+                                                            to_id: thread_id.clone(),
+                                                            is_group,
+                                                            images_only: true,
+                                                            caption: cap,
+                                                            preset_path: Some(clip_path),
+                                                        },
+                                                    );
+                                                }
                                             }
                                         } else if (send_clicked || enter_pressed) && can_send {
                                             let text = self.input_message.trim().to_string();
@@ -9088,6 +9420,121 @@ fn pick_native_file_dialog(images_only: bool) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Read an image bitmap (`CF_DIB = 8`) directly from the Windows Clipboard in pure Rust,
+/// save it as `stickers_cache/clipboard_<unix_ms>.png`, and return `(path, width, height, ColorImage)`.
+fn read_clipboard_image_to_png() -> Option<(std::path::PathBuf, u32, u32, egui::ColorImage)> {
+    #[cfg(target_os = "windows")]
+    {
+        const CF_DIB: u32 = 8;
+        #[link(name = "user32")]
+        extern "system" {
+            fn IsClipboardFormatAvailable(format: u32) -> i32;
+            fn OpenClipboard(h_wnd_new_owner: *mut std::ffi::c_void) -> i32;
+            fn CloseClipboard() -> i32;
+            fn GetClipboardData(u_format: u32) -> *mut std::ffi::c_void;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GlobalLock(h_mem: *mut std::ffi::c_void) -> *const u8;
+            fn GlobalUnlock(h_mem: *mut std::ffi::c_void) -> i32;
+            fn GlobalSize(h_mem: *mut std::ffi::c_void) -> usize;
+        }
+
+        unsafe {
+            if IsClipboardFormatAvailable(CF_DIB) == 0 {
+                return None;
+            }
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return None;
+            }
+            let hmem = GetClipboardData(CF_DIB);
+            if hmem.is_null() {
+                CloseClipboard();
+                return None;
+            }
+            let ptr = GlobalLock(hmem);
+            let len = GlobalSize(hmem);
+            if ptr.is_null() || len < 40 {
+                if !ptr.is_null() {
+                    GlobalUnlock(hmem);
+                }
+                CloseClipboard();
+                return None;
+            }
+            let slice = std::slice::from_raw_parts(ptr, len);
+            let bi_size = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize;
+            let width_i = i32::from_le_bytes([slice[4], slice[5], slice[6], slice[7]]);
+            let height_i = i32::from_le_bytes([slice[8], slice[9], slice[10], slice[11]]);
+            let bit_count = u16::from_le_bytes([slice[14], slice[15]]);
+            let compression = u32::from_le_bytes([slice[16], slice[17], slice[18], slice[19]]);
+
+            if width_i <= 0 || height_i == 0 || (bit_count != 24 && bit_count != 32) {
+                GlobalUnlock(hmem);
+                CloseClipboard();
+                return None;
+            }
+            let width = width_i as u32;
+            let top_down = height_i < 0;
+            let height = height_i.unsigned_abs();
+            let mut offset = bi_size;
+            if compression == 3 && bi_size == 40 {
+                offset += 12; // skip 3 DWORD color masks for BI_BITFIELDS
+            }
+            let bytes_per_px = (bit_count / 8) as usize;
+            let row_stride = (width as usize * bytes_per_px + 3) & !3;
+            let needed = offset.saturating_add(row_stride.saturating_mul(height as usize));
+            if needed > slice.len() {
+                GlobalUnlock(hmem);
+                CloseClipboard();
+                return None;
+            }
+
+            let mut rgba = image::RgbaImage::new(width, height);
+            for y in 0..height {
+                let src_y = if top_down { y } else { height - 1 - y } as usize;
+                let row = &slice[offset + src_y * row_stride..];
+                for x in 0..width {
+                    let p = x as usize * bytes_per_px;
+                    let b = row[p];
+                    let g = row[p + 1];
+                    let r = row[p + 2];
+                    let a = if bytes_per_px == 4 {
+                        let raw_a = row[p + 3];
+                        if raw_a == 0 { 255 } else { raw_a }
+                    } else {
+                        255
+                    };
+                    rgba.put_pixel(x, y, image::Rgba([r, g, b, a]));
+                }
+            }
+            GlobalUnlock(hmem);
+            CloseClipboard();
+
+            let _ = std::fs::create_dir_all("stickers_cache");
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let path = std::path::PathBuf::from(format!("stickers_cache/clipboard_{now_ms}.png"));
+            rgba.save(&path).ok()?;
+
+            let thumb = if width > 240 || height > 240 {
+                image::imageops::thumbnail(&rgba, 240, 240)
+            } else {
+                rgba
+            };
+            let (tw, th) = thumb.dimensions();
+            let col_img =
+                egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], thumb.as_raw());
+            Some((path, width, height, col_img))
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
 
 /// Format a URL for clean UI display by stripping tracking query strings (`?_r=1&utm_...`)
 /// and truncating to `max_chars`.
@@ -10225,6 +10672,7 @@ enum BubbleAction {
     TogglePin,
     ToggleStar,
     DeleteForMe,
+    RecallForEveryone,
     CallAgain { is_video: bool },
     OpenImagePopup {
         tex_key: String,
@@ -10397,6 +10845,17 @@ fn bubble_context_menu(
             ui.close_menu();
         }
         ui.separator();
+        if msg.is_outgoing && msg.text.trim() != "[Tin nhắn đã thu hồi]" {
+            if ui
+                .button(
+                    RichText::new("Thu hồi với mọi người").color(Color32::from_rgb(249, 115, 22)),
+                )
+                .clicked()
+            {
+                action = Some(BubbleAction::RecallForEveryone);
+                ui.close_menu();
+            }
+        }
         if ui
             .button(RichText::new("Xóa chỉ ở phía tôi").color(Color32::from_rgb(220, 60, 60)))
             .clicked()

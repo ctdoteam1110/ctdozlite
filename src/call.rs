@@ -2243,8 +2243,16 @@ impl CallBridge {
                                         eprintln!("audio start failed: {e}");
                                     }
                                 }
-                                // Phase 2: start Opus/RTP media over UDP to the call relay.
-                                match crate::media::MediaHandle::start(st.rtp_ip.clone(), 0) {
+                                // Phase 2: start Opus/RTP media over the registered ZRTP UDP relay sockets.
+                                match crate::media::MediaHandle::start_with_sockets(
+                                    st.rtp_ip.clone(),
+                                    st.rtcp_ip.clone(),
+                                    st.from_uid_u32,
+                                    st.partner_uid_u32,
+                                    st.udp_rtp_sock.clone(),
+                                    st.udp_rtcp_sock.clone(),
+                                    0,
+                                ) {
                                     Ok(m) => {
                                         st.media = Some(m);
                                     }
@@ -2295,6 +2303,9 @@ impl CallBridge {
                         let s_snap = session.lock().await.clone();
                         let guard = active_call.lock().await;
                         if let Some(ref st) = *guard {
+                            if let Some(ref media) = st.media {
+                                media.set_mic_muted(!is_on_mic);
+                            }
                             let call_id = st.call_id;
                             let partner_id = st.partner_id.clone();
                             tokio::spawn(async move {
@@ -2469,9 +2480,16 @@ impl CallBridge {
                                                 eprintln!("audio start failed: {e}");
                                             }
                                         }
-                                        // Phase 2: start Opus/RTP media over UDP to the call relay.
-                                        let rtp = st.rtp_ip.clone();
-                                        match crate::media::MediaHandle::start(rtp, 0) {
+                                        // Phase 2: start Opus/RTP media over the registered ZRTP UDP relay sockets.
+                                        match crate::media::MediaHandle::start_with_sockets(
+                                            st.rtp_ip.clone(),
+                                            st.rtcp_ip.clone(),
+                                            st.from_uid_u32,
+                                            st.partner_uid_u32,
+                                            st.udp_rtp_sock.clone(),
+                                            st.udp_rtcp_sock.clone(),
+                                            0,
+                                        ) {
                                             Ok(m) => {
                                                 st.media = Some(m);
                                             }
