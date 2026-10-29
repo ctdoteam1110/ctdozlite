@@ -569,6 +569,30 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
     if trimmed.is_empty() || trimmed.contains('\n') {
         return None;
     }
+    if let Some(hit) = instant_contextual_stickers_exact(trimmed) {
+        return Some(hit);
+    }
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() >= 2 && words.len() <= 6 {
+        let tail2 = format!("{} {}", words[words.len() - 2], words[words.len() - 1]);
+        if let Some(hit) = instant_contextual_stickers_exact(&tail2) {
+            return Some(hit);
+        }
+        if let Some(hit) = instant_contextual_stickers_exact(words[words.len() - 1]) {
+            return Some(hit);
+        }
+        let head2 = format!("{} {}", words[0], words[1]);
+        if let Some(hit) = instant_contextual_stickers_exact(&head2) {
+            return Some(hit);
+        }
+        if let Some(hit) = instant_contextual_stickers_exact(words[0]) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+fn instant_contextual_stickers_exact(trimmed: &str) -> Option<(&'static str, Vec<crate::chat::StickerItem>)> {
     let low = trimmed.to_lowercase();
     let folded = fold_vn_search(trimmed);
     let f = folded.as_str();
@@ -598,11 +622,11 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
             "buon",
             "Buồn",
             &[
-                (12658, 50619),
+                (12815, 101012),
+                (12748, 99985),
                 (12556, 50348),
                 (12334, 49778),
                 (12238, 49500),
-                (12017, 47239),
                 (12013, 47156),
                 (12003, 46983),
                 (11978, 46576),
@@ -870,11 +894,11 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
                 "buon",
                 "Buồn",
                 &[
-                    (12658, 50619),
+                    (12815, 101012),
+                    (12748, 99985),
                     (12556, 50348),
                     (12334, 49778),
                     (12238, 49500),
-                    (12017, 47239),
                     (12013, 47156),
                     (12003, 46983),
                     (11978, 46576),
@@ -3944,6 +3968,7 @@ impl ZaloGuiApp {
                                         };
                                         let s_resp = ui.add(
                                             egui::TextEdit::singleline(&mut self.search_query)
+                                                .id(Id::new("sidebar_search_input"))
                                                 .frame(false)
                                                 .hint_text("Tìm hội thoại, tin nhắn, SĐT...")
                                                 .desired_width(edit_w),
@@ -5369,6 +5394,10 @@ impl ZaloGuiApp {
                                                     egui::TextEdit::singleline(
                                                         &mut self.in_chat_search_query,
                                                     )
+                                                    .id(Id::new((
+                                                        "in_chat_search_input",
+                                                        &thread_id,
+                                                    )))
                                                     .frame(false)
                                                     .hint_text(
                                                         "Tìm tin nhắn trong hội thoại này...",
@@ -5827,13 +5856,15 @@ impl ZaloGuiApp {
 
                     // 3c. Contextual Sticker Suggestion Strip (auto-appears when typing hi/chào, haha, 🙂, 🙁, ...)
                     if !contextual_stickers.is_empty() {
-                        self.render_contextual_sticker_bar(
-                            ui,
-                            &contextual_stickers,
-                            &thread_id,
-                            is_group,
-                            pal,
-                        );
+                        ui.push_id("contextual_sticker_bar_scope", |ui| {
+                            self.render_contextual_sticker_bar(
+                                ui,
+                                &contextual_stickers,
+                                &thread_id,
+                                is_group,
+                                pal,
+                            );
+                        });
                     }
 
                     // 4. Bottom Message Composer Bar (Compact Icon Actions + Spacious Input + Padded Send Button)
@@ -5996,6 +6027,7 @@ impl ZaloGuiApp {
                                             (ui.available_width() - send_btn_w - 12.0).max(50.0);
                                         let text_edit =
                                             egui::TextEdit::singleline(&mut self.input_message)
+                                                .id(Id::new(("chat_composer_input", &thread_id)))
                                                 .frame(false)
                                                 .hint_text(format!(
                                                     "Nhập tin nhắn tới {}...",
@@ -8016,7 +8048,7 @@ impl ZaloGuiApp {
         if trimmed.contains('\n')
             || trimmed.starts_with('#')
             || trimmed.starts_with('@')
-            || trimmed.split_whitespace().count() > 4
+            || trimmed.split_whitespace().count() > 6
         {
             return Vec::new();
         }
