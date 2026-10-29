@@ -211,6 +211,41 @@ fn avatar_initials(name: &str) -> String {
     }
 }
 
+/// Fold Vietnamese text to lowercase ASCII for diacritic-insensitive search
+/// (e.g. `"Đỗ Trung Thành"` -> `"do trung thanh"`).
+fn fold_vn_search(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for raw in s.chars() {
+        for c in raw.to_lowercase() {
+            let mapped = match c {
+                'à' | 'á' | 'ạ' | 'ả' | 'ã' | 'â' | 'ầ' | 'ấ' | 'ậ' | 'ẩ' | 'ẫ' | 'ă' | 'ằ'
+                | 'ắ' | 'ặ' | 'ẳ' | 'ẵ' => 'a',
+                'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => 'e',
+                'ì' | 'í' | 'ị' | 'ỉ' | 'ĩ' => 'i',
+                'ò' | 'ó' | 'ọ' | 'ỏ' | 'õ' | 'ô' | 'ồ' | 'ố' | 'ộ' | 'ổ' | 'ỗ' | 'ơ' | 'ờ'
+                | 'ớ' | 'ợ' | 'ở' | 'ỡ' => 'o',
+                'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => 'u',
+                'ỳ' | 'ý' | 'ỵ' | 'ỷ' | 'ỹ' => 'y',
+                'đ' => 'd',
+                other => other,
+            };
+            out.push(mapped);
+        }
+    }
+    out
+}
+
+/// Check whether `haystack` matches `query_lower` (or `query_folded` without Vietnamese accents).
+fn matches_vn_query(haystack: &str, query_lower: &str, query_folded: &str) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    if haystack.to_lowercase().contains(query_lower) {
+        return true;
+    }
+    !query_folded.is_empty() && fold_vn_search(haystack).contains(query_folded)
+}
+
 /// Paint a circular user or group avatar: uses the real circular-masked Zalo profile image when
 /// `avatar_url` is available (fetching it asynchronously via `FetchStickerImage`), and falls back
 /// to a colored circle with initials while loading or when no URL exists.
@@ -686,6 +721,7 @@ pub struct ZaloGuiApp {
     phone_lookup_error: Option<String>,
     in_chat_search_open: bool,
     in_chat_search_query: String,
+    in_chat_search_focus_pending: bool,
     // Sticker picker & image cache state
     sticker_picker_open: bool,
     sticker_tab: StickerTab,
@@ -834,6 +870,7 @@ impl ZaloGuiApp {
             phone_lookup_error: None,
             in_chat_search_open: false,
             in_chat_search_query: String::new(),
+            in_chat_search_focus_pending: false,
             sticker_picker_open: false,
             sticker_tab: StickerTab::Popular,
             sticker_textures: HashMap::new(),
@@ -3369,30 +3406,49 @@ impl ZaloGuiApp {
                         let mut trigger_phone_lookup: Option<String> = None;
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
-                            let search_box_w = (avail_row_w - 40.0).max(120.0);
+                            let search_box_w = (avail_row_w - 38.0).max(110.0);
+                            let has_q = !self.search_query.is_empty();
                             egui::Frame::none()
                                 .fill(pal.bg_input)
                                 .rounding(Rounding::same(8.0))
-                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .stroke(Stroke::new(
+                                    1.0_f32,
+                                    if has_q {
+                                        pal.primary.linear_multiply(0.65)
+                                    } else {
+                                        pal.border
+                                    },
+                                ))
                                 .inner_margin(Margin::symmetric(9.0, 6.0))
                                 .show(ui, |ui| {
-                                    ui.set_width((search_box_w - 20.0).max(90.0));
+                                    let inner_w = (search_box_w - 18.0).max(80.0);
+                                    ui.set_width(inner_w);
                                     ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
                                         let (icon_rect, _) = ui.allocate_exact_size(
-                                            Vec2::new(15.0, 15.0),
+                                            Vec2::new(15.0, 18.0),
                                             Sense::hover(),
                                         );
                                         draw_icon_search(
                                             ui.painter(),
                                             icon_rect.center(),
                                             13.5,
-                                            pal.text_muted,
+                                            if has_q {
+                                                pal.primary_hover
+                                            } else {
+                                                pal.text_muted
+                                            },
                                         );
+                                        let edit_w = if has_q {
+                                            (inner_w - 42.0).max(48.0)
+                                        } else {
+                                            (inner_w - 22.0).max(60.0)
+                                        };
                                         let s_resp = ui.add(
                                             egui::TextEdit::singleline(&mut self.search_query)
                                                 .frame(false)
                                                 .hint_text("Tìm hội thoại, tin nhắn, SĐT...")
-                                                .desired_width((search_box_w - 58.0).max(60.0)),
+                                                .desired_width(edit_w),
                                         );
                                         let s_enter = (s_resp.lost_focus() || s_resp.has_focus())
                                             && ui.input(|i| i.key_pressed(Key::Enter));
@@ -3405,14 +3461,36 @@ impl ZaloGuiApp {
                                             trigger_phone_lookup =
                                                 Some(self.search_query.trim().to_string());
                                         }
-                                        if !self.search_query.is_empty()
-                                            && ui
-                                                .small_button("×")
+                                        if has_q {
+                                            let (clr_rect, clr_resp) = ui.allocate_exact_size(
+                                                Vec2::new(16.0, 16.0),
+                                                Sense::click(),
+                                            );
+                                            if clr_resp.hovered() {
+                                                ui.painter().circle_filled(
+                                                    clr_rect.center(),
+                                                    8.0,
+                                                    pal.bg_hover,
+                                                );
+                                            }
+                                            draw_lucide_icon(
+                                                ui.painter(),
+                                                clr_rect.center(),
+                                                lucide::X,
+                                                11.5,
+                                                if clr_resp.hovered() {
+                                                    pal.text_primary
+                                                } else {
+                                                    pal.text_muted
+                                                },
+                                            );
+                                            if clr_resp
                                                 .on_hover_cursor(CursorIcon::PointingHand)
                                                 .on_hover_text("Xóa tìm kiếm")
                                                 .clicked()
-                                        {
-                                            self.search_query.clear();
+                                            {
+                                                self.search_query.clear();
+                                            }
                                         }
                                     });
                                 });
@@ -3555,6 +3633,7 @@ impl ZaloGuiApp {
 
                 // Sort threads: "Cloud của tôi" pinned first, then descending by latest message timestamp
                 let query = self.search_query.trim().to_lowercase();
+                let query_folded = fold_vn_search(&query);
                 let query_digits: String = self
                     .search_query
                     .chars()
@@ -3634,7 +3713,7 @@ impl ZaloGuiApp {
                         };
                         pass_filter
                             && (query.is_empty()
-                                || t.name.to_lowercase().contains(&query)
+                                || matches_vn_query(&t.name, &query, &query_folded)
                                 || t.id.contains(&query))
                     })
                     .map(|(i, _)| i)
@@ -3666,7 +3745,7 @@ impl ZaloGuiApp {
                     let mut hits = Vec::new();
                     for (t_idx, t) in self.threads.iter().enumerate() {
                         for m in t.messages.iter().rev() {
-                            if m.text.to_lowercase().contains(&query) {
+                            if matches_vn_query(&m.text, &query, &query_folded) {
                                 hits.push((
                                     t_idx,
                                     t.name.clone(),
@@ -3712,7 +3791,7 @@ impl ZaloGuiApp {
                             let bg = if is_selected {
                                 pal.bg_selected
                             } else if row_resp.hovered() {
-                                pal.bg_hover.linear_multiply(0.65)
+                                pal.bg_hover
                             } else {
                                 Color32::TRANSPARENT
                             };
@@ -3884,7 +3963,7 @@ impl ZaloGuiApp {
                                     ui.painter().rect_filled(
                                         r_rect,
                                         Rounding::same(10.0),
-                                        pal.bg_hover.linear_multiply(0.75),
+                                        pal.bg_hover,
                                     );
                                 }
                                 let av_c = Pos2::new(r_rect.left() + 24.0, r_rect.center().y);
@@ -3935,11 +4014,23 @@ impl ZaloGuiApp {
                                 }
                             }
                         }
+
+                        if !query.is_empty() && filtered_indices.is_empty() && msg_hits.is_empty() {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(32.0);
+                                ui.label(
+                                    RichText::new("Không tìm thấy hội thoại hoặc tin nhắn phù hợp.")
+                                        .size(12.5)
+                                        .color(pal.text_muted),
+                                );
+                            });
+                        }
                     });
 
                 if let Some((idx, q_str)) = clicked_msg_hit {
                     self.selected_thread_index = idx;
                     self.in_chat_search_open = true;
+                    self.in_chat_search_focus_pending = true;
                     self.in_chat_search_query = q_str;
                 }
                 if let Some((idx, tid, is_group)) = clicked_thread {
@@ -4233,7 +4324,7 @@ impl ZaloGuiApp {
                         ui.add(egui::Separator::default().spacing(1.0));
 
                         egui::Frame::none()
-                            .fill(pal.bg_app.linear_multiply(0.55))
+                            .fill(pal.bg_app)
                             .inner_margin(Margin::symmetric(16.0, 12.0))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
@@ -4354,7 +4445,7 @@ impl ZaloGuiApp {
                                 ui.add_space(6.0);
                                 // Reserve room for the right-hand action cluster so the name/tag
                                 // block can never be overlapped by the call buttons.
-                                let actions_w = if is_compact_w { 82.0 } else { 124.0 };
+                                let actions_w = if is_compact_w { 126.0 } else { 182.0 };
                                 let left_info_w =
                                     (ui.available_width() - actions_w).max(60.0);
                                 ui.allocate_ui_with_layout(
@@ -4598,7 +4689,9 @@ impl ZaloGuiApp {
                                         })
                                     {
                                         self.in_chat_search_open = !self.in_chat_search_open;
-                                        if !self.in_chat_search_open {
+                                        if self.in_chat_search_open {
+                                            self.in_chat_search_focus_pending = true;
+                                        } else {
                                             self.in_chat_search_query.clear();
                                         }
                                     }
@@ -4654,7 +4747,7 @@ impl ZaloGuiApp {
                                     );
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         if ui
-                                            .small_button("Bỏ ghim ✕")
+                                            .small_button(format!("Bỏ ghim {}", lucide::X))
                                             .on_hover_cursor(CursorIcon::PointingHand)
                                             .clicked()
                                         {
@@ -4692,7 +4785,7 @@ impl ZaloGuiApp {
                                     );
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         if ui
-                                            .small_button("Xem tất cả ✕")
+                                            .small_button(format!("Xem tất cả {}", lucide::X))
                                             .on_hover_cursor(CursorIcon::PointingHand)
                                             .clicked()
                                         {
@@ -4705,7 +4798,14 @@ impl ZaloGuiApp {
 
                     // 1d. In-Conversation Message Search Bar (`self.in_chat_search_open`)
                     if self.in_chat_search_open {
+                        if ui.input(|i| i.key_pressed(Key::Escape)) {
+                            self.in_chat_search_open = false;
+                            self.in_chat_search_query.clear();
+                        }
+                    }
+                    if self.in_chat_search_open {
                         let q_low = self.in_chat_search_query.trim().to_lowercase();
+                        let q_folded = fold_vn_search(&q_low);
                         let match_cnt = if q_low.is_empty() {
                             0
                         } else {
@@ -4714,7 +4814,10 @@ impl ZaloGuiApp {
                                 .map(|t| {
                                     t.messages
                                         .iter()
-                                        .filter(|m| m.text.to_lowercase().contains(&q_low))
+                                        .filter(|m| {
+                                            matches_vn_query(&m.text, &q_low, &q_folded)
+                                                || matches_vn_query(&m.sender, &q_low, &q_folded)
+                                        })
                                         .count()
                                 })
                                 .unwrap_or(0)
@@ -4722,46 +4825,129 @@ impl ZaloGuiApp {
                         egui::Frame::none()
                             .fill(pal.bg_sidebar)
                             .stroke(Stroke::new(1.0_f32, pal.border))
-                            .inner_margin(Margin::symmetric(16.0, 7.0))
+                            .inner_margin(Margin::symmetric(18.0, 8.0))
                             .show(ui, |ui| {
+                                let bar_avail_w = ui.available_width();
+                                ui.set_width(bar_avail_w);
                                 ui.horizontal(|ui| {
-                                    let (ir, _) = ui
-                                        .allocate_exact_size(Vec2::new(16.0, 16.0), Sense::hover());
-                                    draw_icon_search(ui.painter(), ir.center(), 14.0, pal.primary_hover);
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.in_chat_search_query)
-                                            .hint_text(
-                                                "Nhập từ khóa cần tìm trong đoạn hội thoại này...",
-                                            )
-                                            .desired_width(280.0),
-                                    );
-                                    if !q_low.is_empty() {
-                                        ui.label(
-                                            RichText::new(format!("Tìm thấy {match_cnt} tin nhắn"))
-                                                .size(12.0)
-                                                .color(if match_cnt > 0 {
-                                                    pal.accent_online
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    let pill_w = (bar_avail_w - 210.0).clamp(150.0, 420.0);
+                                    egui::Frame::none()
+                                        .fill(pal.bg_input)
+                                        .rounding(Rounding::same(8.0))
+                                        .stroke(Stroke::new(
+                                            1.0_f32,
+                                            pal.primary.linear_multiply(0.65),
+                                        ))
+                                        .inner_margin(Margin::symmetric(10.0, 5.0))
+                                        .show(ui, |ui| {
+                                            ui.set_width(pill_w);
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 6.0;
+                                                let (ir, _) = ui.allocate_exact_size(
+                                                    Vec2::new(15.0, 18.0),
+                                                    Sense::hover(),
+                                                );
+                                                draw_icon_search(
+                                                    ui.painter(),
+                                                    ir.center(),
+                                                    13.5,
+                                                    pal.primary_hover,
+                                                );
+                                                let has_txt =
+                                                    !self.in_chat_search_query.is_empty();
+                                                let te_w = if has_txt {
+                                                    (pill_w - 44.0).max(60.0)
                                                 } else {
-                                                    pal.danger
-                                                })
-                                                .strong(),
-                                        );
+                                                    (pill_w - 22.0).max(80.0)
+                                                };
+                                                let te_resp = ui.add(
+                                                    egui::TextEdit::singleline(
+                                                        &mut self.in_chat_search_query,
+                                                    )
+                                                    .frame(false)
+                                                    .hint_text(
+                                                        "Tìm tin nhắn trong hội thoại này...",
+                                                    )
+                                                    .desired_width(te_w),
+                                                );
+                                                if self.in_chat_search_focus_pending {
+                                                    te_resp.request_focus();
+                                                    self.in_chat_search_focus_pending = false;
+                                                }
+                                                if has_txt {
+                                                    let (clr_r, clr_resp) = ui
+                                                        .allocate_exact_size(
+                                                            Vec2::splat(16.0),
+                                                            Sense::click(),
+                                                        );
+                                                    if clr_resp.hovered() {
+                                                        ui.painter().circle_filled(
+                                                            clr_r.center(),
+                                                            8.0,
+                                                            pal.bg_hover,
+                                                        );
+                                                    }
+                                                    draw_lucide_icon(
+                                                        ui.painter(),
+                                                        clr_r.center(),
+                                                        lucide::X,
+                                                        11.5,
+                                                        pal.text_muted,
+                                                    );
+                                                    if clr_resp
+                                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                                        .on_hover_text("Xóa từ khóa")
+                                                        .clicked()
+                                                    {
+                                                        self.in_chat_search_query.clear();
+                                                    }
+                                                }
+                                            });
+                                        });
+
+                                    if !q_low.is_empty() {
+                                        let badge_col = if match_cnt > 0 {
+                                            pal.accent_online
+                                        } else {
+                                            pal.danger
+                                        };
+                                        egui::Frame::none()
+                                            .fill(badge_col.linear_multiply(0.14))
+                                            .rounding(Rounding::same(6.0))
+                                            .inner_margin(Margin::symmetric(8.0, 4.0))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    RichText::new(if match_cnt > 0 {
+                                                        format!("{match_cnt} kết quả")
+                                                    } else {
+                                                        "0 kết quả".to_string()
+                                                    })
+                                                    .size(11.5)
+                                                    .color(badge_col)
+                                                    .strong(),
+                                                );
+                                            });
                                     }
+
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        let close_btn = egui::Button::new(
+                                            RichText::new(format!("{} Đóng", lucide::X))
+                                                .size(11.8)
+                                                .color(pal.text_secondary)
+                                                .strong(),
+                                        )
+                                        .fill(pal.bg_elevated)
+                                        .stroke(Stroke::new(1.0_f32, pal.border))
+                                        .rounding(Rounding::same(6.0))
+                                        .min_size(Vec2::new(66.0, 28.0));
                                         if ui
-                                            .small_button("Đóng ✕")
+                                            .add(close_btn)
                                             .on_hover_cursor(CursorIcon::PointingHand)
+                                            .on_hover_text("Đóng thanh tìm kiếm (Esc)")
                                             .clicked()
                                         {
                                             self.in_chat_search_open = false;
-                                            self.in_chat_search_query.clear();
-                                        }
-                                        if !self.in_chat_search_query.is_empty()
-                                            && ui
-                                                .small_button("Xóa từ khóa")
-                                                .on_hover_cursor(CursorIcon::PointingHand)
-                                                .clicked()
-                                        {
                                             self.in_chat_search_query.clear();
                                         }
                                     });
@@ -4807,6 +4993,7 @@ impl ZaloGuiApp {
                                             } else {
                                                 String::new()
                                             };
+                                            let in_chat_folded = fold_vn_search(&in_chat_q);
                                             let visible_indices: Vec<usize> = thread
                                                 .messages
                                                 .iter()
@@ -4814,15 +5001,32 @@ impl ZaloGuiApp {
                                                 .filter(|(_, m)| {
                                                     (!only_starred || m.is_starred)
                                                         && (in_chat_q.is_empty()
-                                                            || m.text
-                                                                .to_lowercase()
-                                                                .contains(&in_chat_q)
-                                                            || m.sender
-                                                                .to_lowercase()
-                                                                .contains(&in_chat_q))
+                                                            || matches_vn_query(
+                                                                &m.text,
+                                                                &in_chat_q,
+                                                                &in_chat_folded,
+                                                            )
+                                                            || matches_vn_query(
+                                                                &m.sender,
+                                                                &in_chat_q,
+                                                                &in_chat_folded,
+                                                            ))
                                                 })
                                                 .map(|(i, _)| i)
                                                 .collect();
+                                            if visible_indices.is_empty() && !in_chat_q.is_empty() {
+                                                ui.vertical_centered(|ui| {
+                                                    ui.add_space(56.0);
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "Không tìm thấy tin nhắn nào khớp từ khóa \"{}\".",
+                                                            self.in_chat_search_query.trim()
+                                                        ))
+                                                        .size(13.5)
+                                                        .color(pal.text_muted),
+                                                    );
+                                                });
+                                            }
                                             let last_outgoing_idx = thread
                                                 .messages
                                                 .iter()
@@ -5095,7 +5299,7 @@ impl ZaloGuiApp {
                                             Layout::right_to_left(Align::Center),
                                             |ui| {
                                                 if ui
-                                                    .small_button("✕")
+                                                    .small_button(lucide::X)
                                                     .on_hover_cursor(CursorIcon::PointingHand)
                                                     .on_hover_text("Hủy trả lời")
                                                     .clicked()
@@ -5455,7 +5659,7 @@ impl ZaloGuiApp {
                             .add_sized(
                                 [200.0, 28.0],
                                 egui::Button::new(
-                                    RichText::new("✓  Đã đồng bộ đám mây")
+                                    RichText::new(format!("{}  Đã đồng bộ đám mây", lucide::CHECK))
                                         .size(12.2)
                                         .color(pal.text_primary),
                                 )
@@ -6854,7 +7058,7 @@ impl ZaloGuiApp {
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
-                            .small_button("✕ Đóng")
+                            .small_button(format!("{} Đóng", lucide::X))
                             .on_hover_cursor(CursorIcon::PointingHand)
                             .clicked()
                         {
@@ -6938,7 +7142,7 @@ impl ZaloGuiApp {
                                 self.sticker_store_filter.clear();
                             }
                             if ui
-                                .small_button("🔄 Tải lại kho")
+                                .small_button(format!("{} Tải lại kho", lucide::REFRESH))
                                 .on_hover_cursor(CursorIcon::PointingHand)
                                 .clicked()
                             {
@@ -7615,7 +7819,9 @@ fn render_call_card_widget(
     };
 
     ui.set_width(card_width);
+    let text_col_w = (card_width - 52.0).max(110.0);
     ui.vertical(|ui| {
+        ui.set_width(card_width);
         ui.horizontal(|ui| {
             let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 40.0), Sense::hover());
             ui.painter().circle_filled(
@@ -7636,6 +7842,7 @@ fn render_call_card_widget(
 
             ui.add_space(6.0);
             ui.vertical(|ui| {
+                ui.set_width(text_col_w);
                 ui.add(
                     egui::Label::new(
                         RichText::new(&card.title)
@@ -7668,7 +7875,6 @@ fn render_call_card_widget(
                 }
             });
         });
-
         ui.add_space(8.0);
         let (sep_rect, _) =
             ui.allocate_exact_size(Vec2::new(card_width, 1.0), Sense::hover());
@@ -7988,7 +8194,7 @@ fn render_system_notice_pill(ui: &mut egui::Ui, msg: &ChatMessage, pal: &ThemePa
             ui.add_space(left_pad);
         }
         egui::Frame::none()
-            .fill(pal.bg_elevated.linear_multiply(0.85))
+            .fill(pal.bg_elevated)
             .stroke(Stroke::new(1.0_f32, pal.border))
             .rounding(Rounding::same(12.0))
             .inner_margin(Margin::symmetric(12.0, 4.0))
@@ -8180,11 +8386,11 @@ fn render_message_body(
             }
             if let Some(cap) = msg.link_desc.as_deref().filter(|c| !c.trim().is_empty()) {
                 ui.add_space(5.0);
-                ui.add(egui::Label::new(RichText::new(cap).color(text_col).size(14.5)).wrap());
+                ui.add(egui::Label::new(RichText::new(cap).color(text_col).size(14.2)).wrap());
             } else if !trimmed_text.starts_with("[Hình ảnh]") && !trimmed_text.is_empty() {
                 ui.add_space(5.0);
                 ui.add(
-                    egui::Label::new(RichText::new(trimmed_text).color(text_col).size(14.5)).wrap(),
+                    egui::Label::new(RichText::new(trimmed_text).color(text_col).size(14.2)).wrap(),
                 );
             }
             return body_action;
@@ -8200,7 +8406,7 @@ fn render_message_body(
     if is_zalo_file_or_video {
         let is_vid = msg.link_src.as_deref() == Some("Video Zalo")
             || trimmed_text.starts_with("[Video]");
-        let card_w = (max_text_width - 4.0).clamp(210.0, 300.0);
+        let card_w = (max_text_width - 20.0).clamp(185.0, 260.0);
         let card_bg = if outgoing {
             if pal.is_dark {
                 Color32::from_rgba_unmultiplied(0, 0, 0, 48)
@@ -8254,7 +8460,15 @@ fn render_message_body(
                     } else {
                         draw_icon_attachment(ui.painter(), badge_rect.center(), 17.0, icon_col);
                     }
+                    let has_open_url = msg
+                        .link_url
+                        .as_deref()
+                        .map(|u| !u.is_empty())
+                        .unwrap_or(false);
+                    let file_text_w =
+                        (card_w - if has_open_url { 104.0 } else { 46.0 }).max(88.0);
                     ui.vertical(|ui| {
+                        ui.set_width(file_text_w);
                         ui.add(
                             egui::Label::new(
                                 RichText::new(title_str).size(13.2).color(text_col).strong(),
@@ -8288,26 +8502,26 @@ fn render_message_body(
             });
         if let Some(cap) = msg.link_desc.as_deref().filter(|c| !c.trim().is_empty()) {
             ui.add_space(5.0);
-            ui.add(egui::Label::new(RichText::new(cap).color(text_col).size(14.5)).wrap());
+            ui.add(egui::Label::new(RichText::new(cap).color(text_col).size(14.2)).wrap());
         }
         return None;
     }
 
     let Some((caption, url, domain)) = extract_message_link_view(msg) else {
         ui.add(
-            egui::Label::new(RichText::new(&msg.text).color(text_col).size(14.5)).wrap(),
+            egui::Label::new(RichText::new(&msg.text).color(text_col).size(14.2)).wrap(),
         );
         return None;
     };
 
     if !caption.is_empty() && caption != url {
         ui.add(
-            egui::Label::new(RichText::new(&caption).color(text_col).size(14.5)).wrap(),
+            egui::Label::new(RichText::new(&caption).color(text_col).size(14.2)).wrap(),
         );
         ui.add_space(6.0);
     }
 
-    let card_w = (max_text_width - 4.0).clamp(220.0, 320.0);
+    let card_w = (max_text_width - 20.0).clamp(195.0, 286.0);
     let card_bg = if outgoing {
         if pal.is_dark {
             Color32::from_rgba_unmultiplied(0, 0, 0, 45)
@@ -8478,101 +8692,158 @@ fn render_chat_bubble(
             || msg.is_pinned
             || msg.is_starred);
 
-    if msg.is_outgoing {
-        let has_photo_caption = is_photo_card
-            && (msg
+    let has_photo_caption = is_photo_card
+        && (msg
+            .link_desc
+            .as_deref()
+            .map(|c| !c.trim().is_empty())
+            .unwrap_or(false)
+            || (!msg.text.trim().starts_with("[Hình ảnh]") && !msg.text.trim().is_empty()));
+    let is_frameless_photo = is_photo_card
+        && !has_photo_caption
+        && msg.reply_to_text.is_none()
+        && (msg.is_outgoing || !is_group);
+
+    let sender_is_name = !msg.sender.is_empty()
+        && msg.sender != "0"
+        && !msg.sender.chars().all(|c| c.is_ascii_digit());
+    let show_group_sender = !msg.is_outgoing && !prev_same_sender && is_group && sender_is_name;
+
+    // Pre-measure exact content width for both outgoing and incoming bubbles so every bubble,
+    // photo, and call card hugs its content tightly without horizontal overflow or inner/outer frame mismatch.
+    let content_width = if has_sticker {
+        116.0_f32
+    } else if is_call_card {
+        max_text_width.min(256.0)
+    } else if is_photo_card {
+        let thumb_u = msg
+            .link_thumb
+            .as_deref()
+            .or(msg.link_url.as_deref())
+            .unwrap_or("");
+        let tkey = format!("thumb_{}", crate::crypto::md5_hex(thumb_u));
+        let photo_w = if let Some(tex) = sticker_textures.get(&tkey) {
+            let [tw, th] = tex.size();
+            let tw_f = (tw.max(1)) as f32;
+            let th_f = (th.max(1)) as f32;
+            let max_w = max_text_width.clamp(160.0, 270.0);
+            let max_h = 260.0_f32;
+            let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
+            (tw_f * scale).clamp(135.0, max_w).ceil()
+        } else {
+            220.0_f32
+        };
+        if has_photo_caption {
+            let cap_str = msg
                 .link_desc
                 .as_deref()
-                .map(|c| !c.trim().is_empty())
-                .unwrap_or(false)
-                || (!msg.text.trim().starts_with("[Hình ảnh]") && !msg.text.trim().is_empty()));
-        let is_frameless_photo = is_photo_card && !has_photo_caption && msg.reply_to_text.is_none();
-
-        // Pre-measure exact content width so outgoing bubbles and portrait photos hug their content
-        // tightly (`w-fit`) without any excess blue background rectangle.
-        let content_width = if has_sticker {
-            116.0_f32
-        } else if is_call_card {
-            max_text_width.min(300.0)
-        } else if is_photo_card {
-            let thumb_u = msg
-                .link_thumb
-                .as_deref()
-                .or(msg.link_url.as_deref())
-                .unwrap_or("");
-            let tkey = format!("thumb_{}", crate::crypto::md5_hex(thumb_u));
-            if let Some(tex) = sticker_textures.get(&tkey) {
-                let [tw, th] = tex.size();
-                let tw_f = (tw.max(1)) as f32;
-                let th_f = (th.max(1)) as f32;
-                let max_w = max_text_width.clamp(160.0, 270.0);
-                let max_h = 260.0_f32;
-                let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
-                (tw_f * scale).clamp(135.0, max_w).ceil()
-            } else {
-                220.0_f32
-            }
-        } else if is_file_card {
-            max_text_width.min(300.0)
-        } else if has_link_card {
-            max_text_width.min(330.0)
-        } else {
-            let display_str = if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
-                "Tin nhắn đã được thu hồi"
-            } else {
-                msg.text.as_str()
-            };
-            let text_w = ui.fonts(|f| {
+                .filter(|c| !c.trim().is_empty())
+                .unwrap_or_else(|| msg.text.trim());
+            let cap_w = ui.fonts(|f| {
                 f.layout(
-                    display_str.to_string(),
+                    cap_str.to_string(),
                     FontId::proportional(14.2),
-                    pal.bubble_out_text,
+                    Color32::WHITE,
                     max_text_width,
                 )
                 .size()
                 .x
             });
-            let quote_w = match msg.reply_to_text.as_ref() {
-                Some(qt) => {
-                    ui.fonts(|f| {
-                        f.layout(
-                            truncate_chars(qt, 80).into_owned(),
-                            FontId::proportional(12.0),
-                            pal.bubble_out_meta,
-                            max_text_width,
-                        )
-                        .size()
-                        .x
-                    }) + 26.0
-                }
-                None => 0.0_f32,
-            };
-            let marks_w = if !msg.reactions.is_empty() || msg.is_pinned || msg.is_starred {
-                78.0_f32
-            } else {
-                0.0_f32
-            };
-            text_w
-                .max(quote_w)
-                .max(marks_w)
-                .max(44.0)
-                .min(max_text_width)
-                .ceil()
-                + 2.0
-        };
-
-        let h_margin = if has_sticker || is_frameless_photo {
-            2.0_f32
+            photo_w.max(cap_w + 4.0).min(max_text_width).ceil()
         } else {
-            13.0_f32
-        };
-        let v_margin = if has_sticker || is_frameless_photo {
-            2.0_f32
+            photo_w
+        }
+    } else if is_file_card {
+        max_text_width.min(280.0)
+    } else if has_link_card {
+        max_text_width.min(306.0)
+    } else {
+        let display_str = if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
+            "  Tin nhắn đã được thu hồi"
         } else {
-            8.5_f32
+            msg.text.as_str()
         };
-        let total_bubble_w = content_width + h_margin * 2.0;
+        let text_w = ui.fonts(|f| {
+            f.layout(
+                display_str.to_string(),
+                FontId::proportional(14.2),
+                Color32::WHITE,
+                max_text_width,
+            )
+            .size()
+            .x
+        });
+        let quote_w = match msg.reply_to_text.as_ref() {
+            Some(qt) => {
+                let q_body_w = ui.fonts(|f| {
+                    f.layout(
+                        truncate_chars(qt, 80).into_owned(),
+                        FontId::proportional(12.0),
+                        Color32::WHITE,
+                        (max_text_width - 28.0).max(80.0),
+                    )
+                    .size()
+                    .x
+                });
+                let who = msg
+                    .reply_to_sender
+                    .as_deref()
+                    .filter(|sn| !sn.is_empty() && !sn.chars().all(|c| c.is_ascii_digit()))
+                    .unwrap_or("Tin nhắn trích dẫn");
+                let q_who_w = ui.fonts(|f| {
+                    f.layout_no_wrap(
+                        who.to_string(),
+                        FontId::proportional(11.5),
+                        Color32::WHITE,
+                    )
+                    .size()
+                    .x
+                });
+                q_body_w.max(q_who_w) + 30.0
+            }
+            None => 0.0_f32,
+        };
+        let sender_w = if show_group_sender {
+            ui.fonts(|f| {
+                f.layout_no_wrap(
+                    truncate_chars(&msg.sender, 22).into_owned(),
+                    FontId::proportional(12.0),
+                    Color32::WHITE,
+                )
+                .size()
+                .x
+            }) + 8.0
+        } else {
+            0.0_f32
+        };
+        let marks_w = if !msg.reactions.is_empty() || msg.is_pinned || msg.is_starred {
+            78.0_f32
+        } else {
+            0.0_f32
+        };
+        text_w
+            .max(quote_w)
+            .max(sender_w)
+            .max(marks_w)
+            .max(44.0)
+            .min(max_text_width)
+            .ceil()
+            + 4.0
+    };
 
+    let h_margin = if has_sticker || is_frameless_photo {
+        2.0_f32
+    } else {
+        13.0_f32
+    };
+    let v_margin = if has_sticker || is_frameless_photo {
+        2.0_f32
+    } else {
+        8.5_f32
+    };
+    let total_bubble_w = content_width + h_margin * 2.0;
+
+    if msg.is_outgoing {
         let out_resp = ui.vertical(|ui| {
             let row_resp = ui.horizontal(|ui| {
                 let left_pad = (ui.available_width() - total_bubble_w - 6.0).max(0.0);
@@ -8582,8 +8853,16 @@ fn render_chat_bubble(
 
                 let fill = if has_sticker || is_frameless_photo {
                     Color32::TRANSPARENT
-                } else if is_call_card {
-                    pal.bg_elevated
+                } else if let Some(card) = &call_card_opt {
+                    if card.is_missed_or_failed {
+                        if pal.is_dark {
+                            Color32::from_rgb(38, 23, 30)
+                        } else {
+                            Color32::from_rgb(254, 242, 242)
+                        }
+                    } else {
+                        pal.bg_elevated
+                    }
                 } else {
                     pal.bubble_out_bg
                 };
@@ -8591,21 +8870,25 @@ fn render_chat_bubble(
                     Stroke::NONE
                 } else if let Some(card) = &call_card_opt {
                     let border_col = if card.is_missed_or_failed {
-                        Color32::from_rgb(239, 68, 68).linear_multiply(0.45)
+                        Color32::from_rgb(239, 68, 68).linear_multiply(0.55)
                     } else {
-                        Color32::from_rgb(34, 197, 94).linear_multiply(0.45)
+                        Color32::from_rgb(34, 197, 94).linear_multiply(0.55)
                     };
                     Stroke::new(1.2_f32, border_col)
                 } else if !pal.is_dark {
-                    Stroke::new(1.0_f32, Color32::from_rgb(194, 218, 255))
+                    Stroke::new(1.0_f32, Color32::from_rgb(186, 214, 255))
                 } else {
                     Stroke::new(1.0_f32, Color32::from_rgb(30, 112, 238))
                 };
-                let rounding = Rounding {
-                    nw: 15.0,
-                    ne: if prev_same_sender { 5.0 } else { 15.0 },
-                    sw: 15.0,
-                    se: if next_same_sender { 5.0 } else { 4.0 },
+                let rounding = if is_call_card {
+                    Rounding::same(14.0)
+                } else {
+                    Rounding {
+                        nw: 15.0,
+                        ne: if prev_same_sender { 5.0 } else { 15.0 },
+                        sw: 15.0,
+                        se: if next_same_sender { 5.0 } else { 4.0 },
+                    }
                 };
 
                 let mut card_action = None;
@@ -8617,7 +8900,7 @@ fn render_chat_bubble(
                     .show(ui, |ui| {
                         ui.set_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            render_quote_block(ui, msg, pal, true);
+                            render_quote_block(ui, msg, pal, true, content_width);
                             if let Some(card) = &call_card_opt {
                                 card_action =
                                     render_call_card_widget(ui, card, pal, content_width);
@@ -8687,23 +8970,13 @@ fn render_chat_bubble(
         });
         out_resp.inner
     } else {
-        ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
-            let display_sender = if !msg.sender.is_empty()
-                && msg.sender != "0"
-                && !msg.sender.chars().all(|c| c.is_ascii_digit())
-            {
+        ui.horizontal_top(|ui| {
+            let display_sender = if sender_is_name {
                 &msg.sender
             } else {
                 thread_name
             };
-            let sender_accent = avatar_color_for(
-                if !msg.sender.is_empty() && !msg.sender.chars().all(|c| c.is_ascii_digit()) {
-                    &msg.sender
-                } else {
-                    thread_name
-                },
-                false,
-            );
+            let sender_accent = avatar_color_for(display_sender, false);
 
             // Sender Avatar (only on first message of a consecutive group)
             if !prev_same_sender {
@@ -8723,112 +8996,112 @@ fn render_chat_bubble(
                 ui.add_space(30.0);
             }
 
-            let has_in_photo_caption = is_photo_card
-                && (msg
-                    .link_desc
-                    .as_deref()
-                    .map(|c| !c.trim().is_empty())
-                    .unwrap_or(false)
-                    || (!msg.text.trim().starts_with("[Hình ảnh]")
-                        && !msg.text.trim().is_empty()));
-            let is_frameless_in_photo =
-                is_photo_card && !has_in_photo_caption && msg.reply_to_text.is_none() && !is_group;
-
-            let fill = if has_sticker || is_frameless_in_photo {
+            let fill = if has_sticker || is_frameless_photo {
                 Color32::TRANSPARENT
-            } else if is_call_card {
-                pal.bg_elevated
+            } else if let Some(card) = &call_card_opt {
+                if card.is_missed_or_failed {
+                    if pal.is_dark {
+                        Color32::from_rgb(38, 23, 30)
+                    } else {
+                        Color32::from_rgb(254, 242, 242)
+                    }
+                } else {
+                    pal.bg_elevated
+                }
             } else {
                 pal.bubble_in_bg
             };
-            let stroke = if has_sticker || is_frameless_in_photo {
+            let stroke = if has_sticker || is_frameless_photo {
                 Stroke::NONE
             } else if let Some(card) = &call_card_opt {
                 let border_col = if card.is_missed_or_failed {
-                    Color32::from_rgb(239, 68, 68).linear_multiply(0.45)
+                    Color32::from_rgb(239, 68, 68).linear_multiply(0.55)
                 } else {
-                    Color32::from_rgb(34, 197, 94).linear_multiply(0.45)
+                    Color32::from_rgb(34, 197, 94).linear_multiply(0.55)
                 };
                 Stroke::new(1.2_f32, border_col)
             } else {
                 Stroke::new(1.0_f32, pal.bubble_in_border)
             };
-            let rounding = Rounding {
-                nw: if prev_same_sender { 5.0 } else { 4.0 },
-                ne: 15.0,
-                sw: if next_same_sender { 5.0 } else { 15.0 },
-                se: 15.0,
+            let rounding = if is_call_card {
+                Rounding::same(14.0)
+            } else {
+                Rounding {
+                    nw: if prev_same_sender { 5.0 } else { 4.0 },
+                    ne: 15.0,
+                    sw: if next_same_sender { 5.0 } else { 15.0 },
+                    se: 15.0,
+                }
             };
 
-            let mut card_action = None;
-            let fr = egui::Frame::none()
-                .fill(fill)
-                .stroke(stroke)
-                .rounding(rounding)
-                .inner_margin(if has_sticker || is_frameless_in_photo {
-                    Margin::same(2.0)
-                } else {
-                    Margin::symmetric(13.0, 8.5)
-                })
-                .show(ui, |ui| {
-                    ui.set_max_width(max_bubble_width);
-                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                        // Only show a sender label when it is a real name (never a raw numeric UID)
-                        let sender_is_name = !msg.sender.is_empty()
-                            && msg.sender != "0"
-                            && !msg.sender.chars().all(|c| c.is_ascii_digit());
-                        if !prev_same_sender && is_group && sender_is_name {
-                            ui.label(
-                                RichText::new(truncate_chars(&msg.sender, 22))
-                                    .color(sender_accent)
-                                    .size(12.0)
-                                    .strong(),
-                            );
-                            ui.add_space(2.0);
-                        }
-                        render_quote_block(ui, msg, pal, false);
-                        if let Some(card) = &call_card_opt {
-                            card_action = render_call_card_widget(
-                                ui,
-                                card,
-                                pal,
-                                max_text_width.min(300.0),
-                            );
-                        } else if !render_sticker_widget(ui, msg, sticker_textures, loading_stickers)
-                        {
-                            card_action = render_message_body(
+            ui.vertical(|ui| {
+                ui.set_max_width(total_bubble_w);
+                let mut card_action = None;
+                let fr = egui::Frame::none()
+                    .fill(fill)
+                    .stroke(stroke)
+                    .rounding(rounding)
+                    .inner_margin(Margin::symmetric(h_margin, v_margin))
+                    .show(ui, |ui| {
+                        ui.set_width(content_width);
+                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                            if show_group_sender {
+                                ui.label(
+                                    RichText::new(truncate_chars(&msg.sender, 22))
+                                        .color(sender_accent)
+                                        .size(12.0)
+                                        .strong(),
+                                );
+                                ui.add_space(2.0);
+                            }
+                            render_quote_block(ui, msg, pal, false, content_width);
+                            if let Some(card) = &call_card_opt {
+                                card_action =
+                                    render_call_card_widget(ui, card, pal, content_width);
+                            } else if !render_sticker_widget(
                                 ui,
                                 msg,
-                                thread_name,
-                                pal,
-                                false,
-                                max_text_width,
                                 sticker_textures,
                                 loading_stickers,
-                            );
-                        }
-                        render_reactions(ui, msg, pal, emoji_textures);
-                        if show_timestamp {
-                            ui.add_space(2.0);
-                            ui.label(
-                                RichText::new(&msg.time)
-                                    .color(pal.bubble_in_meta)
-                                    .size(10.2),
-                            );
-                        }
+                            ) {
+                                card_action = render_message_body(
+                                    ui,
+                                    msg,
+                                    thread_name,
+                                    pal,
+                                    false,
+                                    content_width,
+                                    sticker_textures,
+                                    loading_stickers,
+                                );
+                            }
+                            render_reactions(ui, msg, pal, emoji_textures);
+                        });
                     });
-                });
-            card_action.or_else(|| {
-                bubble_context_menu(
-                    ui,
-                    &fr.response,
-                    msg,
-                    idx,
-                    pal,
-                    emoji_textures,
-                    has_interactive_card,
-                )
+                if show_timestamp {
+                    ui.add_space(1.5);
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(&msg.time)
+                                .color(pal.text_muted)
+                                .size(10.5),
+                        );
+                    });
+                }
+                card_action.or_else(|| {
+                    bubble_context_menu(
+                        ui,
+                        &fr.response,
+                        msg,
+                        idx,
+                        pal,
+                        emoji_textures,
+                        has_interactive_card,
+                    )
+                })
             })
+            .inner
         })
         .inner
     }
@@ -9026,7 +9299,13 @@ fn bubble_context_menu(
 }
 
 /// Quoted-message block shown at the top of a reply bubble.
-fn render_quote_block(ui: &mut egui::Ui, msg: &ChatMessage, pal: &ThemePalette, outgoing: bool) {
+fn render_quote_block(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    pal: &ThemePalette,
+    outgoing: bool,
+    max_w: f32,
+) {
     let Some(qt) = msg.reply_to_text.as_ref() else {
         return;
     };
@@ -9042,9 +9321,12 @@ fn render_quote_block(ui: &mut egui::Ui, msg: &ChatMessage, pal: &ThemePalette, 
     };
     let bg_col = if outgoing && pal.is_dark {
         Color32::from_rgba_unmultiplied(0, 0, 0, 42)
+    } else if outgoing {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 150)
     } else {
-        text_col.linear_multiply(0.07)
+        text_col.linear_multiply(0.06)
     };
+    let inner_col_w = (max_w - 28.0).max(72.0);
     egui::Frame::none()
         .fill(bg_col)
         .rounding(Rounding::same(7.0))
@@ -9055,16 +9337,20 @@ fn render_quote_block(ui: &mut egui::Ui, msg: &ChatMessage, pal: &ThemePalette, 
                 ui.painter()
                     .rect_filled(bar_rect, Rounding::same(1.5), bar_col);
                 ui.vertical(|ui| {
+                    ui.set_width(inner_col_w);
                     let who = msg
                         .reply_to_sender
                         .as_deref()
                         .filter(|sn| !sn.is_empty() && !sn.chars().all(|c| c.is_ascii_digit()))
                         .unwrap_or("Tin nhắn trích dẫn");
                     ui.label(RichText::new(who).color(bar_col).size(11.5).strong());
-                    ui.label(
-                        RichText::new(truncate_chars(qt, 84))
-                            .color(meta_col)
-                            .size(12.0),
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(truncate_chars(qt, 84))
+                                .color(meta_col)
+                                .size(12.0),
+                        )
+                        .wrap(),
                     );
                 });
             });
