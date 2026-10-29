@@ -580,8 +580,9 @@ fn instant_contextual_stickers(raw_input: &str) -> Option<(&'static str, Vec<cra
             &[
                 (12685, 98981),
                 (12658, 50615),
-                (12003, 46964),
-                (11998, 46891),
+                (12815, 101002),
+                (12748, 99980),
+                (12705, 99279),
                 (11978, 46575),
                 (11954, 46182),
                 (11934, 45835),
@@ -8054,17 +8055,17 @@ impl ZaloGuiApp {
         let mut out: Vec<crate::chat::StickerItem> = Vec::new();
         let mut seen = HashSet::new();
 
-        if let Some(api_items) = self.composer_sticker_cache.get(&kw) {
-            for it in api_items.iter().take(18) {
-                if seen.insert(it.sticker_id) {
-                    out.push(it.clone());
+        if let Some((_, preset_items)) = instant_match {
+            for it in preset_items {
+                if it.cate_id != 12003 && it.cate_id != 11998 && seen.insert(it.sticker_id) {
+                    out.push(it);
                 }
             }
         }
-        if let Some((_, preset_items)) = instant_match {
-            for it in preset_items {
-                if seen.insert(it.sticker_id) {
-                    out.push(it);
+        if let Some(api_items) = self.composer_sticker_cache.get(&kw) {
+            for it in api_items.iter().take(18) {
+                if it.cate_id != 12003 && it.cate_id != 11998 && seen.insert(it.sticker_id) {
+                    out.push(it.clone());
                 }
             }
         }
@@ -8094,6 +8095,7 @@ impl ZaloGuiApp {
             .stroke(Stroke::new(1.0_f32, pal.border))
             .inner_margin(Margin::symmetric(16.0, 8.0))
             .show(ui, |ui| {
+                ui.set_max_height(68.0);
                 let row_avail_w = ui.available_width();
                 ui.horizontal_top(|ui| {
                     let scroll_w = (row_avail_w - 34.0).max(120.0);
@@ -8105,7 +8107,7 @@ impl ZaloGuiApp {
                         .scroll_bar_visibility(
                             egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
                         )
-                        .auto_shrink([false, false])
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
                             if wheel_y.abs() > 0.1
                                 && ui.rect_contains_pointer(ui.max_rect())
