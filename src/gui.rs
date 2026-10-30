@@ -7153,9 +7153,13 @@ impl ZaloGuiApp {
                             self.replying_to = None;
                         }
                     }
-                    // 3c. Clipboard Image Preview Banner (`Ctrl+V` screenshot paste)
-                    if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::V)) {
+                    // 3c. Clipboard Image Preview Banner (`Ctrl+V` / `Shift+Insert` screenshot or image file paste)
+                    if is_clipboard_paste_triggered(ctx) {
                         if let Some((path, w, h, col_img)) = read_clipboard_image_to_png() {
+                            // Consume any text Paste event on this frame so the composer doesn't paste a file path
+                            ctx.input_mut(|i| {
+                                i.events.retain(|e| !matches!(e, egui::Event::Paste(_)));
+                            });
                             let tex = ctx.load_texture(
                                 format!("clip_preview_{}", crate::login::unix_now()),
                                 col_img,
@@ -7163,6 +7167,9 @@ impl ZaloGuiApp {
                             );
                             self.pending_clipboard_image = Some((path, w, h, tex));
                             self.composer_focus_pending = true;
+                            self.show_toast(format!(
+                                "Đã dán ảnh ({w}×{h} px) từ Clipboard — nhấn Enter để gửi"
+                            ));
                         }
                     }
                     if self.pending_clipboard_image.is_some() {
@@ -7403,6 +7410,39 @@ impl ZaloGuiApp {
                                             response.request_focus();
                                             self.composer_focus_pending = false;
                                         }
+                                        response.context_menu(|ui| {
+                                            if ui
+                                                .button(format!(
+                                                    "{} Dán hình ảnh từ Clipboard (Ctrl+V)",
+                                                    lucide::IMAGE
+                                                ))
+                                                .clicked()
+                                            {
+                                                ui.close_menu();
+                                                if let Some((path, w, h, col_img)) =
+                                                    read_clipboard_image_to_png()
+                                                {
+                                                    let tex = ctx.load_texture(
+                                                        format!(
+                                                            "clip_preview_{}",
+                                                            crate::login::unix_now()
+                                                        ),
+                                                        col_img,
+                                                        TextureOptions::LINEAR,
+                                                    );
+                                                    self.pending_clipboard_image =
+                                                        Some((path, w, h, tex));
+                                                    self.composer_focus_pending = true;
+                                                    self.show_toast(format!(
+                                                        "Đã dán ảnh ({w}×{h} px) từ Clipboard — nhấn Enter để gửi"
+                                                    ));
+                                                } else {
+                                                    self.show_toast(
+                                                        "Không tìm thấy hình ảnh nào trong Clipboard",
+                                                    );
+                                                }
+                                            }
+                                        });
 
                                         // Keyboard navigation for contextual sticker popover (Zalo PC `changeSelectedIndex`):
                                         // - ArrowUp selects the first suggested sticker
@@ -10614,15 +10654,89 @@ fn pick_native_file_dialog(images_only: bool) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Read an image bitmap (`CF_DIB = 8`) directly from the Windows Clipboard in pure Rust,
-/// save it as `stickers_cache/clipboard_<unix_ms>.png`, and return `(path, width, height, ColorImage)`.
+/// Detect `Ctrl+V` or `Shift+Insert` reliably on Windows even when `egui-winit` swallows `Key::V`
+/// because the system clipboard contains an image instead of UTF-8 text.
+fn is_clipboard_paste_triggered(ctx: &egui::Context) -> bool {
+    let egui_paste = ctx.input(|i| {
+        (i.modifiers.ctrl && i.key_pressed(Key::V))
+            || (i.modifiers.shift && i.key_pressed(Key::Insert))
+            || i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
+    });
+
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetAsyncKeyState(v_key: i32) -> i16;
+        }
+        static WAS_PASTE_DOWN: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
+        let is_focused = ctx.input(|i| i.focused);
+        if !is_focused {
+            WAS_PASTE_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+            return egui_paste;
+        }
+        let (win32_down, modifier_held) = unsafe {
+            let ctrl = (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0; // VK_CONTROL
+            let v_key = (GetAsyncKeyState(0x56) as u16 & 0x8000) != 0; // 'V'
+            let shift = (GetAsyncKeyState(0x10) as u16 & 0x8000) != 0; // VK_SHIFT
+            let ins = (GetAsyncKeyState(0x2D) as u16 & 0x8000) != 0; // VK_INSERT
+            ((ctrl && v_key) || (shift && ins), ctrl || shift)
+        };
+        if modifier_held {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        let prev = WAS_PASTE_DOWN.swap(win32_down, std::sync::atomic::Ordering::SeqCst);
+        let edge_triggered = win32_down && !prev;
+        return egui_paste || edge_triggered;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        egui_paste
+    }
+}
+
+fn finalize_clipboard_rgba_image(
+    rgba: image::RgbaImage,
+) -> Option<(std::path::PathBuf, u32, u32, egui::ColorImage)> {
+    let (width, height) = rgba.dimensions();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let _ = std::fs::create_dir_all("stickers_cache");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = std::path::PathBuf::from(format!("stickers_cache/clipboard_{now_ms}.png"));
+    rgba.save(&path).ok()?;
+
+    let thumb = if width > 240 || height > 240 {
+        image::imageops::thumbnail(&rgba, 240, 240)
+    } else {
+        rgba
+    };
+    let (tw, th) = thumb.dimensions();
+    let col_img =
+        egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], thumb.as_raw());
+    Some((path, width, height, col_img))
+}
+
+/// Read an image from the Windows Clipboard supporting:
+/// 1. Registered `"PNG"` / `"image/png"` streams (Snipping Tool, ShareX, Chrome/Edge, Discord)
+/// 2. `CF_HDROP` (`15`) copied image files from Windows Explorer or ShareX
+/// 3. `CF_DIB` (`8`) / `CF_DIBV5` (`17`) 24-bit & 32-bit bitmaps (`BI_RGB` & `BI_BITFIELDS`)
 fn read_clipboard_image_to_png() -> Option<(std::path::PathBuf, u32, u32, egui::ColorImage)> {
     #[cfg(target_os = "windows")]
     {
         const CF_DIB: u32 = 8;
+        const CF_HDROP: u32 = 15;
         #[link(name = "user32")]
         extern "system" {
             fn IsClipboardFormatAvailable(format: u32) -> i32;
+            fn RegisterClipboardFormatA(lpsz_format: *const u8) -> u32;
             fn OpenClipboard(h_wnd_new_owner: *mut std::ffi::c_void) -> i32;
             fn CloseClipboard() -> i32;
             fn GetClipboardData(u_format: u32) -> *mut std::ffi::c_void;
@@ -10633,94 +10747,174 @@ fn read_clipboard_image_to_png() -> Option<(std::path::PathBuf, u32, u32, egui::
             fn GlobalUnlock(h_mem: *mut std::ffi::c_void) -> i32;
             fn GlobalSize(h_mem: *mut std::ffi::c_void) -> usize;
         }
+        #[link(name = "shell32")]
+        extern "system" {
+            fn DragQueryFileW(
+                h_drop: *mut std::ffi::c_void,
+                i_file: u32,
+                lpsz_file: *mut u16,
+                cch: u32,
+            ) -> u32;
+        }
 
         unsafe {
-            if IsClipboardFormatAvailable(CF_DIB) == 0 {
-                return None;
-            }
-            if OpenClipboard(std::ptr::null_mut()) == 0 {
-                return None;
-            }
-            let hmem = GetClipboardData(CF_DIB);
-            if hmem.is_null() {
-                CloseClipboard();
-                return None;
-            }
-            let ptr = GlobalLock(hmem);
-            let len = GlobalSize(hmem);
-            if ptr.is_null() || len < 40 {
-                if !ptr.is_null() {
-                    GlobalUnlock(hmem);
-                }
-                CloseClipboard();
-                return None;
-            }
-            let slice = std::slice::from_raw_parts(ptr, len);
-            let bi_size = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize;
-            let width_i = i32::from_le_bytes([slice[4], slice[5], slice[6], slice[7]]);
-            let height_i = i32::from_le_bytes([slice[8], slice[9], slice[10], slice[11]]);
-            let bit_count = u16::from_le_bytes([slice[14], slice[15]]);
-            let compression = u32::from_le_bytes([slice[16], slice[17], slice[18], slice[19]]);
+            let cf_png = RegisterClipboardFormatA(b"PNG\0".as_ptr());
+            let cf_mime_png = RegisterClipboardFormatA(b"image/png\0".as_ptr());
+            let has_png = cf_png != 0 && IsClipboardFormatAvailable(cf_png) != 0;
+            let has_mime_png = cf_mime_png != 0 && IsClipboardFormatAvailable(cf_mime_png) != 0;
+            let has_dib = IsClipboardFormatAvailable(CF_DIB) != 0;
+            let has_hdrop = IsClipboardFormatAvailable(CF_HDROP) != 0;
 
-            if width_i <= 0 || height_i == 0 || (bit_count != 24 && bit_count != 32) {
-                GlobalUnlock(hmem);
-                CloseClipboard();
-                return None;
-            }
-            let width = width_i as u32;
-            let top_down = height_i < 0;
-            let height = height_i.unsigned_abs();
-            let mut offset = bi_size;
-            if compression == 3 && bi_size == 40 {
-                offset += 12; // skip 3 DWORD color masks for BI_BITFIELDS
-            }
-            let bytes_per_px = (bit_count / 8) as usize;
-            let row_stride = (width as usize * bytes_per_px + 3) & !3;
-            let needed = offset.saturating_add(row_stride.saturating_mul(height as usize));
-            if needed > slice.len() {
-                GlobalUnlock(hmem);
-                CloseClipboard();
+            if !has_png && !has_mime_png && !has_dib && !has_hdrop {
                 return None;
             }
 
-            let mut rgba = image::RgbaImage::new(width, height);
-            for y in 0..height {
-                let src_y = if top_down { y } else { height - 1 - y } as usize;
-                let row = &slice[offset + src_y * row_stride..];
-                for x in 0..width {
-                    let p = x as usize * bytes_per_px;
-                    let b = row[p];
-                    let g = row[p + 1];
-                    let r = row[p + 2];
-                    let a = if bytes_per_px == 4 {
-                        let raw_a = row[p + 3];
-                        if raw_a == 0 { 255 } else { raw_a }
-                    } else {
-                        255
-                    };
-                    rgba.put_pixel(x, y, image::Rgba([r, g, b, a]));
+            // Retry OpenClipboard briefly in case egui-winit/arboard or ShareX is releasing the lock
+            let mut opened = false;
+            for _ in 0..6 {
+                if OpenClipboard(std::ptr::null_mut()) != 0 {
+                    opened = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(8));
+            }
+            if !opened {
+                return None;
+            }
+
+            // 1. Try raw PNG stream first (preserves exact RGBA and avoids DIB header quirks)
+            for fmt in [cf_png, cf_mime_png] {
+                if fmt != 0 && IsClipboardFormatAvailable(fmt) != 0 {
+                    let hmem = GetClipboardData(fmt);
+                    if !hmem.is_null() {
+                        let ptr = GlobalLock(hmem);
+                        let len = GlobalSize(hmem);
+                        if !ptr.is_null() && len > 8 {
+                            let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+                            GlobalUnlock(hmem);
+                            if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                                CloseClipboard();
+                                return finalize_clipboard_rgba_image(dyn_img.to_rgba8());
+                            }
+                        } else if !ptr.is_null() {
+                            GlobalUnlock(hmem);
+                        }
+                    }
                 }
             }
-            GlobalUnlock(hmem);
+
+            // 2. Try CF_HDROP (copied image file in Windows Explorer or ShareX)
+            if has_hdrop {
+                let hdrop = GetClipboardData(CF_HDROP);
+                if !hdrop.is_null() {
+                    let mut buf = vec![0u16; 1024];
+                    let chars = DragQueryFileW(hdrop, 0, buf.as_mut_ptr(), buf.len() as u32) as usize;
+                    if chars > 0 && chars < buf.len() {
+                        let file_path =
+                            std::path::PathBuf::from(String::from_utf16_lossy(&buf[..chars]));
+                        if let Ok(dyn_img) = image::open(&file_path) {
+                            CloseClipboard();
+                            let rgba = dyn_img.to_rgba8();
+                            let (width, height) = rgba.dimensions();
+                            let thumb = if width > 240 || height > 240 {
+                                image::imageops::thumbnail(&rgba, 240, 240)
+                            } else {
+                                rgba
+                            };
+                            let (tw, th) = thumb.dimensions();
+                            let col_img = egui::ColorImage::from_rgba_unmultiplied(
+                                [tw as usize, th as usize],
+                                thumb.as_raw(),
+                            );
+                            return Some((file_path, width, height, col_img));
+                        }
+                    }
+                }
+            }
+
+            // 3. Fallback to CF_DIB (24-bit BGR or 32-bit BGRA/BGRX, BI_RGB or BI_BITFIELDS)
+            if has_dib {
+                let hmem = GetClipboardData(CF_DIB);
+                if !hmem.is_null() {
+                    let ptr = GlobalLock(hmem);
+                    let len = GlobalSize(hmem);
+                    if !ptr.is_null() && len >= 40 {
+                        let slice = std::slice::from_raw_parts(ptr, len);
+                        let bi_size =
+                            u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize;
+                        let width_i = i32::from_le_bytes([slice[4], slice[5], slice[6], slice[7]]);
+                        let height_i =
+                            i32::from_le_bytes([slice[8], slice[9], slice[10], slice[11]]);
+                        let bit_count = u16::from_le_bytes([slice[14], slice[15]]);
+                        let compression =
+                            u32::from_le_bytes([slice[16], slice[17], slice[18], slice[19]]);
+
+                        if width_i > 0
+                            && height_i != 0
+                            && (bit_count == 24 || bit_count == 32)
+                            && bi_size >= 40
+                            && bi_size <= slice.len()
+                        {
+                            let width = width_i as u32;
+                            let top_down = height_i < 0;
+                            let height = height_i.unsigned_abs();
+                            let mut offset = bi_size;
+                            if (compression == 3 || compression == 6) && bi_size == 40 {
+                                offset += if compression == 6 { 16 } else { 12 };
+                            }
+                            let bytes_per_px = (bit_count / 8) as usize;
+                            let row_stride = (width as usize * bytes_per_px + 3) & !3;
+                            let needed =
+                                offset.saturating_add(row_stride.saturating_mul(height as usize));
+                            if needed <= slice.len() {
+                                let mut rgba = image::RgbaImage::new(width, height);
+                                let mut any_nonzero_alpha = false;
+                                if bytes_per_px == 4 {
+                                    for y in 0..height {
+                                        let src_y =
+                                            if top_down { y } else { height - 1 - y } as usize;
+                                        let row = &slice[offset + src_y * row_stride..];
+                                        for x in 0..width {
+                                            if row[x as usize * 4 + 3] != 0 {
+                                                any_nonzero_alpha = true;
+                                                break;
+                                            }
+                                        }
+                                        if any_nonzero_alpha {
+                                            break;
+                                        }
+                                    }
+                                }
+                                for y in 0..height {
+                                    let src_y = if top_down { y } else { height - 1 - y } as usize;
+                                    let row = &slice[offset + src_y * row_stride..];
+                                    for x in 0..width {
+                                        let p = x as usize * bytes_per_px;
+                                        let b = row[p];
+                                        let g = row[p + 1];
+                                        let r = row[p + 2];
+                                        let a = if bytes_per_px == 4 && any_nonzero_alpha {
+                                            row[p + 3]
+                                        } else {
+                                            255
+                                        };
+                                        rgba.put_pixel(x, y, image::Rgba([r, g, b, a]));
+                                    }
+                                }
+                                GlobalUnlock(hmem);
+                                CloseClipboard();
+                                return finalize_clipboard_rgba_image(rgba);
+                            }
+                        }
+                    }
+                    if !ptr.is_null() {
+                        GlobalUnlock(hmem);
+                    }
+                }
+            }
+
             CloseClipboard();
-
-            let _ = std::fs::create_dir_all("stickers_cache");
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let path = std::path::PathBuf::from(format!("stickers_cache/clipboard_{now_ms}.png"));
-            rgba.save(&path).ok()?;
-
-            let thumb = if width > 240 || height > 240 {
-                image::imageops::thumbnail(&rgba, 240, 240)
-            } else {
-                rgba
-            };
-            let (tw, th) = thumb.dimensions();
-            let col_img =
-                egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], thumb.as_raw());
-            Some((path, width, height, col_img))
+            None
         }
     }
     #[cfg(not(target_os = "windows"))]
