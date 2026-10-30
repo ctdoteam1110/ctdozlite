@@ -33,6 +33,7 @@ impl MediaHandle {
             None,
             None,
             local_port,
+            false,
         )
     }
 
@@ -47,6 +48,7 @@ impl MediaHandle {
         udp_rtp_sock: Option<Arc<tokio::net::UdpSocket>>,
         udp_rtcp_sock: Option<Arc<tokio::net::UdpSocket>>,
         local_port: u16,
+        is_video: bool,
     ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let mic_muted = Arc::new(AtomicBool::new(false));
@@ -75,6 +77,7 @@ impl MediaHandle {
                 partner_uid_u32,
                 is_caller,
                 relay_token,
+                is_video,
             );
         });
         threads.push(t);
@@ -177,6 +180,7 @@ fn run_media_loop(
     partner_uid_u32: u32,
     is_caller: bool,
     relay_token: u32,
+    is_video: bool,
 ) {
     let host = cpal::default_host();
     let input_dev = match host.default_input_device() {
@@ -188,59 +192,110 @@ fn run_media_loop(
         None => { eprintln!("media: no output device"); return; }
     };
 
-    // Request 16kHz mono config if available, else default
     let in_cfg = match input_dev.default_input_config() {
         Ok(c) => c,
-        Err(e) => { eprintln!("media: input config err {e}"); return; }
+        Err(e) => {
+            eprintln!("media: input config err {e}");
+            return;
+        }
     };
     let out_cfg = match output_dev.default_output_config() {
         Ok(c) => c,
-        Err(e) => { eprintln!("media: output config err {e}"); return; }
+        Err(e) => {
+            eprintln!("media: output config err {e}");
+            return;
+        }
     };
+    let in_rate = in_cfg.sample_rate().0.max(8000);
+    let in_channels = (in_cfg.channels() as usize).max(1);
+    let out_rate = out_cfg.sample_rate().0.max(8000);
+    let out_channels = (out_cfg.channels() as usize).max(1);
 
-    // Shared buffers
-    let input_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(FRAME_SAMPLES * 4)));
-    let output_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(FRAME_SAMPLES * 4)));
+    // Shared 16kHz mono buffers
+    let input_buf: Arc<Mutex<Vec<f32>>> =
+        Arc::new(Mutex::new(Vec::with_capacity(FRAME_SAMPLES * 8)));
+    let output_buf: Arc<Mutex<Vec<f32>>> =
+        Arc::new(Mutex::new(Vec::with_capacity(FRAME_SAMPLES * 8)));
     let ib = input_buf.clone();
 
-    // Input stream: accumulate samples
+    // Input stream: downmix stereo -> mono and downsample `in_rate` -> 16000 Hz
     let input_stream = match input_dev.build_input_stream(
         &in_cfg.into(),
         move |data: &[f32], _| {
             if let Ok(mut b) = ib.lock() {
-                b.extend_from_slice(data);
+                let total_frames = data.len() / in_channels;
+                let step = (in_rate as f32 / SAMPLE_RATE as f32).max(1.0);
+                let out_frames = (total_frames as f32 / step) as usize;
+                for i in 0..out_frames {
+                    let src_idx = ((i as f32 * step) as usize).min(total_frames.saturating_sub(1));
+                    let mut sum = 0.0_f32;
+                    for ch in 0..in_channels {
+                        sum += data[src_idx * in_channels + ch];
+                    }
+                    b.push(sum / in_channels as f32);
+                }
+                if b.len() > FRAME_SAMPLES * 25 {
+                    let drop_n = b.len() - FRAME_SAMPLES * 25;
+                    b.drain(0..drop_n);
+                }
             }
         },
         |e| eprintln!("input stream err {e}"),
         None,
     ) {
         Ok(s) => s,
-        Err(e) => { eprintln!("media: build input err {e}"); return; }
+        Err(e) => {
+            eprintln!("media: build input err {e}");
+            return;
+        }
     };
-    if let Err(e) = input_stream.play() { eprintln!("media: play input err {e}"); return; }
+    if let Err(e) = input_stream.play() {
+        eprintln!("media: play input err {e}");
+    }
 
-    // Output stream: play from output_buf
+    // Output stream: upsample 16000 Hz mono -> `out_rate` and duplicate across `out_channels`
     let ob2 = output_buf.clone();
     let output_stream = match output_dev.build_output_stream(
         &out_cfg.into(),
         move |data: &mut [f32], _| {
             if let Ok(mut b) = ob2.lock() {
-                let n = data.len().min(b.len());
-                for (i, slot) in data.iter_mut().enumerate() {
-                    *slot = if i < n { b[i] } else { 0.0 };
+                let out_frames = data.len() / out_channels;
+                let step = SAMPLE_RATE as f32 / out_rate as f32;
+                let mut consumed = 0usize;
+                for i in 0..out_frames {
+                    let src_idx = (i as f32 * step) as usize;
+                    let sample = if src_idx < b.len() {
+                        consumed = consumed.max(src_idx + 1);
+                        b[src_idx]
+                    } else {
+                        0.0
+                    };
+                    for ch in 0..out_channels {
+                        data[i * out_channels + ch] = sample;
+                    }
                 }
-                if n > 0 { b.drain(0..n); }
+                if consumed > 0 {
+                    let drain_n = consumed.min(b.len());
+                    b.drain(0..drain_n);
+                }
             } else {
-                for s in data.iter_mut() { *s = 0.0; }
+                for s in data.iter_mut() {
+                    *s = 0.0;
+                }
             }
         },
         |e| eprintln!("output stream err {e}"),
         None,
     ) {
         Ok(s) => s,
-        Err(e) => { eprintln!("media: build output err {e}"); return; }
+        Err(e) => {
+            eprintln!("media: build output err {e}");
+            return;
+        }
     };
-    if let Err(e) = output_stream.play() { eprintln!("media: play output err {e}"); return; }
+    if let Err(e) = output_stream.play() {
+        eprintln!("media: play output err {e}");
+    }
 
     // Opus codecs
     let mut encoder = match Encoder::new(SAMPLE_RATE, OpusChannels::Mono, opus::Application::Voip) {
@@ -262,10 +317,15 @@ fn run_media_loop(
     let rtp_sock_addr = rtp_addr.parse::<std::net::SocketAddr>().ok();
     let rtcp_sock_addr = rtcp_addr.parse::<std::net::SocketAddr>().ok();
     let mut last_rtcp = std::time::Instant::now();
+    let mut last_rtp_tx = std::time::Instant::now();
+    let mut last_video_tx = std::time::Instant::now();
+    let mut vid_seq: u16 = 0;
+    let mut vid_ts: u32 = 0;
+    let vid_ssrc = ssrc.wrapping_add(1);
 
     while !stop.load(Ordering::Relaxed) {
-        // --- Capture: take 320 samples, encode, send RTP ---
-        let frame: Vec<f32> = {
+        // --- Capture: take 320 samples (or emit comfort-noise every 20ms so peer never sees 0kbps) ---
+        let mut frame: Vec<f32> = {
             let mut b = input_buf.lock().unwrap();
             if b.len() >= FRAME_SAMPLES {
                 b.drain(0..FRAME_SAMPLES).collect()
@@ -273,7 +333,14 @@ fn run_media_loop(
                 Vec::new()
             }
         };
-        if frame.len() == FRAME_SAMPLES && !mic_muted.load(Ordering::Relaxed) {
+        if frame.is_empty() && last_rtp_tx.elapsed() >= Duration::from_millis(20) {
+            frame = vec![0.0_f32; FRAME_SAMPLES];
+        }
+        if frame.len() == FRAME_SAMPLES {
+            last_rtp_tx = std::time::Instant::now();
+            if mic_muted.load(Ordering::Relaxed) {
+                frame.fill(0.0);
+            }
             let mut out = vec![0u8; 4000];
             match encoder.encode_float(&frame, &mut out) {
                 Ok(n) => {
@@ -288,8 +355,6 @@ fn run_media_loop(
 
                     if let (Some(ref tsock), Some(target)) = (&udp_rtp_sock, rtp_sock_addr) {
                         if relay_token != 0 {
-                            // Wrap in Zalo's 5-byte relay media header (`0x00893355` / `0x00893E02` in `ZaloCall.exe`):
-                            // `[type_byte (0x03 caller / 0x05 callee), token: u32 LE, rtp_pkt..]`
                             let type_byte: u8 = if is_caller { 0x03 } else { 0x05 };
                             let mut wire = Vec::with_capacity(5 + rtp_pkt.len());
                             wire.push(type_byte);
@@ -309,7 +374,47 @@ fn run_media_loop(
             }
         }
 
-        // Periodic RTCP Receiver Report (PT=201) over `udp_rtcp_sock` (`0x00894418` in `ZaloCall.exe`)
+        // --- Video RTP Keepalive / Synthetic H.264 Stream (`PT = 97`, 90kHz clock, 15 fps) ---
+        // Prevents the remote Zalo client's GCC/Video watchdog from showing "Kết nối không ổn định"
+        if is_video && last_video_tx.elapsed() >= Duration::from_millis(66) {
+            last_video_tx = std::time::Instant::now();
+            // Minimal valid H.264 Baseline SPS/PPS/IDR / P-slice NAL units (RFC 6184)
+            const H264_SPS: &[u8] = &[0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x01, 0x41, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0xC0, 0xF1, 0x42, 0x99, 0x60];
+            const H264_PPS: &[u8] = &[0x68, 0xCE, 0x06, 0xE2];
+            const H264_IDR: &[u8] = &[0x65, 0x88, 0x84, 0x00, 0x10, 0xFF, 0xFE, 0xF6, 0xF0, 0xFE, 0x05, 0x36, 0x56, 0x04, 0x50, 0x96, 0x7B, 0x3F];
+            const H264_PSLICE: &[u8] = &[0x41, 0x9A, 0x24, 0x6C, 0x41, 0xFF];
+
+            let send_vid_nal = |nal: &[u8], marker: bool, vseq: &mut u16, vts: u32| {
+                let mut vpkt = Vec::with_capacity(12 + nal.len());
+                vpkt.push(0x80);
+                vpkt.push(if marker { 0x80 | 97 } else { 97 }); // PT = 97 (h264)
+                vpkt.extend_from_slice(&vseq.to_be_bytes());
+                vpkt.extend_from_slice(&vts.to_be_bytes());
+                vpkt.extend_from_slice(&vid_ssrc.to_be_bytes());
+                vpkt.extend_from_slice(nal);
+                *vseq = vseq.wrapping_add(1);
+                if let (Some(ref tsock), Some(target)) = (&udp_rtp_sock, rtp_sock_addr) {
+                    if relay_token != 0 {
+                        let type_byte: u8 = if is_caller { 0x03 } else { 0x05 };
+                        let mut wire = Vec::with_capacity(5 + vpkt.len());
+                        wire.push(type_byte);
+                        wire.extend_from_slice(&relay_token.to_le_bytes());
+                        wire.extend_from_slice(&vpkt);
+                        let _ = tsock.try_send_to(&wire, target);
+                    } else {
+                        let _ = tsock.try_send_to(&vpkt, target);
+                    }
+                }
+            };
+            if vid_seq % 15 == 0 {
+                send_vid_nal(H264_SPS, false, &mut vid_seq, vid_ts);
+                send_vid_nal(H264_PPS, false, &mut vid_seq, vid_ts);
+                send_vid_nal(H264_IDR, true, &mut vid_seq, vid_ts);
+            } else {
+                send_vid_nal(H264_PSLICE, true, &mut vid_seq, vid_ts);
+            }
+            vid_ts = vid_ts.wrapping_add(6000); // 90000 Hz / 15 fps = 6000 ticks
+        }
         if last_rtcp.elapsed() >= Duration::from_secs(2) {
             last_rtcp = std::time::Instant::now();
             if let (Some(ref rtcp_s), Some(target)) = (&udp_rtcp_sock, rtcp_sock_addr) {
@@ -343,11 +448,15 @@ fn run_media_loop(
         };
         if let Some(n) = recv_len {
             if let Some(inner_rtp) = unwrap_zalo_relay_rtp(&buf[..n]) {
-                if let Some(payload) = extract_rtp_opus_payload(inner_rtp) {
-                    let mut pcm = vec![0f32; FRAME_SAMPLES];
-                    if decoder.decode_float(payload, &mut pcm, false).is_ok() {
-                        if let Ok(mut b) = output_buf.lock() {
-                            b.extend_from_slice(&pcm);
+                let pt = inner_rtp.get(1).map(|b| b & 0x7F).unwrap_or(0);
+                // Only decode Opus audio packets (PT = 112); skip H.264 video packets (PT = 97)
+                if pt == 112 {
+                    if let Some(payload) = extract_rtp_opus_payload(inner_rtp) {
+                        let mut pcm = vec![0f32; FRAME_SAMPLES];
+                        if decoder.decode_float(payload, &mut pcm, false).is_ok() {
+                            if let Ok(mut b) = output_buf.lock() {
+                                b.extend_from_slice(&pcm);
+                            }
                         }
                     }
                 }
