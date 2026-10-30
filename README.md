@@ -28,6 +28,12 @@
 - 🖥️ **Đa giao diện (Dual Interface):**
   - **Native GUI (`eframe`/`egui`):** Giao diện đồ họa hiện đại, font Segoe UI tiếng Việt sắc nét, Dark/Light mode tự động, bong bóng chat co giãn thông minh, giữ focus liên tục khi nhấn Enter.
   - **Terminal TUI (`ratatui`/`crossterm`):** Giao diện dòng lệnh 60fps, khung viền phẳng ANSI chống xô lệch, phím tắt điều hướng nhanh nhẹn.
+- 📞 **Gọi thoại & Gọi video 1-1 (thử nghiệm):**
+  - Báo hiệu cuộc gọi qua WebSocket Zalo (`invite` / `answer` / `end`), điều khiển `ZaloCall.exe` chính hãng qua Named Pipe để khởi tạo ZRTP với relay.
+  - Media RTP/RTCP viết bằng Rust: audio Opus (`cpal` + `opus`), video H.264 theo định dạng riêng của Zalo (Annex-B access unit, PT 97/98, phân mảnh `1c <flags>`), RR/SR/SDES, PLI/FIR yêu cầu keyframe.
+  - Camera và giải mã video dùng `ffmpeg` (gửi: webcam → H.264; nhận: H.264 → RGBA hiển thị trong GUI).
+  - Nhật ký chẩn đoán `voip.log` dạng văn bản thuần (tag `CALL`, `SIG`, `RTP>/<`, `RTCP>/<`, `STAT`, `VDEC`, `TXST`).
+  - ⚠️ **Trạng thái:** gọi thoại/video đã thiết lập và truyền media được. Giải mã hình ảnh video của đối phương còn đang hoàn thiện (xem [re-notes/08_video_call.md](re-notes/08_video_call.md), mục *Still open*).
 - 🔍 **Dev Inspector & Protocol Scanner:** Tích hợp bộ chẩn đoán bắt gói tin, đo độ trễ mạng, giải mã payload và tự động quét phát hiện mã lỗi giao thức (`--dev`). Ẩn 100% trong chế độ Production.
 
 ---
@@ -82,7 +88,29 @@ File thực thi độc lập sẽ nằm tại `target/release/zalo-rust.exe` (Wi
 ```
 - Bấm vào thanh `▲ Mở Dev Inspector` ở chân màn hình để xem toàn bộ luồng mạng và payload giải mã.
 
-### 4. Đăng xuất tài khoản
+### 4. Gọi thoại / Gọi video
+
+Yêu cầu thêm:
+- **Windows** + Zalo PC chính hãng đã cài (hoặc thư mục `Zalo-*/plugins/capture/ZaloCall.exe` cạnh dự án). `ZaloCall.exe` được tìm tự động và kiểm tra MD5; app không kèm file này.
+- **`ffmpeg`** có trong `PATH` (cần cho webcam và giải mã video). Gọi thoại không cần `ffmpeg`.
+
+Cách dùng: mở một cuộc trò chuyện 1-1 trong GUI và bấm nút gọi thoại hoặc gọi video. Nhận cuộc gọi đến bằng nút trả lời trên GUI.
+
+Lưu ý:
+- Hiện chỉ hỗ trợ gọi **1-1**; gọi nhóm bị từ chối.
+- Gọi đi bị khóa bằng danh sách cho phép dùng để thử nghiệm (`CALL_ALLOWED_NAMES` / `CALL_ALLOWED_IDS` trong `src/call.rs`). Ghi đè ID lúc chạy bằng biến môi trường `ZALO_CALL_ALLOW_IDS`.
+- Chưa hỗ trợ giải mã HEVC; app tự khai báo `supportHevcDecode=0` để đối phương gửi H.264.
+
+Nhật ký cuộc gọi:
+
+| Biến môi trường | Tác dụng |
+|---|---|
+| `ZALO_VOIP_LOG=<đường dẫn>` | Ghi `voip.log` vào đường dẫn khác (mặc định `./voip.log`, xoay vòng ở 2 MiB) |
+| `ZALO_VOIP_LOG=off` | Tắt hoàn toàn `voip.log` |
+
+`voip.log` và `call_trace.log` là văn bản thuần, chứa địa chỉ relay và `extendData` của cuộc gọi. Cả hai đã nằm trong `.gitignore`, **không chia sẻ hoặc commit**.
+
+### 5. Đăng xuất tài khoản
 - Nhấn nút màu đỏ **`🚪 Đăng xuất`** trên thanh tiêu đề GUI, hoặc bấm phím **`x`** trong TUI, hoặc chạy:
   ```bash
   ./target/release/zalo-rust --logout
@@ -99,12 +127,19 @@ Toàn bộ tài liệu chi tiết được lưu trong thư mục `docs/`:
 - **[docs/GIAO_THUC_ZALO.md](docs/GIAO_THUC_ZALO.md)**: Đặc tả giao thức Zalo PC, ParamCipher v2, PasswordCipher, signkey MD5, bảng mã hóa AES-128/256.
 - **[docs/KHAC_PHUC_SU_CO.md](docs/KHAC_PHUC_SU_CO.md)**: Bảng tra cứu mã lỗi giao thức và cách khắc phục sự cố.
 
+Ghi chú reverse engineering về cuộc gọi (thư mục `re-notes/`):
+
+- **[re-notes/06_call_media.md](re-notes/06_call_media.md)**: Luồng media cuộc gọi (ZRTP, relay, RTP audio).
+- **[re-notes/07_voip_log.md](re-notes/07_voip_log.md)**: Giải mã `voip.log` của `ZaloCall.exe` và máy trạng thái native.
+- **[re-notes/08_video_call.md](re-notes/08_video_call.md)**: Cơ chế gọi video: định dạng H.264 của Zalo, RTCP/PLI, kết quả các lần gọi thử và các việc còn mở.
+
 ---
 
 ## 🔒 Bảo Mật & Lưu Ý
 
 - File `session.json` chứa token phiên xác thực và khóa giải mã cá nhân. **Tuyệt đối không chia sẻ file này hoặc commit lên Git**.
-- Dự án đã tích hợp sẵn `.gitignore` để tự động loại trừ mọi file cấu hình, khóa phiên và database cục bộ.
+- Dự án đã tích hợp sẵn `.gitignore` để tự động loại trừ mọi file cấu hình, khóa phiên, database cục bộ và nhật ký cuộc gọi (`*.log`).
+- Trước khi push, kiểm tra `git status` và không đưa `session.json`, `voip.log`, `call_trace.log`, `*.db`, `dump/` lên Git.
 
 ---
 
