@@ -1374,6 +1374,7 @@ pub struct ZaloGuiApp {
     sticker_textures: HashMap<String, TextureHandle>,
     loading_stickers: HashSet<String>,
     emoji_textures: HashMap<String, TextureHandle>,
+    app_logo_texture: Option<TextureHandle>,
     sticker_store_packs: Vec<crate::chat::StickerPackInfo>,
     sticker_store_loading: bool,
     sticker_store_filter: String,
@@ -1538,6 +1539,7 @@ impl ZaloGuiApp {
             sticker_textures: HashMap::new(),
             loading_stickers: HashSet::new(),
             emoji_textures: load_default_emoji_textures(&cc.egui_ctx),
+            app_logo_texture: load_app_logo_texture(&cc.egui_ctx),
             sticker_store_packs: Vec::new(),
             sticker_store_loading: false,
             sticker_store_filter: String::new(),
@@ -3885,15 +3887,24 @@ impl eframe::App for ZaloGuiApp {
                     ui.horizontal(|ui| {
                         let (logo_rect, _) =
                             ui.allocate_exact_size(Vec2::new(28.0, 28.0), Sense::hover());
-                        ui.painter()
-                            .rect_filled(logo_rect, Rounding::same(7.0), pal.primary);
-                        ui.painter().text(
-                            logo_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "Z",
-                            FontId::proportional(16.5),
-                            Color32::WHITE,
-                        );
+                        if let Some(tex) = &self.app_logo_texture {
+                            ui.painter().image(
+                                tex.id(),
+                                logo_rect,
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        } else {
+                            ui.painter()
+                                .rect_filled(logo_rect, Rounding::same(7.0), pal.primary);
+                            ui.painter().text(
+                                logo_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Z",
+                                FontId::proportional(16.5),
+                                Color32::WHITE,
+                            );
+                        }
                         ui.add_space(4.0);
                         ui.label(
                             RichText::new("Zalo")
@@ -3997,7 +4008,10 @@ impl ZaloGuiApp {
         ui.vertical_centered(|ui| {
             let avail_h = ui.available_height();
             ui.add_space((avail_h * 0.08).max(20.0));
-
+            if let Some(tex) = &self.app_logo_texture {
+                ui.image((tex.id(), Vec2::new(64.0, 64.0)));
+                ui.add_space(10.0);
+            }
             ui.label(
                 RichText::new("Đăng nhập Zalo")
                     .color(pal.primary)
@@ -11692,6 +11706,26 @@ pub fn emoji_to_tex_key(emoji: &str) -> &'static str {
         "😠" | ":-h" => "rage",
         _ => "like",
     }
+}
+
+const APP_ICON_PNG: &[u8] = include_bytes!("assets/app_icon.png");
+
+/// Decode the embedded 256x256 RGBA application icon for the OS window/taskbar (`ViewportBuilder::with_icon`).
+pub fn load_app_icon() -> Option<egui::IconData> {
+    let img = image::load_from_memory(APP_ICON_PNG).ok()?.into_rgba8();
+    let (width, height) = img.dimensions();
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
+}
+
+fn load_app_logo_texture(ctx: &egui::Context) -> Option<TextureHandle> {
+    let img = image::load_from_memory(APP_ICON_PNG).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    let color_img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+    Some(ctx.load_texture("zalo_app_logo", color_img, TextureOptions::LINEAR))
 }
 
 fn load_default_emoji_textures(ctx: &egui::Context) -> HashMap<String, TextureHandle> {
