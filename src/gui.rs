@@ -55,31 +55,32 @@ struct ThemePalette {
 
 impl ThemePalette {
     fn dark() -> Self {
+        // Official Atom One Dark (`one-dark-ui` + `one-dark-syntax`) color system
         Self {
             is_dark: true,
-            bg_app: Color32::from_rgb(13, 19, 31),         // #0D131F Left Rail
-            bg_sidebar: Color32::from_rgb(17, 24, 39),     // #111827 Sidebar & Header
-            bg_chat_canvas: Color32::from_rgb(11, 15, 23), // #0B0F17 Deep Chat Canvas
-            bg_elevated: Color32::from_rgb(30, 41, 59),    // #1E293B Slate 800
-            bg_hover: Color32::from_rgb(30, 41, 59),       // #1E293B
-            bg_selected: Color32::from_rgb(30, 41, 59),    // #1E293B Active Conversation Row
-            bg_input: Color32::from_rgb(15, 23, 42),       // #0F172A
-            border: Color32::from_rgb(30, 41, 59),         // #1E293B Subtle divider
-            text_primary: Color32::from_rgb(248, 250, 252), // #F8FAFC (15.8:1 contrast)
-            text_secondary: Color32::from_rgb(148, 163, 184), // #94A3B8 (6.4:1 contrast)
-            text_muted: Color32::from_rgb(100, 116, 139),  // #64748B
-            primary: Color32::from_rgb(37, 99, 235),       // #2563EB Primary Blue
-            primary_hover: Color32::from_rgb(59, 130, 246), // #3B82F6
-            accent_online: Color32::from_rgb(16, 185, 129), // #10B981 Emerald
-            danger: Color32::from_rgb(239, 68, 68),        // #EF4444
-            warning: Color32::from_rgb(245, 158, 11),      // #F59E0B
-            bubble_out_bg: Color32::from_rgb(0, 88, 218),  // Rich Zalo Royal Blue
-            bubble_out_text: Color32::from_rgb(248, 250, 252),
-            bubble_out_meta: Color32::from_rgb(191, 219, 254),
-            bubble_in_bg: Color32::from_rgb(26, 36, 54),   // Elevated Slate Card
-            bubble_in_border: Color32::from_rgb(48, 63, 90),
-            bubble_in_text: Color32::from_rgb(241, 245, 249),
-            bubble_in_meta: Color32::from_rgb(148, 163, 184),
+            bg_app: Color32::from_rgb(24, 26, 31),          // #181A1F Activity Bar & Title Bar
+            bg_sidebar: Color32::from_rgb(33, 37, 43),      // #21252B Tree-View / Sidebar / Header
+            bg_chat_canvas: Color32::from_rgb(40, 44, 52),  // #282C34 Atom One Dark Editor Canvas
+            bg_elevated: Color32::from_rgb(44, 49, 58),     // #2C313A Elevated Card / Modal / Popover
+            bg_hover: Color32::from_rgb(50, 56, 66),        // #323842 List Hover Surface
+            bg_selected: Color32::from_rgb(58, 63, 75),     // #3A3F4B Active Selection Row
+            bg_input: Color32::from_rgb(29, 31, 35),        // #1D1F23 Input / Search Well
+            border: Color32::from_rgb(52, 57, 66),          // #343942 Subtle Panel Divider
+            text_primary: Color32::from_rgb(215, 218, 224), // #D7DAE0 Bright Foreground
+            text_secondary: Color32::from_rgb(171, 178, 191), // #ABB2BF Atom @mono-1
+            text_muted: Color32::from_rgb(118, 126, 142),   // #767E8E Atom @mono-3 (readable muted)
+            primary: Color32::from_rgb(82, 139, 255),       // #528BFF Atom UI Accent Blue
+            primary_hover: Color32::from_rgb(97, 175, 239), // #61AFEF Atom @hue-2 Cyan-Blue
+            accent_online: Color32::from_rgb(152, 195, 121), // #98C379 Atom @hue-4 Green
+            danger: Color32::from_rgb(224, 108, 117),       // #E06C75 Atom @hue-5 Coral Red
+            warning: Color32::from_rgb(229, 192, 123),      // #E5C07B Atom @hue-62 Warm Gold
+            bubble_out_bg: Color32::from_rgb(43, 76, 126),  // #2B4C7E Atom Deep Blue Outgoing Bubble
+            bubble_out_text: Color32::from_rgb(230, 236, 245), // #E6ECF5
+            bubble_out_meta: Color32::from_rgb(163, 184, 215), // #A3B8D7
+            bubble_in_bg: Color32::from_rgb(50, 56, 66),    // #323842 Atom Elevated Incoming Bubble
+            bubble_in_border: Color32::from_rgb(62, 68, 81), // #3E4451 Atom Gutter Border
+            bubble_in_text: Color32::from_rgb(215, 218, 224), // #D7DAE0
+            bubble_in_meta: Color32::from_rgb(142, 150, 165), // #8E96A5
         }
     }
 
@@ -167,14 +168,14 @@ impl ThemePalette {
 
 fn avatar_color_for(name: &str, is_group: bool) -> Color32 {
     const PALETTE: &[Color32] = &[
-        Color32::from_rgb(37, 99, 235),  // Blue
-        Color32::from_rgb(13, 148, 136), // Teal
-        Color32::from_rgb(124, 58, 237), // Violet
-        Color32::from_rgb(219, 39, 119), // Pink
-        Color32::from_rgb(234, 88, 12),  // Orange
-        Color32::from_rgb(5, 150, 105),  // Emerald
-        Color32::from_rgb(79, 70, 229),  // Indigo
-        Color32::from_rgb(2, 132, 199),  // Sky
+        Color32::from_rgb(64, 120, 192),  // Atom Blue (#4078C0)
+        Color32::from_rgb(56, 148, 160),  // Atom Cyan (#3894A0)
+        Color32::from_rgb(152, 88, 178),  // Atom Purple (#9858B2)
+        Color32::from_rgb(190, 80, 70),   // Atom Red (#BE5046)
+        Color32::from_rgb(184, 118, 62),  // Atom Orange (#B8763E)
+        Color32::from_rgb(98, 148, 72),   // Atom Green (#629448)
+        Color32::from_rgb(82, 116, 196),  // Atom Indigo
+        Color32::from_rgb(72, 138, 182),  // Atom Cerulean
     ];
     let mut hash: usize = if is_group { 3 } else { 0 };
     for b in name.bytes() {
@@ -9751,7 +9752,7 @@ impl ZaloGuiApp {
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(if pal.is_dark {
-                        Color32::from_rgba_unmultiplied(17, 24, 39, 248)
+                        Color32::from_rgba_unmultiplied(33, 37, 43, 248)
                     } else {
                         Color32::from_rgba_unmultiplied(255, 255, 255, 250)
                     })
@@ -10014,7 +10015,7 @@ impl ZaloGuiApp {
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(if pal.is_dark {
-                        Color32::from_rgba_unmultiplied(17, 24, 39, 248)
+                        Color32::from_rgba_unmultiplied(33, 37, 43, 248)
                     } else {
                         Color32::from_rgba_unmultiplied(255, 255, 255, 250)
                     })
@@ -10872,7 +10873,7 @@ fn render_date_divider(ui: &mut egui::Ui, msg: &ChatMessage, pal: &ThemePalette)
             );
         }
         let pill_bg = if pal.is_dark {
-            Color32::from_rgba_unmultiplied(30, 41, 59, 210)
+            Color32::from_rgba_unmultiplied(44, 49, 58, 225)
         } else {
             Color32::from_rgba_unmultiplied(219, 228, 240, 215)
         };
@@ -11145,7 +11146,7 @@ fn render_message_body(
         let card_inner_w = (max_text_width - 22.0).max(165.0);
         let card_bg = if outgoing {
             if pal.is_dark {
-                Color32::from_rgba_unmultiplied(8, 22, 52, 118)
+                Color32::from_rgba_unmultiplied(24, 26, 31, 115)
             } else {
                 Color32::from_rgba_unmultiplied(255, 255, 255, 195)
             }
@@ -11263,7 +11264,7 @@ fn render_message_body(
     let card_inner_w = (max_text_width - 22.0).max(175.0);
     let card_bg = if outgoing {
         if pal.is_dark {
-            Color32::from_rgba_unmultiplied(8, 22, 52, 122)
+            Color32::from_rgba_unmultiplied(24, 26, 31, 120)
         } else {
             Color32::from_rgba_unmultiplied(255, 255, 255, 210)
         }
@@ -11280,7 +11281,7 @@ fn render_message_body(
         pal.border
     };
     let accent_col = if outgoing && pal.is_dark {
-        Color32::from_rgb(147, 197, 253)
+        Color32::from_rgb(97, 175, 239)
     } else {
         pal.primary
     };
@@ -11708,7 +11709,7 @@ fn render_chat_bubble(
                 } else if !pal.is_dark {
                     Stroke::new(1.0_f32, Color32::from_rgb(186, 214, 255))
                 } else {
-                    Stroke::new(1.0_f32, Color32::from_rgb(30, 112, 238))
+                    Stroke::new(1.0_f32, Color32::from_rgb(66, 113, 174))
                 };
                 let rounding = if is_call_card {
                     Rounding::same(14.0)
