@@ -74,9 +74,9 @@ impl ThemePalette {
             accent_online: Color32::from_rgb(152, 195, 121), // #98C379 Atom @hue-4 Green
             danger: Color32::from_rgb(224, 108, 117),       // #E06C75 Atom @hue-5 Coral Red
             warning: Color32::from_rgb(229, 192, 123),      // #E5C07B Atom @hue-62 Warm Gold
-            bubble_out_bg: Color32::from_rgb(43, 76, 126),  // #2B4C7E Atom Deep Blue Outgoing Bubble
-            bubble_out_text: Color32::from_rgb(230, 236, 245), // #E6ECF5
-            bubble_out_meta: Color32::from_rgb(163, 184, 215), // #A3B8D7
+            bubble_out_bg: Color32::from_rgb(37, 55, 77),   // #25374D Zalo Dark Slate-Navy Outgoing Bubble
+            bubble_out_text: Color32::from_rgb(235, 240, 246), // #EBF0F6
+            bubble_out_meta: Color32::from_rgb(154, 171, 192), // #9AABC0
             bubble_in_bg: Color32::from_rgb(50, 56, 66),    // #323842 Atom Elevated Incoming Bubble
             bubble_in_border: Color32::from_rgb(62, 68, 81), // #3E4451 Atom Gutter Border
             bubble_in_text: Color32::from_rgb(215, 218, 224), // #D7DAE0
@@ -10716,41 +10716,59 @@ fn clean_display_url(url: &str, max_chars: usize) -> String {
 /// Note: `user_comment` only contains extra text typed by the sender *outside* the link's own
 /// `link_title` / `link_desc` (so `link_desc` is rendered inside the Link Preview Card rather than
 /// duplicated as a large paragraph above the card).
+fn extract_clean_domain(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("Liên kết")
+        .trim()
+        .strip_prefix("www.")
+        .unwrap_or_else(|| {
+            url.split("://")
+                .nth(1)
+                .unwrap_or(url)
+                .split('/')
+                .next()
+                .unwrap_or("Liên kết")
+                .trim()
+        })
+        .to_string()
+}
+
 fn extract_message_link_view(msg: &ChatMessage) -> Option<(String, String, String)> {
     if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-        let mut user_comment = msg.text.trim().to_string();
-        if let Some(pos) = user_comment
-            .find("http://")
-            .or_else(|| user_comment.find("https://"))
-        {
-            let after = &user_comment[pos..];
-            let end = after.find(char::is_whitespace).unwrap_or(after.len());
-            let found = &after[..end];
-            if found == url || found.starts_with(url.split('?').next().unwrap_or(url)) {
-                user_comment =
-                    format!("{}{}", &user_comment[..pos], &after[end..]).trim().to_string();
-            }
-        }
         let desc_trim = msg.link_desc.as_deref().unwrap_or("").trim();
         let title_trim = msg.link_title.as_deref().unwrap_or("").trim();
-        if user_comment == desc_trim
-            || user_comment == title_trim
-            || user_comment == url
-            || user_comment == "[Chia sẻ]"
-            || user_comment == "[Liên kết]"
-        {
-            user_comment.clear();
+        let url_base = url.split('?').next().unwrap_or(url);
+
+        let mut kept_lines = Vec::new();
+        for raw_line in msg.text.lines() {
+            let mut line = raw_line.trim().to_string();
+            if let Some(pos) = line.find("http://").or_else(|| line.find("https://")) {
+                let after = &line[pos..];
+                let end = after.find(char::is_whitespace).unwrap_or(after.len());
+                let found = &after[..end];
+                if found == url || found.starts_with(url_base) {
+                    line = format!("{}{}", &line[..pos], &after[end..]).trim().to_string();
+                }
+            }
+            if line.is_empty()
+                || line == url
+                || line == title_trim
+                || line == desc_trim
+                || line == "[Chia sẻ]"
+                || line == "[Liên kết]"
+                || (!desc_trim.is_empty() && desc_trim.contains(&line))
+                || (!title_trim.is_empty() && title_trim.contains(&line))
+            {
+                continue;
+            }
+            kept_lines.push(line);
         }
-        let domain = msg
-            .link_src
-            .clone()
-            .or_else(|| {
-                url.split("://")
-                    .nth(1)
-                    .and_then(|r| r.split('/').next())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "Liên kết".into());
+        let user_comment = kept_lines.join("\n").trim().to_string();
+        let domain = extract_clean_domain(url);
         return Some((user_comment, url.to_string(), domain));
     }
     let text = msg.text.trim();
@@ -10762,12 +10780,7 @@ fn extract_message_link_view(msg: &ChatMessage) -> Option<(String, String, Strin
         return None;
     }
     let caption = format!("{}{}", &text[..pos], &after[end..]).trim().to_string();
-    let domain = url
-        .split("://")
-        .nth(1)
-        .and_then(|r| r.split('/').next())
-        .unwrap_or("Liên kết")
-        .to_string();
+    let domain = extract_clean_domain(url);
     Some((caption, url.to_string(), domain))
 }
 
@@ -10842,61 +10855,47 @@ fn format_time_divider_label(msg: &ChatMessage) -> String {
         format!("Hôm nay • {hh:02}:{mm:02}")
     } else if msg_day == today_day - 1 {
         format!("Hôm qua • {hh:02}:{mm:02}")
-    } else if y == ty {
-        format!("{d:02}/{m:02} • {hh:02}:{mm:02}")
     } else {
-        format!("{d:02}/{m:02}/{y} • {hh:02}:{mm:02}")
+        format!("{d:02}/{m:02}/{y}")
     }
 }
 
-/// Render a centered Zalo-style date/time divider pill with soft side hairlines.
+/// Render a centered Zalo-style compact date pill (no side hairlines).
 fn render_date_divider(ui: &mut egui::Ui, msg: &ChatMessage, pal: &ThemePalette) {
     let label = format_time_divider_label(msg);
     let avail_w = ui.available_width();
     ui.horizontal(|ui| {
         let text_w = ui.fonts(|f| {
-            f.layout_no_wrap(label.clone(), FontId::proportional(11.5), pal.text_muted)
+            f.layout_no_wrap(label.clone(), FontId::proportional(11.5), pal.text_secondary)
                 .size()
                 .x
         });
-        let pill_w = text_w + 24.0;
-        let line_w = ((avail_w - pill_w - 24.0) * 0.5).max(0.0).min(90.0);
-        let left_space = ((avail_w - (pill_w + line_w * 2.0 + 16.0)) * 0.5).max(0.0);
+        let pill_w = text_w + 26.0;
+        let left_space = ((avail_w - pill_w) * 0.5).max(0.0);
         if left_space > 0.0 {
             ui.add_space(left_space);
         }
-        if line_w > 12.0 {
-            let (lrect, _) = ui.allocate_exact_size(Vec2::new(line_w, 22.0), Sense::hover());
-            ui.painter().line_segment(
-                [lrect.left_center(), lrect.right_center()],
-                Stroke::new(1.0_f32, pal.border.linear_multiply(0.65)),
-            );
-        }
         let pill_bg = if pal.is_dark {
-            Color32::from_rgba_unmultiplied(44, 49, 58, 225)
+            Color32::from_rgba_unmultiplied(30, 34, 41, 235)
         } else {
             Color32::from_rgba_unmultiplied(219, 228, 240, 215)
         };
         egui::Frame::none()
             .fill(pill_bg)
-            .stroke(Stroke::new(1.0_f32, pal.border.linear_multiply(0.75)))
-            .rounding(Rounding::same(11.0))
-            .inner_margin(Margin::symmetric(11.0, 3.0))
+            .rounding(Rounding::same(10.0))
+            .inner_margin(Margin::symmetric(13.0, 3.5))
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(label)
-                        .size(11.2)
-                        .color(pal.text_secondary)
+                        .size(11.4)
+                        .color(if pal.is_dark {
+                            Color32::from_rgb(215, 218, 224)
+                        } else {
+                            pal.text_secondary
+                        })
                         .strong(),
                 );
             });
-        if line_w > 12.0 {
-            let (rrect, _) = ui.allocate_exact_size(Vec2::new(line_w, 22.0), Sense::hover());
-            ui.painter().line_segment(
-                [rrect.left_center(), rrect.right_center()],
-                Stroke::new(1.0_f32, pal.border.linear_multiply(0.65)),
-            );
-        }
     });
 }
 
@@ -11143,23 +11142,6 @@ fn render_message_body(
     if is_zalo_file_or_video {
         let is_vid = msg.link_src.as_deref() == Some("Video Zalo")
             || trimmed_text.starts_with("[Video]");
-        let card_inner_w = (max_text_width - 22.0).max(165.0);
-        let card_bg = if outgoing {
-            if pal.is_dark {
-                Color32::from_rgba_unmultiplied(24, 26, 31, 115)
-            } else {
-                Color32::from_rgba_unmultiplied(255, 255, 255, 195)
-            }
-        } else if pal.is_dark {
-            pal.bg_app
-        } else {
-            Color32::from_rgb(241, 245, 249)
-        };
-        let card_border = if outgoing && pal.is_dark {
-            Color32::from_rgba_unmultiplied(147, 197, 253, 64)
-        } else {
-            pal.border
-        };
         let title_str = msg
             .link_title
             .as_deref()
@@ -11169,305 +11151,185 @@ fn render_message_body(
             .link_src
             .as_deref()
             .unwrap_or(if is_vid { "Video đính kèm" } else { "Tập tin đính kèm" });
-
-        egui::Frame::none()
-            .fill(card_bg)
-            .stroke(Stroke::new(1.0_f32, card_border))
-            .rounding(Rounding::same(11.0))
-            .inner_margin(Margin::symmetric(11.0, 9.0))
-            .show(ui, |ui| {
-                ui.set_min_width(card_inner_w);
-                ui.set_max_width(card_inner_w);
-                ui.horizontal(|ui| {
-                    let (badge_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(36.0, 36.0), Sense::hover());
-                    let badge_col = if outgoing && pal.is_dark {
-                        Color32::from_rgba_unmultiplied(255, 255, 255, 38)
-                    } else {
-                        pal.primary.linear_multiply(0.15)
-                    };
-                    ui.painter()
-                        .rect_filled(badge_rect, Rounding::same(8.0), badge_col);
-                    let icon_col = if outgoing && pal.is_dark {
-                        Color32::WHITE
-                    } else {
-                        pal.primary
-                    };
-                    if is_vid {
-                        draw_icon_video(ui.painter(), badge_rect.center(), 17.0, icon_col);
-                    } else {
-                        draw_icon_attachment(ui.painter(), badge_rect.center(), 17.0, icon_col);
-                    }
-                    let has_open_url = msg
-                        .link_url
-                        .as_deref()
-                        .map(|u| !u.is_empty())
-                        .unwrap_or(false);
-                    let file_text_w =
-                        (card_inner_w - if has_open_url { 104.0 } else { 46.0 }).max(88.0);
-                    ui.vertical(|ui| {
-                        ui.set_width(file_text_w);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(title_str).size(13.2).color(text_col).strong(),
-                            )
-                            .wrap(),
-                        );
-                        ui.label(RichText::new(sub_str).size(11.2).color(meta_col));
-                    });
-                    if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let btn = egui::Button::new(
-                                RichText::new("Mở ↗")
-                                    .size(11.5)
-                                    .color(icon_col)
-                                    .strong(),
-                            )
-                            .fill(badge_col)
-                            .rounding(Rounding::same(6.0))
-                            .min_size(Vec2::new(52.0, 24.0));
-                            if ui
-                                .add(btn)
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .on_hover_text(url)
-                                .clicked()
-                            {
-                                open_external_url(url);
-                            }
-                        });
-                    }
-                });
-            });
-        if let Some(cap) = msg.link_desc.as_deref().filter(|c| !c.trim().is_empty()) {
-            ui.add_space(5.0);
-            ui.add(egui::Label::new(RichText::new(cap).color(text_col).size(14.2)).wrap());
+        let link_col = if pal.is_dark {
+            Color32::from_rgb(97, 175, 239)
+        } else {
+            pal.primary
+        };
+        let resp = ui
+            .add(
+                egui::Label::new(RichText::new(title_str).size(13.8).color(text_col).strong())
+                    .wrap()
+                    .sense(Sense::click()),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand);
+        if resp.clicked() {
+            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
+                open_external_url(url);
+            }
+        }
+        ui.add_space(2.0);
+        let dom_resp = ui
+            .add(
+                egui::Label::new(RichText::new(sub_str).size(12.5).color(link_col))
+                    .sense(Sense::click()),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand);
+        if dom_resp.clicked() {
+            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
+                open_external_url(url);
+            }
         }
         return None;
     }
 
     let Some((caption, url, domain)) = extract_message_link_view(msg) else {
         ui.add(
-            egui::Label::new(RichText::new(&msg.text).color(text_col).size(14.2)).wrap(),
+            egui::Label::new(RichText::new(&msg.text).color(text_col).size(14.0)).wrap(),
         );
         return None;
     };
 
-    if !caption.is_empty() && caption != url {
-        ui.add(
-            egui::Label::new(RichText::new(&caption).color(text_col).size(14.2)).wrap(),
-        );
-        ui.add_space(6.0);
-    }
-
-    // Strict inner width so `card_inner_w + 2 * 11.0 == max_text_width == content_width`,
-    // ensuring left and right margins inside the outer chat bubble are 100% symmetrical!
-    let card_inner_w = (max_text_width - 22.0).max(175.0);
-    let card_bg = if outgoing {
-        if pal.is_dark {
-            Color32::from_rgba_unmultiplied(24, 26, 31, 120)
-        } else {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 210)
-        }
-    } else if pal.is_dark {
-        pal.bg_elevated
-    } else {
-        Color32::from_rgb(244, 247, 252)
-    };
-    let card_border = if outgoing && pal.is_dark {
-        Color32::from_rgba_unmultiplied(147, 197, 253, 68)
-    } else if outgoing {
-        Color32::from_rgb(172, 206, 255)
-    } else {
-        pal.border
-    };
-    let accent_col = if outgoing && pal.is_dark {
-        Color32::from_rgb(97, 175, 239)
+    let link_col = if pal.is_dark {
+        Color32::from_rgb(97, 175, 239) // #61AFEF Zalo/Atom clean link blue
     } else {
         pal.primary
     };
 
-    let card_frame = egui::Frame::none()
-        .fill(card_bg)
-        .stroke(Stroke::new(1.0_f32, card_border))
-        .rounding(Rounding::same(11.0))
-        .inner_margin(Margin::symmetric(11.0, 9.0))
-        .show(ui, |ui| {
-            ui.set_min_width(card_inner_w);
-            ui.set_max_width(card_inner_w);
-            ui.vertical(|ui| {
-                ui.set_min_width(card_inner_w);
-                ui.set_max_width(card_inner_w);
+    // Auto-enrich link metadata if title or thumbnail is missing/expired
+    let needs_meta_enrich = msg.link_title.is_none()
+        || msg.link_thumb.is_none()
+        || msg
+            .link_thumb
+            .as_deref()
+            .map(|th| {
+                th.contains("zpcloud.zdn.vn")
+                    && !sticker_textures
+                        .contains_key(&format!("thumb_{}", crate::crypto::md5_hex(th)))
+            })
+            .unwrap_or(false);
+    if needs_meta_enrich {
+        let meta_key = format!("linkmeta_{}", crate::crypto::md5_hex(&url));
+        if loading_stickers.insert(meta_key) {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::ParseLinkPreview { url: url.clone() });
+            }
+        }
+    }
 
-                // 1. Optional link thumbnail preview (loaded asynchronously via `FetchStickerImage`)
-                // Auto-enrich link metadata if title or thumbnail is missing/expired
-                let needs_meta_enrich = msg.link_title.is_none()
-                    || msg.link_thumb.is_none()
-                    || msg
-                        .link_thumb
-                        .as_deref()
-                        .map(|th| {
-                            th.contains("zpcloud.zdn.vn")
-                                && !sticker_textures
-                                    .contains_key(&format!("thumb_{}", crate::crypto::md5_hex(th)))
-                        })
-                        .unwrap_or(false);
-                if needs_meta_enrich {
-                    let meta_key = format!("linkmeta_{}", crate::crypto::md5_hex(&url));
-                    if loading_stickers.insert(meta_key) {
-                        if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::ParseLinkPreview { url: url.clone() });
-                        }
-                    }
-                }
-                if let Some(thumb_url) = msg.link_thumb.as_deref().filter(|u| !u.is_empty()) {
-                    let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
-                    if !sticker_textures.contains_key(&key)
-                        && (thumb_url.starts_with("http://") || thumb_url.starts_with("https://"))
-                        && loading_stickers.insert(key.clone())
-                    {
-                        if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                key: key.clone(),
-                                url: thumb_url.to_string(),
-                            });
-                        }
-                    }
-                    if let Some(tex) = sticker_textures.get(&key) {
-                        let [tw, th] = tex.size();
-                        let aspect = if tw > 0 && th > 0 {
-                            (th as f32 / tw as f32).clamp(0.45, 0.95)
-                        } else {
-                            0.56
-                        };
-                        let img_h = (card_inner_w * aspect).min(170.0);
-                        let img = egui::Image::new(tex)
-                            .fit_to_exact_size(Vec2::new(card_inner_w, img_h))
-                            .rounding(Rounding::same(8.0))
-                            .sense(Sense::click());
-                        if ui
-                            .add(img)
-                            .on_hover_cursor(CursorIcon::PointingHand)
-                            .on_hover_text(&url)
-                            .clicked()
-                        {
-                            open_external_url(&url);
-                        }
-                        ui.add_space(7.0);
-                    }
-                }
+    // 1. Optional user comment above the link
+    if !caption.is_empty() && caption != url {
+        ui.add(
+            egui::Label::new(RichText::new(&caption).color(text_col).size(13.8)).wrap(),
+        );
+        ui.add_space(4.0);
+    }
 
-                // 2. Source / Media Title with left accent bar
-                let header_title = msg
-                    .link_title
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
-                    .unwrap_or(&domain);
-                ui.horizontal_top(|ui| {
-                    ui.set_max_width(card_inner_w);
-                    let (bar_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(3.5, 16.0), Sense::hover());
-                    ui.painter()
-                        .rect_filled(bar_rect, Rounding::same(1.75), accent_col);
-                    ui.vertical(|ui| {
-                        ui.set_max_width((card_inner_w - 12.0).max(100.0));
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!("{} {header_title}", lucide::GLOBE))
-                                    .size(13.2)
-                                    .color(if outgoing && pal.is_dark {
-                                        Color32::WHITE
-                                    } else {
-                                        text_col
-                                    })
-                                    .strong(),
-                            )
-                            .wrap(),
-                        );
-                    });
+    // 2. Optional compact thumbnail directly inside the bubble (no nested card box)
+    if let Some(thumb_url) = msg.link_thumb.as_deref().filter(|u| !u.is_empty()) {
+        let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
+        if !sticker_textures.contains_key(&key)
+            && (thumb_url.starts_with("http://") || thumb_url.starts_with("https://"))
+            && loading_stickers.insert(key.clone())
+        {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::FetchStickerImage {
+                    key: key.clone(),
+                    url: thumb_url.to_string(),
                 });
+            }
+        }
+        if let Some(tex) = sticker_textures.get(&key) {
+            let [tw, th] = tex.size();
+            let aspect = if tw > 0 && th > 0 {
+                (th as f32 / tw as f32).clamp(0.45, 0.85)
+            } else {
+                0.56
+            };
+            let thumb_w = max_text_width.min(260.0);
+            let img_h = (thumb_w * aspect).min(132.0);
+            let img = egui::Image::new(tex)
+                .fit_to_exact_size(Vec2::new(thumb_w, img_h))
+                .rounding(Rounding::same(6.0))
+                .sense(Sense::click());
+            if ui
+                .add(img)
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(&url)
+                .clicked()
+            {
+                open_external_url(&url);
+            }
+            ui.add_space(5.0);
+        }
+    }
 
-                // 3. Link Description inside the card (e.g. TikTok/article summary)
-                let desc_opt = msg
-                    .link_desc
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|d| !d.is_empty() && *d != header_title && *d != url);
-                if let Some(desc) = desc_opt {
-                    ui.add_space(4.0);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(truncate_chars(desc, 160))
-                                .size(12.4)
-                                .color(if outgoing && pal.is_dark {
-                                    Color32::from_rgb(219, 234, 254)
-                                } else {
-                                    meta_col
-                                }),
-                        )
-                        .wrap(),
-                    );
-                }
-
-                ui.add_space(6.0);
-                // Subtle horizontal divider above the link footer row
-                let (sep_r, _) =
-                    ui.allocate_exact_size(Vec2::new(card_inner_w, 1.0), Sense::hover());
-                ui.painter().line_segment(
-                    [sep_r.left_center(), sep_r.right_center()],
-                    Stroke::new(1.0_f32, card_border),
-                );
-                ui.add_space(5.0);
-
-                // 4. Footer Row: Clean Domain/URL on left + "Mở ↗" pill button on right
-                let short_url = clean_display_url(&url, 30);
-                ui.horizontal(|ui| {
-                    ui.set_min_width(card_inner_w);
-                    ui.set_max_width(card_inner_w);
-                    ui.label(
-                        RichText::new(format!("{} {short_url}", lucide::LINK))
-                            .size(11.4)
-                            .color(accent_col),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let open_btn = egui::Button::new(
-                            RichText::new("Mở ↗")
-                                .size(11.5)
-                                .color(if outgoing && pal.is_dark {
-                                    Color32::WHITE
-                                } else {
-                                    pal.primary
-                                })
-                                .strong(),
-                        )
-                        .fill(if outgoing && pal.is_dark {
-                            Color32::from_rgba_unmultiplied(59, 130, 246, 95)
-                        } else {
-                            pal.primary.linear_multiply(0.14)
-                        })
-                        .stroke(Stroke::new(
-                            1.0_f32,
-                            if outgoing && pal.is_dark {
-                                Color32::from_rgba_unmultiplied(147, 197, 253, 90)
-                            } else {
-                                pal.primary.linear_multiply(0.35)
-                            },
-                        ))
-                        .rounding(Rounding::same(6.0))
-                        .min_size(Vec2::new(54.0, 24.0));
-                        if ui
-                            .add(open_btn)
-                            .on_hover_cursor(CursorIcon::PointingHand)
-                            .on_hover_text(&url)
-                            .clicked()
-                        {
-                            open_external_url(&url);
-                        }
-                    });
-                });
-            });
+    // 3. Bold Title (exact Zalo PC style: no globe icon, no vertical accent bar, no nested border)
+    let header_title = msg
+        .link_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != domain)
+        .unwrap_or_else(|| {
+            url.strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"))
+                .unwrap_or(&url)
         });
-    let _ = card_frame;
+    let title_resp = ui
+        .add(
+            egui::Label::new(
+                RichText::new(truncate_chars(header_title, 95))
+                    .size(13.8)
+                    .color(text_col)
+                    .strong(),
+            )
+            .wrap()
+            .sense(Sense::click()),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(&url);
+    if title_resp.clicked() {
+        open_external_url(&url);
+    }
+
+    // 4. Optional short description (only if concise and distinct)
+    let desc_opt = msg
+        .link_desc
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && *d != header_title && *d != url && caption.is_empty());
+    if let Some(desc) = desc_opt {
+        ui.add_space(2.0);
+        let d_resp = ui
+            .add(
+                egui::Label::new(
+                    RichText::new(truncate_chars(desc, 110))
+                        .size(12.3)
+                        .color(meta_col),
+                )
+                .wrap()
+                .sense(Sense::click()),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text(&url);
+        if d_resp.clicked() {
+            open_external_url(&url);
+        }
+    }
+
+    // 5. Clean Domain line (`docs.google.com`, `drive.google.com`, `tiktok.com`)
+    ui.add_space(2.5);
+    let dom_resp = ui
+        .add(
+            egui::Label::new(RichText::new(&domain).size(12.6).color(link_col))
+                .sense(Sense::click()),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(&url);
+    if dom_resp.clicked() {
+        open_external_url(&url);
+    }
+
     body_action
 }
 
@@ -11573,10 +11435,46 @@ fn render_chat_bubble(
         } else {
             photo_w
         }
-    } else if is_file_card {
-        max_text_width.min(280.0)
-    } else if has_link_card {
-        max_text_width.min(316.0)
+    } else if is_file_card || has_link_card {
+        let has_loaded_thumb = msg
+            .link_thumb
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .map(|u| sticker_textures.contains_key(&format!("thumb_{}", crate::crypto::md5_hex(u))))
+            .unwrap_or(false);
+        if has_loaded_thumb {
+            max_text_width.min(260.0)
+        } else {
+            let (cap, url, dom) = extract_message_link_view(msg).unwrap_or_default();
+            let title = msg
+                .link_title
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| if !url.is_empty() { &url } else { msg.text.trim() });
+            let desc = msg.link_desc.as_deref().unwrap_or("");
+            let measure = |s: &str, sz: f32| -> f32 {
+                if s.is_empty() {
+                    0.0
+                } else {
+                    ui.fonts(|f| {
+                        f.layout(
+                            truncate_chars(s, 110).into_owned(),
+                            FontId::proportional(sz),
+                            Color32::WHITE,
+                            max_text_width.min(340.0),
+                        )
+                        .size()
+                        .x
+                    })
+                }
+            };
+            let w = measure(title, 13.8)
+                .max(measure(&cap, 13.8))
+                .max(measure(desc, 12.3))
+                .max(measure(&dom, 12.6))
+                + 8.0;
+            w.clamp(135.0, max_text_width.min(340.0)).ceil()
+        }
     } else {
         let display_str = if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
             "  Tin nhắn đã được thu hồi"
@@ -11641,34 +11539,28 @@ fn render_chat_bubble(
         } else {
             0.0_f32
         };
+        let ts_min_w = if show_timestamp && is_latest_outgoing && msg.is_outgoing {
+            96.0_f32
+        } else {
+            44.0_f32
+        };
         text_w
             .max(quote_w)
             .max(sender_w)
             .max(marks_w)
-            .max(44.0)
+            .max(ts_min_w)
             .min(max_text_width)
             .ceil()
             + 4.0
     };
 
-    let is_compact_card_only = (has_link_card
-        && extract_message_link_view(msg)
-            .map(|(cap, _, _)| cap.is_empty())
-            .unwrap_or(false)
-        && msg.reply_to_text.is_none()
-        && !show_group_sender)
-        || (is_file_card && msg.reply_to_text.is_none() && !show_group_sender);
     let h_margin = if has_sticker || is_frameless_photo {
         2.0_f32
-    } else if is_compact_card_only {
-        7.0_f32
     } else {
         12.0_f32
     };
     let v_margin = if has_sticker || is_frameless_photo {
         2.0_f32
-    } else if is_compact_card_only {
-        7.0_f32
     } else {
         8.5_f32
     };
@@ -11709,18 +11601,9 @@ fn render_chat_bubble(
                 } else if !pal.is_dark {
                     Stroke::new(1.0_f32, Color32::from_rgb(186, 214, 255))
                 } else {
-                    Stroke::new(1.0_f32, Color32::from_rgb(66, 113, 174))
+                    Stroke::new(1.0_f32, Color32::from_rgb(53, 76, 104))
                 };
-                let rounding = if is_call_card {
-                    Rounding::same(14.0)
-                } else {
-                    Rounding {
-                        nw: 15.0,
-                        ne: if prev_same_sender { 5.0 } else { 15.0 },
-                        sw: 15.0,
-                        se: if next_same_sender { 5.0 } else { 4.0 },
-                    }
-                };
+                let rounding = Rounding::same(8.0);
 
                 let mut card_action = None;
                 let fr = egui::Frame::none()
@@ -11754,6 +11637,19 @@ fn render_chat_bubble(
                                 );
                             }
                             render_reactions(ui, msg, pal, emoji_textures);
+                            if show_timestamp && !has_sticker && !is_frameless_photo {
+                                ui.add_space(3.5);
+                                let ts_txt = if is_latest_outgoing {
+                                    format!("{} · Đã nhận", msg.time)
+                                } else {
+                                    msg.time.clone()
+                                };
+                                ui.label(
+                                    RichText::new(ts_txt)
+                                        .size(11.0)
+                                        .color(pal.bubble_out_meta),
+                                );
+                            }
                         });
                     });
                 card_action.or_else(|| {
@@ -11768,35 +11664,6 @@ fn render_chat_bubble(
                     )
                 })
             });
-
-            // Crisp external meta row below outgoing bubble with vector double-check icon (`✓✓`)
-            if show_timestamp {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_space(8.0);
-                    let (chk_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(14.0, 12.0), Sense::hover());
-                    draw_icon_check_double(
-                        ui.painter(),
-                        chk_rect.center(),
-                        12.5,
-                        if is_latest_outgoing {
-                            pal.accent_online
-                        } else {
-                            Color32::from_rgb(96, 165, 250)
-                        },
-                    );
-                    let status_txt = if is_latest_outgoing {
-                        format!("{} · Đã nhận", msg.time)
-                    } else {
-                        msg.time.clone()
-                    };
-                    ui.label(
-                        RichText::new(status_txt)
-                            .size(10.8)
-                            .color(pal.text_muted),
-                    );
-                });
-            }
 
             row_resp.inner
         });
@@ -11855,16 +11722,7 @@ fn render_chat_bubble(
             } else {
                 Stroke::new(1.0_f32, pal.bubble_in_border)
             };
-            let rounding = if is_call_card {
-                Rounding::same(14.0)
-            } else {
-                Rounding {
-                    nw: if prev_same_sender { 5.0 } else { 4.0 },
-                    ne: 15.0,
-                    sw: if next_same_sender { 5.0 } else { 15.0 },
-                    se: 15.0,
-                }
-            };
+            let rounding = Rounding::same(8.0);
 
             ui.vertical(|ui| {
                 ui.set_max_width(total_bubble_w);
@@ -11909,19 +11767,16 @@ fn render_chat_bubble(
                                 );
                             }
                             render_reactions(ui, msg, pal, emoji_textures);
+                            if show_timestamp && !has_sticker && !is_frameless_photo {
+                                ui.add_space(3.5);
+                                ui.label(
+                                    RichText::new(&msg.time)
+                                        .color(pal.bubble_in_meta)
+                                        .size(11.0),
+                                );
+                            }
                         });
                     });
-                if show_timestamp {
-                    ui.add_space(1.5);
-                    ui.horizontal(|ui| {
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(&msg.time)
-                                .color(pal.text_muted)
-                                .size(10.5),
-                        );
-                    });
-                }
                 card_action.or_else(|| {
                     bubble_context_menu(
                         ui,
