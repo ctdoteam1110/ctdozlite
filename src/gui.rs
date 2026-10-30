@@ -396,10 +396,6 @@ fn draw_icon_attachment(painter: &egui::Painter, center: Pos2, size: f32, color:
     draw_lucide_icon(painter, center, lucide::PAPERCLIP, size, color);
 }
 
-fn draw_icon_check_double(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    draw_lucide_icon(painter, center, lucide::CHECK_CHECK, size, color);
-}
-
 fn draw_icon_chat_nav(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     draw_lucide_icon(painter, center, lucide::MESSAGE_SQUARE, size, color);
 }
@@ -8775,7 +8771,7 @@ impl ZaloGuiApp {
         }
     }
 
-    fn render_image_viewer_modal(&mut self, ctx: &egui::Context, _pal: &ThemePalette) {
+    fn render_image_viewer_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         let Some(mut viewer) = self.image_viewer.clone() else {
             return;
         };
@@ -8785,27 +8781,38 @@ impl ZaloGuiApp {
             return;
         }
 
-        // Smooth mouse-wheel zoom while lightbox is open (with or without Ctrl)
         let scroll_delta_y = ctx.input(|i| i.smooth_scroll_delta.y);
         if scroll_delta_y.abs() > 0.5 {
             viewer.zoom = (viewer.zoom + scroll_delta_y * 0.0025).clamp(0.4, 4.0);
         }
 
         let screen_rect = ctx.screen_rect();
+        // Start below the 32px custom frameless title bar so window controls stay accessible
+        let viewer_top = (screen_rect.top() + 32.0).min(screen_rect.bottom());
+        let toolbar_h = 46.0_f32;
+        let toolbar_rect = Rect::from_min_max(
+            Pos2::new(screen_rect.left(), viewer_top),
+            Pos2::new(screen_rect.right(), (viewer_top + toolbar_h).min(screen_rect.bottom())),
+        );
+        let stage_area_rect = Rect::from_min_max(
+            Pos2::new(screen_rect.left(), toolbar_rect.bottom()),
+            screen_rect.max,
+        );
         let mut should_close = false;
 
-        // 1. Deep translucent full-screen theater backdrop (click anywhere outside to dismiss)
+        // 1. Clean Atom One Dark theater canvas below the toolbar (click outside image to dismiss)
         egui::Area::new(Id::new("image_viewer_backdrop"))
             .order(egui::Order::Foreground)
-            .fixed_pos(screen_rect.min)
+            .fixed_pos(stage_area_rect.min)
             .show(ctx, |ui| {
                 let (bg_rect, bg_resp) =
-                    ui.allocate_exact_size(screen_rect.size(), Sense::click());
-                ui.painter().rect_filled(
-                    bg_rect,
-                    Rounding::ZERO,
-                    Color32::from_rgba_unmultiplied(4, 7, 15, 232),
-                );
+                    ui.allocate_exact_size(stage_area_rect.size(), Sense::click());
+                let bg_col = if pal.is_dark {
+                    Color32::from_rgba_unmultiplied(24, 26, 31, 244) // #181A1F Atom One Dark deep canvas
+                } else {
+                    Color32::from_rgba_unmultiplied(24, 28, 36, 228)
+                };
+                ui.painter().rect_filled(bg_rect, Rounding::ZERO, bg_col);
                 if bg_resp.clicked() {
                     should_close = true;
                 }
@@ -8818,124 +8825,130 @@ impl ZaloGuiApp {
             .or_else(|| self.sticker_textures.get(&viewer.tex_key))
             .cloned();
 
-        // 2. Compute tight card dimensions that hug the image's natural aspect ratio
-        let max_stage_w = (screen_rect.width() * 0.86).clamp(320.0, 1080.0);
-        let max_stage_h = (screen_rect.height() - 148.0).clamp(220.0, 780.0);
+        let max_stage_w = (stage_area_rect.width() - 48.0).clamp(240.0, 1280.0);
+        let max_stage_h = (stage_area_rect.height() - 36.0).clamp(180.0, 880.0);
 
         let (disp_w, disp_h, natural_dims) = if let Some(ref tex) = active_tex {
             let [tw, th] = tex.size();
             let tw_f = (tw.max(1)) as f32;
             let th_f = (th.max(1)) as f32;
             let fit_scale = (max_stage_w / tw_f).min(max_stage_h / th_f).min(1.5);
-            let w = (tw_f * fit_scale * viewer.zoom).clamp(160.0, max_stage_w);
-            let h = (th_f * fit_scale * viewer.zoom).clamp(120.0, max_stage_h);
+            let w = (tw_f * fit_scale * viewer.zoom).clamp(120.0, max_stage_w);
+            let h = (th_f * fit_scale * viewer.zoom).clamp(90.0, max_stage_h);
             (w, h, Some((tw, th)))
         } else {
-            (380.0_f32.min(max_stage_w), 240.0_f32.min(max_stage_h), None)
+            (340.0_f32.min(max_stage_w), 220.0_f32.min(max_stage_h), None)
         };
 
-        let stage_rect = Rect::from_center_size(
-            Pos2::new(screen_rect.center().x, screen_rect.center().y - 6.0),
-            Vec2::new(disp_w, disp_h),
+        let img_pos = Pos2::new(
+            stage_area_rect.center().x - disp_w * 0.5,
+            stage_area_rect.center().y - disp_h * 0.5,
         );
 
-        // 3. Central Frameless Image Stage (hugs the exact image bounds — zero giant empty box)
+        // 2. Frameless Image Stage (no clunky outer frame box — subtle shadow + 1px hairline on image)
         egui::Area::new(Id::new("image_viewer_stage"))
             .order(egui::Order::Tooltip)
-            .fixed_pos(stage_rect.min)
+            .fixed_pos(img_pos)
             .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(13, 19, 31))
-                    .stroke(Stroke::new(
-                        1.2_f32,
-                        Color32::from_rgba_unmultiplied(148, 163, 184, 55),
-                    ))
-                    .rounding(Rounding::same(14.0))
-                    .inner_margin(Margin::same(6.0))
-                    .show(ui, |ui| {
-                        if let Some(ref tex) = active_tex {
-                            let img_widget = egui::Image::new(tex)
-                                .fit_to_exact_size(Vec2::new(disp_w, disp_h))
-                                .rounding(Rounding::same(10.0))
-                                .sense(Sense::click());
-                            let img_resp = ui.add(img_widget);
-                            if img_resp.double_clicked() {
-                                viewer.zoom = if (viewer.zoom - 1.0).abs() < 0.05 {
-                                    2.0
-                                } else {
-                                    1.0
-                                };
-                            }
+                if let Some(ref tex) = active_tex {
+                    let img_widget = egui::Image::new(tex)
+                        .fit_to_exact_size(Vec2::new(disp_w, disp_h))
+                        .rounding(Rounding::same(4.0))
+                        .sense(Sense::click());
+                    let img_resp = ui.add(img_widget);
+                    ui.painter().rect_stroke(
+                        img_resp.rect,
+                        Rounding::same(4.0),
+                        Stroke::new(1.0_f32, pal.border),
+                    );
+                    if img_resp.double_clicked() {
+                        viewer.zoom = if (viewer.zoom - 1.0).abs() < 0.05 {
+                            2.0
                         } else {
+                            1.0
+                        };
+                    }
+                } else {
+                    egui::Frame::none()
+                        .fill(pal.bg_elevated)
+                        .stroke(Stroke::new(1.0_f32, pal.border))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::same(20.0))
+                        .show(ui, |ui| {
                             ui.set_min_size(Vec2::new(disp_w, disp_h));
                             ui.vertical_centered(|ui| {
-                                ui.add_space(disp_h * 0.34);
+                                ui.add_space(disp_h * 0.30);
                                 ui.spinner();
                                 ui.add_space(10.0);
                                 ui.label(
                                     RichText::new("Đang tải hình ảnh…")
                                         .size(13.0)
-                                        .color(Color32::from_rgb(203, 213, 225))
+                                        .color(pal.text_primary)
                                         .strong(),
                                 );
-                                if !viewer.full_url.is_empty() {
-                                    ui.add_space(8.0);
-                                    if ui
-                                        .button(
-                                            RichText::new(format!(
-                                                "{} Mở trực tiếp trên trình duyệt",
-                                                lucide::EXTERNAL_LINK
-                                            ))
-                                            .size(11.8)
-                                            .color(Color32::from_rgb(96, 165, 250)),
-                                        )
-                                        .on_hover_cursor(CursorIcon::PointingHand)
-                                        .clicked()
-                                    {
-                                        open_external_url(&viewer.full_url);
-                                        should_close = true;
-                                    }
-                                }
                             });
-                        }
-                    });
+                        });
+                }
             });
 
-        // 4. Floating Top Header Pill (Title, Sender/Dimensions + Circular Close Button)
-        let header_w = (screen_rect.width() - 48.0).clamp(300.0, 760.0);
-        let header_pos = Pos2::new(
-            screen_rect.center().x - header_w * 0.5,
-            (screen_rect.top() + 16.0).max(12.0),
-        );
+        // 3. Clean Unified Top Toolbar Bar (docked under custom title bar, matching Atom One Dark pal.bg_sidebar)
+        let clean_title = {
+            let mut t = viewer
+                .title
+                .trim()
+                .trim_start_matches(lucide::IMAGE)
+                .trim();
+            if let Some(paren_idx) = t.rfind(" (") {
+                if t[paren_idx..].contains('×') || t[paren_idx..].contains("KB") || t[paren_idx..].contains("MB") {
+                    t = t[..paren_idx].trim();
+                }
+            }
+            if t.is_empty() {
+                "Hình ảnh đính kèm"
+            } else {
+                t
+            }
+        };
+
         egui::Area::new(Id::new("image_viewer_top_bar"))
             .order(egui::Order::Tooltip)
-            .fixed_pos(header_pos)
+            .fixed_pos(toolbar_rect.min)
             .show(ctx, |ui| {
                 egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(15, 23, 42, 235))
-                    .stroke(Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgba_unmultiplied(71, 85, 105, 120),
-                    ))
-                    .rounding(Rounding::same(12.0))
-                    .inner_margin(Margin::symmetric(14.0, 8.0))
+                    .fill(pal.bg_sidebar)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .inner_margin(Margin::symmetric(16.0, 6.0))
                     .show(ui, |ui| {
-                        ui.set_width(header_w - 28.0);
-                        ui.horizontal(|ui| {
-                            let (ir, _) =
-                                ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                        ui.set_min_size(Vec2::new(
+                            (toolbar_rect.width() - 32.0).max(200.0),
+                            toolbar_h - 12.0,
+                        ));
+                        ui.set_max_size(Vec2::new(
+                            (toolbar_rect.width() - 32.0).max(200.0),
+                            toolbar_h - 12.0,
+                        ));
+                        ui.horizontal_centered(|ui| {
+                            // Left: Subtle icon badge + filename + sender/time/dimensions
+                            let (badge_r, _) =
+                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                            ui.painter().rect_filled(
+                                badge_r,
+                                Rounding::same(6.0),
+                                pal.bg_elevated,
+                            );
                             draw_icon_image(
                                 ui.painter(),
-                                ir.center(),
-                                16.5,
-                                Color32::from_rgb(96, 165, 250),
+                                badge_r.center(),
+                                15.0,
+                                pal.primary_hover,
                             );
+                            ui.add_space(4.0);
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 1.0;
                                 ui.label(
-                                    RichText::new(truncate_chars(&viewer.title, 48))
-                                        .size(13.2)
-                                        .color(Color32::WHITE)
+                                    RichText::new(truncate_chars(clean_title, 44))
+                                        .size(13.0)
+                                        .color(pal.text_primary)
                                         .strong(),
                                 );
                                 let dim_str = match natural_dims {
@@ -8950,168 +8963,149 @@ impl ZaloGuiApp {
                                 ui.label(
                                     RichText::new(sub)
                                         .size(11.0)
-                                        .color(Color32::from_rgb(148, 163, 184)),
+                                        .color(pal.text_muted),
                                 );
                             });
 
+                            // Right: Unified Zoom + Actions + Close
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+
+                                // Close button (30x28, Atom One Dark style)
                                 let (close_r, close_resp) = ui.allocate_exact_size(
-                                    Vec2::new(32.0, 32.0),
+                                    Vec2::new(30.0, 28.0),
                                     Sense::click(),
                                 );
                                 ui.painter().rect_filled(
                                     close_r,
-                                    Rounding::same(8.0),
+                                    Rounding::same(6.0),
                                     if close_resp.hovered() {
-                                        Color32::from_rgb(220, 38, 38)
+                                        pal.danger
                                     } else {
-                                        Color32::from_rgb(30, 41, 59)
+                                        pal.bg_elevated
                                     },
+                                );
+                                ui.painter().rect_stroke(
+                                    close_r,
+                                    Rounding::same(6.0),
+                                    Stroke::new(1.0_f32, pal.border),
                                 );
                                 draw_lucide_icon(
                                     ui.painter(),
                                     close_r.center(),
                                     lucide::X,
-                                    16.0,
-                                    Color32::WHITE,
+                                    14.5,
+                                    if close_resp.hovered() {
+                                        Color32::WHITE
+                                    } else {
+                                        pal.text_secondary
+                                    },
                                 );
                                 if close_resp
                                     .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Đóng (Esc)")
+                                    .on_hover_text("Đóng xem ảnh (Esc)")
                                     .clicked()
                                 {
                                     should_close = true;
                                 }
-                            });
-                        });
-                    });
-            });
 
-        // 5. Floating Bottom Control Dock (Lucide Minus / 100% / Plus / Copy / Open External)
-        let dock_w = if viewer.full_url.is_empty() {
-            164.0
-        } else {
-            356.0
-        };
-        let dock_pos = Pos2::new(
-            screen_rect.center().x - dock_w * 0.5,
-            (screen_rect.bottom() - 56.0).max(stage_rect.bottom() + 10.0).min(screen_rect.bottom() - 48.0),
-        );
-        egui::Area::new(Id::new("image_viewer_bottom_dock"))
-            .order(egui::Order::Tooltip)
-            .fixed_pos(dock_pos)
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(15, 23, 42, 238))
-                    .stroke(Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgba_unmultiplied(71, 85, 105, 135),
-                    ))
-                    .rounding(Rounding::same(20.0))
-                    .inner_margin(Margin::symmetric(12.0, 6.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
+                                if !viewer.full_url.is_empty() {
+                                    let ext_btn = egui::Button::new(
+                                        RichText::new(format!("{} Mở gốc", lucide::EXTERNAL_LINK))
+                                            .size(11.8)
+                                            .color(pal.text_primary),
+                                    )
+                                    .fill(pal.bg_elevated)
+                                    .stroke(Stroke::new(1.0_f32, pal.border))
+                                    .rounding(Rounding::same(6.0))
+                                    .min_size(Vec2::new(72.0, 28.0));
+                                    if ui
+                                        .add(ext_btn)
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .on_hover_text(&viewer.full_url)
+                                        .clicked()
+                                    {
+                                        open_external_url(&viewer.full_url);
+                                    }
 
-                            // Zoom Out (Lucide MINUS — never tofu `□`)
-                            let zout_btn = egui::Button::new(
-                                RichText::new(lucide::MINUS)
-                                    .size(13.5)
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(Color32::from_rgb(30, 41, 59))
-                            .rounding(Rounding::same(14.0))
-                            .min_size(Vec2::new(28.0, 28.0));
-                            if ui
-                                .add(zout_btn)
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .on_hover_text("Thu nhỏ (-25%)")
-                                .clicked()
-                            {
-                                viewer.zoom = (viewer.zoom - 0.25).max(0.4);
-                            }
-
-                            // Reset Zoom Percentage Pill
-                            let zoom_pct = format!("{:.0}%", viewer.zoom * 100.0);
-                            let zreset_btn = egui::Button::new(
-                                RichText::new(zoom_pct)
-                                    .size(12.0)
-                                    .color(Color32::from_rgb(147, 197, 253))
-                                    .strong(),
-                            )
-                            .fill(Color32::from_rgb(30, 41, 59))
-                            .rounding(Rounding::same(14.0))
-                            .min_size(Vec2::new(54.0, 28.0));
-                            if ui
-                                .add(zreset_btn)
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .on_hover_text("Đặt lại 100% (hoặc nhấp đúp vào ảnh)")
-                                .clicked()
-                            {
-                                viewer.zoom = 1.0;
-                            }
-
-                            // Zoom In (Lucide PLUS — never tofu `□`)
-                            let zin_btn = egui::Button::new(
-                                RichText::new(lucide::PLUS)
-                                    .size(13.5)
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(Color32::from_rgb(30, 41, 59))
-                            .rounding(Rounding::same(14.0))
-                            .min_size(Vec2::new(28.0, 28.0));
-                            if ui
-                                .add(zin_btn)
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .on_hover_text("Phóng to (+25%)")
-                                .clicked()
-                            {
-                                viewer.zoom = (viewer.zoom + 0.25).min(4.0);
-                            }
-
-                            if !viewer.full_url.is_empty() {
-                                let (div_r, _) =
-                                    ui.allocate_exact_size(Vec2::new(6.0, 18.0), Sense::hover());
-                                ui.painter().line_segment(
-                                    [div_r.center_top(), div_r.center_bottom()],
-                                    Stroke::new(1.0_f32, Color32::from_rgb(51, 65, 85)),
-                                );
-
-                                let copy_btn = egui::Button::new(
-                                    RichText::new(format!("{} Sao chép", lucide::COPY))
-                                        .size(11.8)
-                                        .color(Color32::from_rgb(226, 232, 240)),
-                                )
-                                .fill(Color32::from_rgb(30, 41, 59))
-                                .rounding(Rounding::same(14.0))
-                                .min_size(Vec2::new(82.0, 28.0));
-                                if ui
-                                    .add(copy_btn)
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .clicked()
-                                {
-                                    ui.ctx().copy_text(viewer.full_url.clone());
-                                    self.show_toast("Đã sao chép đường dẫn ảnh vào bộ nhớ tạm");
+                                    let copy_btn = egui::Button::new(
+                                        RichText::new(format!("{} Sao chép", lucide::COPY))
+                                            .size(11.8)
+                                            .color(pal.text_secondary),
+                                    )
+                                    .fill(pal.bg_elevated)
+                                    .stroke(Stroke::new(1.0_f32, pal.border))
+                                    .rounding(Rounding::same(6.0))
+                                    .min_size(Vec2::new(78.0, 28.0));
+                                    if ui
+                                        .add(copy_btn)
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        ui.ctx().copy_text(viewer.full_url.clone());
+                                        self.show_toast("Đã sao chép đường dẫn ảnh vào bộ nhớ tạm");
+                                    }
                                 }
 
-                                let ext_btn = egui::Button::new(
-                                    RichText::new(format!("{} Mở gốc", lucide::EXTERNAL_LINK))
+                                // Zoom In (+)
+                                let zin_btn = egui::Button::new(
+                                    RichText::new(lucide::PLUS)
+                                        .size(12.5)
+                                        .color(pal.text_secondary),
+                                )
+                                .fill(pal.bg_elevated)
+                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .rounding(Rounding::same(6.0))
+                                .min_size(Vec2::new(28.0, 28.0));
+                                if ui
+                                    .add(zin_btn)
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("Phóng to (+25%)")
+                                    .clicked()
+                                {
+                                    viewer.zoom = (viewer.zoom + 0.25).min(4.0);
+                                }
+
+                                // Zoom Percentage Reset
+                                let zoom_pct = format!("{:.0}%", viewer.zoom * 100.0);
+                                let zreset_btn = egui::Button::new(
+                                    RichText::new(zoom_pct)
                                         .size(11.8)
-                                        .color(Color32::WHITE)
+                                        .color(pal.primary_hover)
                                         .strong(),
                                 )
-                                .fill(Color32::from_rgb(37, 99, 235))
-                                .rounding(Rounding::same(14.0))
-                                .min_size(Vec2::new(78.0, 28.0));
+                                .fill(pal.bg_input)
+                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .rounding(Rounding::same(6.0))
+                                .min_size(Vec2::new(50.0, 28.0));
                                 if ui
-                                    .add(ext_btn)
+                                    .add(zreset_btn)
                                     .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text(&viewer.full_url)
+                                    .on_hover_text("Đặt lại 100% (hoặc nhấp đúp vào ảnh)")
                                     .clicked()
                                 {
-                                    open_external_url(&viewer.full_url);
+                                    viewer.zoom = 1.0;
                                 }
-                            }
+
+                                // Zoom Out (-)
+                                let zout_btn = egui::Button::new(
+                                    RichText::new(lucide::MINUS)
+                                        .size(12.5)
+                                        .color(pal.text_secondary),
+                                )
+                                .fill(pal.bg_elevated)
+                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .rounding(Rounding::same(6.0))
+                                .min_size(Vec2::new(28.0, 28.0));
+                                if ui
+                                    .add(zout_btn)
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("Thu nhỏ (-25%)")
+                                    .clicked()
+                                {
+                                    viewer.zoom = (viewer.zoom - 0.25).max(0.4);
+                                }
+                            });
                         });
                     });
             });
@@ -10849,7 +10843,6 @@ fn format_time_divider_label(msg: &ChatMessage) -> String {
     let now_sec = (crate::login::unix_now() as i64) + tz_offset_sec;
     let today_day = now_sec.div_euclid(86_400);
     let (y, m, d) = civil_from_days(msg_day);
-    let (ty, _, _) = civil_from_days(today_day);
 
     if msg_day == today_day {
         format!("Hôm nay • {hh:02}:{mm:02}")
