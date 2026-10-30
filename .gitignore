@@ -9,6 +9,7 @@ session*.bak
 # Local message caches & databases
 threads_cache.json
 threads_cache*.json
+app_settings.json
 *.db
 *.db-shm
 *.db-wal
