@@ -97,9 +97,10 @@ async fn main() -> Result<()> {
             }
         }
         let mut viewport = eframe::egui::ViewportBuilder::default()
+            .with_decorations(false)
             .with_inner_size([1020.0, 700.0])
             .with_min_inner_size([480.0, 360.0])
-            .with_title("Zalo - Rust Native Client");
+            .with_title("Zalo");
         if let Some(icon) = gui::load_app_icon() {
             viewport = viewport.with_icon(std::sync::Arc::new(icon));
         }

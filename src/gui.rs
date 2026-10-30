@@ -3873,73 +3873,8 @@ impl eframe::App for ZaloGuiApp {
 
         let pal = self.palette();
 
-        // Only show a minimal top bar on the Login screen; when logged in, the 64px Left
-        // Navigation Rail replaces both the top bar and the bottom status footer.
-        if !self.is_logged_in {
-            egui::TopBottomPanel::top("top_bar_login")
-                .frame(
-                    egui::Frame::none()
-                        .fill(pal.bg_sidebar)
-                        .inner_margin(Margin::symmetric(16.0, 9.0))
-                        .stroke(Stroke::new(1.0_f32, pal.border)),
-                )
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        let (logo_rect, _) =
-                            ui.allocate_exact_size(Vec2::new(28.0, 28.0), Sense::hover());
-                        if let Some(tex) = &self.app_logo_texture {
-                            ui.painter().image(
-                                tex.id(),
-                                logo_rect,
-                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                Color32::WHITE,
-                            );
-                        } else {
-                            ui.painter()
-                                .rect_filled(logo_rect, Rounding::same(7.0), pal.primary);
-                            ui.painter().text(
-                                logo_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "Z",
-                                FontId::proportional(16.5),
-                                Color32::WHITE,
-                            );
-                        }
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("Zalo")
-                                .color(pal.text_primary)
-                                .size(17.5)
-                                .strong(),
-                        );
-                        ui.label(
-                            RichText::new("Native Desktop")
-                                .color(pal.text_muted)
-                                .size(12.5),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if !self.threads.is_empty() {
-                                let hist_btn = egui::Button::new(
-                                    RichText::new("Xem lịch sử đã lưu")
-                                        .size(12.5)
-                                        .color(pal.primary)
-                                        .strong(),
-                                )
-                                .fill(pal.primary.linear_multiply(0.12))
-                                .stroke(Stroke::new(1.0_f32, pal.primary))
-                                .rounding(Rounding::same(6.0));
-                                if ui
-                                    .add(hist_btn)
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .clicked()
-                                {
-                                    self.is_logged_in = true;
-                                }
-                            }
-                        });
-                    });
-                });
-        }
+        Self::handle_frameless_resize(ctx);
+        self.render_custom_title_bar(ctx, &pal);
         // Dev Inspector Panel
         if self.dev_mode && self.dev_panel_open {
             egui::TopBottomPanel::bottom("dev_inspector")
@@ -3996,6 +3931,19 @@ impl eframe::App for ZaloGuiApp {
         } else {
             self.render_chat_workspace(ctx, &pal);
         }
+
+        if !ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            let screen = ctx.screen_rect();
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                Id::new("window_border_overlay"),
+            ))
+            .rect_stroke(
+                screen.shrink(0.5),
+                Rounding::ZERO,
+                Stroke::new(1.0_f32, pal.border),
+            );
+        }
     }
 }
 
@@ -4004,6 +3952,329 @@ impl eframe::App for ZaloGuiApp {
 // ---------------------------------------------------------------------------
 
 impl ZaloGuiApp {
+    fn handle_frameless_resize(ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else {
+            return;
+        };
+        let border = 5.0_f32;
+        let corner = 9.0_f32;
+        let left = (pos.x - screen.left()).abs() <= border;
+        let right = (screen.right() - pos.x).abs() <= border;
+        let top = (pos.y - screen.top()).abs() <= border;
+        let bottom = (screen.bottom() - pos.y).abs() <= border;
+
+        let left_c = (pos.x - screen.left()).abs() <= corner;
+        let right_c = (screen.right() - pos.x).abs() <= corner;
+        let top_c = (pos.y - screen.top()).abs() <= corner;
+        let bottom_c = (screen.bottom() - pos.y).abs() <= corner;
+
+        let dir_and_cursor = if top_c && left_c && (top || left) {
+            Some((egui::ResizeDirection::NorthWest, CursorIcon::ResizeNwSe))
+        } else if top_c && right_c && (top || right) {
+            Some((egui::ResizeDirection::NorthEast, CursorIcon::ResizeNeSw))
+        } else if bottom_c && left_c && (bottom || left) {
+            Some((egui::ResizeDirection::SouthWest, CursorIcon::ResizeNeSw))
+        } else if bottom_c && right_c && (bottom || right) {
+            Some((egui::ResizeDirection::SouthEast, CursorIcon::ResizeNwSe))
+        } else if left {
+            Some((egui::ResizeDirection::West, CursorIcon::ResizeHorizontal))
+        } else if right {
+            Some((egui::ResizeDirection::East, CursorIcon::ResizeHorizontal))
+        } else if top {
+            Some((egui::ResizeDirection::North, CursorIcon::ResizeVertical))
+        } else if bottom {
+            Some((egui::ResizeDirection::South, CursorIcon::ResizeVertical))
+        } else {
+            None
+        };
+
+        if let Some((dir, cursor)) = dir_and_cursor {
+            ctx.set_cursor_icon(cursor);
+            if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+            }
+        }
+    }
+
+    fn render_custom_title_bar(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let total_unread: usize = self.unread_counts.values().sum();
+
+        egui::TopBottomPanel::top("custom_title_bar")
+            .exact_height(32.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(pal.bg_app)
+                    .inner_margin(Margin {
+                        left: 12.0,
+                        right: 0.0,
+                        top: 0.0,
+                        bottom: 0.0,
+                    })
+                    .stroke(Stroke::new(1.0_f32, pal.border)),
+            )
+            .show(ctx, |ui| {
+                let bar_rect = ui.max_rect();
+                let mut buttons_left_x = bar_rect.right();
+
+                ui.horizontal_centered(|ui| {
+                    // 1. App Logo (20x20)
+                    let (logo_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(20.0, 20.0), Sense::hover());
+                    if let Some(tex) = &self.app_logo_texture {
+                        ui.painter().image(
+                            tex.id(),
+                            logo_rect,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    } else {
+                        ui.painter()
+                            .rect_filled(logo_rect, Rounding::same(5.0), pal.primary);
+                    }
+
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Zalo")
+                            .color(pal.text_primary)
+                            .size(13.5)
+                            .strong(),
+                    );
+
+                    // Subtle "Native" pill badge
+                    egui::Frame::none()
+                        .fill(pal.primary.linear_multiply(0.14))
+                        .rounding(Rounding::same(4.0))
+                        .inner_margin(Margin::symmetric(5.0, 1.5))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("Native")
+                                    .color(pal.primary)
+                                    .size(10.5)
+                                    .strong(),
+                            );
+                        });
+
+                    if total_unread > 0 {
+                        ui.add_space(4.0);
+                        egui::Frame::none()
+                            .fill(pal.danger)
+                            .rounding(Rounding::same(8.0))
+                            .inner_margin(Margin::symmetric(6.0, 1.5))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(format!("{total_unread} tin mới"))
+                                        .color(Color32::WHITE)
+                                        .size(10.5)
+                                        .strong(),
+                                );
+                            });
+                    } else if self.is_logged_in && !self.user_name.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!("·  {}", self.user_name))
+                                .color(pal.text_muted)
+                                .size(12.0),
+                        );
+                    }
+
+                    // 2. Right-side Window Control Buttons
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+
+                        // Close Button (46x32)
+                        let (close_rect, close_resp) =
+                            ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
+                        if close_resp.hovered() {
+                            ui.painter().rect_filled(
+                                close_rect,
+                                Rounding::ZERO,
+                                Color32::from_rgb(232, 17, 35),
+                            );
+                        }
+                        let close_fg = if close_resp.hovered() {
+                            Color32::WHITE
+                        } else {
+                            pal.text_secondary
+                        };
+                        let cc = close_rect.center();
+                        let d = 4.6_f32;
+                        ui.painter().line_segment(
+                            [Pos2::new(cc.x - d, cc.y - d), Pos2::new(cc.x + d, cc.y + d)],
+                            Stroke::new(1.4_f32, close_fg),
+                        );
+                        ui.painter().line_segment(
+                            [Pos2::new(cc.x + d, cc.y - d), Pos2::new(cc.x - d, cc.y + d)],
+                            Stroke::new(1.4_f32, close_fg),
+                        );
+                        let close_shift = ctx.input(|i| i.modifiers.shift);
+                        if close_resp.secondary_clicked() {
+                            self.allow_quit = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        } else if close_resp
+                            .on_hover_text(
+                                "Thu nhỏ xuống thanh tác vụ (Giữ Shift + Bấm hoặc Chuột phải để thoát hẳn)",
+                            )
+                            .clicked()
+                        {
+                            if close_shift {
+                                self.allow_quit = true;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            } else {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                            }
+                        }
+
+                        // Maximize / Restore Button (46x32)
+                        let (max_rect, max_resp) =
+                            ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
+                        if max_resp.hovered() {
+                            ui.painter()
+                                .rect_filled(max_rect, Rounding::ZERO, pal.bg_hover);
+                        }
+                        let max_fg = if max_resp.hovered() {
+                            pal.text_primary
+                        } else {
+                            pal.text_secondary
+                        };
+                        let mc = max_rect.center();
+                        if is_maximized {
+                            let back = Rect::from_center_size(
+                                Pos2::new(mc.x + 1.2, mc.y - 1.2),
+                                Vec2::splat(7.8),
+                            );
+                            let front = Rect::from_center_size(
+                                Pos2::new(mc.x - 1.2, mc.y + 1.2),
+                                Vec2::splat(7.8),
+                            );
+                            ui.painter()
+                                .rect_stroke(back, Rounding::same(1.0), Stroke::new(1.25_f32, max_fg));
+                            ui.painter().rect_filled(
+                                front,
+                                Rounding::same(1.0),
+                                if max_resp.hovered() {
+                                    pal.bg_hover
+                                } else {
+                                    pal.bg_app
+                                },
+                            );
+                            ui.painter()
+                                .rect_stroke(front, Rounding::same(1.0), Stroke::new(1.25_f32, max_fg));
+                        } else {
+                            let sq = Rect::from_center_size(mc, Vec2::splat(9.5));
+                            ui.painter()
+                                .rect_stroke(sq, Rounding::same(1.2), Stroke::new(1.3_f32, max_fg));
+                        }
+                        if max_resp
+                            .on_hover_text(if is_maximized {
+                                "Khôi phục kích thước"
+                            } else {
+                                "Phóng to toàn màn hình"
+                            })
+                            .clicked()
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
+                        }
+
+                        // Minimize Button (46x32)
+                        let (min_rect, min_resp) =
+                            ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
+                        if min_resp.hovered() {
+                            ui.painter()
+                                .rect_filled(min_rect, Rounding::ZERO, pal.bg_hover);
+                        }
+                        let min_fg = if min_resp.hovered() {
+                            pal.text_primary
+                        } else {
+                            pal.text_secondary
+                        };
+                        let mnc = min_rect.center();
+                        ui.painter().line_segment(
+                            [Pos2::new(mnc.x - 5.0, mnc.y), Pos2::new(mnc.x + 5.0, mnc.y)],
+                            Stroke::new(1.4_f32, min_fg),
+                        );
+                        if min_resp.on_hover_text("Thu nhỏ").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+
+                        // Quick Theme Toggle (36x32)
+                        let (th_rect, th_resp) =
+                            ui.allocate_exact_size(Vec2::new(36.0, 32.0), Sense::click());
+                        if th_resp.hovered() {
+                            ui.painter()
+                                .rect_filled(th_rect, Rounding::ZERO, pal.bg_hover);
+                        }
+                        let th_icon = if self.dark_mode {
+                            lucide::SUN
+                        } else {
+                            lucide::MOON
+                        };
+                        ui.painter().text(
+                            th_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            th_icon,
+                            FontId::proportional(13.5),
+                            if th_resp.hovered() {
+                                pal.text_primary
+                            } else {
+                                pal.text_muted
+                            },
+                        );
+                        if th_resp
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text("Chuyển đổi giao diện Sáng / Tối")
+                            .clicked()
+                        {
+                            self.dark_mode = !self.dark_mode;
+                            self.theme_dirty = true;
+                        }
+
+                        buttons_left_x = th_rect.left();
+
+                        if !self.is_logged_in && !self.threads.is_empty() {
+                            ui.add_space(8.0);
+                            let hist_btn = egui::Button::new(
+                                RichText::new("Xem lịch sử đã lưu")
+                                    .size(11.5)
+                                    .color(pal.primary)
+                                    .strong(),
+                            )
+                            .fill(pal.primary.linear_multiply(0.12))
+                            .stroke(Stroke::new(1.0_f32, pal.primary))
+                            .rounding(Rounding::same(5.0));
+                            let r = ui
+                                .add(hist_btn)
+                                .on_hover_cursor(CursorIcon::PointingHand);
+                            buttons_left_x = r.rect.left() - 8.0;
+                            if r.clicked() {
+                                self.is_logged_in = true;
+                            }
+                        }
+                    });
+                });
+
+                // 3. Interactive drag / double-click region covering everything left of the control buttons
+                let drag_rect = Rect::from_min_max(
+                    bar_rect.min,
+                    Pos2::new((buttons_left_x - 2.0).max(bar_rect.left() + 40.0), bar_rect.max.y),
+                );
+                let drag_resp = ui.interact(
+                    drag_rect,
+                    Id::new("custom_title_bar_drag"),
+                    Sense::click_and_drag(),
+                );
+                if drag_resp.double_clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
+                } else if drag_resp.drag_started_by(egui::PointerButton::Primary) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+            });
+    }
+
     fn render_login_screen(&mut self, ui: &mut egui::Ui, pal: &ThemePalette) {
         ui.vertical_centered(|ui| {
             let avail_h = ui.available_height();
@@ -7354,7 +7625,7 @@ impl ZaloGuiApp {
         let mut do_logout = false;
         let area_resp = egui::Area::new(Id::new("left_rail_profile_popover"))
             .order(egui::Order::Foreground)
-            .fixed_pos(Pos2::new(68.0, 14.0))
+            .fixed_pos(Pos2::new(68.0, 44.0))
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(pal.bg_elevated)
