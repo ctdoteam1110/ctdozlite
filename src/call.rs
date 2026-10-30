@@ -1392,11 +1392,11 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
     let t_start = std::time::Instant::now();
     let mut echo_seq: u32 = 1;
     // Send 14 echo probes per server (matching `settings.checkPkgRec = 14`) across 2 quick bursts,
-    // plus the RTP/RTCP InitZRTP packets.
+    // plus the RTP (`sub_cmd=2`, `w3=0` in `CallController::_sendRequestInitZRTPToServer @ 0x4c18f8`) InitZRTP packet.
+    // Never send `InitZRTP` or `Ping` from `rtcp_sock` (`sub_cmd | 4` is `loopbackMode == 2`, not `isRtcp`).
     for _ in 0..2 {
-        for (rtp_addr, rtcp_addr) in &servers {
+        for (rtp_addr, _rtcp_addr) in &servers {
             let _ = rtp_sock.send_to(&pkt_init, rtp_addr.as_str()).await;
-            let _ = rtcp_sock.send_to(&pkt_init, rtcp_addr.as_str()).await;
             for _ in 0..7 {
                 let pkt_echo = build_zrtp_echo_packet(echo_seq, &ts_now);
                 echo_seq = echo_seq.wrapping_add(1);
@@ -1456,8 +1456,12 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
                         if probe.token == 0 {
                             probe.token = token;
                         }
-                        let pkt_ping = build_zrtp_ping_packet(from_uid, token, sess_id);
-                        let _ = rtcp_sock.send_to(&pkt_ping, peer_str.as_str()).await;
+                        // Only send ping from rtcp_sock when rtcp_addr differs from rtp_addr so a single-port
+                        // relay does not overwrite the RTP socket's source port mapping with rtcp_sock's port.
+                        if servers.iter().any(|(r, c)| c == &peer_str && r != c) {
+                            let pkt_ping = build_zrtp_ping_packet(from_uid, token, sess_id);
+                            let _ = rtcp_sock.send_to(&pkt_ping, peer_str.as_str()).await;
+                        }
                     }
                 }
             }
@@ -1482,9 +1486,8 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
                 changed = abort_rx.changed() => {
                     if changed.is_err() || *abort_rx.borrow() {
                         let pkt_end = build_zrtp_end_packet(from_uid, call_id, &sess_owned);
-                        for (rtp_addr, rtcp_addr) in &servers {
+                        for (rtp_addr, _rtcp_addr) in &servers {
                             let _ = rtp_loop.send_to(&pkt_end, rtp_addr.as_str()).await;
-                            let _ = rtcp_loop.send_to(&pkt_end, rtcp_addr.as_str()).await;
                         }
                         break;
                     }
@@ -1494,17 +1497,15 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
                     seq = seq.wrapping_add(1);
                     if cur_token == 0 {
                         let pkt_init_retry = build_zrtp_init_packet(is_caller, from_uid, partner_uid, call_id, sub_cmd, &sess_owned);
-                        for (rtp_addr, rtcp_addr) in &servers {
+                        for (rtp_addr, _rtcp_addr) in &servers {
                             let _ = rtp_loop.send_to(&pkt_init_retry, rtp_addr.as_str()).await;
                             let _ = rtp_loop.send_to(&pkt_e, rtp_addr.as_str()).await;
-                            let _ = rtcp_loop.send_to(&pkt_init_retry, rtcp_addr.as_str()).await;
                         }
                     } else {
-                        for (rtp_addr, rtcp_addr) in &servers {
+                        for (rtp_addr, _rtcp_addr) in &servers {
                             let tok = server_tokens.get(rtp_addr).copied().unwrap_or(cur_token);
                             let pkt_p = build_zrtp_ping_packet(from_uid, tok, &sess_owned);
                             let _ = rtp_loop.send_to(&pkt_p, rtp_addr.as_str()).await;
-                            let _ = rtcp_loop.send_to(&pkt_p, rtcp_addr.as_str()).await;
                         }
                     }
                 }
@@ -1522,6 +1523,9 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
                             cur_token = token;
                             trace_line("ZRTP", format!("late RTCP init ack from {peer}: token={token} pub={pub_addr:?}"));
                         }
+                    } else {
+                        // Not a ZRTP init reply: hand it to the media loop (PLI/FIR handling).
+                        crate::media::push_rtcp_inbox(&buf_rtcp[..n]);
                     }
                 }
             }
@@ -1771,7 +1775,7 @@ pub fn build_pure_rust_invite_fields_with_probe(
         "srtcp": 0,
         "srtpMode": 0,
         "supportCallBusy": 1,
-        "supportHevcDecode": 1,
+        "supportHevcDecode": 0,
         "tpType": 0,
         "video": {
             "codec": [
@@ -1845,7 +1849,7 @@ pub fn build_callee_extend_data(
         "srtcp": 0,
         "srtpMode": 0,
         "supportCallBusy": 1,
-        "supportHevcDecode": 1,
+        "supportHevcDecode": 0,
         "tpType": 0,
         "video": {
             "codec": [
@@ -2310,8 +2314,9 @@ impl CallBridge {
                         let s_snap = session.lock().await.clone();
                         let guard = active_call.lock().await;
                         if let Some(ref st) = *guard {
-                            if let Some(ref media) = st.media {
+                            if let Some(media) = &st.media {
                                 media.set_mic_muted(!is_on_mic);
+                                media.set_cam_enabled(is_on_cam);
                             }
                             let call_id = st.call_id;
                             let partner_id = st.partner_id.clone();
@@ -2428,6 +2433,7 @@ impl CallBridge {
                         let data = voip_ctrl.get("data").cloned().unwrap_or(Value::Null);
                         trace_line("EVT", format!("act={act} ts={}", voip_ctrl.get("data").and_then(|d| d.get("ts")).cloned().unwrap_or(Value::Null)));
                         trace_line("EVT", format!("act={act} data={data}"));
+                        crate::voip_log::log_signal_media(act, &event_media_params(&data));
                         let ev_call_id = data
                             .get("callId")
                             .or_else(|| data.get("id"))

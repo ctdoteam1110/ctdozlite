@@ -1372,6 +1372,9 @@ struct AppSettings {
     suggest_mentions: bool,
     enable_gif_search: bool,
     enable_sticker_keyword_search: bool,
+    // 7. Thiết bị cuộc gọi (Mic & Camera)
+    selected_mic_device: String,
+    selected_camera_device: String,
 }
 
 impl Default for AppSettings {
@@ -1414,6 +1417,8 @@ impl Default for AppSettings {
             suggest_mentions: true,
             enable_gif_search: true,
             enable_sticker_keyword_search: true,
+            selected_mic_device: String::new(),
+            selected_camera_device: String::new(),
         }
     }
 }
@@ -1557,6 +1562,8 @@ impl ZaloGuiApp {
     ) -> Self {
         setup_custom_fonts(&cc.egui_ctx);
         let loaded_settings = AppSettings::load();
+        crate::media::set_selected_mic_device(&loaded_settings.selected_mic_device);
+        crate::media::set_selected_camera_device(&loaded_settings.selected_camera_device);
         let dark_mode = loaded_settings.theme_mode != "light";
         if dark_mode {
             ThemePalette::dark().apply_to_ctx(&cc.egui_ctx);
@@ -2187,6 +2194,7 @@ impl ZaloGuiApp {
                             .and_then(|c| c.error_reason.as_ref())
                             .is_some();
                         self.sticker_textures.remove("call_remote_video");
+                        self.sticker_textures.remove("call_local_video");
                         if !has_error {
                             self.active_call = None;
                         }
@@ -8617,6 +8625,81 @@ impl ZaloGuiApp {
                                                         });
                                                     });
                                                 });
+                                            ui.add_space(14.0);
+
+                                            ui.label(RichText::new("Thiết bị Âm thanh & Video (Cuộc gọi)").color(pal.text_primary).size(13.5).strong());
+                                            ui.add_space(6.0);
+                                            egui::Frame::none()
+                                                .fill(pal.bg_elevated)
+                                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                                .rounding(Rounding::same(8.0))
+                                                .inner_margin(Margin::symmetric(14.0, 10.0))
+                                                .show(ui, |ui| {
+                                                    let (mics, cams) = crate::media::list_media_devices(false);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new(format!("{} Đầu vào Mic:", lucide::MIC)).color(pal.text_primary).size(13.0));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            let cur_mic_lbl = if self.settings.selected_mic_device.is_empty() {
+                                                                "Mặc định hệ thống"
+                                                            } else {
+                                                                &self.settings.selected_mic_device
+                                                            };
+                                                            egui::ComboBox::from_id_salt("setting_mic_device_combo")
+                                                                .selected_text(truncate_chars(cur_mic_lbl, 30))
+                                                                .width(230.0)
+                                                                .show_ui(ui, |ui| {
+                                                                    if ui.selectable_label(self.settings.selected_mic_device.is_empty(), "Mặc định hệ thống").clicked() {
+                                                                        self.settings.selected_mic_device.clear();
+                                                                        crate::media::set_selected_mic_device("");
+                                                                        self.settings.save();
+                                                                    }
+                                                                    for m in &mics {
+                                                                        if ui.selectable_label(self.settings.selected_mic_device == *m, m).clicked() {
+                                                                            self.settings.selected_mic_device = m.clone();
+                                                                            crate::media::set_selected_mic_device(m);
+                                                                            self.settings.save();
+                                                                        }
+                                                                    }
+                                                                });
+                                                        });
+                                                    });
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new(format!("{} Máy ảnh (Camera):", lucide::VIDEO)).color(pal.text_primary).size(13.0));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            let cur_cam_lbl = if self.settings.selected_camera_device.is_empty() {
+                                                                cams.first().map(String::as_str).unwrap_or("Mặc định hệ thống")
+                                                            } else {
+                                                                &self.settings.selected_camera_device
+                                                            };
+                                                            egui::ComboBox::from_id_salt("setting_cam_device_combo")
+                                                                .selected_text(truncate_chars(cur_cam_lbl, 30))
+                                                                .width(230.0)
+                                                                .show_ui(ui, |ui| {
+                                                                    if ui.selectable_label(self.settings.selected_camera_device.is_empty(), "Tự động (Camera đầu tiên)").clicked() {
+                                                                        self.settings.selected_camera_device.clear();
+                                                                        crate::media::set_selected_camera_device("");
+                                                                        self.settings.save();
+                                                                    }
+                                                                    for c in &cams {
+                                                                        if ui.selectable_label(self.settings.selected_camera_device == *c, c).clicked() {
+                                                                            self.settings.selected_camera_device = c.clone();
+                                                                            crate::media::set_selected_camera_device(c);
+                                                                            self.settings.save();
+                                                                        }
+                                                                    }
+                                                                });
+                                                        });
+                                                    });
+                                                    ui.add_space(6.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            if ui.small_button(format!("{} Quét lại thiết bị", lucide::REFRESH)).clicked() {
+                                                                let _ = crate::media::list_media_devices(true);
+                                                            }
+                                                        });
+                                                    });
+                                                });
                                         }
                                         SettingsTab::Privacy => {
                                             ui.label(RichText::new("Cá nhân").color(pal.text_primary).size(13.5).strong());
@@ -9095,13 +9178,8 @@ impl ZaloGuiApp {
         let Some(mut call) = self.active_call.clone() else {
             return;
         };
-        // Keep timer and pulse animation updating smoothly while call modal is visible
-        ctx.request_repaint_after(Duration::from_millis(250));
-
-        if ctx.input(|i| i.key_pressed(Key::Escape)) && call.error_reason.is_some() {
-            self.active_call = None;
-            return;
-        }
+        // Keep timer and video textures updating smoothly while call window is open
+        ctx.request_repaint_after(Duration::from_millis(66));
 
         let elapsed_f = call.started_at.elapsed().as_secs_f32();
         let elapsed = elapsed_f as u64;
@@ -9109,207 +9187,335 @@ impl ZaloGuiApp {
         let secs = elapsed % 60;
         let timer_str = format!("{mins:02}:{secs:02}");
 
-        let screen_rect = ctx.screen_rect();
         let mut hangup_clicked = false;
         let mut retry_clicked = false;
 
-        // 1. Dimmed theater backdrop
-        egui::Area::new(Id::new("call_overlay_backdrop"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(screen_rect.min)
-            .show(ctx, |ui| {
-                let (bg_rect, bg_resp) =
-                    ui.allocate_exact_size(screen_rect.size(), Sense::click());
-                ui.painter().rect_filled(
-                    bg_rect,
-                    Rounding::ZERO,
-                    Color32::from_rgba_unmultiplied(5, 8, 17, 210),
-                );
-                if bg_resp.clicked() && call.error_reason.is_some() {
-                    hangup_clicked = true;
-                }
-            });
-
         let has_err = call.error_reason.is_some();
         let is_video_stage = call.is_video && !has_err;
-        let card_w = if is_video_stage {
-            (screen_rect.width() * 0.86).clamp(520.0, 680.0)
+        let default_w = if is_video_stage { 860.0 } else { 440.0 };
+        let default_h = if is_video_stage { 660.0 } else { 470.0 };
+        let win_title = if call.is_video {
+            format!("Zalo Video Call — {}", call.partner_name)
         } else {
-            (screen_rect.width() * 0.84).clamp(300.0, 344.0)
+            format!("Zalo Voice Call — {}", call.partner_name)
         };
-        let card_h = if has_err {
-            356.0
-        } else if is_video_stage {
-            (screen_rect.height() * 0.78).clamp(430.0, 520.0)
-        } else {
-            368.0
-        };
-        let card_rect = Rect::from_center_size(screen_rect.center(), Vec2::new(card_w, card_h));
 
         let call_ava = self
             .threads
             .iter()
             .find(|t| t.id == call.partner_id || t.name == call.partner_name)
-            .and_then(|t| t.avatar.as_deref());
+            .and_then(|t| t.avatar.clone());
 
-        egui::Area::new(Id::new("call_overlay_card"))
-            .order(egui::Order::Tooltip)
-            .fixed_pos(card_rect.min)
-            .show(ctx, |ui| {
-                let border_col = if has_err {
-                    Color32::from_rgba_unmultiplied(239, 68, 68, 120)
-                } else {
-                    Color32::from_rgba_unmultiplied(59, 130, 246, 110)
-                };
-                egui::Frame::none()
-                    .fill(pal.bg_sidebar)
-                    .stroke(Stroke::new(1.2_f32, border_col))
-                    .rounding(Rounding::same(22.0))
-                    .inner_margin(Margin::symmetric(22.0, 18.0))
-                    .show(ui, |ui| {
-                        ui.set_width(card_w - 44.0);
+        let viewport_id = egui::ViewportId::from_hash_of("zalo_dedicated_call_window");
+        let builder = egui::ViewportBuilder::default()
+            .with_title(win_title)
+            .with_inner_size([default_w, default_h])
+            .with_min_inner_size([380.0, 420.0]);
 
-                        // Top Bar: Encrypted ZRTP Pill + Subtle Close Icon
-                        ui.horizontal(|ui| {
-                            let pill_col = if has_err {
-                                pal.danger.linear_multiply(0.16)
-                            } else {
-                                pal.accent_online.linear_multiply(0.15)
-                            };
-                            let pill_fg = if has_err {
-                                Color32::from_rgb(252, 165, 165)
-                            } else {
-                                Color32::from_rgb(110, 231, 183)
-                            };
-                            let badge_txt = if call.is_video {
-                                format!("{} Zalo Video · ZRTP", lucide::VIDEO)
-                            } else {
-                                format!("{} Zalo Voice · ZRTP", lucide::SHIELD_CHECK)
-                            };
-                            egui::Frame::none()
-                                .fill(pill_col)
-                                .rounding(Rounding::same(12.0))
-                                .inner_margin(Margin::symmetric(10.0, 4.0))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new(badge_txt)
-                                            .size(11.0)
-                                            .color(pill_fg)
-                                            .strong(),
-                                    );
+        ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
+            if vp_ctx.input(|i| i.viewport().close_requested()) {
+                hangup_clicked = true;
+            }
+            if vp_ctx.input(|i| i.key_pressed(Key::Escape)) && call.error_reason.is_some() {
+                hangup_clicked = true;
+            }
+
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(pal.bg_sidebar)
+                        .inner_margin(Margin::symmetric(20.0, 16.0)),
+                )
+                .show(vp_ctx, |ui| {
+                    let avail_w = ui.available_width();
+                    let avail_h = ui.available_height();
+
+                    // 1. Symmetrically Centered Top Toolbar: Badge · Mic · Camera · Refresh
+                    ui.vertical_centered(|ui| {
+                        egui::Frame::none()
+                            .fill(pal.bg_elevated)
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .rounding(Rounding::same(14.0))
+                            .inner_margin(Margin::symmetric(12.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    let pill_col = if has_err {
+                                        pal.danger.linear_multiply(0.16)
+                                    } else {
+                                        pal.accent_online.linear_multiply(0.15)
+                                    };
+                                    let pill_fg = if has_err {
+                                        Color32::from_rgb(252, 165, 165)
+                                    } else {
+                                        Color32::from_rgb(110, 231, 183)
+                                    };
+                                    let badge_txt = if call.is_video {
+                                        format!("{} Zalo Video · ZRTP", lucide::VIDEO)
+                                    } else {
+                                        format!("{} Zalo Voice · ZRTP", lucide::SHIELD_CHECK)
+                                    };
+                                    egui::Frame::none()
+                                        .fill(pill_col)
+                                        .rounding(Rounding::same(10.0))
+                                        .inner_margin(Margin::symmetric(10.0, 4.0))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new(badge_txt)
+                                                    .size(11.5)
+                                                    .color(pill_fg)
+                                                    .strong(),
+                                            );
+                                        });
+
+                                    let (mics, cams) = crate::media::list_media_devices(false);
+                                    let cur_mic_lbl = if self.settings.selected_mic_device.is_empty()
+                                    {
+                                        mics.first().map(String::as_str).unwrap_or("Mic mặc định")
+                                    } else {
+                                        &self.settings.selected_mic_device
+                                    };
+                                    egui::ComboBox::from_id_salt("call_vp_mic_combo")
+                                        .selected_text(format!(
+                                            "{} {}",
+                                            lucide::MIC,
+                                            truncate_chars(cur_mic_lbl, 22)
+                                        ))
+                                        .width(190.0)
+                                        .show_ui(ui, |ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    self.settings.selected_mic_device.is_empty(),
+                                                    "Mặc định hệ thống",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.settings.selected_mic_device.clear();
+                                                crate::media::set_selected_mic_device("");
+                                                self.settings.save();
+                                            }
+                                            for m in &mics {
+                                                if ui
+                                                    .selectable_label(
+                                                        self.settings.selected_mic_device == *m,
+                                                        m,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.settings.selected_mic_device = m.clone();
+                                                    crate::media::set_selected_mic_device(m);
+                                                    self.settings.save();
+                                                }
+                                            }
+                                        });
+
+                                    let cur_cam_lbl =
+                                        if self.settings.selected_camera_device.is_empty() {
+                                            cams.first()
+                                                .map(String::as_str)
+                                                .unwrap_or("Camera mặc định")
+                                        } else {
+                                            &self.settings.selected_camera_device
+                                        };
+                                    egui::ComboBox::from_id_salt("call_vp_cam_combo")
+                                        .selected_text(format!(
+                                            "{} {}",
+                                            lucide::VIDEO,
+                                            truncate_chars(cur_cam_lbl, 22)
+                                        ))
+                                        .width(190.0)
+                                        .show_ui(ui, |ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    self.settings.selected_camera_device.is_empty(),
+                                                    "Tự động (Camera đầu tiên)",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.settings.selected_camera_device.clear();
+                                                crate::media::set_selected_camera_device("");
+                                                self.settings.save();
+                                            }
+                                            for c in &cams {
+                                                if ui
+                                                    .selectable_label(
+                                                        self.settings.selected_camera_device == *c,
+                                                        c,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.settings.selected_camera_device =
+                                                        c.clone();
+                                                    crate::media::set_selected_camera_device(c);
+                                                    self.settings.save();
+                                                }
+                                            }
+                                        });
+
+                                    if ui
+                                        .small_button(lucide::REFRESH)
+                                        .on_hover_text("Quét lại danh sách Mic & Camera")
+                                        .clicked()
+                                    {
+                                        let _ = crate::media::list_media_devices(true);
+                                    }
                                 });
-
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let (x_rect, x_resp) =
-                                    ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
-                                if x_resp.hovered() {
-                                    ui.painter().circle_filled(
-                                        x_rect.center(),
-                                        14.0,
-                                        Color32::from_rgb(30, 41, 59),
-                                    );
-                                }
-                                draw_lucide_icon(
-                                    ui.painter(),
-                                    x_rect.center(),
-                                    lucide::X,
-                                    14.5,
-                                    pal.text_secondary,
-                                );
-                                if x_resp
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Đóng / Kết thúc cuộc gọi")
-                                    .clicked()
-                                {
-                                    hangup_clicked = true;
-                                }
                             });
-                        });
+                    });
 
-                        ui.add_space(16.0);
+                    ui.add_space(12.0);
 
-                        // Center Avatar with Pulsing Ring Halo
-                        ui.vertical_centered(|ui| {
-                            if is_video_stage {
-                                let stage_w = (card_w - 44.0).max(280.0);
-                                let stage_h = (card_h - 164.0).max(210.0);
-                                let (stage_rect, _) =
-                                    ui.allocate_exact_size(Vec2::new(stage_w, stage_h), Sense::hover());
-                                let painter = ui.painter();
+                    // 2. Main Stage — Strictly Centered
+                    ui.vertical_centered(|ui| {
+                        if is_video_stage {
+                            let stage_w = avail_w.max(320.0);
+                            let stage_h = (avail_h - 156.0).max(240.0);
+                            let (stage_rect, _) = ui.allocate_exact_size(
+                                Vec2::new(stage_w, stage_h),
+                                Sense::hover(),
+                            );
+                            let painter = ui.painter();
+                            painter.rect_filled(
+                                stage_rect,
+                                Rounding::same(16.0),
+                                Color32::from_rgb(15, 20, 30),
+                            );
+                            painter.rect_stroke(
+                                stage_rect,
+                                Rounding::same(16.0),
+                                Stroke::new(1.0_f32, pal.border),
+                            );
+
+                            // Remote video frame card: fitted tightly to the true video aspect ratio (no black bars!)
+                            if let Some(vtex) = self.sticker_textures.get("call_remote_video") {
+                                let inner = stage_rect.shrink(10.0);
+                                let tex_size = vtex.size_vec2();
+                                let tex_aspect = if tex_size.y > 0.0 {
+                                    tex_size.x / tex_size.y
+                                } else {
+                                    4.0 / 3.0
+                                };
+                                let box_aspect = inner.width() / inner.height().max(1.0);
+                                let draw_size = if box_aspect > tex_aspect {
+                                    Vec2::new(inner.height() * tex_aspect, inner.height())
+                                } else {
+                                    Vec2::new(inner.width(), inner.width() / tex_aspect)
+                                };
+                                let draw_rect =
+                                    Rect::from_center_size(inner.center(), draw_size);
                                 painter.rect_filled(
-                                    stage_rect,
-                                    Rounding::same(14.0),
-                                    pal.bg_app,
+                                    draw_rect.expand(2.0),
+                                    Rounding::same(12.0),
+                                    Color32::from_rgb(8, 11, 18),
+                                );
+                                painter.image(
+                                    vtex.id(),
+                                    draw_rect,
+                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                    Color32::WHITE,
                                 );
                                 painter.rect_stroke(
-                                    stage_rect,
-                                    Rounding::same(14.0),
-                                    Stroke::new(1.0_f32, pal.border),
+                                    draw_rect.expand(1.0),
+                                    Rounding::same(12.0),
+                                    Stroke::new(
+                                        1.2_f32,
+                                        Color32::from_rgba_unmultiplied(148, 163, 184, 70),
+                                    ),
                                 );
+                            } else {
+                                let center = Pos2::new(
+                                    stage_rect.center().x,
+                                    stage_rect.center().y - 16.0,
+                                );
+                                let pulse =
+                                    ((elapsed_f * 2.6).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+                                painter.circle_filled(
+                                    center,
+                                    46.0 + pulse * 6.0,
+                                    pal.primary.linear_multiply(0.12),
+                                );
+                                painter.circle_stroke(
+                                    center,
+                                    43.0,
+                                    Stroke::new(1.8_f32, pal.primary_hover.linear_multiply(0.8)),
+                                );
+                                paint_user_avatar(
+                                    painter,
+                                    center,
+                                    40.0,
+                                    &call.partner_name,
+                                    call.is_group,
+                                    call_ava.as_deref(),
+                                    &self.sticker_textures,
+                                    &mut self.loading_stickers,
+                                );
+                                painter.text(
+                                    Pos2::new(stage_rect.center().x, center.y + 56.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    &call.partner_name,
+                                    FontId::proportional(17.5),
+                                    pal.text_primary,
+                                );
+                            }
 
-                                // Remote video frame texture (decoded live from RTP 0x0E H.264 stream)
-                                if let Some(vtex) = self.sticker_textures.get("call_remote_video") {
+                            // Local Camera Picture-in-Picture (PIP) preview in bottom-right corner
+                            let pip_w = 184.0_f32;
+                            let pip_h = 138.0_f32;
+                            let pip_rect = Rect::from_min_size(
+                                Pos2::new(
+                                    stage_rect.right() - pip_w - 16.0,
+                                    stage_rect.bottom() - pip_h - 16.0,
+                                ),
+                                Vec2::new(pip_w, pip_h),
+                            );
+                            painter.rect_filled(
+                                pip_rect,
+                                Rounding::same(12.0),
+                                pal.bg_elevated,
+                            );
+                            if call.cam_enabled {
+                                if let Some(ltex) = self.sticker_textures.get("call_local_video") {
+                                    let inner_pip = pip_rect.shrink(2.0);
+                                    let lsize = ltex.size_vec2();
+                                    let laspect = if lsize.y > 0.0 {
+                                        lsize.x / lsize.y
+                                    } else {
+                                        4.0 / 3.0
+                                    };
+                                    let paspect = inner_pip.width() / inner_pip.height().max(1.0);
+                                    let uv = if laspect > paspect {
+                                        let frac = paspect / laspect;
+                                        let m = (1.0 - frac) * 0.5;
+                                        Rect::from_min_max(Pos2::new(m, 0.0), Pos2::new(1.0 - m, 1.0))
+                                    } else {
+                                        let frac = laspect / paspect;
+                                        let m = (1.0 - frac) * 0.5;
+                                        Rect::from_min_max(Pos2::new(0.0, m), Pos2::new(1.0, 1.0 - m))
+                                    };
                                     painter.image(
-                                        vtex.id(),
-                                        stage_rect.shrink(1.0),
-                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                        ltex.id(),
+                                        inner_pip,
+                                        uv,
                                         Color32::WHITE,
                                     );
                                 } else {
-                                    // Fallback avatar while waiting for first H.264 IDR keyframe
-                                    let center = Pos2::new(stage_rect.center().x, stage_rect.center().y - 16.0);
-                                    let pulse = ((elapsed_f * 2.6).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
-                                    painter.circle_filled(
-                                        center,
-                                        46.0 + pulse * 6.0,
-                                        pal.primary.linear_multiply(0.12),
-                                    );
-                                    painter.circle_stroke(
-                                        center,
-                                        43.0,
-                                        Stroke::new(1.8_f32, pal.primary_hover.linear_multiply(0.8)),
-                                    );
+                                    let self_disp = if self.user_name.is_empty() {
+                                        "Tôi"
+                                    } else {
+                                        &self.user_name
+                                    };
                                     paint_user_avatar(
                                         painter,
-                                        center,
-                                        40.0,
-                                        &call.partner_name,
-                                        call.is_group,
-                                        call_ava,
+                                        Pos2::new(pip_rect.center().x, pip_rect.center().y - 10.0),
+                                        20.0,
+                                        self_disp,
+                                        false,
+                                        self.user_avatar.as_deref(),
                                         &self.sticker_textures,
                                         &mut self.loading_stickers,
                                     );
-                                    painter.text(
-                                        Pos2::new(stage_rect.center().x, center.y + 56.0),
-                                        egui::Align2::CENTER_CENTER,
-                                        &call.partner_name,
-                                        FontId::proportional(17.5),
-                                        pal.text_primary,
-                                    );
                                 }
-
-                                // Local Camera Picture-in-Picture (PIP) preview in bottom-right corner
-                                let pip_rect = Rect::from_min_size(
-                                    Pos2::new(stage_rect.right() - 156.0, stage_rect.bottom() - 108.0),
-                                    Vec2::new(144.0, 96.0),
-                                );
-                                painter.rect_filled(
-                                    pip_rect,
-                                    Rounding::same(10.0),
-                                    pal.bg_elevated,
-                                );
-                                painter.rect_stroke(
-                                    pip_rect,
-                                    Rounding::same(10.0),
-                                    Stroke::new(
-                                        1.4_f32,
-                                        if call.cam_enabled {
-                                            pal.primary_hover
-                                        } else {
-                                            pal.border
-                                        },
-                                    ),
-                                );
+                            } else {
                                 let self_disp = if self.user_name.is_empty() {
                                     "Tôi"
                                 } else {
@@ -9317,132 +9523,167 @@ impl ZaloGuiApp {
                                 };
                                 paint_user_avatar(
                                     painter,
-                                    Pos2::new(pip_rect.center().x, pip_rect.center().y - 8.0),
-                                    18.0,
+                                    Pos2::new(pip_rect.center().x, pip_rect.center().y - 10.0),
+                                    20.0,
                                     self_disp,
                                     false,
                                     self.user_avatar.as_deref(),
                                     &self.sticker_textures,
                                     &mut self.loading_stickers,
                                 );
-                                let pip_status = if call.cam_enabled {
-                                    format!("{} Camera đang bật", lucide::VIDEO)
-                                } else {
-                                    format!("{} Camera đã tắt", lucide::VIDEO_OFF)
-                                };
-                                painter.text(
-                                    Pos2::new(pip_rect.center().x, pip_rect.bottom() - 14.0),
-                                    egui::Align2::CENTER_CENTER,
-                                    pip_status,
-                                    FontId::proportional(10.5),
-                                    if call.cam_enabled {
-                                        pal.accent_online
-                                    } else {
-                                        pal.text_muted
-                                    },
-                                );
-                                ui.add_space(8.0);
+                            }
+                            let pip_badge_rect = Rect::from_center_size(
+                                Pos2::new(pip_rect.center().x, pip_rect.bottom() - 14.0),
+                                Vec2::new(124.0, 20.0),
+                            );
+                            painter.rect_filled(
+                                pip_badge_rect,
+                                Rounding::same(10.0),
+                                Color32::from_rgba_unmultiplied(8, 11, 18, 185),
+                            );
+                            let pip_status = if call.cam_enabled {
+                                format!("{} Camera đang bật", lucide::VIDEO)
                             } else {
-                                let (av_rect, _) =
-                                    ui.allocate_exact_size(Vec2::splat(92.0), Sense::hover());
-                                let center = av_rect.center();
-                                let ring_col = if has_err {
-                                    pal.danger
-                                } else if call.is_incoming_ringing {
+                                format!("{} Camera đã tắt", lucide::VIDEO_OFF)
+                            };
+                            painter.text(
+                                pip_badge_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                pip_status,
+                                FontId::proportional(10.5),
+                                if call.cam_enabled {
                                     pal.accent_online
                                 } else {
-                                    pal.primary_hover
-                                };
-                                let pulse = ((elapsed_f * 2.6).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
-                                ui.painter().circle_filled(
-                                    center,
-                                    42.0 + pulse * 5.0,
-                                    ring_col.linear_multiply(0.10),
-                                );
-                                ui.painter().circle_stroke(
-                                    center,
-                                    40.0,
-                                    Stroke::new(1.8_f32, ring_col.linear_multiply(0.75)),
-                                );
-                                paint_user_avatar(
-                                    ui.painter(),
-                                    center,
-                                    37.0,
-                                    &call.partner_name,
-                                    call.is_group,
-                                    call_ava,
-                                    &self.sticker_textures,
-                                    &mut self.loading_stickers,
-                                );
-
-                                ui.add_space(10.0);
-                                ui.label(
-                                    RichText::new(&call.partner_name)
-                                        .size(18.5)
-                                        .color(pal.text_primary)
-                                        .strong(),
-                                );
-                                ui.add_space(3.0);
-                            }
-                            if let Some(ref err_msg) = call.error_reason {
-                                ui.label(
-                                    RichText::new("Cuộc gọi chưa kết nối được")
-                                        .size(12.5)
-                                        .color(Color32::from_rgb(248, 113, 113))
-                                        .strong(),
-                                );
-                                ui.add_space(8.0);
-                                let clean_err = err_msg
-                                    .strip_prefix("Lỗi khởi tạo cuộc gọi (401): ")
-                                    .unwrap_or(err_msg);
-                                egui::Frame::none()
-                                    .fill(Color32::from_rgba_unmultiplied(127, 29, 29, 68))
-                                    .stroke(Stroke::new(
-                                        1.0_f32,
-                                        Color32::from_rgba_unmultiplied(239, 68, 68, 110),
-                                    ))
-                                    .rounding(Rounding::same(12.0))
-                                    .inner_margin(Margin::symmetric(12.0, 8.0))
-                                    .show(ui, |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(clean_err)
-                                                    .size(11.8)
-                                                    .color(Color32::from_rgb(254, 226, 226)),
-                                            )
-                                            .wrap(),
-                                        );
-                                    });
+                                    pal.text_muted
+                                },
+                            );
+                            painter.rect_stroke(
+                                pip_rect,
+                                Rounding::same(12.0),
+                                Stroke::new(
+                                    1.4_f32,
+                                    if call.cam_enabled {
+                                        pal.primary_hover
+                                    } else {
+                                        pal.border
+                                    },
+                                ),
+                            );
+                            ui.add_space(10.0);
+                        } else {
+                            ui.add_space(18.0);
+                            let (av_rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(96.0), Sense::hover());
+                            let center = av_rect.center();
+                            let ring_col = if has_err {
+                                pal.danger
+                            } else if call.is_incoming_ringing {
+                                pal.accent_online
                             } else {
-                                ui.label(
-                                    RichText::new(&call.state_label)
-                                        .size(12.8)
-                                        .color(Color32::from_rgb(148, 163, 184)),
-                                );
-                                ui.add_space(4.0);
-                                egui::Frame::none()
-                                    .fill(Color32::from_rgb(30, 41, 59))
-                                    .rounding(Rounding::same(10.0))
-                                    .inner_margin(Margin::symmetric(12.0, 3.0))
-                                    .show(ui, |ui| {
+                                pal.primary_hover
+                            };
+                            let pulse = ((elapsed_f * 2.6).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+                            ui.painter().circle_filled(
+                                center,
+                                44.0 + pulse * 5.0,
+                                ring_col.linear_multiply(0.10),
+                            );
+                            ui.painter().circle_stroke(
+                                center,
+                                42.0,
+                                Stroke::new(1.8_f32, ring_col.linear_multiply(0.75)),
+                            );
+                            paint_user_avatar(
+                                ui.painter(),
+                                center,
+                                38.0,
+                                &call.partner_name,
+                                call.is_group,
+                                call_ava.as_deref(),
+                                &self.sticker_textures,
+                                &mut self.loading_stickers,
+                            );
+
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new(&call.partner_name)
+                                    .size(18.5)
+                                    .color(pal.text_primary)
+                                    .strong(),
+                            );
+                            ui.add_space(4.0);
+                        }
+
+                        // 3. Status + Timer Pill — Perfectly Centered
+                        if let Some(err_msg) = &call.error_reason {
+                            ui.label(
+                                RichText::new("Cuộc gọi chưa kết nối được")
+                                    .size(12.5)
+                                    .color(Color32::from_rgb(248, 113, 113))
+                                    .strong(),
+                            );
+                            ui.add_space(6.0);
+                            let clean_err = err_msg
+                                .strip_prefix("Lỗi khởi tạo cuộc gọi (401): ")
+                                .unwrap_or(err_msg);
+                            egui::Frame::none()
+                                .fill(Color32::from_rgba_unmultiplied(127, 29, 29, 68))
+                                .stroke(Stroke::new(
+                                    1.0_f32,
+                                    Color32::from_rgba_unmultiplied(239, 68, 68, 110),
+                                ))
+                                .rounding(Rounding::same(12.0))
+                                .inner_margin(Margin::symmetric(12.0, 8.0))
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(clean_err)
+                                                .size(11.8)
+                                                .color(Color32::from_rgb(254, 226, 226)),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                        } else {
+                            egui::Frame::none()
+                                .fill(Color32::from_rgb(30, 41, 59))
+                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .rounding(Rounding::same(12.0))
+                                .inner_margin(Margin::symmetric(14.0, 4.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        ui.label(
+                                            RichText::new(&call.state_label)
+                                                .size(12.5)
+                                                .color(Color32::from_rgb(203, 213, 225)),
+                                        );
+                                        ui.label(
+                                            RichText::new("·")
+                                                .size(13.0)
+                                                .color(pal.text_muted),
+                                        );
                                         ui.label(
                                             RichText::new(&timer_str)
                                                 .monospace()
-                                                .size(14.0)
+                                                .size(13.5)
                                                 .color(pal.accent_online)
                                                 .strong(),
                                         );
                                     });
-                            }
+                                });
+                        }
 
-                            ui.add_space(18.0);
+                        ui.add_space(10.0);
 
-                            // Bottom Action Dock: Circular Native Call Controls
-                            if has_err {
-                                ui.horizontal(|ui| {
-                                    let w = ui.available_width();
-                                    ui.add_space(((w - 216.0) * 0.5).max(0.0));
-
+                        // 4. Bottom Action Dock — Exact Mathematical Center (`196.0 px` total width: `48 + 22 + 56 + 22 + 48`)
+                        if has_err {
+                            let dock_w = 216.0_f32;
+                            let (dock_rect, _) =
+                                ui.allocate_exact_size(Vec2::new(dock_w, 40.0), Sense::hover());
+                            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(dock_rect), |ui| {
+                                ui.horizontal_centered(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 12.0;
                                     let retry_btn = egui::Button::new(
                                         RichText::new(format!("{} Gọi lại", lucide::PHONE_CALL))
                                             .size(12.8)
@@ -9478,13 +9719,15 @@ impl ZaloGuiApp {
                                         hangup_clicked = true;
                                     }
                                 });
-                            } else if call.is_incoming_ringing {
-                                ui.horizontal(|ui| {
-                                    let w = ui.available_width();
-                                    ui.add_space(((w - 156.0) * 0.5).max(0.0));
-
-                                    // Circular Decline Button
-                                    ui.vertical(|ui| {
+                            });
+                        } else if call.is_incoming_ringing {
+                            let dock_w = 148.0_f32;
+                            let (dock_rect, _) =
+                                ui.allocate_exact_size(Vec2::new(dock_w, 72.0), Sense::hover());
+                            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(dock_rect), |ui| {
+                                ui.horizontal_centered(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 44.0;
+                                    ui.vertical_centered(|ui| {
                                         let (dec_r, dec_resp) = ui.allocate_exact_size(
                                             Vec2::splat(52.0),
                                             Sense::click(),
@@ -9507,8 +9750,8 @@ impl ZaloGuiApp {
                                             .clicked()
                                         {
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ =
-                                                    tx.send(WorkerCmd::AnswerCall { accept: false });
+                                                let _ = tx
+                                                    .send(WorkerCmd::AnswerCall { accept: false });
                                             }
                                             hangup_clicked = true;
                                         }
@@ -9519,10 +9762,7 @@ impl ZaloGuiApp {
                                         );
                                     });
 
-                                    ui.add_space(44.0);
-
-                                    // Circular Accept Button
-                                    ui.vertical(|ui| {
+                                    ui.vertical_centered(|ui| {
                                         let (acc_r, acc_resp) = ui.allocate_exact_size(
                                             Vec2::splat(52.0),
                                             Sense::click(),
@@ -9547,8 +9787,8 @@ impl ZaloGuiApp {
                                             call.is_incoming_ringing = false;
                                             call.state_label = "Đang kết nối cuộc gọi…".into();
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ =
-                                                    tx.send(WorkerCmd::AnswerCall { accept: true });
+                                                let _ = tx
+                                                    .send(WorkerCmd::AnswerCall { accept: true });
                                             }
                                         }
                                         ui.label(
@@ -9558,11 +9798,13 @@ impl ZaloGuiApp {
                                         );
                                     });
                                 });
-                            } else {
-                                // Active / Outgoing Call: Circular Mic · Hangup · Camera Dock
-                                ui.horizontal(|ui| {
-                                    let w = ui.available_width();
-                                    ui.add_space(((w - 204.0) * 0.5).max(0.0));
+                            });
+                        } else {
+                            let dock_w = 196.0_f32;
+                            let (dock_rect, _) =
+                                ui.allocate_exact_size(Vec2::new(dock_w, 56.0), Sense::hover());
+                            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(dock_rect), |ui| {
+                                ui.horizontal_centered(|ui| {
                                     ui.spacing_mut().item_spacing.x = 22.0;
 
                                     // 1) Circular Mic Button
@@ -9621,7 +9863,7 @@ impl ZaloGuiApp {
                                         }
                                     }
 
-                                    // 2) Prominent Circular Red Hangup Button
+                                    // 2) Prominent Circular Red Hangup Button (dead-center of window)
                                     let (end_r, end_resp) =
                                         ui.allocate_exact_size(Vec2::splat(56.0), Sense::click());
                                     ui.painter().circle_filled(
@@ -9693,6 +9935,9 @@ impl ZaloGuiApp {
                                     {
                                         call.cam_enabled = !call.cam_enabled;
                                         call.is_video = call.cam_enabled;
+                                        if !call.cam_enabled {
+                                            self.sticker_textures.remove("call_local_video");
+                                        }
                                         if let Some(tx) = WORKER_TX.get() {
                                             let _ = tx.send(WorkerCmd::SetCallMediaState {
                                                 is_on_mic: !call.mic_muted,
@@ -9701,10 +9946,11 @@ impl ZaloGuiApp {
                                         }
                                     }
                                 });
-                            }
-                        });
+                            });
+                        }
                     });
-            });
+                });
+        });
 
         if retry_clicked {
             call.error_code = None;
@@ -9727,6 +9973,8 @@ impl ZaloGuiApp {
             self.active_call = Some(call);
         } else if hangup_clicked {
             self.active_call = None;
+            self.sticker_textures.remove("call_remote_video");
+            self.sticker_textures.remove("call_local_video");
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::EndCall);
             }

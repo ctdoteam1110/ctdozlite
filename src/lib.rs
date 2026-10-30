@@ -14,3 +14,4 @@ pub mod socket;
 pub mod store;
 pub mod tui;
 pub mod ui;
+pub mod voip_log;
