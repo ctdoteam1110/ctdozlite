@@ -1377,8 +1377,14 @@ struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         let default_dl = std::env::var("USERPROFILE")
+            .ok()
             .map(|p| format!(r"{p}\Downloads\Zalo Received Files"))
-            .unwrap_or_else(|_| r"C:\Users\Public\Downloads\Zalo Received Files".into());
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| format!("{h}/Downloads/Zalo Received Files"))
+            })
+            .unwrap_or_else(|| "Downloads/Zalo Received Files".into());
         Self {
             show_all_contacts: false,
             language: "Tiếng Việt".into(),
@@ -9068,7 +9074,14 @@ impl ZaloGuiApp {
         if open_dl_dir {
             let p = std::path::PathBuf::from(&self.settings.download_dir);
             let _ = std::fs::create_dir_all(&p);
-            let _ = std::process::Command::new("explorer").arg(&p).spawn();
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("explorer").arg(&p).spawn();
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+            }
         }
 
         if !open {
@@ -11641,7 +11654,30 @@ fn pick_native_file_dialog(images_only: bool) -> Option<std::path::PathBuf> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = images_only;
+        let mut zcmd = std::process::Command::new("zenity");
+        zcmd.arg("--file-selection");
+        if images_only {
+            zcmd.arg("--file-filter=Images | *.png *.jpg *.jpeg *.webp *.gif *.bmp");
+        }
+        if let Ok(out) = zcmd.output() {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return Some(std::path::PathBuf::from(s));
+                }
+            }
+        }
+        if let Ok(out) = std::process::Command::new("kdialog")
+            .arg("--getopenfilename")
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return Some(std::path::PathBuf::from(s));
+                }
+            }
+        }
         None
     }
 }
@@ -11911,6 +11947,22 @@ fn read_clipboard_image_to_png() -> Option<(std::path::PathBuf, u32, u32, egui::
     }
     #[cfg(not(target_os = "windows"))]
     {
+        // Wayland (`wl-paste --type image/png`) or X11 (`xclip -selection clipboard -t image/png -o`)
+        for (prog, args) in [
+            ("wl-paste", &["--no-newline", "--type", "image/png"][..]),
+            (
+                "xclip",
+                &["-selection", "clipboard", "-t", "image/png", "-o"][..],
+            ),
+        ] {
+            if let Ok(out) = std::process::Command::new(prog).args(args).output() {
+                if out.status.success() && out.stdout.len() > 8 {
+                    if let Ok(dyn_img) = image::load_from_memory(&out.stdout) {
+                        return finalize_clipboard_rgba_image(dyn_img.to_rgba8());
+                    }
+                }
+            }
+        }
         None
     }
 }
@@ -13421,6 +13473,12 @@ fn setup_custom_fonts(ctx: &egui::Context) {
         "C:\\Windows\\Fonts\\segoeui.ttf",
         "C:\\Windows\\Fonts\\arial.ttf",
         "C:\\Windows\\Fonts\\tahoma.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     ];
 
     for path in font_candidates {

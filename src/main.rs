@@ -20,6 +20,7 @@ mod socket;
 mod store;
 mod tui;
 mod ui;
+mod voip_log;
 
 use anyhow::Result;
 use session::Session;
