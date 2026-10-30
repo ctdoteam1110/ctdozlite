@@ -439,16 +439,31 @@ fn run_media_loop(
 
         // --- Receive: unwrap Zalo relay framing, parse RTP, decode Opus, play ---
         let mut buf = [0u8; 4000];
-        let recv_len = if let Some(ref tsock) = udp_rtp_sock {
-            tsock.try_recv_from(&mut buf).ok().map(|(n, _)| n)
-        } else if let Some(ref fsock) = fallback_sock {
-            fsock.recv_from(&mut buf).ok().map(|(n, _)| n)
-        } else {
-            None
-        };
-        if let Some(n) = recv_len {
+        for _ in 0..8 {
+            let recv_info = if let Some(tsock) = &udp_rtp_sock {
+                tsock.try_recv_from(&mut buf).ok()
+            } else if let Some(fsock) = &fallback_sock {
+                fsock.recv_from(&mut buf).ok()
+            } else {
+                None
+            };
+            let Some((n, peer)) = recv_info else {
+                break;
+            };
             if let Some(inner_rtp) = unwrap_zalo_relay_rtp(&buf[..n]) {
                 let pt = inner_rtp.get(1).map(|b| b & 0x7F).unwrap_or(0);
+                static LOGGED_RX: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let cnt = LOGGED_RX.fetch_add(1, Ordering::Relaxed);
+                if cnt < 12 || cnt % 100 == 0 {
+                    crate::call::trace_line(
+                        "RTP<",
+                        format!(
+                            "from={peer} len={n} outer=0x{:02x} pt={pt}",
+                            buf[0]
+                        ),
+                    );
+                }
                 // Only decode Opus audio packets (PT = 112); skip H.264 video packets (PT = 97)
                 if pt == 112 {
                     if let Some(payload) = extract_rtp_opus_payload(inner_rtp) {
@@ -459,6 +474,18 @@ fn run_media_loop(
                             }
                         }
                     }
+                }
+            } else if n > 0 && buf[0] != 0x01 {
+                static LOGGED_UNK: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if LOGGED_UNK.fetch_add(1, Ordering::Relaxed) < 10 {
+                    crate::call::trace_line(
+                        "UDP?",
+                        format!(
+                            "from={peer} len={n} head={:02x?}",
+                            &buf[..n.min(16)]
+                        ),
+                    );
                 }
             }
         }

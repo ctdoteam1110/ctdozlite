@@ -1456,9 +1456,6 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
                         if probe.token == 0 {
                             probe.token = token;
                         }
-                        if probe.public_p2p.is_none() && pub_addr.is_some() {
-                            probe.public_p2p = pub_addr;
-                        }
                         let pkt_ping = build_zrtp_ping_packet(from_uid, token, sess_id);
                         let _ = rtcp_sock.send_to(&pkt_ping, peer_str.as_str()).await;
                     }
@@ -1507,7 +1504,6 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
                             let tok = server_tokens.get(rtp_addr).copied().unwrap_or(cur_token);
                             let pkt_p = build_zrtp_ping_packet(from_uid, tok, &sess_owned);
                             let _ = rtp_loop.send_to(&pkt_p, rtp_addr.as_str()).await;
-                            let _ = rtp_loop.send_to(&pkt_e, rtp_addr.as_str()).await;
                             let _ = rtcp_loop.send_to(&pkt_p, rtcp_addr.as_str()).await;
                         }
                     }
@@ -1768,7 +1764,7 @@ pub fn build_pure_rust_invite_fields_with_probe(
         "p2p": p2p_entries,
         "packetMode": 2,
         "platform": 2,
-        "sP2P": 1,
+        "sP2P": 0,
         "serverAddr": server_addr,
         "serverResult": server_result,
         "spTcp": 1,
@@ -1834,7 +1830,7 @@ pub fn build_callee_extend_data(
         "p2p": p2p_entries,
         "packetMode": 2,
         "platform": 2,
-        "sP2P": 1,
+        "sP2P": 0,
         "select2side": 1,
         "serverAddr": [
             {
@@ -2527,6 +2523,25 @@ impl CallBridge {
                                             if let Some(&tok) = st.server_tokens.get(sel_srv) {
                                                 st.relay_token = tok;
                                             }
+                                        }
+                                        trace_line(
+                                            "MEDIA",
+                                            format!(
+                                                "start caller=true rtp={} token={} video={}",
+                                                st.rtp_ip, st.relay_token, st.is_video
+                                            ),
+                                        );
+                                        // Send an immediate ZRTP Ping (cmd=0x0002) to the selected relay
+                                        if let (Some(rsock), Ok(target)) = (
+                                            &st.udp_rtp_sock,
+                                            st.rtp_ip.parse::<std::net::SocketAddr>(),
+                                        ) {
+                                            let pkt_p = build_zrtp_ping_packet(
+                                                st.from_uid_u32,
+                                                st.relay_token,
+                                                &st.sess_id,
+                                            );
+                                            let _ = rsock.try_send_to(&pkt_p, target);
                                         }
                                         // Start Opus/RTP media over the registered ZRTP UDP relay sockets
                                         // (falling back to local audio pass-through only if RTP media fails).
