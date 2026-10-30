@@ -8556,7 +8556,7 @@ impl ZaloGuiApp {
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new("Thay đổi ngôn ngữ").color(pal.text_primary).size(13.2));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            egui::ComboBox::from_id_source("setting_lang_combo")
+                                                            egui::ComboBox::from_id_salt("setting_lang_combo")
                                                                 .selected_text(&self.settings.language)
                                                                 .width(130.0)
                                                                 .show_ui(ui, |ui| {
@@ -8623,7 +8623,7 @@ impl ZaloGuiApp {
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new("Hiện ngày sinh").color(pal.text_primary).size(13.2));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            egui::ComboBox::from_id_source("setting_bday_combo")
+                                                            egui::ComboBox::from_id_salt("setting_bday_combo")
                                                                 .selected_text(&self.settings.show_birthday)
                                                                 .width(170.0)
                                                                 .show_ui(ui, |ui| {
@@ -8661,7 +8661,7 @@ impl ZaloGuiApp {
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new("Cho phép nhắn tin").color(pal.text_primary).size(13.2));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            egui::ComboBox::from_id_source("setting_msg_stranger_combo")
+                                                            egui::ComboBox::from_id_salt("setting_msg_stranger_combo")
                                                                 .selected_text(&self.settings.allow_message_from)
                                                                 .width(170.0)
                                                                 .show_ui(ui, |ui| {
@@ -8674,7 +8674,7 @@ impl ZaloGuiApp {
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new("Cho phép gọi điện").color(pal.text_primary).size(13.2));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            egui::ComboBox::from_id_source("setting_call_stranger_combo")
+                                                            egui::ComboBox::from_id_salt("setting_call_stranger_combo")
                                                                 .selected_text(&self.settings.allow_call_from)
                                                                 .width(220.0)
                                                                 .show_ui(ui, |ui| {
@@ -8774,7 +8774,7 @@ impl ZaloGuiApp {
                                                                         },
                                                                     );
                                                                 }
-                                                                ui.painter().rect_stroke(card_r, Rounding::same(8.0), Stroke::new(if selected { 2.0 } else { 1.0 }, stroke_col));
+                                                                ui.painter().rect_stroke(card_r, Rounding::same(8.0), Stroke::new(if selected { 2.0_f32 } else { 1.0_f32 }, stroke_col));
                                                                 ui.painter().circle_filled(Pos2::new(card_r.left() + 18.0, card_r.top() + 22.0), 5.5, Color32::from_rgb(82, 139, 255));
                                                                 let mock_in = Rect::from_min_size(Pos2::new(card_r.left() + 30.0, card_r.top() + 15.0), Vec2::new(62.0, 22.0));
                                                                 ui.painter().rect_filled(mock_in, Rounding::same(4.0), if is_dark_val && mode_key != "light" { Color32::from_rgb(76, 82, 94) } else { Color32::WHITE });
@@ -8833,9 +8833,9 @@ impl ZaloGuiApp {
                                                                     pal.border
                                                                 };
                                                                 let scr_r = Rect::from_min_max(Pos2::new(lap_r.left() + 14.0, lap_r.top() + 6.0), Pos2::new(lap_r.right() - 14.0, lap_r.bottom() - 16.0));
-                                                                ui.painter().rect_stroke(scr_r, Rounding::same(4.0), Stroke::new(1.8, stroke_c));
+                                                                ui.painter().rect_stroke(scr_r, Rounding::same(4.0), Stroke::new(1.8_f32, stroke_c));
                                                                 let base_r = Rect::from_min_max(Pos2::new(lap_r.left() + 6.0, lap_r.bottom() - 16.0), Pos2::new(lap_r.right() - 6.0, lap_r.bottom() - 6.0));
-                                                                ui.painter().rect_stroke(base_r, Rounding::same(4.0), Stroke::new(1.8, stroke_c));
+                                                                ui.painter().rect_stroke(base_r, Rounding::same(4.0), Stroke::new(1.8_f32, stroke_c));
                                                                 if en_val {
                                                                     let toast_r = Rect::from_min_size(Pos2::new(scr_r.right() - 62.0, scr_r.top() + 8.0), Vec2::new(54.0, 22.0));
                                                                     ui.painter().rect_filled(toast_r, Rounding::same(3.0), pal.bg_selected);
@@ -9116,9 +9116,20 @@ impl ZaloGuiApp {
                 }
             });
 
-        let card_w = (screen_rect.width() * 0.84).clamp(300.0, 344.0);
         let has_err = call.error_reason.is_some();
-        let card_h = if has_err { 356.0 } else { 368.0 };
+        let is_video_stage = call.is_video && !has_err;
+        let card_w = if is_video_stage {
+            (screen_rect.width() * 0.86).clamp(520.0, 680.0)
+        } else {
+            (screen_rect.width() * 0.84).clamp(300.0, 344.0)
+        };
+        let card_h = if has_err {
+            356.0
+        } else if is_video_stage {
+            (screen_rect.height() * 0.78).clamp(430.0, 520.0)
+        } else {
+            368.0
+        };
         let card_rect = Rect::from_center_size(screen_rect.center(), Vec2::new(card_w, card_h));
 
         let call_ava = self
@@ -9137,7 +9148,7 @@ impl ZaloGuiApp {
                     Color32::from_rgba_unmultiplied(59, 130, 246, 110)
                 };
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(15, 23, 42))
+                    .fill(pal.bg_sidebar)
                     .stroke(Stroke::new(1.2_f32, border_col))
                     .rounding(Rounding::same(22.0))
                     .inner_margin(Margin::symmetric(22.0, 18.0))
@@ -9205,47 +9216,150 @@ impl ZaloGuiApp {
 
                         // Center Avatar with Pulsing Ring Halo
                         ui.vertical_centered(|ui| {
-                            let (av_rect, _) =
-                                ui.allocate_exact_size(Vec2::splat(92.0), Sense::hover());
-                            let center = av_rect.center();
-                            let ring_col = if has_err {
-                                pal.danger
-                            } else if call.is_incoming_ringing {
-                                pal.accent_online
+                            if is_video_stage {
+                                let stage_w = (card_w - 44.0).max(280.0);
+                                let stage_h = (card_h - 164.0).max(210.0);
+                                let (stage_rect, _) =
+                                    ui.allocate_exact_size(Vec2::new(stage_w, stage_h), Sense::hover());
+                                let painter = ui.painter();
+                                painter.rect_filled(
+                                    stage_rect,
+                                    Rounding::same(14.0),
+                                    pal.bg_app,
+                                );
+                                painter.rect_stroke(
+                                    stage_rect,
+                                    Rounding::same(14.0),
+                                    Stroke::new(1.0_f32, pal.border),
+                                );
+
+                                // Remote video stage center (avatar + name + timer pill)
+                                let center = Pos2::new(stage_rect.center().x, stage_rect.center().y - 16.0);
+                                let pulse = ((elapsed_f * 2.6).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+                                painter.circle_filled(
+                                    center,
+                                    46.0 + pulse * 6.0,
+                                    pal.primary.linear_multiply(0.12),
+                                );
+                                painter.circle_stroke(
+                                    center,
+                                    43.0,
+                                    Stroke::new(1.8_f32, pal.primary_hover.linear_multiply(0.8)),
+                                );
+                                paint_user_avatar(
+                                    painter,
+                                    center,
+                                    40.0,
+                                    &call.partner_name,
+                                    call.is_group,
+                                    call_ava,
+                                    &self.sticker_textures,
+                                    &mut self.loading_stickers,
+                                );
+                                painter.text(
+                                    Pos2::new(stage_rect.center().x, center.y + 56.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    &call.partner_name,
+                                    FontId::proportional(17.5),
+                                    pal.text_primary,
+                                );
+
+                                // Local Camera Picture-in-Picture (PIP) preview in bottom-right corner
+                                let pip_rect = Rect::from_min_size(
+                                    Pos2::new(stage_rect.right() - 156.0, stage_rect.bottom() - 108.0),
+                                    Vec2::new(144.0, 96.0),
+                                );
+                                painter.rect_filled(
+                                    pip_rect,
+                                    Rounding::same(10.0),
+                                    pal.bg_elevated,
+                                );
+                                painter.rect_stroke(
+                                    pip_rect,
+                                    Rounding::same(10.0),
+                                    Stroke::new(
+                                        1.4_f32,
+                                        if call.cam_enabled {
+                                            pal.primary_hover
+                                        } else {
+                                            pal.border
+                                        },
+                                    ),
+                                );
+                                let self_disp = if self.user_name.is_empty() {
+                                    "Tôi"
+                                } else {
+                                    &self.user_name
+                                };
+                                paint_user_avatar(
+                                    painter,
+                                    Pos2::new(pip_rect.center().x, pip_rect.center().y - 8.0),
+                                    18.0,
+                                    self_disp,
+                                    false,
+                                    self.user_avatar.as_deref(),
+                                    &self.sticker_textures,
+                                    &mut self.loading_stickers,
+                                );
+                                let pip_status = if call.cam_enabled {
+                                    format!("{} Camera đang bật", lucide::VIDEO)
+                                } else {
+                                    format!("{} Camera đã tắt", lucide::VIDEO_OFF)
+                                };
+                                painter.text(
+                                    Pos2::new(pip_rect.center().x, pip_rect.bottom() - 14.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    pip_status,
+                                    FontId::proportional(10.5),
+                                    if call.cam_enabled {
+                                        pal.accent_online
+                                    } else {
+                                        pal.text_muted
+                                    },
+                                );
+                                ui.add_space(8.0);
                             } else {
-                                pal.primary_hover
-                            };
-                            let pulse = ((elapsed_f * 2.6).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
-                            ui.painter().circle_filled(
-                                center,
-                                42.0 + pulse * 5.0,
-                                ring_col.linear_multiply(0.10),
-                            );
-                            ui.painter().circle_stroke(
-                                center,
-                                40.0,
-                                Stroke::new(1.8_f32, ring_col.linear_multiply(0.75)),
-                            );
-                            paint_user_avatar(
-                                ui.painter(),
-                                center,
-                                37.0,
-                                &call.partner_name,
-                                call.is_group,
-                                call_ava,
-                                &self.sticker_textures,
-                                &mut self.loading_stickers,
-                            );
+                                let (av_rect, _) =
+                                    ui.allocate_exact_size(Vec2::splat(92.0), Sense::hover());
+                                let center = av_rect.center();
+                                let ring_col = if has_err {
+                                    pal.danger
+                                } else if call.is_incoming_ringing {
+                                    pal.accent_online
+                                } else {
+                                    pal.primary_hover
+                                };
+                                let pulse = ((elapsed_f * 2.6).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+                                ui.painter().circle_filled(
+                                    center,
+                                    42.0 + pulse * 5.0,
+                                    ring_col.linear_multiply(0.10),
+                                );
+                                ui.painter().circle_stroke(
+                                    center,
+                                    40.0,
+                                    Stroke::new(1.8_f32, ring_col.linear_multiply(0.75)),
+                                );
+                                paint_user_avatar(
+                                    ui.painter(),
+                                    center,
+                                    37.0,
+                                    &call.partner_name,
+                                    call.is_group,
+                                    call_ava,
+                                    &self.sticker_textures,
+                                    &mut self.loading_stickers,
+                                );
 
-                            ui.add_space(10.0);
-                            ui.label(
-                                RichText::new(&call.partner_name)
-                                    .size(18.5)
-                                    .color(Color32::WHITE)
-                                    .strong(),
-                            );
-                            ui.add_space(3.0);
-
+                                ui.add_space(10.0);
+                                ui.label(
+                                    RichText::new(&call.partner_name)
+                                        .size(18.5)
+                                        .color(pal.text_primary)
+                                        .strong(),
+                                );
+                                ui.add_space(3.0);
+                            }
                             if let Some(ref err_msg) = call.error_reason {
                                 ui.label(
                                     RichText::new("Cuộc gọi chưa kết nối được")
