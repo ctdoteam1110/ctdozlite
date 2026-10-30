@@ -2251,6 +2251,8 @@ impl CallBridge {
                                     st.udp_rtcp_sock.clone(),
                                     0,
                                     st.is_video,
+                                    Some(gui_tx.clone()),
+                                    Some(egui_ctx.clone()),
                                 ) {
                                     Ok(m) => {
                                         st.media = Some(m);
@@ -2556,6 +2558,8 @@ impl CallBridge {
                                             st.udp_rtcp_sock.clone(),
                                             0,
                                             st.is_video,
+                                            Some(gui_tx.clone()),
+                                            Some(egui_ctx.clone()),
                                         ) {
                                             Ok(m) => {
                                                 st.media = Some(m);

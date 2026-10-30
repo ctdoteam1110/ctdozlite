@@ -2180,6 +2180,7 @@ impl ZaloGuiApp {
                             .as_ref()
                             .and_then(|c| c.error_reason.as_ref())
                             .is_some();
+                        self.sticker_textures.remove("call_remote_video");
                         if !has_error {
                             self.active_call = None;
                         }
@@ -9233,36 +9234,46 @@ impl ZaloGuiApp {
                                     Stroke::new(1.0_f32, pal.border),
                                 );
 
-                                // Remote video stage center (avatar + name + timer pill)
-                                let center = Pos2::new(stage_rect.center().x, stage_rect.center().y - 16.0);
-                                let pulse = ((elapsed_f * 2.6).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
-                                painter.circle_filled(
-                                    center,
-                                    46.0 + pulse * 6.0,
-                                    pal.primary.linear_multiply(0.12),
-                                );
-                                painter.circle_stroke(
-                                    center,
-                                    43.0,
-                                    Stroke::new(1.8_f32, pal.primary_hover.linear_multiply(0.8)),
-                                );
-                                paint_user_avatar(
-                                    painter,
-                                    center,
-                                    40.0,
-                                    &call.partner_name,
-                                    call.is_group,
-                                    call_ava,
-                                    &self.sticker_textures,
-                                    &mut self.loading_stickers,
-                                );
-                                painter.text(
-                                    Pos2::new(stage_rect.center().x, center.y + 56.0),
-                                    egui::Align2::CENTER_CENTER,
-                                    &call.partner_name,
-                                    FontId::proportional(17.5),
-                                    pal.text_primary,
-                                );
+                                // Remote video frame texture (decoded live from RTP 0x0E H.264 stream)
+                                if let Some(vtex) = self.sticker_textures.get("call_remote_video") {
+                                    painter.image(
+                                        vtex.id(),
+                                        stage_rect.shrink(1.0),
+                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                } else {
+                                    // Fallback avatar while waiting for first H.264 IDR keyframe
+                                    let center = Pos2::new(stage_rect.center().x, stage_rect.center().y - 16.0);
+                                    let pulse = ((elapsed_f * 2.6).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+                                    painter.circle_filled(
+                                        center,
+                                        46.0 + pulse * 6.0,
+                                        pal.primary.linear_multiply(0.12),
+                                    );
+                                    painter.circle_stroke(
+                                        center,
+                                        43.0,
+                                        Stroke::new(1.8_f32, pal.primary_hover.linear_multiply(0.8)),
+                                    );
+                                    paint_user_avatar(
+                                        painter,
+                                        center,
+                                        40.0,
+                                        &call.partner_name,
+                                        call.is_group,
+                                        call_ava,
+                                        &self.sticker_textures,
+                                        &mut self.loading_stickers,
+                                    );
+                                    painter.text(
+                                        Pos2::new(stage_rect.center().x, center.y + 56.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        &call.partner_name,
+                                        FontId::proportional(17.5),
+                                        pal.text_primary,
+                                    );
+                                }
 
                                 // Local Camera Picture-in-Picture (PIP) preview in bottom-right corner
                                 let pip_rect = Rect::from_min_size(

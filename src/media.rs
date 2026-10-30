@@ -34,6 +34,8 @@ impl MediaHandle {
             None,
             local_port,
             false,
+            None,
+            None,
         )
     }
 
@@ -49,6 +51,8 @@ impl MediaHandle {
         udp_rtcp_sock: Option<Arc<tokio::net::UdpSocket>>,
         local_port: u16,
         is_video: bool,
+        gui_tx: Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
+        egui_ctx: Option<eframe::egui::Context>,
     ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let mic_muted = Arc::new(AtomicBool::new(false));
@@ -78,6 +82,8 @@ impl MediaHandle {
                 is_caller,
                 relay_token,
                 is_video,
+                gui_tx,
+                egui_ctx,
             );
         });
         threads.push(t);
@@ -109,10 +115,10 @@ pub fn unwrap_zalo_relay_rtp(pkt: &[u8]) -> Option<&[u8]> {
         return None;
     }
     let inner = match pkt[0] {
-        // 1-byte relay media header (`0x04` = incoming RTP, `0x07` = P2P RTP, `0x0E` = incoming RTCP)
-        0x04 | 0x07 => pkt.get(1..)?,
-        // 5-byte relay media header (`0x03` / `0x05` + `token: u32 LE`)
-        0x03 | 0x05 => pkt.get(5..)?,
+        // 1-byte relay media header (`0x04` = incoming audio RTP, `0x07` = P2P RTP, `0x0E` = incoming video RTP)
+        0x04 | 0x07 | 0x0E => pkt.get(1..)?,
+        // 5-byte relay media header (`0x03` / `0x05` / `0x0D` / `0x0F` + `token: u32 LE`)
+        0x03 | 0x05 | 0x0D | 0x0F => pkt.get(5..)?,
         // 9-byte `0x7F` relay media header (`0x7F, 0x00, role, call_id: u32 LE, cmd: u16 LE`)
         0x7F if pkt.len() > 9 => {
             let cmd = u16::from_le_bytes([pkt[7], pkt[8]]);
@@ -181,7 +187,17 @@ fn run_media_loop(
     is_caller: bool,
     relay_token: u32,
     is_video: bool,
+    gui_tx: Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
+    egui_ctx: Option<eframe::egui::Context>,
 ) {
+    let (h264_tx, h264_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(120);
+    if let (Some(tx), Some(ctx)) = (gui_tx, egui_ctx) {
+        let stop_v = stop.clone();
+        thread::spawn(move || {
+            run_h264_ffmpeg_decoder(stop_v, h264_rx, tx, ctx);
+        });
+    }
+    let mut fu_a_buf: Vec<u8> = Vec::with_capacity(65536);
     let host = cpal::default_host();
     let input_dev = match host.default_input_device() {
         Some(d) => d,
@@ -395,7 +411,7 @@ fn run_media_loop(
                 *vseq = vseq.wrapping_add(1);
                 if let (Some(ref tsock), Some(target)) = (&udp_rtp_sock, rtp_sock_addr) {
                     if relay_token != 0 {
-                        let type_byte: u8 = if is_caller { 0x03 } else { 0x05 };
+                        let type_byte: u8 = if is_caller { 0x0D } else { 0x0E };
                         let mut wire = Vec::with_capacity(5 + vpkt.len());
                         wire.push(type_byte);
                         wire.extend_from_slice(&relay_token.to_le_bytes());
@@ -455,7 +471,7 @@ fn run_media_loop(
                 static LOGGED_RX: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
                 let cnt = LOGGED_RX.fetch_add(1, Ordering::Relaxed);
-                if cnt < 12 || cnt % 100 == 0 {
+                if cnt < 16 || cnt % 100 == 0 {
                     crate::call::trace_line(
                         "RTP<",
                         format!(
@@ -464,7 +480,6 @@ fn run_media_loop(
                         ),
                     );
                 }
-                // Only decode Opus audio packets (PT = 112); skip H.264 video packets (PT = 97)
                 if pt == 112 {
                     if let Some(payload) = extract_rtp_opus_payload(inner_rtp) {
                         let mut pcm = vec![0f32; FRAME_SAMPLES];
@@ -474,18 +489,10 @@ fn run_media_loop(
                             }
                         }
                     }
-                }
-            } else if n > 0 && buf[0] != 0x01 {
-                static LOGGED_UNK: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                if LOGGED_UNK.fetch_add(1, Ordering::Relaxed) < 10 {
-                    crate::call::trace_line(
-                        "UDP?",
-                        format!(
-                            "from={peer} len={n} head={:02x?}",
-                            &buf[..n.min(16)]
-                        ),
-                    );
+                } else if pt == 96 || pt == 97 || buf[0] == 0x0E {
+                    if let Some(payload) = extract_rtp_opus_payload(inner_rtp) {
+                        depacketize_rfc6184_h264(payload, &mut fu_a_buf, &h264_tx);
+                    }
                 }
             }
         }
@@ -494,6 +501,155 @@ fn run_media_loop(
 
     drop(input_stream);
     drop(output_stream);
+}
+
+/// Reassemble RFC 6184 H.264 RTP payloads (Single NAL 1..23, STAP-A 24, FU-A 28) into Annex-B (`00 00 00 01`) byte stream.
+fn depacketize_rfc6184_h264(
+    payload: &[u8],
+    fu_a_buf: &mut Vec<u8>,
+    h264_tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+) {
+    if payload.is_empty() {
+        return;
+    }
+    let nal_type = payload[0] & 0x1F;
+    match nal_type {
+        1..=23 => {
+            let mut annexb = Vec::with_capacity(4 + payload.len());
+            annexb.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            annexb.extend_from_slice(payload);
+            let _ = h264_tx.try_send(annexb);
+        }
+        24 => {
+            // STAP-A: multiple NAL units prefixed by u16 BE length
+            let mut idx = 1usize;
+            let mut annexb = Vec::new();
+            while idx + 2 <= payload.len() {
+                let sz = u16::from_be_bytes([payload[idx], payload[idx + 1]]) as usize;
+                idx += 2;
+                if sz > 0 && idx + sz <= payload.len() {
+                    annexb.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                    annexb.extend_from_slice(&payload[idx..idx + sz]);
+                    idx += sz;
+                } else {
+                    break;
+                }
+            }
+            if !annexb.is_empty() {
+                let _ = h264_tx.try_send(annexb);
+            }
+        }
+        28 if payload.len() >= 2 => {
+            // FU-A fragmented NAL unit
+            let fu_ind = payload[0];
+            let fu_hdr = payload[1];
+            let start_bit = (fu_hdr & 0x80) != 0;
+            let end_bit = (fu_hdr & 0x40) != 0;
+            let orig_nal_hdr = (fu_ind & 0xE0) | (fu_hdr & 0x1F);
+            if start_bit {
+                fu_a_buf.clear();
+                fu_a_buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, orig_nal_hdr]);
+                fu_a_buf.extend_from_slice(&payload[2..]);
+            } else if !fu_a_buf.is_empty() {
+                fu_a_buf.extend_from_slice(&payload[2..]);
+                if end_bit {
+                    let completed = std::mem::take(fu_a_buf);
+                    let _ = h264_tx.try_send(completed);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Spawn a headless `ffmpeg` pipe to decode incoming H.264 Annex-B NAL units into `480×360` RGBA frames.
+fn run_h264_ffmpeg_decoder(
+    stop: Arc<AtomicBool>,
+    h264_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    gui_tx: std::sync::mpsc::Sender<crate::gui::GuiEvent>,
+    egui_ctx: eframe::egui::Context,
+) {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    const VID_W: usize = 480;
+    const VID_H: usize = 360;
+    const FRAME_BYTES: usize = VID_W * VID_H * 4;
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-f",
+        "h264",
+        "-i",
+        "pipe:0",
+        "-vf",
+        "scale=480:360:force_original_aspect_ratio=decrease,pad=480:360:(ow-iw)/2:(oh-ih)/2",
+        "-pix_fmt",
+        "rgba",
+        "-f",
+        "rawvideo",
+        "pipe:1",
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let Ok(mut child) = cmd.spawn() else {
+        return;
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        return;
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return;
+    };
+
+    let stop_writer = stop.clone();
+    thread::spawn(move || {
+        while !stop_writer.load(Ordering::Relaxed) {
+            match h264_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(nal) => {
+                    if stdin.write_all(&nal).is_err() {
+                        break;
+                    }
+                    let _ = stdin.flush();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+
+    let mut raw_frame = vec![0u8; FRAME_BYTES];
+    while !stop.load(Ordering::Relaxed) {
+        if stdout.read_exact(&mut raw_frame).is_ok() {
+            let color_img =
+                eframe::egui::ColorImage::from_rgba_unmultiplied([VID_W, VID_H], &raw_frame);
+            let _ = gui_tx.send(crate::gui::GuiEvent::StickerImageReady {
+                key: "call_remote_video".to_string(),
+                image: color_img,
+            });
+            egui_ctx.request_repaint();
+        } else {
+            break;
+        }
+    }
+    let _ = child.kill();
 }
 
 #[cfg(test)]
