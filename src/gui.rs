@@ -1314,6 +1314,7 @@ struct ImageViewerModal {
     sender: String,
     time: String,
     zoom: f32,
+    pan: Vec2,
 }
 
 pub struct ZaloGuiApp {
@@ -5823,6 +5824,7 @@ impl ZaloGuiApp {
                                                     sender: d_name.clone(),
                                                     time: String::new(),
                                                     zoom: 1.0,
+                                                    pan: Vec2::ZERO,
                                                 });
                                             }
                                         }
@@ -7084,6 +7086,7 @@ impl ZaloGuiApp {
                                         sender,
                                         time,
                                         zoom: 1.0,
+                                        pan: Vec2::ZERO,
                                     });
                                 }
                             }
@@ -8781,11 +8784,6 @@ impl ZaloGuiApp {
             return;
         }
 
-        let scroll_delta_y = ctx.input(|i| i.smooth_scroll_delta.y);
-        if scroll_delta_y.abs() > 0.5 {
-            viewer.zoom = (viewer.zoom + scroll_delta_y * 0.0025).clamp(0.4, 4.0);
-        }
-
         let screen_rect = ctx.screen_rect();
         // Start below the 32px custom frameless title bar so window controls stay accessible
         let viewer_top = (screen_rect.top() + 32.0).min(screen_rect.bottom());
@@ -8800,24 +8798,6 @@ impl ZaloGuiApp {
         );
         let mut should_close = false;
 
-        // 1. Clean Atom One Dark theater canvas below the toolbar (click outside image to dismiss)
-        egui::Area::new(Id::new("image_viewer_backdrop"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(stage_area_rect.min)
-            .show(ctx, |ui| {
-                let (bg_rect, bg_resp) =
-                    ui.allocate_exact_size(stage_area_rect.size(), Sense::click());
-                let bg_col = if pal.is_dark {
-                    Color32::from_rgba_unmultiplied(24, 26, 31, 244) // #181A1F Atom One Dark deep canvas
-                } else {
-                    Color32::from_rgba_unmultiplied(24, 28, 36, 228)
-                };
-                ui.painter().rect_filled(bg_rect, Rounding::ZERO, bg_col);
-                if bg_resp.clicked() {
-                    should_close = true;
-                }
-            });
-
         let active_tex = viewer
             .hd_tex_key
             .as_ref()
@@ -8825,72 +8805,126 @@ impl ZaloGuiApp {
             .or_else(|| self.sticker_textures.get(&viewer.tex_key))
             .cloned();
 
-        let max_stage_w = (stage_area_rect.width() - 48.0).clamp(240.0, 1280.0);
-        let max_stage_h = (stage_area_rect.height() - 36.0).clamp(180.0, 880.0);
+        let max_stage_w = (stage_area_rect.width() - 48.0).max(160.0);
+        let max_stage_h = (stage_area_rect.height() - 36.0).max(120.0);
 
-        let (disp_w, disp_h, natural_dims) = if let Some(ref tex) = active_tex {
+        let (base_w, base_h, natural_dims) = if let Some(ref tex) = active_tex {
             let [tw, th] = tex.size();
             let tw_f = (tw.max(1)) as f32;
             let th_f = (th.max(1)) as f32;
             let fit_scale = (max_stage_w / tw_f).min(max_stage_h / th_f).min(1.5);
-            let w = (tw_f * fit_scale * viewer.zoom).clamp(120.0, max_stage_w);
-            let h = (th_f * fit_scale * viewer.zoom).clamp(90.0, max_stage_h);
-            (w, h, Some((tw, th)))
+            (tw_f * fit_scale, th_f * fit_scale, Some((tw, th)))
         } else {
             (340.0_f32.min(max_stage_w), 220.0_f32.min(max_stage_h), None)
         };
 
-        let img_pos = Pos2::new(
-            stage_area_rect.center().x - disp_w * 0.5,
-            stage_area_rect.center().y - disp_h * 0.5,
-        );
+        // Mouse-wheel zoom (zooms smoothly around cursor without clamping disp_w/disp_h to max_stage)
+        let scroll_y = ctx.input(|i| {
+            if i.raw_scroll_delta.y.abs() > 0.1 {
+                i.raw_scroll_delta.y
+            } else {
+                i.smooth_scroll_delta.y
+            }
+        });
+        if scroll_y.abs() > 0.1 {
+            let old_zoom = viewer.zoom;
+            let factor = if scroll_y > 0.0 { 1.15 } else { 1.0 / 1.15 };
+            let new_zoom = (old_zoom * factor).clamp(0.25, 8.0);
+            if let Some(ptr) = ctx.input(|i| i.pointer.hover_pos()) {
+                if stage_area_rect.contains(ptr) {
+                    let rel = ptr - (stage_area_rect.center() + viewer.pan);
+                    viewer.pan -= rel * (new_zoom / old_zoom - 1.0);
+                }
+            }
+            viewer.zoom = new_zoom;
+        }
 
-        // 2. Frameless Image Stage (no clunky outer frame box — subtle shadow + 1px hairline on image)
-        egui::Area::new(Id::new("image_viewer_stage"))
-            .order(egui::Order::Tooltip)
-            .fixed_pos(img_pos)
+        let disp_w = (base_w * viewer.zoom).max(48.0);
+        let disp_h = (base_h * viewer.zoom).max(48.0);
+
+        // Clamp pan so the image stays centered when <= stage size, and pans within bounds when enlarged
+        let max_pan_x = ((disp_w - stage_area_rect.width() + 40.0) * 0.5).max(0.0);
+        let max_pan_y = ((disp_h - stage_area_rect.height() + 40.0) * 0.5).max(0.0);
+        viewer.pan.x = viewer.pan.x.clamp(-max_pan_x, max_pan_x);
+        viewer.pan.y = viewer.pan.y.clamp(-max_pan_y, max_pan_y);
+
+        // 1. Unified Clipped Stage Canvas (never uses a floating Area at img_pos so it NEVER shifts left!)
+        egui::Area::new(Id::new("image_viewer_backdrop"))
+            .order(egui::Order::Foreground)
+            .constrain(false)
+            .fixed_pos(stage_area_rect.min)
             .show(ctx, |ui| {
+                let (bg_rect, bg_resp) =
+                    ui.allocate_exact_size(stage_area_rect.size(), Sense::click_and_drag());
+                let painter = ui.painter().with_clip_rect(bg_rect);
+                let bg_col = if pal.is_dark {
+                    Color32::from_rgba_unmultiplied(24, 26, 31, 244)
+                } else {
+                    Color32::from_rgba_unmultiplied(24, 28, 36, 228)
+                };
+                painter.rect_filled(bg_rect, Rounding::ZERO, bg_col);
+
+                let img_center = bg_rect.center() + viewer.pan;
+                let img_rect = Rect::from_center_size(img_center, Vec2::new(disp_w, disp_h));
+
                 if let Some(ref tex) = active_tex {
-                    let img_widget = egui::Image::new(tex)
-                        .fit_to_exact_size(Vec2::new(disp_w, disp_h))
-                        .rounding(Rounding::same(4.0))
-                        .sense(Sense::click());
-                    let img_resp = ui.add(img_widget);
-                    ui.painter().rect_stroke(
-                        img_resp.rect,
-                        Rounding::same(4.0),
+                    painter.image(
+                        tex.id(),
+                        img_rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    painter.rect_stroke(
+                        img_rect,
+                        Rounding::ZERO,
                         Stroke::new(1.0_f32, pal.border),
                     );
-                    if img_resp.double_clicked() {
-                        viewer.zoom = if (viewer.zoom - 1.0).abs() < 0.05 {
-                            2.0
+
+                    if bg_resp.dragged_by(egui::PointerButton::Primary) {
+                        viewer.pan += bg_resp.drag_delta();
+                        viewer.pan.x = viewer.pan.x.clamp(-max_pan_x, max_pan_x);
+                        viewer.pan.y = viewer.pan.y.clamp(-max_pan_y, max_pan_y);
+                        ctx.set_cursor_icon(CursorIcon::Grabbing);
+                    } else if let Some(ptr) = bg_resp.hover_pos() {
+                        if img_rect.contains(ptr) && (max_pan_x > 1.0 || max_pan_y > 1.0) {
+                            ctx.set_cursor_icon(CursorIcon::Grab);
+                        }
+                    }
+
+                    if bg_resp.double_clicked() {
+                        if (viewer.zoom - 1.0).abs() < 0.05 {
+                            viewer.zoom = 2.0;
                         } else {
-                            1.0
-                        };
+                            viewer.zoom = 1.0;
+                            viewer.pan = Vec2::ZERO;
+                        }
+                    } else if bg_resp.clicked() {
+                        let ptr = bg_resp
+                            .interact_pointer_pos()
+                            .or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+                        if ptr.map(|p| !img_rect.contains(p)).unwrap_or(false) {
+                            should_close = true;
+                        }
                     }
                 } else {
-                    egui::Frame::none()
-                        .fill(pal.bg_elevated)
-                        .stroke(Stroke::new(1.0_f32, pal.border))
-                        .rounding(Rounding::same(8.0))
-                        .inner_margin(Margin::same(20.0))
-                        .show(ui, |ui| {
-                            ui.set_min_size(Vec2::new(disp_w, disp_h));
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(disp_h * 0.30);
-                                ui.spinner();
-                                ui.add_space(10.0);
-                                ui.label(
-                                    RichText::new("Đang tải hình ảnh…")
-                                        .size(13.0)
-                                        .color(pal.text_primary)
-                                        .strong(),
-                                );
-                            });
-                        });
+                    painter.rect_filled(img_rect, Rounding::same(8.0), pal.bg_elevated);
+                    painter.rect_stroke(
+                        img_rect,
+                        Rounding::same(8.0),
+                        Stroke::new(1.0_f32, pal.border),
+                    );
+                    painter.text(
+                        img_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Đang tải hình ảnh…",
+                        FontId::proportional(13.0),
+                        pal.text_primary,
+                    );
+                    if bg_resp.clicked() {
+                        should_close = true;
+                    }
                 }
             });
-
         // 3. Clean Unified Top Toolbar Bar (docked under custom title bar, matching Atom One Dark pal.bg_sidebar)
         let clean_title = {
             let mut t = viewer
@@ -9063,7 +9097,7 @@ impl ZaloGuiApp {
                                     .on_hover_text("Phóng to (+25%)")
                                     .clicked()
                                 {
-                                    viewer.zoom = (viewer.zoom + 0.25).min(4.0);
+                                    viewer.zoom = (viewer.zoom + 0.25).min(8.0);
                                 }
 
                                 // Zoom Percentage Reset
@@ -9085,6 +9119,7 @@ impl ZaloGuiApp {
                                     .clicked()
                                 {
                                     viewer.zoom = 1.0;
+                                    viewer.pan = Vec2::ZERO;
                                 }
 
                                 // Zoom Out (-)
@@ -9103,7 +9138,10 @@ impl ZaloGuiApp {
                                     .on_hover_text("Thu nhỏ (-25%)")
                                     .clicked()
                                 {
-                                    viewer.zoom = (viewer.zoom - 0.25).max(0.4);
+                                    viewer.zoom = (viewer.zoom - 0.25).max(0.25);
+                                    if viewer.zoom <= 1.0 {
+                                        viewer.pan = Vec2::ZERO;
+                                    }
                                 }
                             });
                         });
