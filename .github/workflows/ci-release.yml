@@ -41,10 +41,23 @@ jobs:
           chmod +x packaging/linux/ctdozlite packaging/linux/install.sh packaging/linux/uninstall.sh
       - name: Package .deb (Debian / Ubuntu 22.04+ / Linux Mint / Kali / Pop!_OS / Zorin)
         run: |
-          cargo install cargo-deb --locked
-          cargo deb --no-build
-          mkdir -p dist
-          cp target/debian/ctdozlite_*.deb dist/ctdozlite_0.0.1_amd64.deb
+          mkdir -p dist pkg_deb/DEBIAN pkg_deb/usr/bin pkg_deb/usr/share/applications pkg_deb/usr/share/icons/hicolor/256x256/apps
+          cp target/release/zalo-rust pkg_deb/usr/bin/zalo-rust
+          cp packaging/linux/ctdozlite pkg_deb/usr/bin/ctdozlite
+          cp packaging/linux/ctdozlite.desktop pkg_deb/usr/share/applications/ctdozlite.desktop
+          cp src/assets/app_icon.png pkg_deb/usr/share/icons/hicolor/256x256/apps/ctdozlite.png
+          cat > pkg_deb/DEBIAN/control << 'EOF'
+          Package: ctdozlite
+          Version: 0.0.1
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Depends: libc6, libasound2 | libasound2t64, libx11-6, libxcb1, libxkbcommon0, libgl1
+          Recommends: ffmpeg, zenity, xclip, wl-clipboard, fonts-noto-core
+          Maintainer: TIPC1110 <tienichpc1110@gmail.com>
+          Description: Lightweight native Zalo PC client written in Rust
+          EOF
+          dpkg-deb --build --root-owner-group pkg_deb dist/ctdozlite_0.0.1_amd64.deb
       - name: Package .rpm (Fedora / RHEL / Rocky / AlmaLinux / CentOS / openSUSE)
         run: |
           mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
@@ -135,8 +148,9 @@ jobs:
           key: bullseye-glibc231
       - name: Install build dependencies (Debian 11 Bullseye)
         run: |
+          sed -i '/bullseye-security/d' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
           apt-get update
-          apt-get install -y build-essential cmake pkg-config \
+          apt-get install -y --no-upgrade build-essential cmake pkg-config \
             libasound2-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxkbcommon-dev libssl-dev \
             libgtk-3-dev
@@ -229,7 +243,7 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: [linux-packages, linux-legacy-glibc231, windows-exe, macos-dmg]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.linux-packages.result == 'success' && needs.windows-exe.result == 'success' && needs.macos-dmg.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
