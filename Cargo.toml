@@ -1,6 +1,6 @@
 [package]
 name = "ctdozlite"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 authors = ["TIPC1110 <tienichpc1110@gmail.com>"]
 description = "Lightweight, high-performance native Zalo PC client written in Rust (zero Node.js, zero Electron)"
@@ -67,12 +67,13 @@ name = "ctdozlite"
 maintainer = "TIPC1110 <tienichpc1110@gmail.com>"
 copyright = "2026, TIPC1110 <tienichpc1110@gmail.com>"
 license-file = ["LICENSE-MIT", "0"]
-depends = "$auto"
+depends = "libc6 (>= 2.31), libasound2 | libasound2t64, libx11-6, libxcb1, libxkbcommon0, libgl1"
 recommends = "ffmpeg, zenity, xclip, wl-clipboard, fonts-noto-core"
 section = "net"
 priority = "optional"
 assets = [
     ["target/release/zalo-rust", "usr/bin/", "755"],
+    ["packaging/linux/ctdozlite", "usr/bin/", "755"],
     ["packaging/linux/ctdozlite.desktop", "usr/share/applications/", "644"],
     ["src/assets/app_icon.png", "usr/share/icons/hicolor/256x256/apps/ctdozlite.png", "644"],
     ["README.md", "usr/share/doc/ctdozlite/README.md", "644"],

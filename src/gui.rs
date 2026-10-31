@@ -1323,14 +1323,14 @@ impl ZaloGuiApp {
                             .strong(),
                     );
 
-                    // Subtle "Native" pill badge
+                    // Subtle "Native v0.0.1" pill badge
                     egui::Frame::none()
                         .fill(pal.primary.linear_multiply(0.14))
                         .rounding(Rounding::same(4.0))
                         .inner_margin(Margin::symmetric(5.0, 1.5))
                         .show(ui, |ui| {
                             ui.label(
-                                RichText::new("Native")
+                                RichText::new(format!("Native v{}", env!("CARGO_PKG_VERSION")))
                                     .color(pal.primary)
                                     .size(10.5)
                                     .strong(),

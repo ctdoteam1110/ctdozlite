@@ -2,9 +2,10 @@
 
 Client Zalo Desktop viết bằng Rust (`eframe`/`egui` + `ratatui`), giao tiếp trực tiếp với hệ thống API và WebSocket của Zalo Web/PC mà không qua Electron hay Chromium.
 
+[![Release](https://img.shields.io/badge/release-v0.0.1-success.svg)](https://github.com/ctdoteam1110/ctdozlite/releases)
 [![CI & Release](https://github.com/ctdoteam1110/ctdozlite/actions/workflows/ci-release.yml/badge.svg)](https://github.com/ctdoteam1110/ctdozlite/actions/workflows/ci-release.yml)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue.svg)](#cài-đặt--biên-dịch)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue.svg)](https://github.com/ctdoteam1110/ctdozlite/releases)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 ---
@@ -79,7 +80,43 @@ src/
 
 ---
 
-## Cài đặt & Biên dịch
+## Tải bản cài đặt dựng sẵn (Releases — v0.0.1)
+
+Toàn bộ gói cài đặt dựng sẵn cho từng hệ điều hành và các bản phân phối Linux nằm tại **[GitHub Releases (v0.0.1)](https://github.com/ctdoteam1110/ctdozlite/releases)**. Binary Linux được liên kết tĩnh `libopus`, `sqlite3` và `rustls`, đồng thời cung cấp đủ định dạng để cài đặt trên cả distro đời mới lẫn đời cũ (`glibc >= 2.31`):
+
+### 1. Cài đặt nhanh trên Linux (Mọi bản phân phối)
+
+- **Ubuntu 22.04 / 24.04, Debian 12+, Linux Mint 21+, Kali, Pop!_OS, Zorin (`.deb`):**
+  ```bash
+  sudo apt install ./ctdozlite_0.0.1_amd64.deb
+  ```
+- **Ubuntu 20.04, Debian 11, Linux Mint 20 hoặc distro nhân cũ `glibc 2.31+` (`.deb` legacy):**
+  ```bash
+  sudo apt install ./ctdozlite_0.0.1_legacy_glibc2.31_amd64.deb
+  ```
+- **Fedora, RHEL, Rocky Linux, AlmaLinux, CentOS Stream, openSUSE (`.rpm`):**
+  ```bash
+  sudo dnf install ./ctdozlite-0.0.1-1.x86_64.rpm
+  ```
+- **AppImage (Chạy trực tiếp trên mọi bản Linux, không cần quyền root hay cài đặt):**
+  ```bash
+  chmod +x ctdozlite-0.0.1-x86_64.AppImage
+  ./ctdozlite-0.0.1-x86_64.AppImage
+  ```
+- **Arch Linux, Manjaro, EndeavourOS, Gentoo, Void, NixOS hoặc cài thủ công (`.tar.gz`):**
+  ```bash
+  tar -xzf ctdozlite-0.0.1-linux-x86_64.tar.gz
+  cd ctdozlite-0.0.1-linux-x86_64
+  ./install.sh
+  ```
+
+### 2. Cài đặt trên Windows & macOS
+- **Windows (x64):** Chạy bộ cài `ctdozlite-0.0.1-setup-windows-x86_64.exe` hoặc bản chạy ngay `ctdozlite-0.0.1-portable-windows-x86_64.exe`.
+- **macOS:** Mở `ctdozlite-0.0.1-macos.dmg` và kéo `ctdozlite.app` vào `/Applications`.
+
+---
+
+## Tự biên dịch từ mã nguồn (Windows / Linux / macOS)
 
 ### 1. Yêu cầu chung
 - **Rust** 1.75 trở lên ([rustup.rs](https://rustup.rs/))
@@ -173,11 +210,36 @@ Binary đầu ra: `target/release/zalo-rust`
 
 ## Đóng gói đa nền tảng (CI/CD)
 
-Workflow GitHub Actions tại [`.github/workflows/ci-release.yml`](.github/workflows/ci-release.yml) tự động chạy `cargo test` và đóng gói bộ cài cho cả 3 hệ điều hành khi đẩy tag `v*` hoặc chạy thủ công:
+Workflow GitHub Actions tại [`.github/workflows/ci-release.yml`](.github/workflows/ci-release.yml) tự động chạy `cargo test`, đóng gói và phát hành lên [GitHub Releases](https://github.com/ctdoteam1110/ctdozlite/releases) khi đẩy tag `v*`:
 
-- **Linux:** `ctdozlite_<ver>_amd64.deb` ([`packaging/linux/ctdozlite.desktop`](packaging/linux/ctdozlite.desktop))
-- **Windows:** `ctdozlite-portable-windows-x86_64.exe` và bộ cài Inno Setup `ctdozlite-setup-windows-x86_64.exe` ([`packaging/windows/installer.iss`](packaging/windows/installer.iss))
-- **macOS:** `ctdozlite_<ver>_macos.dmg` đóng gói `ctdozlite.app` ([`packaging/macos/Info.plist`](packaging/macos/Info.plist))
+- **Linux (5 gói tương thích đa distro):**
+  - `ctdozlite_0.0.1_amd64.deb` (Debian 12+ / Ubuntu 22.04, 24.04+ / Mint 21+)
+  - `ctdozlite_0.0.1_legacy_glibc2.31_amd64.deb` (Debian 11 / Ubuntu 20.04+ / Mint 20+)
+  - `ctdozlite-0.0.1-1.x86_64.rpm` (Fedora / RHEL / Rocky / AlmaLinux / openSUSE)
+  - `ctdozlite-0.0.1-x86_64.AppImage` (Gói thực thi độc lập chạy trên mọi bản Linux)
+  - `ctdozlite-0.0.1-linux-x86_64.tar.gz` & `ctdozlite-0.0.1-linux-x86_64-legacy-glibc2.31.tar.gz` (kèm script `install.sh` / `uninstall.sh`)
+- **Windows:** `ctdozlite-0.0.1-portable-windows-x86_64.exe` và `ctdozlite-0.0.1-setup-windows-x86_64.exe` ([`packaging/windows/installer.iss`](packaging/windows/installer.iss))
+- **macOS:** `ctdozlite-0.0.1-macos.dmg` đóng gói `ctdozlite.app` ([`packaging/macos/Info.plist`](packaging/macos/Info.plist))
+
+---
+
+## Phiên bản hiện tại & Quy tắc cập nhật (Versioning)
+
+- **Phiên bản hiện tại:** `0.0.1` (`v0.0.1`)
+- **Quy tắc tăng phiên bản cho các bản cập nhật tiếp theo:**
+  Khi phát hành bản cập nhật mới, tăng tuần tự số phiên bản (`0.0.1` -> `0.0.2` -> `0.0.3`...) đồng bộ tại 5 vị trí:
+  1. `Cargo.toml` (`version = "0.0.x"`)
+  2. `packaging/macos/Info.plist` (`CFBundleShortVersionString`)
+  3. `packaging/windows/installer.iss` (`#define MyAppVersion`)
+  4. `.github/workflows/ci-release.yml` (tên file đóng gói và tag release)
+  5. `README.md` (badge `release-v0.0.x` và mục Lịch sử phiên bản dưới đây), sau đó tạo git tag `v0.0.x` và push lên `origin` để CI tự động build & đính kèm toàn bộ gói cài đặt vào trang Releases.
+
+### Lịch sử phiên bản (Changelog)
+- **`v0.0.1` (2026-10-31):**
+  - Bản phát hành đầu tiên (`v0.0.1`): hoàn thiện giao diện GUI (`egui`, tách 7 module `src/gui/`) và TUI (`ratatui`).
+  - Nâng cấp gợi ý & tìm kiếm sticker theo thời gian thực khi gõ (kết hợp song song `cmd 11741` + `cmd 11747`, hỗ trợ tiếng Việt có dấu/không dấu/viết tắt và prefetch thumbnail).
+  - Hỗ trợ nhắn tin thời gian thực qua WebSocket (`zpw_ws`), lưu trữ cục bộ SQLite + JSON, gọi thoại & gọi video 1-1 thuần Rust.
+  - Phát hành bộ cài đặt đa nền tảng (`.deb` chuẩn, `.deb` legacy `glibc 2.31`, `.rpm`, `.AppImage`, `.tar.gz`, `.exe`, `.dmg`).
 
 ---
 

@@ -30,6 +30,10 @@ pub const POLL_SECS: u64 = 4;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("ctdozlite v{} (zalo-rust)", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let dev_mode = args.iter().any(|a| a == "--dev" || a == "-v" || a == "--verbose");
     let dump = args.iter().any(|a| a == "-d" || a == "--dump");
     let dump_raw = args.iter().any(|a| a == "--dump-raw");
