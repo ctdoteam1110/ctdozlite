@@ -4,6 +4,7 @@ version = "0.0.1"
 edition = "2021"
 authors = ["TIPC1110 <tienichpc1110@gmail.com>"]
 description = "Lightweight, high-performance native Zalo PC client written in Rust (zero Node.js, zero Electron)"
+homepage = "https://ctdozlite.ctdo.net/"
 repository = "https://github.com/ctdoteam1110/ctdozlite"
 license = "MIT OR Apache-2.0"
 default-run = "zalo-rust"
