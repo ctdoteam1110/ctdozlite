@@ -2,7 +2,7 @@
 
 > **Client Zalo PC Native siêu nhẹ bằng Rust — Zero Node.js, Zero Electron, tiêu thụ ~10MB RAM.**
 
-[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
+[![CI & Release](https://github.com/ctdoteam1110/ctdozlite/actions/workflows/ci-release.yml/badge.svg)](https://github.com/ctdoteam1110/ctdozlite/actions/workflows/ci-release.yml)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)]()
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue.svg)]()
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)]()
@@ -123,6 +123,26 @@
    CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo build --release
    ```
 3. File thực thi độc lập nằm tại: `target/release/zalo-rust`
+
+---
+
+### 5. CI/CD Tự Động Đóng Gói Đa Nền Tảng (`.deb` / `.exe` / `.dmg`)
+
+Dự án tích hợp sẵn GitHub Actions tại [`.github/workflows/ci-release.yml`](.github/workflows/ci-release.yml), tự động chạy `cargo test` và đóng gói bộ cài gốc cho cả 3 hệ điều hành trên mỗi lần `push`, `pull_request`, hoặc khi gắn tag phát hành:
+
+| Hệ điều hành | Sản phẩm đóng gói tự động | Cấu hình nguồn |
+|---|---|---|
+| **Linux (Debian / Ubuntu / Mint)** | `ctdozlite_<ver>_amd64.deb` (tích hợp `/usr/bin/zalo-rust`, symlink `ctdozlite`, biểu tượng & menu `.desktop`) | [`packaging/linux/ctdozlite.desktop`](packaging/linux/ctdozlite.desktop) |
+| **Windows (x64)** | `ctdozlite-portable-windows-x86_64.exe` (file đơn) + `ctdozlite-setup-windows-x86_64.exe` (bộ cài Inno Setup) | [`packaging/windows/installer.iss`](packaging/windows/installer.iss) |
+| **macOS (Apple Silicon / Intel)** | `ctdozlite_<ver>_macos.dmg` (chứa `ctdozlite.app` đã gắn `AppIcon.icns`, quyền Mic/Camera & liên kết kéo-thả `/Applications`) | [`packaging/macos/Info.plist`](packaging/macos/Info.plist) |
+
+**Cách phát hành phiên bản mới lên GitHub Releases (kèm bảng băm `SHA256SUMS.txt`):**
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+Hoặc vào tab **Actions -> CI & Cross-Platform Release (.deb / .exe / .dmg) -> Run workflow** để tải trực tiếp các gói `.deb`, `.exe`, `.dmg` từ mục **Artifacts**.
+
 ---
 
 ## 📖 Hướng Dẫn Sử Dụng

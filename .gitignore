@@ -1,5 +1,6 @@
 # Rust build artifacts
 target/
+dist/
 
 # Active session credentials and tokens (CRITICAL: NEVER COMMIT)
 session.json

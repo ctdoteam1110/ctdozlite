@@ -61,3 +61,19 @@ path = "src/bin/test_qr_tag.rs"
 [[bin]]
 name = "call_probe"
 path = "src/bin/call_probe.rs"
+
+[package.metadata.deb]
+name = "ctdozlite"
+maintainer = "TIPC1110 <tienichpc1110@gmail.com>"
+copyright = "2026, TIPC1110 <tienichpc1110@gmail.com>"
+license-file = ["README.md", "0"]
+depends = "$auto"
+recommends = "ffmpeg, zenity, xclip, wl-clipboard, fonts-noto-core"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/zalo-rust", "usr/bin/", "755"],
+    ["packaging/linux/ctdozlite.desktop", "usr/share/applications/", "644"],
+    ["src/assets/app_icon.png", "usr/share/icons/hicolor/256x256/apps/ctdozlite.png", "644"],
+    ["README.md", "usr/share/doc/ctdozlite/README.md", "644"],
+]
