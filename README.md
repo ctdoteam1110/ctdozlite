@@ -112,10 +112,13 @@ Toàn bộ gói cài đặt dựng sẵn cho từng hệ điều hành và các 
   ./install.sh
   ```
 
-### 2. Cài đặt trên Windows, macOS & iOS (Đang phát triển)
+### 2. Cài đặt trên Windows & macOS
 - **Windows (x64):** Chạy bộ cài `ctdozlite-0.0.1-setup-windows-x86_64.exe` hoặc bản chạy ngay `ctdozlite-0.0.1-portable-windows-x86_64.exe`.
 - **macOS:** Mở `ctdozlite-0.0.1-macos.dmg` và kéo `ctdozlite.app` vào `/Applications`.
-- **iOS (Sắp có):** Phiên bản cho iOS hoạt động dưới dạng phiên phụ (`zpw_type=30`), giúp đăng nhập và sử dụng **chung 1 tài khoản Zalo song song trên 2 máy điện thoại** mà không bị văng thiết bị chính. Hiện tại tài khoản Apple Developer của mình vừa bị thu hồi chứng chỉ và phần giao diện cảm ứng chưa hoàn thiện trọn vẹn nên sẽ bổ sung gói `.ipa` trong bản cập nhật tới.
+
+> [!IMPORTANT]
+> **Phiên bản iOS — Dùng 1 tài khoản Zalo song song trên 2 máy (Sắp ra mắt):**
+> Bản iOS của `ctdozlite` hoạt động dưới dạng phiên phụ (`zpw_type=30`), cho phép đăng nhập và sử dụng **chung 1 tài khoản Zalo song song trên 2 máy điện thoại** mà không làm văng thiết bị chính. Hiện tại tài khoản Apple Developer của mình vừa bị Apple thu hồi chứng chỉ và phần giao diện cảm ứng chưa hoàn thiện trọn vẹn, nên gói `.ipa` sẽ sớm được bổ sung trong bản cập nhật tới.
 
 ---
 
