@@ -96,6 +96,49 @@ fn enumerate_ffmpeg_cameras() -> Vec<String> {
             return cams;
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""]);
+        if let Ok(out) = cmd.output() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let mut cams = Vec::new();
+            let mut in_video_section = false;
+            for line in stderr.lines() {
+                if line.contains("AVFoundation video devices:") {
+                    in_video_section = true;
+                    continue;
+                }
+                if line.contains("AVFoundation audio devices:") {
+                    break;
+                }
+                if in_video_section {
+                    if let Some((_, right)) = line.rsplit_once(']') {
+                        let name = right.trim().to_string();
+                        if !name.is_empty() && !cams.contains(&name) {
+                            cams.push(name);
+                        }
+                    }
+                }
+            }
+            if !cams.is_empty() {
+                return cams;
+            }
+        }
+        return vec!["0".to_string()];
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut cams = Vec::new();
+        for idx in 0..8 {
+            let dev = format!("/dev/video{idx}");
+            if std::path::Path::new(&dev).exists() {
+                cams.push(dev);
+            }
+        }
+        return cams;
+    }
+    #[allow(unreachable_code)]
     Vec::new()
 }
 
@@ -753,16 +796,28 @@ fn spawn_camera_capture_thread(
                 stream_acc.clear();
 
                 let mut cmd = Command::new("ffmpeg");
+                cmd.args(["-hide_banner", "-loglevel", "error"]);
+                #[cfg(target_os = "windows")]
                 cmd.args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
                     "-f",
                     "dshow",
                     "-rtbufsize",
                     "32M",
                     "-i",
                     &format!("video={current_dev}"),
+                ]);
+                #[cfg(target_os = "macos")]
+                cmd.args([
+                    "-f",
+                    "avfoundation",
+                    "-framerate",
+                    "30",
+                    "-i",
+                    &format!("{current_dev}:none"),
+                ]);
+                #[cfg(target_os = "linux")]
+                cmd.args(["-f", "v4l2", "-i", &current_dev]);
+                cmd.args([
                     "-vf",
                     "fps=15,scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
                     "-c:v",
@@ -790,7 +845,6 @@ fn spawn_camera_capture_thread(
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
-
                 #[cfg(target_os = "windows")]
                 {
                     use std::os::windows::process::CommandExt;

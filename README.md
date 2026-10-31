@@ -28,12 +28,11 @@
 - 🖥️ **Đa giao diện (Dual Interface):**
   - **Native GUI (`eframe`/`egui`):** Giao diện đồ họa hiện đại, font Segoe UI tiếng Việt sắc nét, Dark/Light mode tự động, bong bóng chat co giãn thông minh, giữ focus liên tục khi nhấn Enter.
   - **Terminal TUI (`ratatui`/`crossterm`):** Giao diện dòng lệnh 60fps, khung viền phẳng ANSI chống xô lệch, phím tắt điều hướng nhanh nhẹn.
-- 📞 **Gọi thoại & Gọi video 1-1 (thử nghiệm):**
-  - Báo hiệu cuộc gọi qua WebSocket Zalo (`invite` / `answer` / `end`), điều khiển `ZaloCall.exe` chính hãng qua Named Pipe để khởi tạo ZRTP với relay.
-  - Media RTP/RTCP viết bằng Rust: audio Opus (`cpal` + `opus`), video H.264 theo định dạng riêng của Zalo (Annex-B access unit, PT 97/98, phân mảnh `1c <flags>`), RR/SR/SDES, PLI/FIR yêu cầu keyframe.
-  - Camera và giải mã video dùng `ffmpeg` (gửi: webcam → H.264; nhận: H.264 → RGBA hiển thị trong GUI).
-  - Nhật ký chẩn đoán `voip.log` dạng văn bản thuần (tag `CALL`, `SIG`, `RTP>/<`, `RTCP>/<`, `STAT`, `VDEC`, `TXST`).
-  - ⚠️ **Trạng thái:** gọi thoại/video đã thiết lập và truyền media được. Giải mã hình ảnh video của đối phương còn đang hoàn thiện (xem [re-notes/08_video_call.md](re-notes/08_video_call.md), mục *Still open*).
+- 📞 **Gọi thoại & Gọi video 1-1 (Pure-Rust VoIP):**
+  - Báo hiệu cuộc gọi (`401` / `416` / `407` / `402` / `408` / `409`) và khởi tạo phiên relay ZRTP (`InitZRTP` `0x000B`/`0x000C`, `Echo` `0x0005`, `Ping` `0x0002`, `IncallNegotiateInfo` `0x0020/0x14`) viết 100% bằng Rust, **không cần `ZaloCall.exe`**.
+  - Media RTP/RTCP hai chiều: audio Opus (`cpal` + `opus`), video H.264 theo định dạng khung của Zalo (`0x03`/`0x04` Audio RTP, `0x05` Audio RTCP, `0x0D`/`0x0E` Video RTP PT 97/98, `0x0F` Video RTCP SR/SDES/PLI/REMB).
+  - Cửa sổ cuộc gọi riêng biệt, hỗ trợ chọn thiết bị đầu vào **Mic** và **Camera**, thu hình webcam thật + xem trước PIP và giải mã video H.264 thời gian thực qua `ffmpeg`.
+  - Nhật ký chẩn đoán `voip.log` dạng văn bản thuần (tag `CALL`, `SIG`, `RTP>/<`, `RTCP>/<`, `STAT`, `VDEC`, `VCAM`, `TXST`).
 - 🔍 **Dev Inspector & Protocol Scanner:** Tích hợp bộ chẩn đoán bắt gói tin, đo độ trễ mạng, giải mã payload và tự động quét phát hiện mã lỗi giao thức (`--dev`). Ẩn 100% trong chế độ Production.
 
 ---
@@ -49,19 +48,81 @@
 
 ---
 
-## 🚀 Cài Đặt & Biên Dịch
+## 🚀 Cài Đặt & Biên Dịch (Windows / Linux / macOS)
 
-### Yêu cầu
-- Rust toolchain 1.75 trở lên: [https://rustup.rs/](https://rustup.rs/)
+### 1. Yêu cầu chung
+- **Rust toolchain** (1.75 trở lên): [https://rustup.rs/](https://rustup.rs/)
+- **CMake** (3.15+) & trình biên dịch C/C++ (để crate `opus` biên dịch tĩnh `libopus`, và `rusqlite` biên dịch tĩnh SQLite).
+- **FFmpeg** trong `PATH` (tùy chọn — dùng để thu hình webcam và giải mã video H.264 khi gọi video; chat và gọi thoại không cần `ffmpeg`).
 
-### Biên dịch bản Release
-```bash
-git clone https://github.com/ctdoteam1110/ctdozlite.git
-cd ctdozlite
-cargo build --release
-```
-File thực thi độc lập sẽ nằm tại `target/release/zalo-rust.exe` (Windows) hoặc `target/release/zalo-rust` (Linux/macOS).
+> **Lưu ý cho CMake 4.0+:** Nếu máy cài CMake 4.x báo lỗi tương thích với `CMakeLists.txt` của `opus-sys`, hãy đặt biến môi trường `CMAKE_POLICY_VERSION_MINIMUM=3.5` trước khi chạy `cargo build`.
 
+---
+
+### 2. Biên dịch trên Windows (MSVC)
+
+1. Cài đặt **Rust** (`rustup-init.exe`) và **Visual Studio Build Tools** (chọn workload *Desktop development with C++* + *CMake tools for Windows*).
+2. Cài đặt `ffmpeg` (qua Winget hoặc Scoop):
+   ```powershell
+   winget install Gyan.FFmpeg
+   ```
+3. Clone và biên dịch bản Release:
+   ```powershell
+   git clone https://github.com/ctdoteam1110/ctdozlite.git
+   cd ctdozlite
+   $env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+   cargo build --release
+   ```
+4. File thực thi độc lập nằm tại: `target\release\zalo-rust.exe`
+
+---
+
+### 3. Biên dịch trên Linux (Ubuntu / Debian / Fedora / Arch)
+
+1. Cài đặt các thư viện phát triển hệ thống cho âm thanh (`ALSA`) và cửa sổ đồ họa (`X11` / `Wayland` / `OpenGL`):
+   - **Ubuntu / Debian:**
+     ```bash
+     sudo apt update
+     sudo apt install -y build-essential cmake pkg-config \
+       libasound2-dev libxcb-render0-dev libxcb-shape0-dev \
+       libxcb-xfixes0-dev libxkbcommon-dev libssl-dev \
+       libgtk-3-dev zenity xclip wl-clipboard ffmpeg
+     ```
+   - **Fedora / RHEL:**
+     ```bash
+     sudo dnf install -y gcc gcc-c++ make cmake pkgconf-pkg-config \
+       alsa-lib-devel libxcb-devel libxkbcommon-devel openssl-devel \
+       gtk3-devel zenity xclip wl-clipboard ffmpeg
+     ```
+   - **Arch Linux:**
+     ```bash
+     sudo pacman -S --needed base-devel cmake pkgconf alsa-lib \
+       libxcb libxkbcommon openssl gtk3 zenity xclip wl-clipboard ffmpeg
+     ```
+2. Clone và biên dịch bản Release:
+   ```bash
+   git clone https://github.com/ctdoteam1110/ctdozlite.git
+   cd ctdozlite
+   CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo build --release
+   ```
+3. File thực thi độc lập nằm tại: `target/release/zalo-rust`
+
+---
+
+### 4. Biên dịch trên macOS (Apple Silicon & Intel)
+
+1. Cài đặt **Xcode Command Line Tools**, **CMake** và **FFmpeg** (qua Homebrew):
+   ```bash
+   xcode-select --install
+   brew install cmake pkg-config ffmpeg
+   ```
+2. Clone và biên dịch bản Release:
+   ```bash
+   git clone https://github.com/ctdoteam1110/ctdozlite.git
+   cd ctdozlite
+   CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo build --release
+   ```
+3. File thực thi độc lập nằm tại: `target/release/zalo-rust`
 ---
 
 ## 📖 Hướng Dẫn Sử Dụng
@@ -88,19 +149,21 @@ File thực thi độc lập sẽ nằm tại `target/release/zalo-rust.exe` (Wi
 ```
 - Bấm vào thanh `▲ Mở Dev Inspector` ở chân màn hình để xem toàn bộ luồng mạng và payload giải mã.
 
-### 4. Gọi thoại / Gọi video
+### 4. Gọi thoại / Gọi video (Pure-Rust VoIP)
 
-Yêu cầu thêm:
-- **Windows** + Zalo PC chính hãng đã cài (hoặc thư mục `Zalo-*/plugins/capture/ZaloCall.exe` cạnh dự án). `ZaloCall.exe` được tìm tự động và kiểm tra MD5; app không kèm file này.
-- **`ffmpeg`** có trong `PATH` (cần cho webcam và giải mã video). Gọi thoại không cần `ffmpeg`.
+Yêu cầu:
+- **Hoạt động độc lập 100% bằng Rust** (không cần cài Zalo PC hay `ZaloCall.exe`).
+- **`ffmpeg`** có trong `PATH` (cần cho thu hình webcam và giải mã video H.264; gọi thoại chỉ dùng `cpal` + `opus` nên không cần `ffmpeg`).
 
-Cách dùng: mở một cuộc trò chuyện 1-1 trong GUI và bấm nút gọi thoại hoặc gọi video. Nhận cuộc gọi đến bằng nút trả lời trên GUI.
+Cách dùng:
+- Mở một cuộc trò chuyện 1-1 trong GUI và bấm biểu tượng **Gọi thoại** hoặc **Gọi video** ở góc phải thanh tiêu đề.
+- Khi có cuộc gọi đến, cửa sổ cuộc gọi sẽ tự động bật lên với 2 nút **Nghe máy** (xanh) và **Từ chối** (đỏ).
+- Có thể chọn thiết bị đầu vào **Mic** và **Camera** ngay trên thanh công cụ đầu cửa sổ cuộc gọi hoặc trong **Cài đặt -> Cài đặt chung -> Thiết bị Âm thanh & Video**.
 
 Lưu ý:
-- Hiện chỉ hỗ trợ gọi **1-1**; gọi nhóm bị từ chối.
-- Gọi đi bị khóa bằng danh sách cho phép dùng để thử nghiệm (`CALL_ALLOWED_NAMES` / `CALL_ALLOWED_IDS` trong `src/call.rs`). Ghi đè ID lúc chạy bằng biến môi trường `ZALO_CALL_ALLOW_IDS`.
-- Chưa hỗ trợ giải mã HEVC; app tự khai báo `supportHevcDecode=0` để đối phương gửi H.264.
-
+- Hiện hỗ trợ gọi **1-1** (thoại & video); gọi nhóm bị khóa.
+- Gọi đi được bảo vệ bởi danh sách cho phép thử nghiệm (`CALL_ALLOWED_NAMES` / `CALL_ALLOWED_IDS` trong `src/call.rs`). Ghi đè ID lúc chạy bằng biến môi trường `ZALO_CALL_ALLOW_IDS`.
+- App tự động đàm phán H.264 (`supportHevcDecode=0`), gửi `RTCP REMB` và `H264DecCapacityInfo(720p, 30fps)` để tối ưu chất lượng hình ảnh nhận về.
 Nhật ký cuộc gọi:
 
 | Biến môi trường | Tác dụng |

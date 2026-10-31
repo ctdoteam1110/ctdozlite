@@ -2226,6 +2226,10 @@ impl ZaloGuiApp {
                         .find(|t| t.id == caller_id)
                         .map(|t| t.name.clone())
                         .unwrap_or(caller_name);
+                    self.status_msg = format!(
+                        "📲 Cuộc gọi {} đến từ {resolved_name}…",
+                        if is_video { "video" } else { "thoại" }
+                    );
                     self.active_call = Some(ActiveCallOverlay {
                         partner_id: caller_id,
                         partner_name: resolved_name,
@@ -2239,6 +2243,9 @@ impl ZaloGuiApp {
                         error_code: None,
                         error_reason: None,
                     });
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Critical,
+                    ));
                 }
                 GuiEvent::CallRejected { code, reason } => {
                     self.status_msg = format!("⚠️ Từ chối cuộc gọi (mã {code}): {reason}");
@@ -2482,16 +2489,14 @@ fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: eg
                                     .await
                                     {
                                         Ok(Some(ev)) => {
-                                            if ev.is_voip_ish() {
-                                                let data_node = ev
-                                                    .payload
-                                                    .get("data")
-                                                    .unwrap_or(&ev.payload);
-                                                for voip_ev in
-                                                    crate::call::extract_voip_controls(data_node)
-                                                {
-                                                    cb.handle_control_event(voip_ev);
-                                                }
+                                            let data_node = ev
+                                                .payload
+                                                .get("data")
+                                                .unwrap_or(&ev.payload);
+                                            for voip_ev in
+                                                crate::call::extract_voip_controls(data_node)
+                                            {
+                                                cb.handle_control_event(voip_ev);
                                             }
                                             if ev.is_chat_ish() {
                                                 let mut ws_threads = Vec::new();
@@ -9161,7 +9166,11 @@ impl ZaloGuiApp {
             {
                 let _ = std::process::Command::new("explorer").arg(&p).spawn();
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open").arg(&p).spawn();
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             {
                 let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
             }
@@ -9753,7 +9762,7 @@ impl ZaloGuiApp {
                                                 let _ = tx
                                                     .send(WorkerCmd::AnswerCall { accept: false });
                                             }
-                                            hangup_clicked = true;
+                                            self.active_call = None;
                                         }
                                         ui.label(
                                             RichText::new("Từ chối")
@@ -11857,7 +11866,11 @@ fn open_external_url(url: &str) {
             .creation_flags(CREATE_NO_WINDOW)
             .spawn();
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(trimmed).spawn();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = std::process::Command::new("xdg-open").arg(trimmed).spawn();
     }
@@ -11900,7 +11913,27 @@ fn pick_native_file_dialog(images_only: bool) -> Option<std::path::PathBuf> {
             Some(std::path::PathBuf::from(path_str))
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        let prompt = if images_only {
+            "POSIX path of (choose file with prompt \"Chọn hình ảnh để gửi qua Zalo\" of type {\"public.image\"})"
+        } else {
+            "POSIX path of (choose file with prompt \"Chọn tập tin đính kèm để gửi qua Zalo\")"
+        };
+        if let Ok(out) = std::process::Command::new("osascript")
+            .args(["-e", prompt])
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return Some(std::path::PathBuf::from(s));
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let mut zcmd = std::process::Command::new("zenity");
         zcmd.arg("--file-selection");
@@ -13721,6 +13754,9 @@ fn setup_custom_fonts(ctx: &egui::Context) {
         "C:\\Windows\\Fonts\\segoeui.ttf",
         "C:\\Windows\\Fonts\\arial.ttf",
         "C:\\Windows\\Fonts\\tahoma.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Tahoma.ttf",
+        "/Library/Fonts/Arial.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
