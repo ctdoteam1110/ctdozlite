@@ -5,7 +5,7 @@ Client Zalo Desktop viết bằng Rust (`eframe`/`egui` + `ratatui`), giao tiế
 [![CI & Release](https://github.com/ctdoteam1110/ctdozlite/actions/workflows/ci-release.yml/badge.svg)](https://github.com/ctdoteam1110/ctdozlite/actions/workflows/ci-release.yml)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue.svg)](#cài-đặt--biên-dịch)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#giấy-phép)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 ---
 
@@ -199,4 +199,4 @@ Workflow GitHub Actions tại [`.github/workflows/ci-release.yml`](.github/workf
 
 ## Giấy phép
 
-Phân phối dưới giấy phép **MIT OR Apache-2.0**. Dự án phục vụ mục đích học tập và nghiên cứu kỹ thuật hệ thống với Rust.
+Phân phối dưới giấy phép kép **[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)**. Dự án phục vụ mục đích học tập và nghiên cứu kỹ thuật hệ thống với Rust.
