@@ -1646,6 +1646,16 @@ pub async fn fetch_sticker_pack_items(
     Ok(items)
 }
 
+/// Normalize a sticker keyword by converting non-breaking spaces (`\u{a0}`), collapsing
+/// consecutive whitespace to a single ASCII space, and converting to lowercase.
+pub fn normalize_sticker_keyword(s: &str) -> String {
+    s.replace('\u{a0}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// Strip Vietnamese diacritics to lowercase ASCII (`simpleStripVietnamese` in `compact-app-pc.js:12955017`).
 pub fn strip_vn_for_sticker_kw(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1661,19 +1671,103 @@ pub fn strip_vn_for_sticker_kw(s: &str) -> String {
                 'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => 'u',
                 'ỳ' | 'ý' | 'ỵ' | 'ỷ' | 'ỹ' => 'y',
                 'đ' => 'd',
+                '\u{a0}' => ' ',
                 other => other,
             };
             out.push(mapped);
         }
     }
-    out
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Map common unaccented Vietnamese keywords, English terms, or chat slang to the accented
+/// Vietnamese form indexed by Zalo's `/api/message/sticker/suggest/stickers` (`cmd 11741`) and
+/// `/api/message/sticker/search` (`cmd 11747`) endpoints.
+pub fn canonical_accented_vn_for_sticker(stripped: &str) -> Option<&'static str> {
+    match stripped {
+        "nho" | "nho em" | "nho anh" | "nho qua" | "miss" | "miss u" | "miss you" => Some("nhớ"),
+        "khoc" | "huhu" | "huhuhu" | "hic" | "cry" => Some("khóc"),
+        "buon" | "buon qua" | "sad" | "tui than" => Some("buồn"),
+        "vui" | "vui ve" | "vui qua" | "happy" => Some("vui"),
+        "cuoi" | "mac cuoi" | "buon cuoi" => Some("cười"),
+        "yeu" | "iu" | "yeu em" | "yeu anh" | "iu em" | "iu anh" | "love" | "love u"
+        | "love you" | "tha tim" | "tim" => Some("yêu"),
+        "thuong" | "thuong em" | "thuong anh" | "thuong qua" => Some("thương"),
+        "gian" | "gian doi" | "doi hon" | "tuc" | "buc" | "buc minh" | "cay" | "angry" => {
+            Some("giận")
+        }
+        "met" | "met qua" | "met moi" | "duoi" | "duoi qua" | "tired" => Some("mệt"),
+        "doi" | "doi bung" | "doi qua" | "hungry" => Some("đói"),
+        "an" | "an com" | "di an" => Some("ăn cơm"),
+        "ca phe" | "cf" | "cafe" | "coffee" => Some("cà phê"),
+        "tra sua" | "trasua" => Some("trà sữa"),
+        "nhau" | "di nhau" | "bia" | "dzoo" | "dzo" => Some("nhậu"),
+        "ngu" | "di ngu" | "buon ngu" | "ngu ngon" | "ngu ngon nhe" | "ngu ngon nha"
+        | "good night" | "goodnight" | "gn" | "g9" => Some("ngủ"),
+        "chao" | "xin chao" | "chao ban" | "chao anh" | "chao chi" | "chao em" | "he lo"
+        | "helo" => Some("xin chào"),
+        "cam on" | "cam on ban" | "cam on anh" | "cam on chi" | "cam on em" | "cam on nhieu"
+        | "thank" | "thanks" | "thank you" | "tks" | "tkss" | "thank kiu" => Some("cảm ơn"),
+        "xin loi" | "xin loi nha" | "xin loi nhe" | "sorry" | "sr" | "so ry" => Some("xin lỗi"),
+        "tam biet" | "tam biet nhe" | "bye" | "byebye" | "good bye" | "goodbye" | "bibi" | "pp" => {
+            Some("tạm biệt")
+        }
+        "chuc mung" | "happy birthday" | "hpbd" | "sinh nhat" | "cmsn" => Some("chúc mừng"),
+        "tet" | "chuc mung nam moi" | "nam moi" => Some("tết"),
+        "co len" | "co gang" | "fighting" => Some("cố lên"),
+        "tuyet" | "tuyet voi" | "xuat sac" | "dinh" | "dinh qua" | "chuan" | "duoc" => {
+            Some("tuyệt vời")
+        }
+        "ngai" | "ngai qua" | "ngai nhi" | "xau ho" => Some("ngại"),
+        "so" | "so qua" | "scared" => Some("sợ"),
+        "lanh" | "lanh qua" | "lanh khong" | "ret" | "ret qua" => Some("lạnh"),
+        "nong" | "nong qua" | "nong buc" => Some("nóng"),
+        "tien" | "luong" => Some("tiền"),
+        "het tien" | "ngheo" | "ngheo qua" | "vi rong" => Some("hết tiền"),
+        "quy" | "lay" | "xin" | "van xin" => Some("lạy"),
+        "ban" | "ban qua" | "busy" => Some("bận"),
+        "chan" | "chan qua" | "chan doi" | "boring" => Some("chán"),
+        "cho" | "cho chut" | "cho xiu" | "doi chut" | "doi xiu" | "wait" => Some("chờ chút"),
+        "di choi" | "choi" | "dao pho" => Some("đi chơi"),
+        "di lam" | "lam viec" | "deadline" | "code" => Some("làm"),
+        "hong" | "hong chuyen" | "ngac nhien" => Some("ngạc nhiên"),
+        _ => None,
+    }
+}
+
+/// Build the deduplicated list of query variants (accented + unaccented + canonical synonym)
+/// to maximize recall across both Zalo Sticker Suggest (`cmd 11741`) and Search (`cmd 11747`).
+pub fn canonical_vn_sticker_queries(keyword: &str) -> Vec<String> {
+    let norm = normalize_sticker_keyword(keyword);
+    if norm.is_empty() {
+        return Vec::new();
+    }
+    let stripped = strip_vn_for_sticker_kw(&norm);
+    let mut queries = vec![norm.clone()];
+    if !stripped.is_empty() && stripped != norm && !queries.contains(&stripped) {
+        queries.push(stripped.clone());
+    }
+    if let Some(accented) = canonical_accented_vn_for_sticker(&stripped) {
+        let acc_s = accented.to_string();
+        if !queries.contains(&acc_s) {
+            queries.push(acc_s.clone());
+        }
+        let acc_stripped = strip_vn_for_sticker_kw(&acc_s);
+        if !acc_stripped.is_empty() && !queries.contains(&acc_stripped) {
+            queries.push(acc_stripped);
+        }
+    }
+    queries.truncate(4);
+    queries
 }
 
 /// Fetch official Zalo contextual sticker trigger keywords (`getStickerListKeyWords` — `cmd 11740`).
+/// Includes both normalized accented/raw forms and ASCII-folded forms so typing accented or
+/// unaccented Vietnamese triggers suggestions reliably.
 pub async fn fetch_sticker_suggest_keywords(s: &Session) -> Result<Vec<String>> {
     let cache_dir = std::path::Path::new("stickers_cache");
     let _ = std::fs::create_dir_all(cache_dir);
-    let cache_path = cache_dir.join("suggest_keywords.json");
+    let cache_path = cache_dir.join("suggest_keywords_v2.json");
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<String>>(&raw_cache) {
             if cached.len() >= 100 {
@@ -1694,21 +1788,42 @@ pub async fn fetch_sticker_suggest_keywords(s: &Session) -> Result<Vec<String>> 
         "{sticker_host}/api/message/sticker/suggest/keywords?{}&params={params}",
         s.common_params()
     );
-    let resp = s.get(&url).await?;
+    let resp = match s.get(&url).await {
+        Ok(r) => r,
+        Err(_) => {
+            let fallback_url = format!(
+                "https://tt-sticker-wpa.zaloapp.com/api/message/sticker/suggest/keywords?{}&params={params}",
+                s.common_params()
+            );
+            s.get(&fallback_url).await?
+        }
+    };
     let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    let kws: Vec<String> = dec
+    let mut seen = std::collections::HashSet::new();
+    let mut kws: Vec<String> = Vec::new();
+    if let Some(arr) = dec
         .get("data")
         .or(Some(&dec))
         .and_then(|d| d.get("keywords"))
         .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(|k| k.trim().to_lowercase())
-                .filter(|k| !k.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    {
+        for raw_v in arr {
+            let Some(raw_str) = raw_v.as_str() else {
+                continue;
+            };
+            let norm = normalize_sticker_keyword(raw_str);
+            if norm.is_empty() || norm.starts_with("zkwd_") {
+                continue;
+            }
+            if seen.insert(norm.clone()) {
+                kws.push(norm.clone());
+            }
+            let stripped = strip_vn_for_sticker_kw(&norm);
+            if !stripped.is_empty() && seen.insert(stripped.clone()) {
+                kws.push(stripped);
+            }
+        }
+    }
     if !kws.is_empty() {
         if let Ok(txt) = serde_json::to_string(&kws) {
             let _ = std::fs::write(&cache_path, txt);
@@ -1717,15 +1832,147 @@ pub async fn fetch_sticker_suggest_keywords(s: &Session) -> Result<Vec<String>> 
     Ok(kws)
 }
 
-/// Search Zalo stickers by Vietnamese, English, or emoji keyword (`getStickerSuggestion` — `cmd 11741`).
+async fn query_sticker_endpoints_once(
+    s: &Session,
+    sticker_host: &str,
+    queries: &[String],
+) -> Vec<(u64, u64, u32, u8)> {
+    let mut futs = Vec::with_capacity(queries.len() * 2);
+    for (q_idx, q) in queries.iter().enumerate() {
+        // 1) Contextual suggest endpoint (`getStickerSuggestion` — `cmd 11741`)
+        let sugg_body = obj(&[
+            ("keyword", json!(q)),
+            ("gif", json!(1)),
+            ("guggy", json!(0)),
+            ("imei", json!(s.imei)),
+        ]);
+        if let Ok(params) = s.encoded_params(&sugg_body) {
+            let url = format!(
+                "{sticker_host}/api/message/sticker/suggest/stickers?{}&params={params}",
+                s.common_params()
+            );
+            let is_primary = q_idx == 0;
+            futs.push(async move {
+                let Ok(resp) = s.get(&url).await else {
+                    return Vec::new();
+                };
+                let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+                let arr = dec
+                    .get("data")
+                    .or(Some(&dec))
+                    .and_then(|d| d.get("sugg_sticker"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut items = Vec::with_capacity(arr.len());
+                for it in arr {
+                    let Some(sid) = it
+                        .get("sticker_id")
+                        .or_else(|| it.get("id"))
+                        .and_then(Value::as_u64)
+                    else {
+                        continue;
+                    };
+                    let cid = it
+                        .get("cate_id")
+                        .or_else(|| it.get("cateId"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let stype = it.get("type").and_then(Value::as_u64).unwrap_or(7) as u32;
+                    items.push((cid, sid, stype, if is_primary { 3u8 } else { 2u8 }));
+                }
+                items
+            });
+        }
+    }
+
+    let mut search_futs = Vec::with_capacity(queries.len());
+    for (q_idx, q) in queries.iter().enumerate() {
+        // 2) Full sticker tag search endpoint (`searchSticker` — `cmd 11747`)
+        let search_body = obj(&[
+            ("keyword", json!(q)),
+            ("limit", json!(30)),
+            ("srcType", json!(0)),
+            ("imei", json!(s.imei)),
+        ]);
+        if let Ok(params) = s.encoded_params(&search_body) {
+            let url = format!(
+                "{sticker_host}/api/message/sticker/search?{}&params={params}",
+                s.common_params()
+            );
+            let is_primary = q_idx == 0;
+            search_futs.push(async move {
+                let Ok(resp) = s.get(&url).await else {
+                    return Vec::new();
+                };
+                let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+                let arr = dec
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .or_else(|| dec.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut items = Vec::with_capacity(arr.len());
+                for it in arr {
+                    let Some(sid) = it
+                        .get("sticker_id")
+                        .or_else(|| it.get("id"))
+                        .and_then(Value::as_u64)
+                    else {
+                        continue;
+                    };
+                    let cid = it
+                        .get("cate_id")
+                        .or_else(|| it.get("cateId"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let stype = it.get("type").and_then(Value::as_u64).unwrap_or(7) as u32;
+                    items.push((cid, sid, stype, if is_primary { 3u8 } else { 2u8 }));
+                }
+                items
+            });
+        }
+    }
+
+    let (sugg_batches, search_batches) = tokio::join!(
+        futures_util::future::join_all(futs),
+        futures_util::future::join_all(search_futs)
+    );
+
+    // Merge and boost stickers that matched across multiple endpoints/queries
+    let mut score_map: std::collections::HashMap<u64, (u64, u32, u8)> =
+        std::collections::HashMap::new();
+    for batch in sugg_batches.into_iter().chain(search_batches.into_iter()) {
+        for (cid, sid, stype, weight) in batch {
+            score_map
+                .entry(sid)
+                .and_modify(|e| {
+                    e.2 = e.2.saturating_add(weight);
+                    if e.0 == 0 && cid > 0 {
+                        e.0 = cid;
+                    }
+                })
+                .or_insert((cid, stype, weight));
+        }
+    }
+
+    score_map
+        .into_iter()
+        .map(|(sid, (cid, stype, score))| (cid, sid, stype, score))
+        .collect()
+}
+
+/// Search Zalo stickers by Vietnamese, English, or emoji keyword by querying both
+/// `/api/message/sticker/suggest/stickers` (`cmd 11741`) and `/api/message/sticker/search` (`cmd 11747`)
+/// concurrently across accented and unaccented Vietnamese variants.
 pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Vec<StickerItem>> {
-    let kw = keyword.trim().to_lowercase();
+    let kw = normalize_sticker_keyword(keyword);
     if kw.is_empty() {
         return Ok(Vec::new());
     }
     let cache_dir = std::path::Path::new("stickers_cache");
     let _ = std::fs::create_dir_all(cache_dir);
-    let cache_path = cache_dir.join(format!("suggest_{}.json", crate::crypto::md5_hex(&kw)));
+    let cache_path = cache_dir.join(format!("suggest_v2_{}.json", crate::crypto::md5_hex(&kw)));
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<StickerItem>>(&raw_cache) {
             if !cached.is_empty() {
@@ -1742,79 +1989,59 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
         s.domains.sticker.trim_end_matches('/')
     };
 
-    let stripped = strip_vn_for_sticker_kw(&kw);
-    let mut queries = vec![kw.clone()];
-    if stripped != kw && !stripped.is_empty() {
-        queries.push(stripped);
-    }
+    let queries = canonical_vn_sticker_queries(&kw);
+    let mut raw_items = query_sticker_endpoints_once(s, sticker_host, &queries).await;
 
-    let mut raw_items: Vec<(u64, u64, u32)> = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
-
-    for q in queries {
-        let body = obj(&[
-            ("keyword", json!(q)),
-            ("gif", json!(1)),
-            ("guggy", json!(0)),
-            ("imei", json!(s.imei)),
-        ]);
-        let Ok(params) = s.encoded_params(&body) else {
-            continue;
-        };
-        let url = format!(
-            "{sticker_host}/api/message/sticker/suggest/stickers?{}&params={params}",
-            s.common_params()
-        );
-        let Ok(resp) = s.get(&url).await else {
-            continue;
-        };
-        let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-        let arr = dec
-            .get("data")
-            .or(Some(&dec))
-            .and_then(|d| d.get("sugg_sticker"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-
-        for it in arr.iter() {
-            let Some(sid) = it
-                .get("sticker_id")
-                .or_else(|| it.get("id"))
-                .and_then(Value::as_u64)
-            else {
-                continue;
-            };
-            if !seen_ids.insert(sid) {
-                continue;
+    // If a multi-word sentence/phrase (e.g. "anh ơi đi chơi", "hôm nay mệt quá") had no direct match,
+    // automatically fallback to its trailing 2-word phrase (`tail2`) or trailing word (`last_word`).
+    if raw_items.is_empty() {
+        let words: Vec<&str> = kw.split_whitespace().collect();
+        if words.len() >= 2 && words.len() <= 5 {
+            let mut fallback_phrases = Vec::new();
+            if words.len() >= 3 {
+                fallback_phrases.push(format!(
+                    "{} {}",
+                    words[words.len() - 2],
+                    words[words.len() - 1]
+                ));
             }
-            let cid = it
-                .get("cate_id")
-                .or_else(|| it.get("cateId"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let stype = it.get("type").and_then(Value::as_u64).unwrap_or(7) as u32;
-            raw_items.push((cid, sid, stype));
+            let last_w = words[words.len() - 1];
+            if last_w.chars().count() >= 2 {
+                fallback_phrases.push(last_w.to_string());
+            }
+            for fb in fallback_phrases {
+                let fb_queries = canonical_vn_sticker_queries(&fb);
+                raw_items = query_sticker_endpoints_once(s, sticker_host, &fb_queries).await;
+                if !raw_items.is_empty() {
+                    break;
+                }
+            }
         }
     }
 
     // Prioritize modern illustrated Zalo character packs (`cate_id` descending, matching Zalo PC's
     // `pointCate` ranking) and exclude legacy round-emoji/photo-meme packs when character packs exist.
-    const LEGACY_NON_CHAR_PACKS: &[u64] = &[0, 50, 10788, 11190, 11984, 11998, 12002, 12003, 12024, 12658];
+    const LEGACY_NON_CHAR_PACKS: &[u64] = &[
+        0, 50, 10788, 11190, 11984, 11998, 12002, 12003, 12024, 12658,
+    ];
     let has_modern_char = raw_items
         .iter()
-        .any(|(cid, _, _)| *cid >= 10000 && !LEGACY_NON_CHAR_PACKS.contains(cid));
+        .any(|(cid, _, _, _)| *cid >= 10000 && !LEGACY_NON_CHAR_PACKS.contains(cid));
     if has_modern_char {
-        raw_items.retain(|(cid, _, _)| *cid >= 10000 && !LEGACY_NON_CHAR_PACKS.contains(cid));
+        raw_items.retain(|(cid, _, _, _)| *cid >= 10000 && !LEGACY_NON_CHAR_PACKS.contains(cid));
     }
-    raw_items.sort_by(|a, b| b.0.cmp(&a.0));
+    // Sort by relevance score first (matched in both search + suggest), then newest pack (`cate_id` desc)
+    raw_items.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| b.0.cmp(&a.0)));
 
-    // Keep at most 2 stickers from the same pack in the top strip so suggestions show diverse characters
+    // Keep at most 2 stickers from the same pack in the first pass so suggestions show diverse characters,
+    // then fill up to 24 items if needed for Sticker Picker search grids.
     let mut pack_counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-    let mut out = Vec::with_capacity(18);
-    for &(cid, sid, stype) in &raw_items {
+    let mut out = Vec::with_capacity(24);
+    let mut deferred = Vec::new();
+    for &(cid, sid, stype, _) in &raw_items {
         let cnt = pack_counts.entry(cid).or_insert(0);
         if *cnt >= 2 {
+            deferred.push((cid, sid, stype));
             continue;
         }
         *cnt += 1;
@@ -1825,9 +2052,21 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
             sticker_type: stype,
             label: format!("{kw} #{idx}"),
         });
-        if out.len() >= 18 {
+        if out.len() >= 24 {
             break;
         }
+    }
+    for (cid, sid, stype) in deferred {
+        if out.len() >= 24 {
+            break;
+        }
+        let idx = out.len() + 1;
+        out.push(StickerItem {
+            sticker_id: sid,
+            cate_id: cid,
+            sticker_type: stype,
+            label: format!("{kw} #{idx}"),
+        });
     }
 
     if !out.is_empty() {
@@ -4252,6 +4491,15 @@ mod tests {
         assert_eq!(strip_vn_for_sticker_kw("Cảm ơn nhiều"), "cam on nhieu");
         assert_eq!(strip_vn_for_sticker_kw("Ngủ ngon nhé"), "ngu ngon nhe");
         assert_eq!(strip_vn_for_sticker_kw("Nguyễn Văn An"), "nguyen van an");
+        assert_eq!(normalize_sticker_keyword("  iu\u{a0}that\u{a0}  "), "iu that");
+
+        let q1 = canonical_vn_sticker_queries("Mệt quá");
+        assert!(q1.contains(&"mệt quá".to_string()));
+        assert!(q1.contains(&"met qua".to_string()));
+
+        let q2 = canonical_vn_sticker_queries("khoc");
+        assert!(q2.contains(&"khoc".to_string()));
+        assert!(q2.contains(&"khóc".to_string()));
     }
 
     #[test]

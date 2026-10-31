@@ -210,6 +210,9 @@ impl Session {
             "https://chat.zalo.me",
             "https://wpa.zaloapp.com",
             "https://wpa.chat.zalo.me",
+            "https://tt-sticker-wpa.chat.zalo.me",
+            "https://tt-sticker-wpa.zaloapp.com",
+            "https://sticker-wpa.chat.zalo.me",
             &self.domains.auth,
             &self.domains.chat,
             &self.domains.conversation,
@@ -221,6 +224,7 @@ impl Session {
             &self.domains.group,
             &self.domains.cloud_msg,
             &self.domains.voice_call,
+            &self.domains.sticker,
         ];
         for host in hosts {
             if let Ok(url) = reqwest::Url::parse(host) {
@@ -393,6 +397,11 @@ impl Session {
             }
             self.domains.conversation = crate::endpoints::service("conversation")
                 .unwrap_or("https://tt-convers-wpa.chat.zalo.me")
+                .into();
+        }
+        if self.domains.sticker.is_empty() {
+            self.domains.sticker = crate::endpoints::service("sticker")
+                .unwrap_or("https://tt-sticker-wpa.chat.zalo.me")
                 .into();
         }
         self.session_key = saved.session_key;
