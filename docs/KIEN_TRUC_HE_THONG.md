@@ -1,107 +1,72 @@
-# Kiến Trúc Hệ Thống ctdozlite (Zalo Native Client)
+# Kiến trúc hệ thống ctdozlite
 
-Tài liệu này mô tả chi tiết kiến trúc phần mềm, mô hình xử lý đa luồng, cơ chế đồng bộ và hệ thống lưu trữ dữ liệu của **ctdozlite**.
+Tài liệu mô tả cách phân tách luồng xử lý, tổ chức module giao diện và cơ chế lưu trữ cục bộ của `ctdozlite`.
 
 ---
 
-## 1. Sơ đồ khối tổng thể (High-level Architecture)
+## 1. Sơ đồ tổng thể
 
-```
+```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│                        TẦNG GIAO DIỆN (UI LAYER)                       │
+│                           TẦNG GIAO DIỆN (UI)                          │
 │                                                                        │
-│   ┌───────────────────────────┐      ┌─────────────────────────────┐   │
-│   │   GUI (eframe / egui)     │      │   TUI (ratatui / crossterm) │   │
-│   │  • 60 FPS Glow Render     │      │  • 30ms Event Loop          │   │
-│   │  • Segoe UI Custom Font   │      │  • Flat ANSI Borders        │   │
-│   │  • Dev Inspector Panel    │      │  • Keystroke Auto-focus     │   │
-│   └─────────────┬─────────────┘      └──────────────┬──────────────┘   │
-└─────────────────┼───────────────────────────────────┼──────────────────┘
-                  │ mpsc::channel                     │ mpsc::channel
-                  ▼                                   ▼
+│   ┌───────────────────────────────┐  ┌─────────────────────────────┐   │
+│   │  GUI (src/gui.rs + src/gui/*) │  │     TUI (src/tui.rs)        │   │
+│   │  • eframe / egui              │  │  • ratatui / crossterm      │   │
+│   │  • Event-driven repaint       │  │  • 30ms terminal poll loop  │   │
+│   └───────────────┬───────────────┘  └──────────────┬──────────────┘   │
+└───────────────────┼─────────────────────────────────┼──────────────────┘
+                    │ WorkerCmd (mpsc)                │
+                    ▼                                 ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│                    TẦNG XỬ LÝ NỀN (BACKGROUND WORKER)                  │
+│                     LUỒNG NỀN (TOKIO ASYNC WORKER)                     │
 │                                                                        │
-│   ┌────────────────────────────────────────────────────────────────┐   │
-│   │             Tokio Multi-threaded Runtime (Non-blocking)        │   │
-│   │  • WorkerCmd Receiver: Xử lý RequestQr, SendMessage, Logout    │   │
-│   │  • Background Poller (3s): Gọi get_last_msgs chống lỗi 429     │   │
-│   │  • GuiEvent / BgEvent Sender: Bắn dữ liệu về UI không delay   │   │
-│   └────────────────────────────────┬───────────────────────────────┘   │
-└────────────────────────────────────┼───────────────────────────────────┘
-                                     │
-         ┌───────────────────────────┴───────────────────────────┐
-         ▼                                                       ▼
-┌───────────────────────────────────┐   ┌────────────────────────────────┐
-│   TẦNG DỮ LIỆU & LƯU TRỮ (STORE)  │   │   TẦNG MẬT MÃ & PHIÊN (CRYPTO) │
-│                                   │   │                                │
-│ • JSON Cache (threads_cache.json) │   │ • ParamCipher v2 (zcid, AES)   │
-│   - Snapshot nạp nhanh < 5ms      │   │ • PasswordCipher (loginPassv2) │
-│ • SQLite Database (zalo_history)  │   │ • SignKey Generator (MD5)      │
-│   - Index (thread_id, ts)         │   │ • AES-128-CBC / AES-256-CBC    │
-│   - Deduplication 2 tầng          │   │ • Session Jar & Domain Router  │
-└───────────────────────────────────┘   └────────────────────────────────┘
+│   • WebSocket loop (`zpw_ws`): nhận tin nhắn & sự kiện VoIP tức thì    │
+│   • HTTP Poller (`get_last_msgs` / `lp_control`): đồng bộ dự phòng     │
+│   • Sticker Engine: gọi song song suggest + search & prefetch ảnh      │
+│   • CallBridge (`src/call.rs`): quản lý báo hiệu & luồng RTP/RTCP      │
+└───────────────────┬─────────────────────────────────┬──────────────────┘
+                    │                                 │
+                    ▼                                 ▼
+┌───────────────────────────────────┐  ┌─────────────────────────────────┐
+│        LƯU TRỮ CỤC BỘ             │  │      MẬT MÃ & PHIÊN MẠNG        │
+│                                   │  │                                 │
+│ • threads_cache.json (snapshot)   │  │ • ParamCipher v2 & SignKey MD5  │
+│ • zalo_history.db (SQLite)        │  │ • AES-128-CBC / AES-256-CBC     │
+│ • stickers_cache/ (WebP/PNG)      │  │ • Cookie jar đa domain zpw_sek  │
+└───────────────────────────────────┘  └─────────────────────────────────┘
 ```
 
 ---
 
-## 2. Mô hình Xử lý Bất đồng bộ (Non-blocking Asynchronous Runtime)
+## 2. Tổ chức module GUI (`src/gui/`)
 
-Một trong những hạn chế lớn nhất của phiên bản cũ là việc gọi mạng đồng bộ ngay trong vòng lặp vẽ giao diện, dẫn đến hiện tượng đứng hình (freeze) khi mạng chậm hoặc khi đang chờ quét QR.
+Để dễ bảo trì, phần giao diện đồ họa được chia thành các module con theo trách nhiệm:
 
-### 2.1. Phân tách Luồng Giao diện và Luồng Mạng
-- **Luồng chính (UI Thread):** Chỉ thực hiện render khung hình và lắng nghe sự kiện chuột/bàn phím. Tốc độ làm tươi đạt 60 FPS (GUI) hoặc 30ms (TUI).
-- **Luồng nền (Session Worker):** Chạy trên một Tokio Multi-threaded Runtime chuyên biệt. Mọi tác vụ tốn thời gian (HTTPS requests, long-polling QR 180 giây, nạp danh bạ 20.000 người) đều thực thi tại đây.
-- **Kênh giao tiếp hai chiều (`tokio::sync::mpsc`):**
-  - `WorkerCmd`: Gửi lệnh từ UI xuống Worker (`RequestQr`, `RefreshThreads`, `PollMessages`, `SendMessage`, `Logout`).
-  - `GuiEvent`: Bắn kết quả từ Worker lên UI (`QrReady`, `QrScanned`, `LoginSuccess`, `ThreadsUpdated`, `MessageSent`, `LoggedOut`).
-
-### 2.2. Cơ chế Polling chống giật (Jank-free Polling)
-- Thay vì gọi toàn bộ danh bạ `getfriends` mỗi chu kỳ (vốn gây quá tải và bị máy chủ Zalo chặn `HTTP 429 Too Many Requests`), ứng dụng chỉ gọi `get_last_msgs` với `threadIdLocalMsgId = "{}"` mỗi 3 giây.
-- Sử dụng cờ nguyên tử `IS_POLLING` để ngăn chặn việc gửi request mới khi request cũ chưa kịp phản hồi khi mạng lag.
+- `src/gui.rs`: Khởi tạo `ZaloGuiApp`, quản lý trạng thái ứng dụng, xử lý hàng đợi `GuiEvent`, thanh tiêu đề cửa sổ và màn hình đăng nhập.
+- `src/gui/theme.rs`: Bảng màu `ThemePalette` (Dark/Light), bộ icon vector `lucide`, vẽ avatar và nạp font tiếng Việt của hệ điều hành.
+- `src/gui/stickers.rs`: Bảng chọn nhãn dán (`StickerPicker`), thuật toán gợi ý nhãn dán theo thời gian thực khi gõ (`resolve_contextual_sticker_suggestions`) và thanh popover gợi ý nổi trên ô nhập.
+- `src/gui/worker.rs`: Định nghĩa `WorkerCmd`, luồng nền Tokio (`spawn_session_worker`) và bộ tải trước ảnh thumbnail nhãn dán (`preload_disk_sticker_thumbnails`, `prefetch_missing_sticker_thumbnails`).
+- `src/gui/workspace.rs`: Bố cục 3 cột gồm thanh điều hướng, danh sách hội thoại, vùng khung chat chính và ngăn thông tin chi tiết bên phải.
+- `src/gui/messages.rs`: Hiển thị bong bóng tin nhắn, nhãn dán, thẻ cuộc gọi, trích dẫn, cảm xúc (reaction), menu chuột phải và xử lý dán ảnh từ clipboard.
+- `src/gui/modals.rs`: Các cửa sổ phụ gồm cài đặt, cuộc gọi thoại/video, xem ảnh phóng to, chuyển tiếp tin nhắn, tìm kiếm theo số điện thoại và Dev Inspector.
 
 ---
 
-## 3. Kiến trúc Lưu trữ Dữ liệu 2 Tầng (Two-tier Storage)
+## 3. Cơ chế đồng bộ bất đồng bộ
 
-Để giải quyết triệt để vấn đề mất tin nhắn và tốc độ khởi động, hệ thống sử dụng kiến trúc lưu trữ 2 tầng:
+### 3.1. Tách biệt luồng vẽ giao diện và luồng mạng
+- Luồng giao diện (UI thread) không bao giờ gọi trực tiếp các hàm mạng chặn (blocking). Mọi thao tác mạng được gửi qua kênh `tokio::sync::mpsc::unbounded_channel` dưới dạng `WorkerCmd`.
+- Luồng worker chạy trên một Tokio runtime 2 worker threads, xử lý kết nối WebSocket `zpw_ws`, các truy vấn REST API và giải mã ảnh trên nền. Khi có kết quả, worker gửi `GuiEvent` về UI kèm lệnh `egui_ctx.request_repaint()`.
 
-### Tầng 1: Snapshot Cache (`threads_cache.json`)
-- **Mục đích:** Lưu trữ trạng thái xem trước tức thì của danh sách hội thoại và các tin nhắn gần nhất.
-- **Tốc độ:** Khởi động ứng dụng nạp file này trong thời gian dưới 5ms, người dùng thấy ngay danh bạ và tin nhắn trước khi máy chủ Zalo kịp phản hồi.
-
-### Tầng 2: Cơ sở Dữ liệu Quan hệ (`zalo_history.db` - SQLite)
-- **Mục đích:** Lưu trữ lịch sử tin nhắn tích lũy vĩnh viễn, hỗ trợ truy vấn và tìm kiếm tin nhắn cũ.
-- **Schema:**
-  ```sql
-  CREATE TABLE IF NOT EXISTS messages (
-      msg_id TEXT PRIMARY KEY,
-      thread_id TEXT NOT NULL,
-      sender_id TEXT,
-      sender_name TEXT,
-      text TEXT NOT NULL,
-      msg_type TEXT NOT NULL,
-      ts INTEGER NOT NULL,
-      is_outgoing INTEGER NOT NULL,
-      raw_json TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_thread_ts ON messages(thread_id, ts);
-  ```
-- **Thuật toán Deduplication 2 lớp:**
-  1. Khử trùng tuyệt đối theo `msg_id`.
-  2. Khử trùng theo bộ `(text, is_outgoing, ts)` với sai số `|ts1 - ts2| < 5000 ms` để bảo vệ các tin nhắn được gửi từ client chưa kịp nhận ID chính thức từ server.
+### 3.2. Gợi ý nhãn dán & Prefetch ảnh song song
+- Khi người dùng gõ từ khóa trong ô soạn thảo (sau khoảng trễ debounce 145ms cho chữ cái hoặc 0ms cho biểu tượng cảm xúc/từ khóa đã cache), UI gửi lệnh `WorkerCmd::SuggestComposerStickers`.
+- Worker chuẩn hóa chuỗi truy vấn tiếng Việt (sinh cả dạng có dấu, không dấu và từ đồng nghĩa/viết tắt), sau đó gọi đồng thời hai API `/api/message/sticker/suggest/stickers` (`cmd 11741`) và `/api/message/sticker/search` (`cmd 11747`).
+- Ngay khi nhận danh sách ID nhãn dán, worker nạp trước các file ảnh đã có trong `stickers_cache/` lên bộ nhớ texture trước khi gửi `GuiEvent::ComposerStickerSuggestions`, đồng thời tải song song các ảnh còn thiếu qua HTTP để tránh hiện tượng nhấp nháy khung chờ.
 
 ---
 
-## 4. Tách bạch Chế độ Production và Dev Mode
+## 4. Lưu trữ dữ liệu 2 tầng
 
-Hệ thống được thiết kế theo nguyên tắc an toàn thông tin nghiêm ngặt:
-
-- **Production Mode (Mặc định):**
-  - Badge trạng thái màu xanh `[PRODUCTION]`.
-  - Toàn bộ cơ chế log mạng (`logger::log_request`) lập tức return mà không cấp phát bộ nhớ.
-  - Tuyệt đối không lưu URL thô, token, khóa bí mật hay payload giải mã vào bộ nhớ RAM.
-- **Dev Mode (Kích hoạt qua `--dev`):**
-  - Badge trạng thái màu vàng `[DEV MODE]`.
-  - Bật ngăn kéo Dev Inspector ở đáy màn hình.
-  - Bắt toàn bộ lưu lượng request/response, đo đạc độ trễ mạng chính xác đến mili-giây, hiển thị payload giải mã và chạy máy quét chẩn đoán mã lỗi tự động.
+1. **Snapshot JSON (`threads_cache.json`)**: Lưu danh sách hội thoại và các tin nhắn gần nhất để hiển thị ngay khi khởi động ứng dụng.
+2. **SQLite (`zalo_history.db`)**: Lưu trữ lâu dài toàn bộ tin nhắn theo bảng `messages(msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json)` có đánh chỉ mục trên `(thread_id, ts)`. Khi đồng bộ tin nhắn mới, hệ thống khử trùng theo `msg_id` và theo cặp `(text, is_outgoing, ts)` trong biên độ 5 giây.
