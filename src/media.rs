@@ -216,6 +216,7 @@ impl MediaHandle {
         gui_tx: Option<crate::gui::GuiTx>,
         egui_ctx: Option<eframe::egui::Context>,
     ) -> Result<Self> {
+        crate::runtime_scope::check()?;
         let stop = Arc::new(AtomicBool::new(false));
         let mic_muted = Arc::new(AtomicBool::new(false));
         let cam_enabled = Arc::new(AtomicBool::new(is_video));

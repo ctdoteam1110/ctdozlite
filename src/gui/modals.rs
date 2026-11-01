@@ -285,7 +285,6 @@ impl ZaloGuiApp {
             // `threads_cache.json` but keeps `zalo_history.db` (#21).
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::Logout);
-                let _ = tx.send(WorkerCmd::RequestQr);
             }
         }
         if do_wipe {

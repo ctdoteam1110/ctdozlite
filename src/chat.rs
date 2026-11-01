@@ -1235,6 +1235,7 @@ pub fn load_threads_cache() -> Vec<Thread> {
 /// `PRELOAD_MSGS` messages per thread are kept: full history lives in `zalo_history.db`, and
 /// rewriting every message as pretty JSON on each change cost more than the SQLite write.
 pub fn save_threads_cache(threads: &[Thread]) {
+    let Ok(_scope_guard) = crate::runtime_scope::mutation() else { return; };
     let keep = crate::store::MessageStore::PRELOAD_MSGS;
     let slim: Vec<Thread> = threads
         .iter()
@@ -1251,7 +1252,9 @@ pub fn save_threads_cache(threads: &[Thread]) {
         })
         .collect();
     if let Ok(text) = serde_json::to_string(&slim) {
-        let _ = std::fs::write("threads_cache.json", text);
+        if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+            let _ = std::fs::write("threads_cache.json", text);
+        }
     }
 }
 
@@ -1735,9 +1738,13 @@ pub async fn send_attachment(
         };
         // Pre-populate `stickers_cache/thumb_<md5>.png` with the local image bytes so the GUI
         // renders the sent photo immediately without an extra network round-trip.
-        let _ = std::fs::create_dir_all("stickers_cache");
+        if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+            let _ = std::fs::create_dir_all("stickers_cache");
+        }
         let cache_key = format!("thumb_{}", crate::crypto::md5_hex(&final_thumb));
-        let _ = std::fs::write(format!("stickers_cache/{cache_key}.png"), &file_bytes);
+        if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+            let _ = std::fs::write(format!("stickers_cache/{cache_key}.png"), &file_bytes);
+        }
 
         let msg_id = send_resp
             .get("data")
@@ -2432,7 +2439,9 @@ pub struct StickerItem {
 /// `stickers_cache/store_packs.json`.
 pub async fn fetch_sticker_store_packs(s: &Session) -> Result<Vec<StickerPackInfo>> {
     let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+        let _ = std::fs::create_dir_all(cache_dir);
+    }
     let cache_path = cache_dir.join("store_packs.json");
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<StickerPackInfo>>(&raw_cache) {
@@ -2539,7 +2548,9 @@ pub async fn fetch_sticker_store_packs(s: &Session) -> Result<Vec<StickerPackInf
     // Sort newest packs first (`id` descending) so modern Zalo packs appear at the top of the store
     packs.sort_by(|a, b| b.id.cmp(&a.id));
     if let Ok(txt) = serde_json::to_string(&packs) {
-        let _ = std::fs::write(&cache_path, txt);
+        if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+            let _ = std::fs::write(&cache_path, txt);
+        }
     }
     Ok(packs)
 }
@@ -2562,7 +2573,9 @@ pub async fn fetch_sticker_pack_items(
     }
 
     let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+        let _ = std::fs::create_dir_all(cache_dir);
+    }
     let cache_path = cache_dir.join(format!("pack_{cate_id}.json"));
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<StickerItem>>(&raw_cache) {
@@ -2615,7 +2628,9 @@ pub async fn fetch_sticker_pack_items(
 
     if !items.is_empty() {
         if let Ok(txt) = serde_json::to_string(&items) {
-            let _ = std::fs::write(&cache_path, txt);
+            if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+                let _ = std::fs::write(&cache_path, txt);
+            }
         }
     }
     Ok(items)
@@ -2741,7 +2756,9 @@ pub fn canonical_vn_sticker_queries(keyword: &str) -> Vec<String> {
 /// unaccented Vietnamese triggers suggestions reliably.
 pub async fn fetch_sticker_suggest_keywords(s: &Session) -> Result<Vec<String>> {
     let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+        let _ = std::fs::create_dir_all(cache_dir);
+    }
     let cache_path = cache_dir.join("suggest_keywords_v2.json");
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<String>>(&raw_cache) {
@@ -2801,7 +2818,9 @@ pub async fn fetch_sticker_suggest_keywords(s: &Session) -> Result<Vec<String>> 
     }
     if !kws.is_empty() {
         if let Ok(txt) = serde_json::to_string(&kws) {
-            let _ = std::fs::write(&cache_path, txt);
+            if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+                let _ = std::fs::write(&cache_path, txt);
+            }
         }
     }
     Ok(kws)
@@ -2946,7 +2965,9 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
         return Ok(Vec::new());
     }
     let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+        let _ = std::fs::create_dir_all(cache_dir);
+    }
     let cache_path = cache_dir.join(format!("suggest_v2_{}.json", crate::crypto::md5_hex(&kw)));
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<StickerItem>>(&raw_cache) {
@@ -3046,7 +3067,9 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
 
     if !out.is_empty() {
         if let Ok(txt) = serde_json::to_string(&out) {
-            let _ = std::fs::write(&cache_path, txt);
+            if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+                let _ = std::fs::write(&cache_path, txt);
+            }
         }
     }
     Ok(out)

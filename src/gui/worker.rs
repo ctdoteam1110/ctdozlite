@@ -2,8 +2,9 @@ use super::*;
 
 /// Thread (id, name, is_group) list the poll timer maps incoming messages onto; the GUI
 /// republishes it whenever its threads change.
-pub(super) static KNOWN_THREADS: std::sync::Mutex<Vec<(String, String, bool)>> =
-    std::sync::Mutex::new(Vec::new());
+type KnownThreadsSnapshot = (u64, Vec<(String, String, bool)>);
+pub(super) static KNOWN_THREADS: std::sync::Mutex<KnownThreadsSnapshot> =
+    std::sync::Mutex::new((0, Vec::new()));
 
 pub enum WorkerCmd {
     /// Open a native photo viewer only following an explicit viewer-button click.
@@ -38,6 +39,8 @@ pub enum WorkerCmd {
         account: String,
         threads: Vec<Thread>,
     },
+    /// Drain account writes and native media teardown before the GUI closes.
+    Shutdown,
     /// Read OS authorization without prompting.
     ReadNotificationAuthorization { request_id: u64 },
     /// Request OS authorization following an explicit Settings click.
@@ -213,6 +216,7 @@ pub enum WorkerCmd {
     },
     FetchSocialProfile {
         target_uid: String,
+        request_id: u64,
     },
     FetchMySocialAvatars {
         page: u32,
@@ -392,7 +396,55 @@ async fn process_reaction_journal_at(
     }
 }
 
-pub(super) static WORKER_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<WorkerCmd>> =
+/// Enqueue-time epoch capture prevents old UI commands from adopting a new login.
+pub(super) struct WorkerSender {
+    sender: tokio::sync::mpsc::UnboundedSender<(u64, WorkerCmd)>,
+    ui_thread: std::thread::ThreadId,
+    ui_generation: std::sync::atomic::AtomicU64,
+}
+impl WorkerSender {
+    pub(super) fn acknowledge_ui_generation(&self, generation: u64) {
+        self.ui_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub(super) fn ui_generation(&self) -> u64 {
+        self.ui_generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[allow(clippy::result_large_err)]
+    fn send_at(&self, generation: u64, command: WorkerCmd) -> Result<(), tokio::sync::mpsc::error::SendError<(u64, WorkerCmd)>> {
+        self.sender.send((generation, command))
+    }
+    #[allow(clippy::result_large_err)]
+    fn send_lifecycle_from(&self, generation: u64, command: WorkerCmd) -> Result<(), tokio::sync::mpsc::error::SendError<(u64, WorkerCmd)>> {
+        match crate::runtime_scope::registry().invalidate_if_current(generation) {
+            Ok(next) => self.send_at(next, command),
+            Err(_) => Err(tokio::sync::mpsc::error::SendError((generation, command))),
+        }
+    }
+    #[allow(clippy::result_large_err)]
+    pub(super) fn send(&self, command: WorkerCmd) -> Result<(), tokio::sync::mpsc::error::SendError<(u64, WorkerCmd)>> {
+        let lifecycle = matches!(command, WorkerCmd::Shutdown | WorkerCmd::Logout | WorkerCmd::WipeLocalData | WorkerCmd::RequestQr | WorkerCmd::LoginPassword { .. });
+        let generation = if lifecycle {
+            // A late expired-session response must not invalidate a newer login.
+            if let Some(scope) = crate::runtime_scope::execution_scope() {
+                match crate::runtime_scope::registry().invalidate_if_current(scope.generation) {
+                    Ok(generation) => generation,
+                    Err(_) => return Err(tokio::sync::mpsc::error::SendError((scope.generation, command))),
+                }
+            } else {
+                crate::runtime_scope::registry().invalidate_now();
+                crate::runtime_scope::registry().generation()
+            }
+        } else if let Some(scope) = crate::runtime_scope::execution_scope() {
+            scope.generation
+        } else if std::thread::current().id() == self.ui_thread {
+            // The visible UI may not have consumed LoginSuccess yet. Never adopt the newer
+            // worker account for commands or snapshots built from the old screen's state.
+            self.ui_generation()
+        } else { crate::runtime_scope::registry().generation() };
+        self.send_at(generation, command)
+    }
+}
+pub(super) static WORKER_TX: std::sync::OnceLock<WorkerSender> =
     std::sync::OnceLock::new();
 
 pub(super) fn extract_msg_id(resp: &serde_json::Value) -> String {
@@ -421,7 +473,9 @@ pub(super) fn preload_disk_sticker_thumbnails(
     limit: usize,
 ) -> Vec<(String, String, std::path::PathBuf)> {
     let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+        let _ = std::fs::create_dir_all(cache_dir);
+    }
 
     let mut missing = Vec::new();
     for item in items.iter().take(limit) {
@@ -439,7 +493,9 @@ pub(super) fn preload_disk_sticker_thumbnails(
                 });
                 continue;
             } else {
-                let _ = std::fs::remove_file(&cache_path);
+                if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+                    let _ = std::fs::remove_file(&cache_path);
+                }
             }
         }
         let url = if item.cate_id == 0 && (1..=30).contains(&item.sticker_id) {
@@ -479,7 +535,9 @@ async fn prefetch_missing_sticker_thumbnails(
                     if let Ok(b) = resp.bytes().await {
                         let vec = b.to_vec();
                         if let Ok(dyn_img) = image::load_from_memory(&vec) {
-                            let _ = std::fs::write(&cache_path, &vec);
+                            if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+                                let _ = std::fs::write(&cache_path, &vec);
+                            }
                             let rgba = dyn_img.to_rgba8();
                             let size = [rgba.width() as usize, rgba.height() as usize];
                             let pixels = rgba.as_flat_samples();
@@ -500,8 +558,12 @@ async fn prefetch_missing_sticker_thumbnails(
 }
 
 pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: egui::Context) {
-    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
-    let _ = WORKER_TX.set(cmd_tx);
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, WorkerCmd)>();
+    let _ = crate::runtime_scope::transition(session.login.as_ref().map(|login| login.uin.as_str()).unwrap_or(""));
+    let _ = WORKER_TX.set(WorkerSender {
+        sender: cmd_tx, ui_thread: std::thread::current().id(),
+        ui_generation: std::sync::atomic::AtomicU64::new(crate::runtime_scope::registry().generation()),
+    });
 
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
     let poll_state =
@@ -522,7 +584,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
             rt.block_on(async move {
                 {
                     let s = session.lock().await.clone();
-                    let _ = crate::login::get_server_info(&s).await;
+                    let scope = crate::runtime_scope::registry().current();
+                    crate::runtime_scope::run(scope, async { let _ = crate::login::get_server_info(&s).await; }).await;
                 }
                 // Message poll timer. It used to live in the GUI's update(), which forced a full
                 // repaint every 1.2 s just to fire it. The PollMessages handler skips while a
@@ -532,10 +595,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tick.tick().await;
-                        let known_threads =
+                        let (generation, known_threads) =
                             KNOWN_THREADS.lock().map(|k| k.clone()).unwrap_or_default();
                         if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::PollMessages { known_threads });
+                            let _ = tx.send_at(generation, WorkerCmd::PollMessages { known_threads });
                         }
                     }
                 });
@@ -546,7 +609,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         if port > 0 {
                             let s_api = session.clone();
                             tokio::spawn(async move {
-                                let _ = crate::api_mcp::run_local_http_server(
+                                let _ = crate::api_mcp::run_scoped_local_http_server(
                                     s_api,
                                     port,
                                     "zalo_history.db".into(),
@@ -565,15 +628,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
                             tick.tick().await;
+                            let scope = crate::runtime_scope::registry().current();
+                            if scope.account.is_empty() { continue; }
+                            crate::runtime_scope::run(scope, async {
                             let now_ts = crate::login::unix_now() as i64;
-                            let due = crate::scheduler::claim_due_scheduled_messages(
-                                "zalo_history.db",
-                                now_ts,
-                            )
-                            .unwrap_or_default();
-                            if due.is_empty() {
-                                continue;
-                            }
+                            let Ok(batch) = crate::scheduler::claim_due_scheduled_batch("zalo_history.db", now_ts) else { return; };
+                            let due = batch.messages.clone();
+                            if due.is_empty() { return; }
                             let s = s_sched.lock().await.clone();
                             if s.login.is_none() {
                                 for item in due {
@@ -585,9 +646,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 }
                                 let _ = gui_tx_sched.send(GuiEvent::ScheduledListUpdated);
                                 ctx_sched.request_repaint();
-                                continue;
+                                return;
                             }
                             for item in due {
+                                batch.begin_send(item.id);
                                 let client_id = crate::chat::next_client_message_id();
                                 let send_res = if item.is_group {
                                     crate::chat::send_group_message_with_client_id(&s, &item.thread_id, &item.text, client_id)
@@ -628,6 +690,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             }
                             let _ = gui_tx_sched.send(GuiEvent::ScheduledListUpdated);
                             ctx_sched.request_repaint();
+                            }).await;
                         }
                     });
                 }
@@ -635,7 +698,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     let s_kw = session.clone();
                     let gui_tx_kw = gui_tx.clone();
                     let ctx_kw = egui_ctx.clone();
-                    tokio::spawn(async move {
+                    crate::runtime_scope::spawn(async move {
                         let s = s_kw.lock().await.clone();
                         if s.login.is_some() {
                             if let Some(tx) = WORKER_TX.get() {
@@ -669,7 +732,16 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             tokio::sync::mpsc::UnboundedReceiver<crate::socket::WsEvent>,
                         > = None;
                         let mut ws_sek = String::new();
+                        let mut ws_generation = 0;
                         loop {
+                            let scope = crate::runtime_scope::registry().current();
+                            if ws_generation != scope.generation {
+                                ws_rx = None;
+                                ws_sek.clear();
+                                ws_generation = scope.generation;
+                            }
+                            if scope.account.is_empty() { tokio::time::sleep(Duration::from_millis(100)).await; continue; }
+                            crate::runtime_scope::run(scope, async {
                             let s_snap = s_ws.lock().await.clone();
                             if s_snap.login.is_some() {
                                 let cur_sek = s_snap.zpw_sek.clone().unwrap_or_default();
@@ -750,6 +822,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 ws_sek.clear();
                                 tokio::time::sleep(Duration::from_secs(3)).await;
                             }
+                            }).await;
                         }
                     });
                 }
@@ -761,6 +834,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     let cb = call_bridge.clone();
                     tokio::spawn(async move {
                         loop {
+                            let scope = crate::runtime_scope::registry().current();
+                            if scope.account.is_empty() { tokio::time::sleep(Duration::from_millis(100)).await; continue; }
+                            crate::runtime_scope::run(scope, async {
                             let s_snap = s_ctrl.lock().await.clone();
                             if s_snap.login.is_some() {
                                 let voip_res = {
@@ -777,6 +853,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             } else {
                                 tokio::time::sleep(Duration::from_secs(3)).await;
                             }
+                            }).await;
                         }
                     });
                 }
@@ -804,7 +881,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
 
                 let mut current_qr_task: Option<tokio::task::JoinHandle<()>> = None;
 
-                while let Some(cmd) = cmd_rx.recv().await {
+                while let Some((generation, cmd)) = cmd_rx.recv().await {
+                    let lifecycle = matches!(cmd, WorkerCmd::Shutdown | WorkerCmd::Logout | WorkerCmd::WipeLocalData | WorkerCmd::RequestQr | WorkerCmd::LoginPassword { .. });
+                    let application = matches!(cmd, WorkerCmd::ReadNotificationAuthorization { .. } | WorkerCmd::RequestNotificationAuthorization { .. } | WorkerCmd::CheckForUpdates { .. } | WorkerCmd::DownloadAndApplyUpdate { .. });
+                    let command_scope = crate::runtime_scope::registry().current();
+                    if !application && generation != command_scope.generation { continue; }
+                    if !lifecycle && !application && command_scope.account.is_empty() { continue; }
                     match cmd {
                         WorkerCmd::ImportOriginalReactions { account, path } => {
                             let captured = session.lock().await.clone();
@@ -889,6 +971,25 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 let _ = tx.send(GuiEvent::IncomingNotificationFinished { result: Err(crate::native_notifications::NotificationError::HelperUnavailable) });
                             }
                         }
+                        WorkerCmd::Shutdown => {
+                            let barrier = tokio::task::spawn_blocking(move || crate::runtime_scope::transition_if_current(generation, "", || {}));
+                            let result = async {
+                                let shutdown_scope = barrier.await.map_err(|_| "Dừng ghi dữ liệu bị gián đoạn".to_owned())?
+                                    .map_err(|_| "Phiên làm việc đã thay đổi".to_owned())?;
+                                crate::runtime_scope::drain().await;
+                                call_bridge.shutdown().await.map_err(|_| "Chưa dừng xong âm thanh cuộc gọi".to_owned())?;
+                                if !crate::runtime_scope::registry().accepts(&shutdown_scope) { return Err("Đã có thao tác mới; yêu cầu đóng cũ đã được huỷ".to_owned()); }
+                                Ok(())
+                            };
+                            match tokio::time::timeout(Duration::from_secs(10), result).await {
+                                Ok(Ok(())) => {
+                                    let _ = gui_tx.send(GuiEvent::ShutdownFinished(Ok(())));
+                                    break;
+                                }
+                                Ok(Err(error)) => { let _ = gui_tx.send(GuiEvent::ShutdownFinished(Err(error))); }
+                                Err(_) => { let _ = gui_tx.send(GuiEvent::ShutdownFinished(Err("Đóng ứng dụng quá thời gian; hãy thử lại".into()))); }
+                            }
+                        }
                         WorkerCmd::ReadNotificationAuthorization { request_id }
                         | WorkerCmd::RequestNotificationAuthorization { request_id } => {
                             let request = matches!(
@@ -908,7 +1009,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::PersistThreads(threads_snapshot) => {
-                            tokio::task::spawn_blocking(move || {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
+                            let _ = crate::runtime_scope::spawn_blocking(move || {
                                 if let Ok(mut store) =
                                     crate::store::MessageStore::open("zalo_history.db")
                                 {
@@ -916,31 +1018,39 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         crate::store::persist_threads(&mut store, &threads_snapshot);
                                 }
                                 crate::chat::save_threads_cache(&threads_snapshot);
+                            }).await;
                             });
                         }
                         WorkerCmd::Logout => {
-                            if let Some(task) = current_qr_task.take() {
-                                task.abort();
-                            }
-                            // Credentials and the account-scoped thread cache only:
-                            // message history is removed by `WipeLocalData` (#21).
-                            let _ = std::fs::remove_file("session.json");
-                            let _ = std::fs::remove_file("threads_cache.json");
-                            {
-                                let mut s = session.lock().await;
-                                s.logout();
-                            }
-                            {
-                                let mut ps = poll_state.lock().await;
-                                *ps = crate::chat::PollState::default();
-                            }
-                            let _ = gui_tx.send(GuiEvent::LoggedOut);
+                            crate::history_sync::CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+                            if let Some(task) = current_qr_task.take() { task.abort(); }
+                            let Ok(Ok(logout_scope)) = tokio::task::spawn_blocking(move || {
+                                crate::runtime_scope::transition_if_current(generation, "", || {
+                                    let _ = std::fs::remove_file("session.json");
+                                    let _ = std::fs::remove_file("threads_cache.json");
+                                })
+                            }).await else { continue; };
+                            session.lock().await.logout();
+                            *poll_state.lock().await = crate::chat::PollState::default();
+                            let _ = gui_tx.send(GuiEvent::Scoped {
+                                scope: logout_scope.clone(), event: Box::new(GuiEvent::LoggedOut),
+                            });
                             egui_ctx.request_repaint();
+                            // QR begins only after logout cleanup; it carries a fresh validated intent.
+                            if let Some(tx) = WORKER_TX.get() { let _ = tx.send_lifecycle_from(logout_scope.generation, WorkerCmd::RequestQr); }
                         }
                         WorkerCmd::WipeLocalData => {
-                            let _ = std::fs::remove_file("zalo_history.db");
-                            let _ = std::fs::remove_file("threads_cache.json");
-                            let _ = gui_tx.send(GuiEvent::LocalDataWiped);
+                            let account = session.lock().await.login.as_ref().map(|login| login.uin.clone()).unwrap_or_default();
+                            let Ok(Ok(wipe_scope)) = tokio::task::spawn_blocking(move || {
+                                crate::runtime_scope::transition_if_current(generation, &account, || {
+                                    for path in ["zalo_history.db", "zalo_history.db-wal", "zalo_history.db-shm", "threads_cache.json"] {
+                                        let _ = std::fs::remove_file(path);
+                                    }
+                                })
+                            }).await else { continue; };
+                            let _ = gui_tx.send(GuiEvent::Scoped {
+                                scope: wipe_scope, event: Box::new(GuiEvent::LocalDataWiped),
+                            });
                             egui_ctx.request_repaint();
                         }
                         WorkerCmd::PinThread {
@@ -949,7 +1059,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             pin,
                         } => {
                             let session_clone = session.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let _ = crate::chat::update_pinned_conversation(
                                     &s, &thread_id, is_group, pin,
@@ -963,7 +1073,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             unread,
                         } => {
                             let session_clone = session.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let _ =
                                     crate::chat::set_unread_mark(&s, &thread_id, is_group, unread)
@@ -977,7 +1087,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             mute,
                         } => {
                             let session_clone = session.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let _ = crate::chat::set_mute_conversation(
                                     &s,
@@ -995,7 +1105,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             hide,
                         } => {
                             let session_clone = session.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let _ = crate::chat::set_hidden_conversation(
                                     &s, &thread_id, is_group, hide,
@@ -1009,7 +1119,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             last_cli_msg_id,
                         } => {
                             let session_clone = session.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let _ = crate::chat::delete_conversation(
                                     &s,
@@ -1021,6 +1131,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::RequestQr => {
+                            let Ok(Ok(attempt_scope)) = tokio::task::spawn_blocking(move || crate::runtime_scope::transition_if_current(generation, "", || {})).await else { continue; };
+                            let _ = gui_tx.send(GuiEvent::Scoped {
+                                scope: attempt_scope.clone(), event: Box::new(GuiEvent::LoggedOut),
+                            });
                             if let Some(task) = current_qr_task.take() {
                                 task.abort();
                             }
@@ -1029,7 +1143,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
 
-                            let handle = tokio::spawn(async move {
+                            let handle = crate::runtime_scope::spawn_scoped(attempt_scope, async move {
                                 {
                                     let mut s = session_clone.lock().await;
                                     s.logout();
@@ -1102,7 +1216,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                         crate::qr::confirm(&s_snap, &q).await;
 
                                                     if let Ok(resp) = confirm_res {
-                                                        let mut s = session_clone.lock().await;
+                                                        let mut s = session_clone.lock().await.clone();
                                                         if let Some(sek) =
                                                             crate::qr::extract_zpw_sek(&resp)
                                                         {
@@ -1113,8 +1227,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                 &mut s, data,
                                                             );
                                                         }
-                                                        let _ = s.save_to_file("session.json");
-
                                                         if let Ok(info) =
                                                             crate::login::get_login_info(&s).await
                                                         {
@@ -1126,7 +1238,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                             }
                                                         }
                                                         let _ = s.sync_profile_me().await;
-                                                        let _ = s.save_to_file("session.json");
+                                                        {
+                                                            let mut shared = session_clone.lock().await;
+                                                            let account = s.login.as_ref().map(|login| login.uin.as_str()).unwrap_or("");
+                                                            if crate::runtime_scope::transition(account).is_err() { return; }
+                                                            *shared = s.clone();
+                                                            let _ = s.save_to_file("session.json");
+                                                        }
 
                                                         let uin = s
                                                             .login
@@ -1174,7 +1292,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                         let s_kw = s.clone();
                                                         let tx_kw = gui_tx_clone.clone();
                                                         let ctx_kw = ctx_clone.clone();
-                                                        tokio::spawn(async move {
+                                                        crate::runtime_scope::spawn(async move {
                                                             if let Ok(kws) = crate::chat::fetch_sticker_suggest_keywords(&s_kw).await {
                                                                 if !kws.is_empty() {
                                                                     let _ = tx_kw.send(GuiEvent::StickerSuggestKeywordsLoaded(kws));
@@ -1202,7 +1320,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let mut s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
                                     match s.session_status().await {
@@ -1212,6 +1330,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             // readable until a new login replaces the file (#21).
                                             {
                                                 let mut sl = session_clone.lock().await;
+                                                let Ok(_scope_guard) = crate::runtime_scope::mutation() else { return; };
                                                 sl.mark_expired();
                                                 let _ = sl.save_to_file("session.json");
                                                 sl.logout();
@@ -1243,6 +1362,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     if let Some((uid, name)) = s.sync_profile_me().await {
                                         {
                                             let mut sl = session_clone.lock().await;
+                                            if crate::runtime_scope::transition(&uid).is_err() { return; }
                                             if let Some(ref mut li) = sl.login {
                                                 li.uin = uid.clone();
                                                 if !name.is_empty() {
@@ -1366,7 +1486,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            let reset_poll = crate::runtime_scope::ResetFlag(&IS_POLLING);
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
+                                let _reset_poll = reset_poll;
                                 let s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
                                     let mut temp_threads: Vec<Thread> = known_threads
@@ -1431,6 +1553,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             {
                                                 {
                                                     let mut sl = session_clone.lock().await;
+                                                let Ok(_scope_guard) = crate::runtime_scope::mutation() else { return; };
                                                     sl.mark_expired();
                                                     let _ = sl.save_to_file("session.json");
                                                     sl.logout();
@@ -1499,7 +1622,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         }
                                     }
                                 }
-                                IS_POLLING.store(false, std::sync::atomic::Ordering::SeqCst);
                             });
                         }
                         WorkerCmd::SyncHistory { threads } => {
@@ -1511,7 +1633,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            let reset_sync = crate::runtime_scope::ResetFlag(&crate::history_sync::RUNNING);
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
+                                let _reset_sync = reset_sync;
                                 let s = session_clone.lock().await.clone();
                                 let total = threads.len();
                                 let mut added = 0;
@@ -1546,7 +1670,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     cancelled: crate::history_sync::CANCEL.load(Ordering::Relaxed),
                                 });
                                 ctx_clone.request_repaint();
-                                crate::history_sync::RUNNING.store(false, Ordering::SeqCst);
                             });
                         }
                         WorkerCmd::LoadGroupHistory {
@@ -1557,7 +1680,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
                                     let is_send2me = s
@@ -1730,7 +1853,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let client_id = crate::chat::next_client_message_id();
                                 if let Some(found_url) = crate::chat::extract_first_url(&text) {
@@ -1838,6 +1961,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         {
                                             {
                                                 let mut sl = session_clone.lock().await;
+                                                let Ok(_scope_guard) = crate::runtime_scope::mutation() else { return; };
                                                 sl.mark_expired();
                                                 let _ = sl.save_to_file("session.json");
                                                 sl.logout();
@@ -1890,7 +2014,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let client_id = crate::chat::next_client_message_id();
                                 match crate::chat::send_quote_message_with_client_id(
@@ -1927,7 +2051,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let client_id = crate::chat::next_client_message_id();
                                 let res = crate::chat::forward_message_with_client_id(
@@ -1989,7 +2113,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let res = crate::chat::send_reaction(
                                     &s, &to_id, is_group, &msg, &reaction,
@@ -2032,7 +2156,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let local_only = msg.id.is_empty()
                                     || msg.id.starts_with("out_")
@@ -2047,7 +2171,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     Ok(resp) if resp_error_code(&resp).is_none() => {
                                         let (tid, mid, ts) =
                                             (to_id.clone(), msg.id.clone(), msg.ts);
-                                        let _ = tokio::task::spawn_blocking(move || {
+                                        let _ = crate::runtime_scope::spawn_blocking(move || {
                                             if let Ok(mut store) =
                                                 crate::store::MessageStore::open("zalo_history.db")
                                             {
@@ -2089,7 +2213,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let local_only = msg.id.is_empty()
                                     || msg.id.starts_with("out_")
@@ -2137,7 +2261,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let client_id = crate::chat::next_client_message_id();
                                 let res = crate::chat::send_sticker_with_client_id(
@@ -2182,6 +2306,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         {
                                             {
                                                 let mut sl = session_clone.lock().await;
+                                                let Ok(_scope_guard) = crate::runtime_scope::mutation() else { return; };
                                                 sl.mark_expired();
                                                 let _ = sl.save_to_file("session.json");
                                                 sl.logout();
@@ -2206,9 +2331,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let cache_dir = std::path::Path::new("stickers_cache");
-                                let _ = std::fs::create_dir_all(cache_dir);
+                                if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+                                    let _ = std::fs::create_dir_all(cache_dir);
+                                }
                                 let cache_path = cache_dir.join(format!("{key}.png"));
 
                                 // Bytes come from the disk cache, a local file or the network. They
@@ -2235,16 +2362,20 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     return;
                                 };
 
-                                let _ = tokio::task::spawn_blocking(move || {
+                                let _ = crate::runtime_scope::spawn_blocking(move || {
                                     let Ok(mut dyn_img) = image::load_from_memory(&bytes) else {
                                         if !from_network {
                                             // Corrupt cache entry: drop it so the next request refetches.
-                                            let _ = std::fs::remove_file(&cache_path);
+                                            if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+                                                let _ = std::fs::remove_file(&cache_path);
+                                            }
                                         }
                                         return;
                                     };
                                     if from_network {
-                                        let _ = std::fs::write(&cache_path, &bytes);
+                                        if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+                                            let _ = std::fs::write(&cache_path, &bytes);
+                                        }
                                     }
                                     // Bubbles draw images at most 240 pt wide; full-size photos kept as
                                     // textures cost ~8 MB each (1080p) and are never freed.
@@ -2314,7 +2445,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 match crate::chat::fetch_sticker_store_packs(&s).await {
                                     Ok(packs) => {
@@ -2340,7 +2471,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 match crate::chat::fetch_sticker_pack_items(&s, cate_id, &name)
                                     .await
@@ -2371,7 +2502,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 match crate::chat::search_stickers_by_keyword(&s, &keyword).await {
                                     Ok(items) => {
@@ -2411,7 +2542,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let items = crate::chat::search_stickers_by_keyword(&s, &keyword)
                                     .await
@@ -2437,7 +2568,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 if let Ok(meta) = crate::chat::parse_link_metadata(&s, &url).await {
                                     let _ = gui_tx_clone.send(GuiEvent::LinkPreviewReady(meta));
@@ -2455,15 +2586,16 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let picked_path = if let Some(p) = preset_path {
                                     Some(p)
                                 } else {
-                                    tokio::task::spawn_blocking(move || {
+                                    crate::runtime_scope::spawn_blocking(move || {
                                         pick_native_file_dialog(images_only)
                                     })
                                     .await
                                     .ok()
+                                    .and_then(Result::ok)
                                     .flatten()
                                 };
 
@@ -2512,6 +2644,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             is_video,
                             is_group,
                         } => {
+                            crate::runtime_scope::run(command_scope.clone(), async {
                             let kind_label = if is_video { "Gọi video" } else { "Gọi thoại" };
                             call_bridge.make_call(
                                 &partner_id,
@@ -2525,31 +2658,38 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             );
                             let _ = gui_tx.send(GuiEvent::StatusUpdate(status_msg));
                             egui_ctx.request_repaint();
+                            }).await;
                         }
                         WorkerCmd::AnswerCall { accept } => {
+                            crate::runtime_scope::run(command_scope.clone(), async {
                             call_bridge.answer_call(accept);
                             egui_ctx.request_repaint();
+                            }).await;
                         }
                         WorkerCmd::SetCallMediaState {
                             is_on_mic,
                             is_on_cam,
                         } => {
+                            crate::runtime_scope::run(command_scope.clone(), async {
                             call_bridge.set_media_state(is_on_mic, is_on_cam);
                             egui_ctx.request_repaint();
+                            }).await;
                         }
                         WorkerCmd::EndCall => {
+                            crate::runtime_scope::run(command_scope.clone(), async {
                             call_bridge.end_call();
                             let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
                             let _ = gui_tx.send(GuiEvent::StatusUpdate(
                                 "Đã kết thúc cuộc gọi".into(),
                             ));
                             egui_ctx.request_repaint();
+                            }).await;
                         }
                         WorkerCmd::CheckFriendStatus { user_id } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let status_res =
                                     crate::chat::check_friendship_status(&s, &user_id).await;
@@ -2569,7 +2709,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 match crate::chat::accept_friend_request(&s, &user_id).await {
                                     Ok(_) => {
@@ -2595,7 +2735,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 if crate::chat::reject_friend_request(&s, &user_id)
                                     .await
@@ -2617,7 +2757,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 if crate::chat::undo_friend_request(&s, &user_id).await.is_ok() {
                                     let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
@@ -2636,7 +2776,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 // Check if there is an incoming request we can accept directly
                                 if crate::chat::accept_friend_request(&s, &user_id).await.is_ok() {
@@ -2681,7 +2821,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 match crate::chat::find_user_by_phone(&s, &phone).await {
                                     Ok(profile) => {
@@ -2701,16 +2841,20 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::LoginPassword { phone, pass } => {
+                            let Ok(Ok(attempt_scope)) = tokio::task::spawn_blocking(move || crate::runtime_scope::transition_if_current(generation, "", || {})).await else { continue; };
+                            let _ = gui_tx.send(GuiEvent::Scoped {
+                                scope: attempt_scope.clone(), event: Box::new(GuiEvent::AuthenticationStarted),
+                            });
                             let session_clone = session.clone();
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(attempt_scope, async move {
                                 let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
                                     "Đang xác thực tài khoản…".into(),
                                 ));
                                 ctx_clone.request_repaint();
-                                let mut s = session_clone.lock().await;
+                                let mut s = session_clone.lock().await.clone();
                                 match crate::login::login_by_password(&mut s, &phone, &pass, "VN")
                                     .await
                                 {
@@ -2719,7 +2863,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             if let Some(cfg) = info.get("data") {
                                                 crate::login::apply_login_config(&mut s, cfg);
                                                 s.apply_server_info(cfg);
-                                                let _ = s.save_to_file("session.json");
+                                                {
+                                                    let mut shared = session_clone.lock().await;
+                                                    let account = s.login.as_ref().map(|login| login.uin.as_str()).unwrap_or("");
+                                                    if crate::runtime_scope::transition(account).is_err() { return; }
+                                                    *shared = s.clone();
+                                                    let _ = s.save_to_file("session.json");
+                                                }
 
                                                 let uin = s
                                                     .login
@@ -2833,17 +2983,17 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 ctx_clone.request_repaint();
                             });
                         }
-                        WorkerCmd::FetchSocialProfile { target_uid } => {
+                        WorkerCmd::FetchSocialProfile { target_uid, request_id } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let res = s
                                     .get_friend_social_profile(&target_uid)
                                     .await
                                     .map_err(|e| e.to_string());
-                                let _ = gui_tx_clone.send(GuiEvent::SocialProfileLoaded(res));
+                                let _ = gui_tx_clone.send(GuiEvent::SocialProfileLoaded { target_uid, request_id, result: res });
                                 ctx_clone.request_repaint();
                             });
                         }
@@ -2851,7 +3001,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let res = s
                                     .get_my_social_avatar_list(page, count)
@@ -2868,7 +3018,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let res = s
                                     .fetch_timeline_feed(&friend_uids, &shared_media_by_uid)
@@ -2881,6 +3031,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     }
                 }
             });
+            rt.shutdown_timeout(Duration::from_secs(2));
         })
         .expect("Failed to spawn zalo-worker thread");
 }
@@ -3737,5 +3888,44 @@ mod delivery_consumer_tests {
         )
         .await;
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_worker_lifecycle_intents_do_not_invalidate_or_enqueue() {
+        let _serial = crate::runtime_scope::tests::TEST_LOCK.lock().await;
+        let stale = crate::runtime_scope::transition("account-a").unwrap();
+        let current = crate::runtime_scope::transition("account-b").unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let bridge = WorkerSender {
+            sender, ui_thread: std::thread::current().id(),
+            ui_generation: std::sync::atomic::AtomicU64::new(current.generation),
+        };
+        crate::runtime_scope::run_stale_for_test(stale, async {
+            assert!(bridge.send(WorkerCmd::RequestQr).is_err());
+            assert!(bridge.send(WorkerCmd::Logout).is_err());
+        }).await;
+        assert_eq!(crate::runtime_scope::registry().current(), current);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn ui_commands_keep_visible_epoch_until_transition_event_is_consumed() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let bridge = WorkerSender {
+            sender, ui_thread: std::thread::current().id(),
+            ui_generation: std::sync::atomic::AtomicU64::new(7),
+        };
+        bridge.send(WorkerCmd::RefreshThreads).unwrap();
+        assert_eq!(receiver.try_recv().unwrap().0, 7);
+        bridge.acknowledge_ui_generation(9);
+        bridge.send(WorkerCmd::RefreshThreads).unwrap();
+        assert_eq!(receiver.try_recv().unwrap().0, 9);
+        bridge.send_at(7, WorkerCmd::PollMessages { known_threads: Vec::new() }).unwrap();
+        assert_eq!(receiver.try_recv().unwrap().0, 7);
     }
 }

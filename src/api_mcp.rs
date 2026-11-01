@@ -57,6 +57,7 @@ pub fn load_autoreply_rules() -> Vec<AutoReplyRule> {
 }
 
 pub fn save_autoreply_rules(rules: &[AutoReplyRule]) -> Result<()> {
+    let _scope_guard = crate::runtime_scope::mutation()?;
     let text = serde_json::to_string_pretty(rules)?;
     crate::data_dir::write_private_atomic(std::path::Path::new(AUTOREPLY_FILE), text.as_bytes())?;
     Ok(())
@@ -724,9 +725,23 @@ pub async fn handle_rest_request(
 
 /// Spawn the local HTTP REST & MCP server on `127.0.0.1:<port>`.
 pub async fn run_local_http_server(
-    session: Arc<Mutex<Session>>,
-    port: u16,
-    db_path: String,
+    session: Arc<Mutex<Session>>, port: u16, db_path: String,
+) -> Result<()> {
+    run_local_http_server_inner(session, port, db_path, false).await
+}
+
+/// Serve GUI requests with an acceptance-time session epoch while keeping the listener alive.
+///
+/// # Errors
+/// Returns listener and socket setup errors, matching the standalone server entry point.
+pub async fn run_scoped_local_http_server(
+    session: Arc<Mutex<Session>>, port: u16, db_path: String,
+) -> Result<()> {
+    run_local_http_server_inner(session, port, db_path, true).await
+}
+
+async fn run_local_http_server_inner(
+    session: Arc<Mutex<Session>>, port: u16, db_path: String, scoped: bool,
 ) -> Result<()> {
     let bind_addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -739,7 +754,14 @@ pub async fn run_local_http_server(
         let sess = session.clone();
         let db = db_path.clone();
         let tok = expected_token.clone();
+        let scope = scoped.then(|| crate::runtime_scope::registry().current());
         tokio::spawn(async move {
+            if scope.as_ref().is_some_and(|scope| scope.account.is_empty()) {
+                let response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+                return;
+            }
+            let operation = async {
             let mut buf = vec![0u8; 65536];
             let Ok(n) = stream.read(&mut buf).await else {
                 return;
@@ -799,6 +821,10 @@ pub async fn run_local_http_server(
                 body_str
             );
             let _ = stream.write_all(resp.as_bytes()).await;
+            };
+            if let Some(scope) = scope {
+                crate::runtime_scope::run(scope, operation).await;
+            } else { operation.await; }
         });
     }
 }

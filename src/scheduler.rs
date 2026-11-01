@@ -51,6 +51,7 @@ pub struct ScheduledMessage {
 }
 
 fn open_scheduler_db(db_path: &str) -> Result<Connection> {
+    let _scope_guard = crate::runtime_scope::mutation()?;
     let conn = if db_path == ":memory:" {
         Connection::open_in_memory()?
     } else {
@@ -61,6 +62,7 @@ fn open_scheduler_db(db_path: &str) -> Result<Connection> {
 }
 
 pub fn init_scheduler_schema(conn: &Connection) -> Result<()> {
+    let _scope_guard = crate::runtime_scope::mutation()?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS scheduled_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -247,6 +249,7 @@ pub fn schedule_message(
     deliver_at: i64,
     now_ts: i64,
 ) -> Result<ScheduledMessage> {
+    let _scope_guard = crate::runtime_scope::mutation()?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         anyhow::bail!("Nội dung tin nhắn hẹn giờ không được để trống");
@@ -289,6 +292,7 @@ pub fn list_pending_scheduled(
     db_path: &str,
     thread_id: Option<&str>,
 ) -> Result<Vec<ScheduledMessage>> {
+    let _scope_guard = crate::runtime_scope::mutation()?;
     let conn = open_scheduler_db(db_path)?;
     let mut out = Vec::new();
     if let Some(tid) = thread_id {
@@ -339,6 +343,7 @@ pub fn update_scheduled_message(
     new_text: &str,
     new_deliver_at: i64,
 ) -> Result<bool> {
+    let _scope_guard = crate::runtime_scope::mutation()?;
     let trimmed = new_text.trim();
     if trimmed.is_empty() {
         anyhow::bail!("Nội dung tin nhắn hẹn giờ không được để trống");
@@ -355,6 +360,7 @@ pub fn update_scheduled_message(
 
 /// Cancel and remove a scheduled message before it is sent (#38).
 pub fn cancel_scheduled_message(db_path: &str, id: i64) -> Result<bool> {
+    let _scope_guard = crate::runtime_scope::mutation()?;
     let conn = open_scheduler_db(db_path)?;
     let changed = conn.execute(
         "DELETE FROM scheduled_messages WHERE id = ?1 AND status != 'sent'",
@@ -365,7 +371,12 @@ pub fn cancel_scheduled_message(db_path: &str, id: i64) -> Result<bool> {
 
 /// Atomically claim all scheduled messages whose `deliver_at <= now_ts` and `status = 'pending'`.
 pub fn claim_due_scheduled_messages(db_path: &str, now_ts: i64) -> Result<Vec<ScheduledMessage>> {
+    let _scope_guard = crate::runtime_scope::mutation()?;
     let conn = open_scheduler_db(db_path)?;
+    claim_due_with_connection(&conn, now_ts)
+}
+
+fn claim_due_with_connection(conn: &Connection, now_ts: i64) -> Result<Vec<ScheduledMessage>> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let res = (|| -> Result<Vec<ScheduledMessage>> {
         let mut stmt = conn.prepare(
@@ -399,8 +410,61 @@ pub fn claim_due_scheduled_messages(db_path: &str, now_ts: i64) -> Result<Vec<Sc
     }
 }
 
+/// A claimed batch owns a pinned connection until every remaining claim is terminal.
+pub(crate) struct ScheduledBatch {
+    pub(crate) messages: Vec<ScheduledMessage>,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    cleanup: u64,
+}
+impl ScheduledBatch {
+    pub(crate) fn begin_send(&self, id: i64) {
+        self.in_flight.store(id, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl Drop for ScheduledBatch {
+    fn drop(&mut self) { crate::runtime_scope::schedule_cleanup(self.cleanup); }
+}
+
+/// Claim due rows and register cancellation settlement before releasing the disk barrier.
+/// The callback only updates captured IDs still marked sending, on the pinned database;
+/// transitions drain it before wipe can unlink or recreate that database.
+///
+/// # Errors
+/// Returns claim, connection or stale-scope errors before exposing the batch.
+pub(crate) fn claim_due_scheduled_batch(db_path: &str, now_ts: i64) -> Result<ScheduledBatch> {
+    let _guard = crate::runtime_scope::mutation()?;
+    let conn = open_scheduler_db(db_path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))?;
+    let messages = claim_due_with_connection(&conn, now_ts)?;
+    let ids: Vec<i64> = messages.iter().map(|item| item.id).collect();
+    let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
+    let attempted = in_flight.clone();
+    let cleanup = crate::runtime_scope::register_cleanup(move || {
+        let result = (|| -> Result<()> {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            for id in ids {
+                let reason = if id == attempted.load(std::sync::atomic::Ordering::SeqCst) {
+                    "Phiên đã đổi khi đang gửi; chưa rõ kết quả. Hãy kiểm tra cuộc trò chuyện trước khi gửi lại."
+                } else {
+                    "Phiên đã đổi trước khi gửi. Bạn có thể sửa lịch hoặc thử lại."
+                };
+                conn.execute("UPDATE scheduled_messages SET status = 'failed', error_msg = ?1 WHERE id = ?2 AND status = 'sending'", params![reason, id])?;
+            }
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            // Preserve the error and rollback rather than silently resubmitting an unknown outcome.
+            let _ = conn.execute_batch("ROLLBACK");
+            crate::logger::log_error("scheduler::settle_cancelled", &error.to_string());
+        }
+    });
+    Ok(ScheduledBatch { messages, in_flight, cleanup })
+}
+
 /// Mark a claimed scheduled message as sent (removes it from active queue).
 pub fn mark_scheduled_sent(db_path: &str, id: i64) -> Result<()> {
+    let _scope_guard = crate::runtime_scope::mutation()?;
     let conn = open_scheduler_db(db_path)?;
     conn.execute(
         "DELETE FROM scheduled_messages WHERE id = ?1",
@@ -411,6 +475,7 @@ pub fn mark_scheduled_sent(db_path: &str, id: i64) -> Result<()> {
 
 /// Record failure on a scheduled message so the user can see the error and retry or edit.
 pub fn mark_scheduled_failed(db_path: &str, id: i64, err: &str) -> Result<()> {
+    let _scope_guard = crate::runtime_scope::mutation()?;
     let conn = open_scheduler_db(db_path)?;
     conn.execute(
         "UPDATE scheduled_messages SET status = 'failed', error_msg = ?1 WHERE id = ?2",

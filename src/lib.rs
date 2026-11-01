@@ -55,3 +55,5 @@ pub mod delivery_receipts;
 
 /// Account-owned durable composer state without automatic resend.
 pub mod composer_store;
+/// Authentication generations and guarded asynchronous effects.
+pub mod runtime_scope;

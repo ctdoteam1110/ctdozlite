@@ -69,6 +69,7 @@ impl MessageStore {
 
     /// Open SQLite database at `path` and initialize table schemas and indices if absent.
     pub fn open(path: &str) -> Result<Self> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         let conn = if path == ":memory:" {
             Connection::open_in_memory()?
         } else {
@@ -111,6 +112,7 @@ impl MessageStore {
 
     /// Insert a message. Returns `true` if a new row was inserted, `false` if already existed.
     pub fn upsert_message(&mut self, msg: &StoredMessage) -> Result<bool> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         let rows = self.conn.execute(
             "INSERT OR IGNORE INTO messages (msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -141,6 +143,7 @@ impl MessageStore {
     /// # Errors
     /// Returns an error for an empty identity or failed SQLite deletion.
     pub fn delete_message(&mut self, thread_id: &str, msg_id: &str, _ts: i64) -> Result<()> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         anyhow::ensure!(
             !thread_id.is_empty() && !msg_id.is_empty(),
             "Cần định danh cuộc trò chuyện và tin nhắn để xóa lịch sử"
@@ -154,6 +157,7 @@ impl MessageStore {
 
     /// Delete an entire conversation and all its messages from local SQLite store (#24).
     pub fn delete_thread(&mut self, thread_id: &str) -> Result<()> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         if thread_id.is_empty() {
             return Ok(());
         }
@@ -206,6 +210,7 @@ impl MessageStore {
 
     /// Insert or update thread metadata.
     pub fn upsert_thread(&mut self, t: &StoredThread) -> Result<()> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         self.conn.execute(
             "INSERT INTO threads (thread_id, name, is_group, last_ts)
              VALUES (?1, ?2, ?3, ?4)
@@ -300,6 +305,7 @@ impl MessageStore {
     /// Hydrate `threads` with persisted threads and message history from SQLite.
     /// Returns the total number of messages loaded into `threads`.
     pub fn hydrate_threads(&self, threads: &mut Vec<Thread>, limit_per_thread: usize) -> Result<usize> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         deduplicate_exact_threads(threads);
 
         let stored_threads = self.all_threads()?;
@@ -664,6 +670,7 @@ impl From<&ChatMessage> for StoredMessage {
 
 /// Persist threads and their messages to SQLite store, returning the count of newly inserted messages.
 pub fn persist_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
+    let _scope_guard = crate::runtime_scope::mutation()?;
     // One transaction for the whole snapshot: in autocommit every row was its own fsync.
     store.conn.execute_batch("BEGIN")?;
     let res = persist_threads_inner(store, threads);
@@ -701,6 +708,7 @@ fn persist_threads_inner(store: &mut MessageStore, threads: &[Thread]) -> Result
 
 /// Convenience helper: open `zalo_history.db` (or `path`) and hydrate `threads` with saved history.
 pub fn load_history_into_threads(path: &str, threads: &mut Vec<Thread>, limit_per_thread: usize) {
+    let Ok(_scope_guard) = crate::runtime_scope::mutation() else { return; };
     if let Ok(store) = MessageStore::open(path) {
         let _ = store.hydrate_threads(threads, limit_per_thread);
     }
@@ -732,6 +740,7 @@ pub fn import_history_delta_from_path(src: &std::path::Path, dst_db_path: &str) 
 }
 
 fn import_history_impl(src: &std::path::Path, dst_db_path: &str, capture_delta: bool) -> Result<(ImportReport, Vec<Thread>)> {
+    let _scope_guard = crate::runtime_scope::mutation()?;
     if !src.exists() {
         anyhow::bail!("Đường dẫn nguồn không tồn tại: {}", src.display());
     }

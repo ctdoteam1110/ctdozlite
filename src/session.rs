@@ -686,6 +686,7 @@ impl Session {
 
     /// Save the authenticated session to disk so subsequent runs can restore it without re-authenticating.
     pub fn save_to_file(&self, path: &str) -> Result<()> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         use base64::Engine;
         let saved = SavedSession {
             imei: self.imei.clone(),
@@ -998,6 +999,7 @@ impl Session {
                     .header("Referer", "https://chat.zalo.me/");
             }
         }
+        crate::runtime_scope::check()?;
         let resp = rb.body(body).send().await?;
         let latency_ms = start.elapsed().as_millis();
         let status = resp.status();
@@ -1063,6 +1065,7 @@ impl Session {
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .body(b.clone());
         }
+        crate::runtime_scope::check()?;
         let resp_result = rb.send().await;
         let latency_ms = start.elapsed().as_millis();
 

@@ -363,7 +363,7 @@ fn pull_next_frame(
 /// Reconnects forever with capped backoff. Dropping the returned receiver stops the task.
 pub fn spawn(sess: Session) -> mpsc::UnboundedReceiver<WsEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
+    crate::runtime_scope::spawn_inherited(async move {
         let mut backoff = 2u64;
         let mut endpoint_idx = 0usize;
         loop {

@@ -33,8 +33,8 @@ pub static RUNNING: AtomicBool = AtomicBool::new(false);
 pub async fn sync_thread(s: &Session, t: &mut Thread) -> Result<usize> {
     let id = t.id.clone();
     let mut cursor =
-        tokio::task::spawn_blocking(move || MessageStore::open(DB_PATH).ok()?.oldest_msg_id(&id))
-            .await?
+        crate::runtime_scope::spawn_blocking(move || MessageStore::open(DB_PATH).ok()?.oldest_msg_id(&id))
+            .await??
             .unwrap_or_default();
     let mut added = 0;
     for _ in 0..MAX_PAGES {
@@ -48,13 +48,13 @@ pub async fn sync_thread(s: &Session, t: &mut Thread) -> Result<usize> {
             break; // nothing older on the server
         }
         let snapshot = t.clone();
-        added += tokio::task::spawn_blocking(move || {
+        added += crate::runtime_scope::spawn_blocking(move || {
             store::persist_threads(
                 &mut MessageStore::open(DB_PATH)?,
                 std::slice::from_ref(&snapshot),
             )
         })
-        .await??;
+        .await???;
         match next_cursor(t, &cursor) {
             Some(c) => cursor = c,
             None => break,

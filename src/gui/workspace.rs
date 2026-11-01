@@ -2044,11 +2044,7 @@ impl ZaloGuiApp {
                                             self.feed_loading_profile = true;
                                             self.feed_profile_error = None;
                                             self.trigger_feed_timeline_load();
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::FetchSocialProfile {
-                                                    target_uid: d_id.clone(),
-                                                });
-                                            }
+                                            self.request_social_profile(d_id.clone());
                                         }
                                     }
                                 });

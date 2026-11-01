@@ -43,6 +43,27 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
     crate::chat::merge_sent_message(thread, message);
 }
 
+fn reset_epoch_loading(
+    sets: &mut [&mut HashSet<String>],
+    packs: &mut HashSet<u64>,
+    flags: &mut [&mut bool],
+) {
+    for pending in sets { pending.clear(); }
+    packs.clear();
+    for pending in flags { **pending = false; }
+}
+
+fn is_epoch_transition(event: &GuiEvent) -> bool {
+    matches!(event, GuiEvent::AuthenticationStarted | GuiEvent::LoginSuccess { .. } | GuiEvent::LoggedOut | GuiEvent::LocalDataWiped)
+}
+fn epoch_event_allowed(ui_generation: u64, generation: u64, event: &GuiEvent) -> bool {
+    is_epoch_transition(event) || ui_generation == generation || matches!(event, GuiEvent::CallStateChanged(state) if state == "free")
+}
+
+fn profile_reply_matches(target: &str, request: u64, reply_target: &str, reply_request: u64) -> bool {
+    target == reply_target && request == reply_request
+}
+
 pub enum GuiEvent {
     /// Terminal native-viewer result after its child closes or fails.
     NativePhotoViewerFinished { account: String, result: Result<(), crate::media_resources::MediaError> },
@@ -64,6 +85,12 @@ pub enum GuiEvent {
             crate::native_notifications::NotificationError,
         >,
     },
+    /// Accept the password-attempt epoch before progress or failure events are delivered.
+    AuthenticationStarted,
+    /// Shutdown barrier result; the GUI closes only after a successful acknowledgement.
+    ShutdownFinished(Result<(), String>),
+    /// Scoped worker output, checked again when dequeued by the UI.
+    Scoped { scope: crate::runtime_scope::SessionScope, event: Box<GuiEvent> },
     /// Terminal response for a Settings authorization action.
     NotificationAuthorization {
         request_id: u64,
@@ -233,7 +260,11 @@ pub enum GuiEvent {
         total: u64,
     },
     UpdateAppliedAndRestarting(String),
-    SocialProfileLoaded(Result<crate::feed::SocialUserProfile, String>),
+    SocialProfileLoaded {
+        target_uid: String,
+        request_id: u64,
+        result: Result<crate::feed::SocialUserProfile, String>,
+    },
     SocialAvatarsLoaded(Result<Vec<crate::feed::FeedMedia>, String>),
     SocialTimelineLoaded(
         Result<
@@ -459,16 +490,37 @@ const CHAT_RENDER_STEP: usize = 150;
 
 /// Worker → GUI channel that wakes the UI on every send. The GUI no longer repaints on a
 /// 1.2 s timer, so an event sent without a repaint would sit unseen until the next mouse move.
-#[derive(Clone)]
 pub struct GuiTx {
     tx: Sender<GuiEvent>,
     ctx: egui::Context,
+    scope: Option<crate::runtime_scope::SessionScope>,
+}
+impl Clone for GuiTx {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(), ctx: self.ctx.clone(),
+            // Native media threads have no Tokio task-local context, so retain their creation epoch.
+            scope: crate::runtime_scope::execution_scope().or_else(|| self.scope.clone()),
+        }
+    }
 }
 
 impl GuiTx {
+    /// Construct an isolated channel sender without starting a GUI or reading local user files.
+    #[cfg(test)]
+    pub(crate) fn for_test(tx: Sender<GuiEvent>) -> Self {
+        Self { tx, ctx: egui::Context::default(), scope: None }
+    }
+
     /// Same contract as `Sender::send` (callers already `let _ =` it), plus the wake-up.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, ev: GuiEvent) -> Result<(), std::sync::mpsc::SendError<GuiEvent>> {
+        let ev = if let Some(scope) = crate::runtime_scope::execution_scope().or_else(|| self.scope.clone()) {
+            if !crate::runtime_scope::registry().accepts(&scope) {
+                return Ok(());
+            }
+            GuiEvent::Scoped { scope, event: Box::new(ev) }
+        } else { ev };
         let res = self.tx.send(ev);
         self.ctx.request_repaint();
         res
@@ -598,6 +650,7 @@ pub struct ZaloGuiApp {
     checking_friend_status: HashSet<String>,
     user_online_map: HashMap<String, (bool, String)>,
     allow_quit: bool,
+    shutdown_pending: bool,
     settings_modal_open: bool,
     settings_tab: SettingsTab,
     notification_authorization: crate::native_notifications::AuthorizationState,
@@ -625,6 +678,7 @@ pub struct ZaloGuiApp {
     feed_modal_tab: FeedModalTab,
     feed_target_uid: String,
     feed_loading_profile: bool,
+    feed_profile_request_id: u64,
     feed_profile: Option<crate::feed::SocialUserProfile>,
     feed_profile_error: Option<String>,
     feed_loading_avatars: bool,
@@ -810,6 +864,7 @@ impl ZaloGuiApp {
             checking_friend_status: HashSet::new(),
             user_online_map: HashMap::new(),
             allow_quit: false,
+            shutdown_pending: false,
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
             notification_authorization: Default::default(),
@@ -839,6 +894,7 @@ impl ZaloGuiApp {
             feed_modal_tab: FeedModalTab::Profile,
             feed_target_uid: String::new(),
             feed_loading_profile: false,
+            feed_profile_request_id: 0,
             feed_profile: None,
             feed_profile_error: None,
             feed_loading_avatars: false,
@@ -881,9 +937,11 @@ impl ZaloGuiApp {
             GuiTx {
                 tx,
                 ctx: cc.egui_ctx.clone(),
+                scope: None,
             },
             cc.egui_ctx.clone(),
         );
+        app.publish_known_threads();
         ensure_cjk_font(&cc.egui_ctx, thread_texts(&app.threads));
 
         if let Some(wtx) = WORKER_TX.get() {
@@ -931,11 +989,46 @@ impl ZaloGuiApp {
     /// Hand the worker's poll timer the thread ids/names it maps incoming messages onto.
     fn publish_known_threads(&self) {
         if let Ok(mut known) = KNOWN_THREADS.lock() {
-            *known = self
-                .threads
-                .iter()
-                .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
-                .collect();
+            let generation = WORKER_TX.get().map(|tx| tx.ui_generation()).unwrap_or_else(|| crate::runtime_scope::registry().generation());
+            if generation != crate::runtime_scope::registry().generation() { return; }
+            *known = (generation, self.threads.iter().map(|t| (t.id.clone(), t.name.clone(), t.is_group)).collect());
+        }
+    }
+
+    fn reset_epoch_inflight(&mut self) {
+        reset_epoch_loading(
+            &mut [&mut self.loading_stickers, &mut self.composer_sticker_loading,
+                &mut self.loading_link_previews, &mut self.checking_friend_status],
+            &mut self.loading_sticker_packs,
+            &mut [&mut self.login_in_progress, &mut self.phone_lookup_loading,
+                &mut self.sticker_store_loading, &mut self.sticker_search_loading,
+                &mut self.feed_loading_profile, &mut self.feed_loading_avatars,
+                &mut self.feed_loading_timeline],
+        );
+        self.last_sticker_search_dispatched.clear();
+    }
+
+    /// Version profile requests at the UI intent boundary, including error completions.
+    pub(super) fn request_social_profile(&mut self, target_uid: String) {
+        let Some(request_id) = self.feed_profile_request_id.checked_add(1) else { return; };
+        self.feed_profile_request_id = request_id;
+        self.feed_target_uid = target_uid.clone();
+        self.feed_loading_profile = true;
+        self.feed_profile = None;
+        self.feed_profile_error = None;
+        if WORKER_TX.get().map(|tx| tx.send(WorkerCmd::FetchSocialProfile { target_uid, request_id }).is_ok()) != Some(true) {
+            self.feed_loading_profile = false;
+            self.feed_profile_error = Some("Chưa kết nối được tiến trình nền để đọc hồ sơ".into());
+        }
+    }
+
+    fn request_shutdown(&mut self) {
+        if self.shutdown_pending || self.allow_quit { return; }
+        self.shutdown_pending = true;
+        self.status_msg = "Đang lưu dữ liệu và dừng cuộc gọi…".into();
+        if WORKER_TX.get().map(|tx| tx.send(WorkerCmd::Shutdown).is_ok()) != Some(true) {
+            self.shutdown_pending = false;
+            self.status_msg = "Chưa kết nối được tiến trình nền để đóng ứng dụng".into();
         }
     }
 
@@ -958,8 +1051,37 @@ impl ZaloGuiApp {
 
     fn check_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.event_rx.try_recv() {
+            let event = match event {
+                GuiEvent::Scoped { scope, event } => {
+                    if !crate::runtime_scope::registry().accepts(&scope) { continue; }
+                    let transition = is_epoch_transition(&event);
+                    if let Some(tx) = WORKER_TX.get() {
+                        if transition {
+                            if tx.ui_generation() != scope.generation { self.reset_epoch_inflight(); }
+                            tx.acknowledge_ui_generation(scope.generation);
+                        }
+                        else if !epoch_event_allowed(tx.ui_generation(), scope.generation, &event) { continue; }
+                    }
+                    *event
+                }
+                event => event,
+            };
             let live_arrival = matches!(&event, GuiEvent::LiveThreadsUpdated(_));
             match event {
+                GuiEvent::AuthenticationStarted => {
+                    self.is_logged_in = false;
+                    self.login_in_progress = true;
+                    // Keep the in-memory composer untouched; durable draft policy is independent.
+                    self.login_status_msg.clear();
+                }
+                GuiEvent::ShutdownFinished(result) => {
+                    self.shutdown_pending = false;
+                    match result {
+                        Ok(()) => { self.allow_quit = true; ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+                        Err(error) => { self.status_msg = error.clone(); self.show_toast(error); }
+                    }
+                }
+                GuiEvent::Scoped { .. } => continue,
                 GuiEvent::HistoryImported { account, result } => {
                     if self.is_logged_in && account == self.user_uin {
                         match result {
@@ -1029,6 +1151,11 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::LoginSuccess { name, uin, avatar } => {
                     self.original_reaction_import_pending = false;
+                    if self.user_uin != uin {
+                        self.threads.clear();
+                        self.selected_thread_index = 0;
+                    }
+                    self.publish_known_threads();
                     self.is_logged_in = true;
                     self.user_name = name;
                     if self.user_uin != uin {
@@ -1202,6 +1329,7 @@ impl ZaloGuiApp {
                     self.composer_mentions = Default::default();
                     self.input_message.clear();
                     self.replying_to = None;
+                    self.publish_known_threads();
                     self.selected_thread_index = 0;
                     self.status_msg = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên)".into();
                 }
@@ -1219,6 +1347,7 @@ impl ZaloGuiApp {
                     self.qr_texture = None;
                     self.qr_status = "Đang xin mã QR mới…".into();
                     self.status_msg = "Đã đăng xuất".into();
+                    self.publish_known_threads();
                 }
                 GuiEvent::ComposerMessageSent { account, thread_id, msg } => {
                     if self.is_logged_in && self.user_uin == account {
@@ -1744,17 +1873,12 @@ impl ZaloGuiApp {
                 GuiEvent::UpdateAppliedAndRestarting(ver) => {
                     self.update_downloading = false;
                     self.show_toast(format!("✅ Đã cập nhật lên v{ver} — Đang khởi động lại…"));
-                    self.allow_quit = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    std::process::exit(0);
+                    self.request_shutdown();
                 }
-                GuiEvent::SocialProfileLoaded(res) => {
-                    // A newer exact-UID selection must not display an older profile response.
-                    if res.as_ref().is_ok_and(|prof| !self.feed_target_uid.is_empty() && prof.uid != self.feed_target_uid) {
-                        continue;
-                    }
+                GuiEvent::SocialProfileLoaded { target_uid, request_id, result } => {
+                    if !profile_reply_matches(&self.feed_target_uid, self.feed_profile_request_id, &target_uid, request_id) { continue; }
                     self.feed_loading_profile = false;
-                    match res {
+                    match result {
                         Ok(prof) => {
                             self.feed_profile = Some(prof);
                             self.feed_profile_error = None;
@@ -1807,11 +1931,10 @@ impl eframe::App for ZaloGuiApp {
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
             || ctx.input(|i| i.viewport().close_requested())
         {
-            self.allow_quit = true;
-            if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::EndCall);
+            if !self.allow_quit {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.request_shutdown();
             }
-            std::process::exit(0);
         }
         if self.theme_dirty {
             self.palette().apply_to_ctx(ctx);
@@ -1901,7 +2024,8 @@ impl eframe::App for ZaloGuiApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        std::process::exit(0);
+        // Normal close already received the worker's disk/media barrier acknowledgement.
+        crate::runtime_scope::registry().invalidate_now();
     }
 }
 
@@ -2071,12 +2195,7 @@ impl ZaloGuiApp {
                         );
                         let close_resp = close_resp.on_hover_text("Đóng ứng dụng (Ctrl+Q)");
                         if close_resp.clicked() || close_resp.secondary_clicked() {
-                            self.allow_quit = true;
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::EndCall);
-                            }
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            std::process::exit(0);
+                            self.request_shutdown();
                         }
 
                         // Maximize / Restore Button (46x32)
@@ -2483,6 +2602,44 @@ impl ZaloGuiApp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn password_attempt_epoch_accepts_progress_and_failure_after_handshake() {
+        let mut ui_generation = 7;
+        let attempt_generation = 8;
+        let failed = super::GuiEvent::LoginFailed("Sai thông tin đăng nhập".into());
+        assert!(!super::epoch_event_allowed(ui_generation, attempt_generation, &failed));
+        let started = super::GuiEvent::AuthenticationStarted;
+        assert!(super::is_epoch_transition(&started));
+        assert!(super::epoch_event_allowed(ui_generation, attempt_generation, &started));
+        ui_generation = attempt_generation;
+        assert!(super::epoch_event_allowed(ui_generation, attempt_generation, &super::GuiEvent::StatusUpdate("Đang xác thực".into())));
+        assert!(super::epoch_event_allowed(ui_generation, attempt_generation, &failed));
+    }
+
+    #[test]
+    fn epoch_change_clears_pending_sticker_and_profile_work_without_clearing_completed_cache() {
+        let mut stickers = std::collections::HashSet::from(["pending-image".to_owned()]);
+        let mut packs = std::collections::HashSet::from([7]);
+        let mut profile_loading = true;
+        let completed = std::collections::HashMap::from([("cached-image", "texture")]);
+        assert!(!stickers.insert("pending-image".to_owned()));
+        super::reset_epoch_loading(&mut [&mut stickers], &mut packs, &mut [&mut profile_loading]);
+        assert!(stickers.insert("pending-image".to_owned()));
+        assert!(packs.insert(7));
+        assert!(!profile_loading);
+        assert_eq!(completed.get("cached-image"), Some(&"texture"));
+        profile_loading = true;
+        assert!(profile_loading);
+    }
+
+    #[test]
+    fn profile_success_and_error_replies_need_matching_target_and_request() {
+        assert!(super::profile_reply_matches("user-b", 3, "user-b", 3));
+        assert!(!super::profile_reply_matches("user-b", 3, "user-a", 3));
+        assert!(!super::profile_reply_matches("user-b", 3, "user-b", 2));
+        assert!(!super::profile_reply_matches("user-a", 3, "user-a", 1));
+    }
+
     use super::is_newer_semver;
 
     #[test]
