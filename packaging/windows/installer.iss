@@ -3,7 +3,7 @@
 ;   iscc /DMyAppVersion=<version> packaging/windows/installer.iss
 ; A local build without that flag intentionally gets 0.0.0 instead of a stale version.
 #ifndef MyAppVersion
-#define MyAppVersion "0.0.0"
+#define MyAppVersion "0.0.3"
 #endif
 #define MyAppPublisher "ctdoteam1110"
 #define MyAppURL "https://github.com/ctdoteam1110/ctdozlite"
