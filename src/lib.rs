@@ -18,6 +18,8 @@ pub mod param_cipher;
 pub mod presence;
 pub mod qr;
 pub mod reactions;
+/// Durable account-owned incremental reaction inbox and replay.
+pub mod reaction_journal;
 pub mod session;
 pub mod socket;
 pub mod store;

@@ -6,6 +6,11 @@ pub(super) static KNOWN_THREADS: std::sync::Mutex<Vec<(String, String, bool)>> =
     std::sync::Mutex::new(Vec::new());
 
 pub enum WorkerCmd {
+    /// Replay durable reactions into a loaded snapshot on the blocking worker.
+    ReplayReactions {
+        account: String,
+        threads: Vec<Thread>,
+    },
     /// Read OS authorization without prompting.
     ReadNotificationAuthorization { request_id: u64 },
     /// Request OS authorization following an explicit Settings click.
@@ -183,6 +188,79 @@ pub enum WorkerCmd {
         friend_uids: Vec<String>,
         shared_media_by_uid: std::collections::HashMap<String, Vec<crate::feed::FeedMedia>>,
     },
+}
+
+// A single lane serializes append/replay across accounts, bounding concurrent SQLite writers.
+static REACTION_JOURNAL_LANE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn process_reaction_journal(
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
+    captured: Session,
+    sender: GuiTx,
+    events: Vec<crate::reactions::ReactionEvent>,
+    threads: Vec<Thread>,
+) {
+    process_reaction_journal_at(
+        std::path::PathBuf::from("."),
+        session,
+        captured,
+        sender,
+        events,
+        threads,
+    )
+    .await;
+}
+
+async fn process_reaction_journal_at(
+    root: std::path::PathBuf,
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
+    captured: Session,
+    sender: GuiTx,
+    events: Vec<crate::reactions::ReactionEvent>,
+    mut threads: Vec<Thread>,
+) {
+    if events.is_empty() && threads.is_empty() { return; }
+    let account = captured
+        .login
+        .as_ref()
+        .map(|l| l.uin.clone())
+        .unwrap_or_default();
+    if account.is_empty() {
+        return;
+    }
+    let _lane = REACTION_JOURNAL_LANE.lock().await;
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<(String, Vec<Thread>)>> {
+            // Keep the account stable through all journal side effects. The runtime epoch fence
+            // additionally rejects same-account reauthentication and queued stale UI results.
+            let current = session.blocking_lock();
+            if current.login.as_ref().map(|l| &l.uin) != Some(&account)
+                || current.zpw_sek != captured.zpw_sek
+            {
+                return Ok(None);
+            }
+            let mut journal = crate::reaction_journal::ReactionJournal::open(&root, &account)?;
+            journal.append(&events)?;
+            if !threads.is_empty() { journal.apply_loaded(&mut threads)?; }
+            Ok(Some((account, threads)))
+        })
+        .await;
+    match result {
+        Ok(Ok(Some((account, threads)))) => {
+            let event = if threads.is_empty() {
+                GuiEvent::ReactionEvents { account }
+            } else {
+                GuiEvent::ReactionThreadsUpdated { account, threads }
+            };
+            let _ = sender.send(event);
+        }
+        Ok(Ok(None)) => {}
+        _ => {
+            let _ = sender.send(GuiEvent::StatusUpdate(
+                "Chưa lưu hoặc khôi phục được sự kiện thả cảm xúc; vui lòng thử đồng bộ lại".into(),
+            ));
+        }
+    }
 }
 
 pub(super) static WORKER_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<WorkerCmd>> =
@@ -487,6 +565,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             {
                                                 cb.handle_control_event(voip_ev);
                                             }
+                                            let account = s_snap.login.as_ref().map(|l| l.uin.as_str()).unwrap_or_default();
+                                            let reactions = crate::reaction_journal::socket_events(ev.cmd, &ev.payload, account);
+                                            if !reactions.is_empty() {
+                                                process_reaction_journal(s_ws.clone(), s_snap.clone(), gui_tx_ws.clone(), reactions, Vec::new()).await;
+                                            }
                                             if ev.is_chat_ish() {
                                                 let mut ws_threads = Vec::new();
                                                 if let Some(li) = s_snap.login.as_ref() {
@@ -593,6 +676,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
 
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
+                        WorkerCmd::ReplayReactions { account, threads } => {
+                            let captured = session.lock().await.clone();
+                            if captured.login.as_ref().map(|l| l.uin.as_str()) == Some(account.as_str()) {
+                                process_reaction_journal(session.clone(), captured, gui_tx.clone(), Vec::new(), threads).await;
+                            }
+                        }
                         WorkerCmd::ReadNotificationAuthorization { request_id }
                         | WorkerCmd::RequestNotificationAuthorization { request_id } => {
                             let request = matches!(
@@ -1096,6 +1185,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         };
                                         match poll_res {
                                             Ok(lp_resp) => {
+                                                let account = s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or_default();
+                                                let reactions = crate::reaction_journal::account_events(&lp_resp, account);
+                                                if !reactions.is_empty() {
+                                                    process_reaction_journal(session_clone.clone(), s.clone(), gui_tx_clone.clone(), reactions, Vec::new()).await;
+                                                }
                                                 crate::chat::merge_previews(
                                                     &mut temp_threads,
                                                     &lp_resp,
@@ -2789,3 +2883,155 @@ async fn apply_github_release_update(
     Ok(false)
 }
 
+
+#[cfg(test)]
+mod reaction_consumer_tests {
+    use super::*;
+
+    fn session_fixture(account: &str) -> Session {
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo {
+            uin: account.into(),
+            ..Default::default()
+        });
+        session.zpw_sek = Some("fixture-session".into());
+        session
+    }
+
+    fn fixture_root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "zl-reaction-consumer-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn event_fixture() -> Vec<crate::reactions::ReactionEvent> {
+        crate::reaction_journal::account_events(
+            &serde_json::json!({"error_code":0,"data":{"reacts":[{
+                "idTo":"account-a", "uidFrom":"peer-fixture", "msgId":"event-fixture", "ts":1700000000000_i64,
+                "content":{"rType":5,"rMsg":[{"gMsgID":"message-fixture"}]}
+            }]}}),
+            "account-a",
+        )
+    }
+
+    #[tokio::test]
+    async fn reaction_consumer_empty_replay_never_loops_notifications() {
+        let root = fixture_root("empty");
+        let captured = session_fixture("account-a");
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let (tx, rx) = channel();
+        let sender = GuiTx { tx, ctx: egui::Context::default() };
+        process_reaction_journal_at(root.clone(), session, captured, sender, Vec::new(), Vec::new()).await;
+        assert!(!root.exists());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reaction_consumer_appends_before_notification_and_replays_after_target_load() {
+        let root = fixture_root("flow");
+        let captured = session_fixture("account-a");
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let (tx, rx) = channel();
+        let sender = GuiTx {
+            tx,
+            ctx: egui::Context::default(),
+        };
+        process_reaction_journal_at(
+            root.clone(),
+            session.clone(),
+            captured.clone(),
+            sender.clone(),
+            event_fixture(),
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            matches!(rx.try_recv().unwrap(), GuiEvent::ReactionEvents { account } if account == "account-a")
+        );
+        let journal = crate::reaction_journal::ReactionJournal::open(&root, "account-a").unwrap();
+        assert_eq!(journal.pending_count().unwrap(), 1);
+        drop(journal);
+        let loaded = vec![Thread {
+            id: "peer-fixture".into(),
+            messages: vec![ChatMessage {
+                id: "message-fixture".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        for _ in 0..2 {
+            process_reaction_journal_at(
+                root.clone(),
+                session.clone(),
+                captured.clone(),
+                sender.clone(),
+                Vec::new(),
+                loaded.clone(),
+            )
+            .await;
+            let GuiEvent::ReactionThreadsUpdated { account, threads } = rx.try_recv().unwrap()
+            else {
+                panic!("projection missing");
+            };
+            assert_eq!(account, "account-a");
+            assert_eq!(threads[0].messages[0].reaction_summaries[0].count, 1);
+        }
+        let journal = crate::reaction_journal::ReactionJournal::open(&root, "account-a").unwrap();
+        assert_eq!(journal.pending_count().unwrap(), 0);
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reaction_consumer_rejects_account_switch_before_any_journal_mutation() {
+        let root = fixture_root("switch");
+        let captured = session_fixture("account-a");
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(session_fixture("account-b")));
+        let (tx, rx) = channel();
+        let sender = GuiTx {
+            tx,
+            ctx: egui::Context::default(),
+        };
+        process_reaction_journal_at(
+            root.clone(),
+            session,
+            captured,
+            sender,
+            event_fixture(),
+            Vec::new(),
+        )
+        .await;
+        assert!(!root.exists());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reaction_consumer_reports_disk_failure_without_false_durable_notification() {
+        let root = fixture_root("failure");
+        std::fs::write(&root, "fixture file prevents creating directory").unwrap();
+        let captured = session_fixture("account-a");
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let (tx, rx) = channel();
+        let sender = GuiTx {
+            tx,
+            ctx: egui::Context::default(),
+        };
+        process_reaction_journal_at(
+            root.clone(),
+            session,
+            captured,
+            sender,
+            event_fixture(),
+            Vec::new(),
+        )
+        .await;
+        assert!(matches!(rx.try_recv().unwrap(), GuiEvent::StatusUpdate(_)));
+        assert!(rx.try_recv().is_err());
+        std::fs::remove_file(root).unwrap();
+    }
+}

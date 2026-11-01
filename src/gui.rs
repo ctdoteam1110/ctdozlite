@@ -63,6 +63,15 @@ pub enum GuiEvent {
     },
     LoginFailed(String),
     ThreadsUpdated(Vec<Thread>),
+    /// A durable batch arrived; request replay against currently loaded targets.
+    ReactionEvents {
+        account: String,
+    },
+    /// Worker projection merged only into still-existing reaction targets.
+    ReactionThreadsUpdated {
+        account: String,
+        threads: Vec<Thread>,
+    },
     MessageSent {
         client_message_id: String,
         thread_id: String,
@@ -777,6 +786,10 @@ impl ZaloGuiApp {
 
         if let Some(wtx) = WORKER_TX.get() {
             if is_logged_in {
+                let _ = wtx.send(WorkerCmd::ReplayReactions {
+                    account: app.user_uin.clone(),
+                    threads: app.threads.clone(),
+                });
                 let _ = wtx.send(WorkerCmd::RefreshThreads);
             } else {
                 let _ = wtx.send(WorkerCmd::RequestQr);
@@ -824,6 +837,15 @@ impl ZaloGuiApp {
         }
     }
 
+    fn replay_reactions_async(&self) {
+        if let Some(wtx) = WORKER_TX.get() {
+            let _ = wtx.send(WorkerCmd::ReplayReactions {
+                account: self.user_uin.clone(),
+                threads: self.threads.clone(),
+            });
+        }
+    }
+
     fn persist_threads_async(&self) {
         self.publish_known_threads();
         let snapshot = self.threads.clone();
@@ -865,6 +887,22 @@ impl ZaloGuiApp {
                 GuiEvent::LoginFailed(err) => {
                     self.login_in_progress = false;
                     self.login_status_msg = format!("Lỗi đăng nhập: {err}");
+                }
+                GuiEvent::ReactionEvents { account } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        self.replay_reactions_async();
+                    }
+                }
+                GuiEvent::ReactionThreadsUpdated { account, threads } => {
+                    if self.is_logged_in
+                        && self.user_uin == account
+                        && crate::reaction_journal::merge_loaded_reactions(
+                            &mut self.threads,
+                            &threads,
+                        )
+                    {
+                        self.persist_threads_async();
+                    }
                 }
                 GuiEvent::ThreadsUpdated(updates) => {
                     ensure_cjk_font(ctx, thread_texts(&updates));
@@ -950,6 +988,7 @@ impl ZaloGuiApp {
                             self.selected_thread_index = self.threads.len().saturating_sub(1);
                         }
                         self.persist_threads_async();
+                        self.replay_reactions_async();
                     }
                     self.status_msg = format!("Trực tuyến · Cập nhật {}", crate::ui::clock());
                 }
