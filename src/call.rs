@@ -369,6 +369,42 @@ async fn voicecall_get(s: &Session, endpoint_path: &str, payload: &Value) -> Res
     Ok(normalize_voicecall_data(raw_data))
 }
 
+/// Upgrade the active Zalo session on the backend to PC desktop (`type=24`, `client_version=665`)
+/// so `/api/voicecall/group/requestcall` (`12433`) is enabled even after a Web (`type=30`) QR login.
+pub async fn upgrade_session_for_group_call(s: &Session) -> Result<()> {
+    let client_time = crate::login::unix_now();
+    let payload = json!({
+        "imei": s.imei,
+        "computer_name": s.computer_name,
+        "language": "vi",
+        "ts": client_time,
+    });
+    let cipher = crate::param_cipher::ParamCipher::new("24", &s.imei, client_time)?;
+    let body = cipher.build_body("24", "665", &payload, "getlogininfo")?;
+    let query = body
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    let s = v
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string());
+                    format!("{k}={}", crate::session::urlencode(&s))
+                })
+                .collect::<Vec<_>>()
+                .join("&")
+        })
+        .unwrap_or_default();
+    for host in [&s.domains.auth, &s.domains.wpa_chat] {
+        let url = format!("{host}/api/login/getLoginInfo?{query}&nretry=0");
+        if s.get(&url).await.is_ok() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Append a diagnostic line to `call_trace.log` (current directory) and mirror it to stderr.
 ///
 /// The trace contains decrypted signaling payloads (call ids, session ids, RTP addresses),
@@ -623,7 +659,7 @@ async fn dispatch_send_signal_inner(s: &Session, command: i64, n: &Value) -> Res
             });
             voicecall_get(s, "/api/voicecall/group/request", &body).await
         }
-        // 12435 -> `/api/voicecall/group/adduser`
+        // 12435 -> `/api/voicecall/group/adduser` (`groupId` also accepted)
         12435 => {
             let body = json!({
                 "calleeId": n.get("calleeId").cloned().unwrap_or(json!("")),
@@ -633,6 +669,7 @@ async fn dispatch_send_signal_inner(s: &Session, command: i64, n: &Value) -> Res
                 "data": n.get("data").cloned().unwrap_or(json!("")),
                 "session": n.get("session").cloned().unwrap_or(json!("")),
                 "partners": n.get("partners").cloned().unwrap_or(json!([])),
+                "groupId": n.get("groupId").cloned().unwrap_or(json!("")),
             });
             voicecall_get(s, "/api/voicecall/group/adduser", &body).await
         }
@@ -645,6 +682,7 @@ async fn dispatch_send_signal_inner(s: &Session, command: i64, n: &Value) -> Res
                 "hostCall": n.get("hostCall").cloned().unwrap_or(json!("")),
                 "data": n.get("data").cloned().unwrap_or(json!("")),
                 "partners": n.get("partners").cloned().unwrap_or(json!([])),
+                "groupId": n.get("groupId").cloned().unwrap_or(json!("")),
             });
             voicecall_get(s, "/api/voicecall/group/answer", &body).await
         }
@@ -657,6 +695,7 @@ async fn dispatch_send_signal_inner(s: &Session, command: i64, n: &Value) -> Res
                 "hostCall": n.get("hostCall").cloned().unwrap_or(json!("")),
                 "data": n.get("data").cloned().unwrap_or(json!("")),
                 "partners": n.get("partners").cloned().unwrap_or(json!([])),
+                "groupId": n.get("groupId").cloned().unwrap_or(json!("")),
             });
             voicecall_get(s, "/api/voicecall/group/cancel", &body).await
         }
@@ -669,6 +708,7 @@ async fn dispatch_send_signal_inner(s: &Session, command: i64, n: &Value) -> Res
                 "hostCall": n.get("hostCall").cloned().unwrap_or(json!("")),
                 "data": n.get("data").cloned().unwrap_or(json!("")),
                 "partners": n.get("partners").cloned().unwrap_or(json!([])),
+                "groupId": n.get("groupId").cloned().unwrap_or(json!("")),
             });
             voicecall_get(s, "/api/voicecall/group/endcall", &body).await
         }
@@ -1058,6 +1098,11 @@ struct PureRustCallState {
     from_uid_u32: u32,
     partner_uid_u32: u32,
     relay_token: u32,
+    group_id_u32: u32,
+    group_host_call: String,
+    group_partners_str: String,
+    group_pending_uids: Vec<u32>,
+    group_active_uids: Vec<u32>,
     server_tokens: BTreeMap<String, u32>,
     udp_rtp_sock: Option<Arc<tokio::net::UdpSocket>>,
     udp_rtcp_sock: Option<Arc<tokio::net::UdpSocket>>,
@@ -1153,6 +1198,116 @@ pub fn build_zrtp_init_packet(
     buf
 }
 
+/// Build `GroupCallController::_sendRequestInitZRTPToServer` UDP packet (`0x008940FF` -> `0x008931D9` in `ZaloCall.exe`).
+/// - `cmd = 0x000B`, `sub_cmd = 4`
+/// - `payload = [callId: u32 LE][groupId: u32 LE][u16_len][sessId][0x0004: u16 LE][0x00, 0x03, 0x01, 0x01]`
+pub fn build_zrtp_group_init_packet(
+    from_uid: u32,
+    call_id: u32,
+    group_id: u32,
+    _sub_cmd: u8,
+    sess_id: &str,
+) -> Vec<u8> {
+    let sess_bytes = sess_id.as_bytes();
+    let extra = [0x00u8, 0x03, 0x01, 0x01];
+    let mut buf = Vec::with_capacity(21 + 10 + sess_bytes.len() + 6);
+    write_zrtp_common_header(&mut buf, 0x7E, 0, 0, from_uid, 0, 0x000B, 4);
+    buf.extend_from_slice(&call_id.to_le_bytes());
+    buf.extend_from_slice(&group_id.to_le_bytes());
+    buf.extend_from_slice(&(sess_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(sess_bytes);
+    buf.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&extra);
+    buf
+}
+
+/// Alternate Group InitZRTP variant (`0x00893142`: `cmd = 0x000C, sub_cmd = 6`, `[callId: u32 LE][0, 3, 0][sessId][extra]`).
+pub fn build_zrtp_group_init_packet_v6(from_uid: u32, call_id: u32, sess_id: &str) -> Vec<u8> {
+    let sess_bytes = sess_id.as_bytes();
+    let extra = [0x00u8, 0x03, 0x01, 0x01];
+    let mut buf = Vec::with_capacity(21 + 9 + sess_bytes.len() + 6);
+    write_zrtp_common_header(&mut buf, 0x7E, 0, 0, from_uid, 0, 0x000C, 6);
+    buf.extend_from_slice(&call_id.to_le_bytes());
+    buf.extend_from_slice(&[0x00, 0x03, 0x00]);
+    buf.extend_from_slice(&(sess_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(sess_bytes);
+    buf.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&extra);
+    buf
+}
+
+/// Build `GroupCallController::_handlePingTimer` UDP packet (`0x0092647D` -> `0x008942B1` -> `0x008931D9` in `ZaloCall.exe`).
+/// - `cmd = 0x0033`, `sub_cmd = 1`, `token` at header `[0x14]` (`[esi+0x14]`)
+/// - `payload = [callId: u32 LE][groupId: u32 LE][u16_len][sessId][0x0003: u16 LE][0x00, 0x03, 0x01]`
+pub fn build_zrtp_group_ping_packet(
+    from_uid: u32,
+    token: u32,
+    call_id: u32,
+    group_id: u32,
+    sess_id: &str,
+) -> Vec<u8> {
+    let sess_bytes = sess_id.as_bytes();
+    let extra = [0x00u8, 0x03, 0x01];
+    let mut buf = Vec::with_capacity(21 + 10 + sess_bytes.len() + 5);
+    write_zrtp_common_header(&mut buf, 0x7E, 0, 0, from_uid, token, 0x0033, 0x01);
+    buf.extend_from_slice(&call_id.to_le_bytes());
+    buf.extend_from_slice(&group_id.to_le_bytes());
+    buf.extend_from_slice(&(sess_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(sess_bytes);
+    buf.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&extra);
+    buf
+}
+
+/// Build `GroupCallController::requestStartReceiveVideo` UDP packet (`0x0092EB2E` -> `0x00893F37` in `ZaloCall.exe`).
+/// - `cmd = 0x0020`, `sub_cmd = 0x0D`, `pkt_type = 0x01`
+/// - `payload = [u16_len][count: u8]([partner_uid: u32 LE][quality_id: u8 = 0])*`
+///   (`quality_id = 0` is base spatial layer `S=0`, which every mobile/PC sender encodes;
+///   requesting `quality_id = 2` gets dropped by the SFU when the sender only transmits `S=0`.)
+pub fn build_zrtp_group_subscribe_video_packet(
+    from_uid: u32,
+    token: u32,
+    seq: u32,
+    partner_uids: &[u32],
+) -> Vec<u8> {
+    let count = partner_uids.len().min(32);
+    let body_len = 1 + count * 5;
+    let mut buf = Vec::with_capacity(21 + 2 + body_len);
+    write_zrtp_common_header(&mut buf, 0x01, 0, seq, from_uid, token, 0x0020, 0x0D);
+    buf.extend_from_slice(&(body_len as u16).to_le_bytes());
+    buf.push(count as u8);
+    for &uid in partner_uids.iter().take(count) {
+        buf.extend_from_slice(&uid.to_le_bytes());
+        buf.push(0); // quality_id = 0 (base spatial layer S=0, guaranteed present on all senders)
+    }
+    buf
+}
+
+/// Build `GroupCallController` video encoder spatial-layer announcement (`0x0092E8FB` -> `0x00893ED5` in `ZaloCall.exe`).
+/// - `cmd = 0x0020`, `sub_cmd = 0x0C`, `pkt_type = 0x01`
+pub fn build_zrtp_group_video_layers_packet(from_uid: u32, token: u32, seq: u32) -> Vec<u8> {
+    // Announce 3 spatial layers (`quality_id = 3 * s + 0` -> `0, 3, 6`, matching `0x0092B62A` and
+    // `0x00A91735` in `ZaloCall.exe`) so remote clients' `getPreferredQualityId` (`0x0092B4D6`)
+    // always resolves to a valid qualityId regardless of tile mode (1=low, 2=medium, 3=high).
+    let layers: [(u8, u32, u16, u16); 3] = [
+        (0, 120, 160, 120),
+        (3, 300, 320, 240),
+        (6, 600, 640, 480),
+    ];
+    let body_len = 1 + layers.len() * 9;
+    let mut buf = Vec::with_capacity(21 + 2 + body_len);
+    write_zrtp_common_header(&mut buf, 0x01, 0, seq, from_uid, token, 0x0020, 0x0C);
+    buf.extend_from_slice(&(body_len as u16).to_le_bytes());
+    buf.push(layers.len() as u8);
+    for (qid, br, w, h) in layers {
+        buf.push(qid);
+        buf.extend_from_slice(&br.to_le_bytes());
+        buf.extend_from_slice(&w.to_le_bytes());
+        buf.extend_from_slice(&h.to_le_bytes());
+    }
+    buf
+}
+
 /// Build `_sendRequestZRTPPing` UDP packet (`0x00894388` -> `0x00893126` in `ZaloCall.exe`).
 /// - `cmd = 0x0002`, `sub_cmd = 1`
 pub fn build_zrtp_ping_packet(from_uid: u32, call_id: u32, sess_id: &str) -> Vec<u8> {
@@ -1195,10 +1350,23 @@ pub fn build_zrtp_end_packet(from_uid: u32, call_id: u32, sess_id: &str) -> Vec<
     buf
 }
 
+/// Build `GroupCallController::_sendRequestZRTPEndCall` UDP packet (`0x009263CE` -> `0x00894063` in `ZaloCall.exe`).
+/// - `cmd = 0x0003`, `sub_cmd = 1`, `pkt_type = 0x7E`, `payload = [callId: u32 LE]`
+pub fn build_zrtp_group_end_packet(from_uid: u32, token: u32, call_id: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(25);
+    write_zrtp_common_header(&mut buf, 0x7E, 0, 0, from_uid, token, 0x0003, 0x01);
+    buf.extend_from_slice(&call_id.to_le_bytes());
+    buf
+}
+
 /// Collect all candidate `(rtp_addr, rtcp_addr)` IPv4 relay server pairs from a `401` or `request` payload.
 fn collect_relay_servers(payload: &Value) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    if let Some(arr) = payload.get("servers").and_then(Value::as_array) {
+    if let Some(arr) = payload
+        .get("servers")
+        .or_else(|| payload.pointer("/callSetting/servers"))
+        .and_then(Value::as_array)
+    {
         for srv in arr {
             let rtp = srv
                 .get("rtpaddr")
@@ -1333,6 +1501,7 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
     call_id: u32,
     is_caller: bool,
     sess_id: &str,
+    group_id: Option<u32>,
 ) -> (
     Option<Arc<tokio::net::UdpSocket>>,
     Option<Arc<tokio::net::UdpSocket>>,
@@ -1359,18 +1528,38 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
     // to include `"public_ip|public_port"` in its `0x02 0x7E` response.
     let sub_cmd: u8 = 2;
 
-    let pkt_init =
-        build_zrtp_init_packet(is_caller, from_uid, partner_uid, call_id, sub_cmd, sess_id);
+    let group_to_ids: Vec<u32> = payload
+        .get("toId")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                        .map(|n| n as u32)
+                })
+                .filter(|&uid| uid != 0 && uid != from_uid)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let pkt_init = match group_id {
+        Some(gid) => build_zrtp_group_init_packet(from_uid, call_id, gid, sub_cmd, sess_id),
+        None => build_zrtp_init_packet(is_caller, from_uid, partner_uid, call_id, sub_cmd, sess_id),
+    };
+    let pkt_init_v6 = group_id.map(|_| build_zrtp_group_init_packet_v6(from_uid, call_id, sess_id));
     let ts_now = crate::login::unix_now().to_string();
 
     let t_start = std::time::Instant::now();
     let mut echo_seq: u32 = 1;
     // Send 14 echo probes per server (matching `settings.checkPkgRec = 14`) across 2 quick bursts,
-    // plus the RTP (`sub_cmd=2`, `w3=0` in `CallController::_sendRequestInitZRTPToServer @ 0x4c18f8`) InitZRTP packet.
-    // Never send `InitZRTP` or `Ping` from `rtcp_sock` (`sub_cmd | 4` is `loopbackMode == 2`, not `isRtcp`).
+    // plus the RTP InitZRTP packet.
     for _ in 0..2 {
         for (rtp_addr, _rtcp_addr) in &servers {
             let _ = rtp_sock.send_to(&pkt_init, rtp_addr.as_str()).await;
+            if let Some(ref p6) = pkt_init_v6 {
+                let _ = rtp_sock.send_to(p6, rtp_addr.as_str()).await;
+            }
             for _ in 0..7 {
                 let pkt_echo = build_zrtp_echo_packet(echo_seq, &ts_now);
                 echo_seq = echo_seq.wrapping_add(1);
@@ -1412,8 +1601,25 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
                         if probe.public_p2p.is_none() && pub_addr.is_some() {
                             probe.public_p2p = pub_addr.clone();
                         }
-                        let pkt_ping = build_zrtp_ping_packet(from_uid, token, sess_id);
-                        let _ = rtp_sock.send_to(&pkt_ping, peer_str.as_str()).await;
+                        if let Some(gid) = group_id {
+                            let pkt_gp =
+                                build_zrtp_group_ping_packet(from_uid, token, call_id, gid, sess_id);
+                            let _ = rtp_sock.send_to(&pkt_gp, peer_str.as_str()).await;
+                            let pkt_lay = build_zrtp_group_video_layers_packet(from_uid, token, 1);
+                            let _ = rtp_sock.send_to(&pkt_lay, peer_str.as_str()).await;
+                            if !group_to_ids.is_empty() {
+                                let pkt_sub = build_zrtp_group_subscribe_video_packet(
+                                    from_uid,
+                                    token,
+                                    2,
+                                    &group_to_ids,
+                                );
+                                let _ = rtp_sock.send_to(&pkt_sub, peer_str.as_str()).await;
+                            }
+                        } else {
+                            let pkt_ping = build_zrtp_ping_packet(from_uid, token, sess_id);
+                            let _ = rtp_sock.send_to(&pkt_ping, peer_str.as_str()).await;
+                        }
                     }
                 }
             }
@@ -1433,7 +1639,11 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
                         // Only send ping from rtcp_sock when rtcp_addr differs from rtp_addr so a single-port
                         // relay does not overwrite the RTP socket's source port mapping with rtcp_sock's port.
                         if servers.iter().any(|(r, c)| c == &peer_str && r != c) {
-                            let pkt_ping = build_zrtp_ping_packet(from_uid, token, sess_id);
+                            let pkt_ping = if let Some(gid) = group_id {
+                                build_zrtp_group_ping_packet(from_uid, token, call_id, gid, sess_id)
+                            } else {
+                                build_zrtp_ping_packet(from_uid, token, sess_id)
+                            };
                             let _ = rtcp_sock.send_to(&pkt_ping, peer_str.as_str()).await;
                         }
                     }
@@ -1459,7 +1669,11 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
             tokio::select! {
                 changed = abort_rx.changed() => {
                     if changed.is_err() || *abort_rx.borrow() {
-                        let pkt_end = build_zrtp_end_packet(from_uid, call_id, &sess_owned);
+                        let pkt_end = if group_id.is_some() {
+                            build_zrtp_group_end_packet(from_uid, cur_token, call_id)
+                        } else {
+                            build_zrtp_end_packet(from_uid, call_id, &sess_owned)
+                        };
                         for (rtp_addr, _rtcp_addr) in &servers {
                             let _ = rtp_loop.send_to(&pkt_end, rtp_addr.as_str()).await;
                         }
@@ -1470,16 +1684,61 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
                     let pkt_e = build_zrtp_echo_packet(seq, &crate::login::unix_now().to_string());
                     seq = seq.wrapping_add(1);
                     if cur_token == 0 {
-                        let pkt_init_retry = build_zrtp_init_packet(is_caller, from_uid, partner_uid, call_id, sub_cmd, &sess_owned);
+                        let pkt_init_retry = match group_id {
+                            Some(gid) => build_zrtp_group_init_packet(
+                                from_uid,
+                                call_id,
+                                gid,
+                                sub_cmd,
+                                &sess_owned,
+                            ),
+                            None => build_zrtp_init_packet(
+                                is_caller,
+                                from_uid,
+                                partner_uid,
+                                call_id,
+                                sub_cmd,
+                                &sess_owned,
+                            ),
+                        };
                         for (rtp_addr, _rtcp_addr) in &servers {
                             let _ = rtp_loop.send_to(&pkt_init_retry, rtp_addr.as_str()).await;
+                            if group_id.is_some() {
+                                let p6 = build_zrtp_group_init_packet_v6(
+                                    from_uid,
+                                    call_id,
+                                    &sess_owned,
+                                );
+                                let _ = rtp_loop.send_to(&p6, rtp_addr.as_str()).await;
+                            }
                             let _ = rtp_loop.send_to(&pkt_e, rtp_addr.as_str()).await;
                         }
                     } else {
                         for (rtp_addr, _rtcp_addr) in &servers {
-                            let tok = server_tokens.get(rtp_addr).copied().unwrap_or(cur_token);
-                            let pkt_p = build_zrtp_ping_packet(from_uid, tok, &sess_owned);
-                            let _ = rtp_loop.send_to(&pkt_p, rtp_addr.as_str()).await;
+                            let tok =
+                                server_tokens.get(rtp_addr).copied().unwrap_or(cur_token);
+                            if let Some(gid) = group_id {
+                                let pkt_gp = build_zrtp_group_ping_packet(
+                                    from_uid,
+                                    tok,
+                                    call_id,
+                                    gid,
+                                    &sess_owned,
+                                );
+                                let _ = rtp_loop.send_to(&pkt_gp, rtp_addr.as_str()).await;
+                                if !group_to_ids.is_empty() {
+                                    let pkt_sub = build_zrtp_group_subscribe_video_packet(
+                                        from_uid,
+                                        tok,
+                                        seq,
+                                        &group_to_ids,
+                                    );
+                                    let _ = rtp_loop.send_to(&pkt_sub, rtp_addr.as_str()).await;
+                                }
+                            } else {
+                                let pkt_p = build_zrtp_ping_packet(from_uid, tok, &sess_owned);
+                                let _ = rtp_loop.send_to(&pkt_p, rtp_addr.as_str()).await;
+                            }
                         }
                     }
                 }
@@ -1531,6 +1790,7 @@ pub async fn start_zrtp_udp_relay_session(
         call_id,
         is_caller,
         sess_id,
+        None,
     )
     .await;
     (rtp, rtcp, abort, probe.local_port)
@@ -1616,23 +1876,45 @@ pub fn build_pure_rust_invite_fields_with_probe(
 ) -> (String, String, String, String, String) {
     let first_srv = resp_401
         .get("servers")
+        .or_else(|| resp_401.pointer("/callSetting/servers"))
         .and_then(Value::as_array)
         .and_then(|arr| arr.first());
 
-    let rtp_ip = first_srv
+    let selected_rtp = probe
+        .and_then(|p| p.selected_rtp.as_deref())
+        .filter(|s| !s.is_empty());
+    let selected_srv = selected_rtp.and_then(|sel| {
+        resp_401
+            .get("servers")
+            .or_else(|| resp_401.pointer("/callSetting/servers"))
+            .and_then(Value::as_array)
+            .and_then(|arr| {
+                arr.iter().find(|s| {
+                    s.get("rtpaddr")
+                        .or_else(|| s.get("rtp"))
+                        .and_then(Value::as_str)
+                        == Some(sel)
+                })
+            })
+    });
+    let chosen_srv = selected_srv.or(first_srv);
+
+    let rtp_ip = chosen_srv
         .and_then(|s| s.get("rtpaddr").or_else(|| s.get("rtp")))
         .and_then(Value::as_str)
+        .or(selected_rtp)
         .or_else(|| {
             resp_401
                 .get("rtpIP")
                 .or_else(|| resp_401.get("rtpSerIp"))
                 .or_else(|| resp_401.get("rtpAddress"))
                 .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
         })
         .unwrap_or("")
         .to_string();
 
-    let rtcp_ip = first_srv
+    let rtcp_ip = chosen_srv
         .and_then(|s| s.get("rtcpaddr").or_else(|| s.get("rtcp")))
         .and_then(Value::as_str)
         .or_else(|| {
@@ -1641,6 +1923,7 @@ pub fn build_pure_rust_invite_fields_with_probe(
                 .or_else(|| resp_401.get("rtcpAddress"))
                 .or_else(|| resp_401.get("rtpSerIp"))
                 .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
         })
         .unwrap_or(&rtp_ip)
         .to_string();
@@ -1657,7 +1940,14 @@ pub fn build_pure_rust_invite_fields_with_probe(
     let sess_id = resp_401
         .get("sessId")
         .or_else(|| resp_401.get("session"))
+        .or_else(|| resp_401.pointer("/callSetting/session"))
         .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            resp_401
+                .pointer("/callSetting/session")
+                .and_then(Value::as_str)
+        })
         .unwrap_or("")
         .to_string();
 
@@ -1681,6 +1971,7 @@ pub fn build_pure_rust_invite_fields_with_probe(
 
     let server_result: Vec<Value> = resp_401
         .get("servers")
+        .or_else(|| resp_401.pointer("/callSetting/servers"))
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -2021,7 +2312,7 @@ impl CallBridge {
                                     "groupId": clean_gid,
                                     "groupName": grp_name,
                                     "maxUsers": max_users,
-                                    "noiseId": partners_str
+                                    "noiseId": partners_vec
                                 });
                                 let inner_12433_str =
                                     serde_json::to_string(&inner_12433).unwrap_or_default();
@@ -2033,9 +2324,16 @@ impl CallBridge {
                                     "data": inner_12433_str,
                                     "partners": partners_str
                                 });
-                                let resp_res =
+                                let mut resp_res =
                                     dispatch_send_signal(&s_snap, 12433, &req_12433).await;
-                                if let Ok(ref r) = resp_res {
+                                if let Ok(r) = &resp_res {
+                                    if r.get("status").and_then(Value::as_i64) == Some(2) {
+                                        let _ = upgrade_session_for_group_call(&s_snap).await;
+                                        resp_res =
+                                            dispatch_send_signal(&s_snap, 12433, &req_12433).await;
+                                    }
+                                }
+                                if let Ok(r) = &resp_res {
                                     if let Some(pids) =
                                         r.get("partnerIds").and_then(Value::as_array)
                                     {
@@ -2057,10 +2355,20 @@ impl CallBridge {
                                 let status_12433 = resp_res
                                     .as_ref()
                                     .ok()
-                                    .and_then(|r| r.get("status"))
-                                    .and_then(|v| {
-                                        v.as_i64()
-                                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                                    .and_then(|r| {
+                                        r.get("status").and_then(|v| {
+                                            v.as_i64()
+                                                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                                        }).or_else(|| {
+                                            if r.get("params").is_some()
+                                                || r.get("hostCall").is_some()
+                                                || r.get("callId").is_some()
+                                            {
+                                                Some(0)
+                                            } else {
+                                                None
+                                            }
+                                        })
                                     })
                                     .unwrap_or(-1);
                                 if status_12433 == 0 {
@@ -2075,8 +2383,15 @@ impl CallBridge {
                                                     (resp.as_object_mut(), p_obj.as_object())
                                                 {
                                                     for (k, v) in src {
-                                                        dst.entry(k.clone())
-                                                            .or_insert_with(|| v.clone());
+                                                        let should_replace = match dst.get(k) {
+                                                            None => true,
+                                                            Some(Value::Null) => true,
+                                                            Some(Value::String(s)) => s.is_empty(),
+                                                            _ => false,
+                                                        };
+                                                        if should_replace {
+                                                            dst.insert(k.clone(), v.clone());
+                                                        }
                                                     }
                                                 }
                                             }
@@ -2095,21 +2410,44 @@ impl CallBridge {
                                         {
                                             max_users = mu;
                                         }
-                                        let host_call = resp
+                                        let host_call_u64 = resp
                                             .get("hostCall")
                                             .or_else(|| resp.get("fromId"))
                                             .and_then(|v| {
-                                                v.as_str().map(str::to_string).or_else(|| {
-                                                    v.as_i64().map(|n| n.to_string())
+                                                v.as_u64().or_else(|| {
+                                                    v.as_i64()
+                                                        .and_then(|n| u64::try_from(n).ok())
+                                                        .or_else(|| {
+                                                            v.as_str().and_then(|s| s.parse().ok())
+                                                        })
                                                 })
                                             })
-                                            .filter(|s| !s.is_empty())
-                                            .unwrap_or_else(|| my_uid.clone());
+                                            .unwrap_or_else(|| uid_str_to_u32(&my_uid) as u64);
+                                        let host_call = host_call_u64.to_string();
+                                        let group_id_u64 = resp
+                                            .get("groupId")
+                                            .and_then(|v| {
+                                                v.as_u64().or_else(|| {
+                                                    v.as_str().and_then(|s| s.parse().ok())
+                                                })
+                                            })
+                                            .or_else(|| clean_gid.parse::<u64>().ok())
+                                            .unwrap_or(0);
+                                        let group_id_u32 = group_id_u64 as u32;
                                         let sess_id_raw = resp
                                             .pointer("/callSetting/session")
-                                            .or_else(|| resp.get("session"))
-                                            .or_else(|| resp.get("sessId"))
                                             .and_then(Value::as_str)
+                                            .filter(|s| !s.is_empty())
+                                            .or_else(|| {
+                                                resp.get("session")
+                                                    .and_then(Value::as_str)
+                                                    .filter(|s| !s.is_empty())
+                                            })
+                                            .or_else(|| {
+                                                resp.get("sessId")
+                                                    .and_then(Value::as_str)
+                                                    .filter(|s| !s.is_empty())
+                                            })
                                             .unwrap_or("")
                                             .to_string();
                                         let from_uid_u32 = s_snap
@@ -2118,7 +2456,39 @@ impl CallBridge {
                                             .and_then(|sek| sek.split('.').nth(1))
                                             .and_then(|x| x.parse::<u32>().ok())
                                             .unwrap_or_else(|| uid_str_to_u32(&my_uid));
-                                        let partner_uid_u32 = uid_str_to_u32(&host_call);
+                                        let partner_uid_u32 = resp
+                                            .get("toId")
+                                            .and_then(Value::as_array)
+                                            .and_then(|arr| {
+                                                arr.iter()
+                                                    .filter_map(|v| {
+                                                        v.as_u64()
+                                                            .or_else(|| {
+                                                                v.as_str()
+                                                                    .and_then(|s| s.parse().ok())
+                                                            })
+                                                            .map(|n| n as u32)
+                                                    })
+                                                    .find(|&uid| uid != 0 && uid != from_uid_u32)
+                                            })
+                                            .unwrap_or(host_call_u64 as u32);
+                                        let group_pending_uids: Vec<u32> = resp
+                                            .get("toId")
+                                            .and_then(Value::as_array)
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .filter_map(|v| {
+                                                        v.as_u64()
+                                                            .or_else(|| {
+                                                                v.as_str()
+                                                                    .and_then(|s| s.parse().ok())
+                                                            })
+                                                            .map(|n| n as u32)
+                                                    })
+                                                    .filter(|&uid| uid != 0 && uid != from_uid_u32)
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
                                         let (
                                             udp_rtp_sock,
                                             udp_rtcp_sock,
@@ -2131,22 +2501,29 @@ impl CallBridge {
                                             real_call_id as u32,
                                             true,
                                             &sess_id_raw,
+                                            Some(group_id_u32),
                                         )
                                         .await;
-                                        let (rtp_ip, rtcp_ip, sess_id, codec_str, extend_str) =
+                                        let (rtp_ip, rtcp_ip, mut sess_id, codec_str, extend_str) =
                                             build_pure_rust_invite_fields_with_probe(
                                                 &resp,
                                                 is_video,
                                                 Some(zrtp_probe.local_port),
                                                 Some(&zrtp_probe),
                                             );
+                                        if sess_id.is_empty() {
+                                            sess_id = sess_id_raw.clone();
+                                        }
+                                        let partners_str_updated =
+                                            serde_json::to_string(&partners_vec)
+                                                .unwrap_or_else(|_| partners_str.clone());
                                         let inner_12434_meta = json!({
                                             "extraData": "",
                                             "groupAvatar": grp_avt,
                                             "groupName": grp_name,
-                                            "hostCall": host_call,
+                                            "hostCall": host_call_u64,
                                             "maxUsers": max_users,
-                                            "noiseId": partners_str
+                                            "noiseId": partners_vec
                                         });
                                         let outer_12434_data = json!({
                                             "codec": codec_str,
@@ -2158,12 +2535,12 @@ impl CallBridge {
                                             "rtpAddressIPv6": ""
                                         });
                                         let req_12434 = json!({
-                                            "calleeId": host_call,
+                                            "calleeId": host_call_u64,
                                             "callId": real_call_id,
                                             "callType": grp_call_type_wire,
                                             "data": serde_json::to_string(&outer_12434_data).unwrap_or_default(),
                                             "session": sess_id,
-                                            "partners": partners_str,
+                                            "partners": partners_str_updated,
                                             "groupId": clean_gid
                                         });
                                         let _ =
@@ -2201,6 +2578,11 @@ impl CallBridge {
                                             from_uid_u32,
                                             partner_uid_u32,
                                             relay_token: zrtp_probe.token,
+                                            group_id_u32,
+                                            group_host_call: host_call,
+                                            group_partners_str: partners_str_updated,
+                                            group_pending_uids,
+                                            group_active_uids: Vec::new(),
                                             server_tokens: zrtp_probe.server_tokens,
                                             udp_rtp_sock,
                                             udp_rtcp_sock,
@@ -2328,6 +2710,7 @@ impl CallBridge {
                                             real_call_id as u32,
                                             true,
                                             &sess_id_raw,
+                                            None,
                                         )
                                         .await;
                                         let (rtp_ip, rtcp_ip, sess_id, codec_str, extend_str) =
@@ -2418,9 +2801,15 @@ impl CallBridge {
                                 });
                                 let _ = gui_tx_clone.send(GuiEvent::MessageSent {
                                     thread_id: partner_id,
-                                    text: format!(
-                                        "📞 Cuộc gọi đi (0s) — {last_err_reason} (Mã {last_err_code})"
-                                    ),
+                                    text: if is_video {
+                                        format!(
+                                            "📹 Cuộc gọi video đi (0s) — {last_err_reason} (Mã {last_err_code})"
+                                        )
+                                    } else {
+                                        format!(
+                                            "📞 Cuộc gọi đi (0s) — {last_err_reason} (Mã {last_err_code})"
+                                        )
+                                    },
                                     msg_id: format!("call_{}", crate::login::unix_now()),
                                 });
                                 ctx_clone.request_repaint();
@@ -2447,6 +2836,11 @@ impl CallBridge {
                                 from_uid_u32: primary.from_uid_u32,
                                 partner_uid_u32: primary.partner_uid_u32,
                                 relay_token: primary.relay_token,
+                                group_id_u32: 0,
+                                group_host_call: String::new(),
+                                group_partners_str: String::new(),
+                                group_pending_uids: Vec::new(),
+                                group_active_uids: Vec::new(),
                                 server_tokens: std::mem::take(&mut primary.server_tokens),
                                 udp_rtp_sock: primary.udp_rtp_sock.take(),
                                 udp_rtcp_sock: primary.udp_rtcp_sock.take(),
@@ -2548,12 +2942,17 @@ impl CallBridge {
                                     )));
                                 } else {
                                     let partner_id = st.partner_id.clone();
+                                    let was_video = st.is_video;
                                     *guard = None;
                                     let _ = gui_tx_clone
                                         .send(GuiEvent::CallStateChanged("free".into()));
                                     let _ = gui_tx_clone.send(GuiEvent::MessageSent {
                                         thread_id: partner_id,
-                                        text: "📞 Cuộc gọi đến (Đã từ chối)".into(),
+                                        text: if was_video {
+                                            "📹 Cuộc gọi video đến (Đã từ chối)".into()
+                                        } else {
+                                            "📞 Cuộc gọi đến (Đã từ chối)".into()
+                                        },
                                         msg_id: format!("call_{}", crate::login::unix_now()),
                                     });
                                 }
@@ -2655,6 +3054,8 @@ impl CallBridge {
                             let is_group = st.is_group;
                             let is_caller = st.is_caller;
                             let is_connected = st.is_connected;
+                            let group_host_call = st.group_host_call.clone();
+                            let group_partners_str = st.group_partners_str.clone();
                             let extra_hangup: Vec<(String, i64, bool)> = st
                                 .extra_legs
                                 .drain(..)
@@ -2662,10 +3063,15 @@ impl CallBridge {
                                 .collect();
 
                             if !thread_id.is_empty() {
-                                let label = if is_caller {
-                                    format!("📞 Cuộc gọi đi ({duration_sec}s)")
-                                } else {
-                                    format!("📞 Cuộc gọi đến ({duration_sec}s)")
+                                let is_vid_call = matches!(
+                                    call_type,
+                                    x if x == CallType::DirectVideo as u8 || x == CallType::GroupVideo as u8
+                                );
+                                let label = match (is_caller, is_vid_call) {
+                                    (true, true) => format!("📹 Cuộc gọi video đi ({duration_sec}s)"),
+                                    (true, false) => format!("📞 Cuộc gọi đi ({duration_sec}s)"),
+                                    (false, true) => format!("📹 Cuộc gọi video đến ({duration_sec}s)"),
+                                    (false, false) => format!("📞 Cuộc gọi đến ({duration_sec}s)"),
                                 };
                                 let _ = gui_tx.send(GuiEvent::MessageSent {
                                     thread_id: thread_id.clone(),
@@ -2690,17 +3096,26 @@ impl CallBridge {
                                             0
                                         };
                                     let cmd_code = if is_connected { 12438 } else { 12437 };
+                                    let host_val: Value = group_host_call
+                                        .parse::<u64>()
+                                        .map(|n| json!(n))
+                                        .unwrap_or_else(|_| json!(group_host_call));
+                                    let partners_val = if group_partners_str.is_empty() {
+                                        "[]".to_string()
+                                    } else {
+                                        group_partners_str.clone()
+                                    };
                                     let body = json!({
-                                        "calleeId": clean_gid,
+                                        "calleeId": host_val,
                                         "callId": call_id,
                                         "callType": grp_call_type_wire,
-                                        "hostCall": "",
+                                        "hostCall": host_val,
                                         "data": "",
-                                        "partners": "[]"
+                                        "partners": partners_val,
+                                        "groupId": clean_gid
                                     });
                                     let _ = dispatch_send_signal(&s_snap, cmd_code, &body).await;
-                                }
-                                if is_caller && !is_connected {
+                                } else if is_caller && !is_connected {
                                     let req_405 = json!({
                                         "toId": partner_id,
                                         "callId": call_id,
@@ -2772,8 +3187,8 @@ impl CallBridge {
 
                         match act {
                             "ring_ring" | "group_ring_ring" => {
-                                let guard = active_call.lock().await;
-                                let Some(ref st) = *guard else {
+                                let mut guard = active_call.lock().await;
+                                let Some(st) = guard.as_mut() else {
                                     continue;
                                 };
                                 let matches_leg = ev_call_id == 0
@@ -2871,6 +3286,49 @@ impl CallBridge {
                                     continue;
                                 }
                                 if is_primary_leg && st_check.is_connected {
+                                    if st_check.is_group {
+                                        let ans_status = data
+                                            .get("extraData")
+                                            .and_then(Value::as_str)
+                                            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                                            .and_then(|v| v.get("status").and_then(Value::as_i64))
+                                            .unwrap_or(status);
+                                        if let Some(fid) = data
+                                            .get("fromId")
+                                            .and_then(|v| {
+                                                v.as_u64().or_else(|| {
+                                                    v.as_str().and_then(|s| s.parse().ok())
+                                                })
+                                            })
+                                            .map(|v| v as u32)
+                                        {
+                                            if fid != 0 && fid != st_check.from_uid_u32 {
+                                                if let Some(st) = guard.as_mut() {
+                                                    st.group_pending_uids.retain(|&u| u != fid);
+                                                    if ans_status == 0 {
+                                                        if !st.group_active_uids.contains(&fid) {
+                                                            st.group_active_uids.push(fid);
+                                                        }
+                                                        if let (Some(rsock), Ok(target)) = (
+                                                            &st.udp_rtp_sock,
+                                                            st.rtp_ip.parse::<std::net::SocketAddr>(),
+                                                        ) {
+                                                            let pkt_sub =
+                                                                build_zrtp_group_subscribe_video_packet(
+                                                                    st.from_uid_u32,
+                                                                    st.relay_token,
+                                                                    1,
+                                                                    &st.group_active_uids,
+                                                                );
+                                                            let _ = rsock.try_send_to(&pkt_sub, target);
+                                                        }
+                                                    } else {
+                                                        st.group_active_uids.retain(|&u| u != fid);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     continue;
                                 }
                                 if let Some(idx) = extra_leg_idx {
@@ -2879,7 +3337,16 @@ impl CallBridge {
                                     }
                                 }
 
-                                if status == 0 {
+                                let eff_status = if act == "group_answer" {
+                                    data.get("extraData")
+                                        .and_then(Value::as_str)
+                                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                                        .and_then(|v| v.get("status").and_then(Value::as_i64))
+                                        .unwrap_or(status)
+                                } else {
+                                    status
+                                };
+                                if eff_status == 0 {
                                     if let Some(st) = guard.as_mut() {
                                         // If an extra leg answered first before primary connected, promote it to primary!
                                         if let Some(idx) = extra_leg_idx {
@@ -2952,6 +3419,25 @@ impl CallBridge {
 
                                         st.is_connected = true;
                                         st.started_at = std::time::Instant::now();
+                                        if act == "group_answer" {
+                                            if let Some(fid) = data
+                                                .get("fromId")
+                                                .and_then(|v| {
+                                                    v.as_u64().or_else(|| {
+                                                        v.as_str().and_then(|s| s.parse().ok())
+                                                    })
+                                                })
+                                                .map(|v| v as u32)
+                                            {
+                                                if fid != 0 && fid != st.from_uid_u32 {
+                                                    st.partner_uid_u32 = fid;
+                                                    st.group_pending_uids.retain(|&u| u != fid);
+                                                    if !st.group_active_uids.contains(&fid) {
+                                                        st.group_active_uids.push(fid);
+                                                    }
+                                                }
+                                            }
+                                        }
                                         let ans_media = event_media_params(&data);
                                         if let Some(sel_srv) = ans_media
                                             .get("rtpSerIp")
@@ -2977,49 +3463,81 @@ impl CallBridge {
                                             &st.udp_rtp_sock,
                                             st.rtp_ip.parse::<std::net::SocketAddr>(),
                                         ) {
-                                            let pkt_p = build_zrtp_ping_packet(
-                                                st.from_uid_u32,
-                                                st.relay_token,
-                                                &st.sess_id,
-                                            );
-                                            let _ = rsock.try_send_to(&pkt_p, target);
-                                        }
-                                        st.media = None;
-                                        match crate::media::MediaHandle::start_with_sockets(
-                                            st.rtp_ip.clone(),
-                                            st.rtcp_ip.clone(),
-                                            st.from_uid_u32,
-                                            st.partner_uid_u32,
-                                            st.is_caller,
-                                            st.relay_token,
-                                            st.udp_rtp_sock.clone(),
-                                            st.udp_rtcp_sock.clone(),
-                                            0,
-                                            st.is_video,
-                                            Some(gui_tx.clone()),
-                                            Some(egui_ctx.clone()),
-                                        ) {
-                                            Ok(m) => {
-                                                st.media = Some(m);
+                                            if st.is_group {
+                                                let pkt_gp = build_zrtp_group_ping_packet(
+                                                    st.from_uid_u32,
+                                                    st.relay_token,
+                                                    st.call_id as u32,
+                                                    st.group_id_u32,
+                                                    &st.sess_id,
+                                                );
+                                                let _ = rsock.try_send_to(&pkt_gp, target);
+                                                let pkt_lay = build_zrtp_group_video_layers_packet(
+                                                    st.from_uid_u32,
+                                                    st.relay_token,
+                                                    1,
+                                                );
+                                                let _ = rsock.try_send_to(&pkt_lay, target);
+                                                let pkt_sub =
+                                                    build_zrtp_group_subscribe_video_packet(
+                                                        st.from_uid_u32,
+                                                        st.relay_token,
+                                                        2,
+                                                        &[st.partner_uid_u32],
+                                                    );
+                                                let _ = rsock.try_send_to(&pkt_sub, target);
+                                            } else {
+                                                let pkt_p = build_zrtp_ping_packet(
+                                                    st.from_uid_u32,
+                                                    st.relay_token,
+                                                    &st.sess_id,
+                                                );
+                                                let _ = rsock.try_send_to(&pkt_p, target);
                                             }
-                                            Err(e) => {
-                                                eprintln!("media start failed: {e}");
-                                                if let Ok(sess) = crate::audio::AudioHandle::start()
-                                                {
-                                                    st.audio = Some(sess);
+                                        }
+                                        let is_group_call = st.is_group;
+                                        if !(is_group_call && st.media.is_some() && st.relay_token != 0)
+                                        {
+                                            st.media = None;
+                                            match crate::media::MediaHandle::start_with_sockets(
+                                                st.rtp_ip.clone(),
+                                                st.rtcp_ip.clone(),
+                                                st.from_uid_u32,
+                                                st.partner_uid_u32,
+                                                st.is_caller,
+                                                st.relay_token,
+                                                st.udp_rtp_sock.clone(),
+                                                st.udp_rtcp_sock.clone(),
+                                                0,
+                                                st.is_video,
+                                                Some(gui_tx.clone()),
+                                                Some(egui_ctx.clone()),
+                                            ) {
+                                                Ok(m) => {
+                                                    st.media = Some(m);
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("media start failed: {e}");
+                                                    if let Ok(sess) =
+                                                        crate::audio::AudioHandle::start()
+                                                    {
+                                                        st.audio = Some(sess);
+                                                    }
                                                 }
                                             }
                                         }
                                         let call_id = st.call_id;
                                         let callee_id = st.partner_id.clone();
-                                        tokio::spawn(async move {
-                                            let req_408 = json!({
-                                                "calleeId": callee_id,
-                                                "callId": call_id
+                                        if !is_group_call {
+                                            tokio::spawn(async move {
+                                                let req_408 = json!({
+                                                    "calleeId": callee_id,
+                                                    "callId": call_id
+                                                });
+                                                let _ = dispatch_send_signal(&s_snap, 408, &req_408)
+                                                    .await;
                                             });
-                                            let _ =
-                                                dispatch_send_signal(&s_snap, 408, &req_408).await;
-                                        });
+                                        }
                                     }
                                     let _ =
                                         gui_tx.send(GuiEvent::CallStateChanged("connected".into()));
@@ -3052,6 +3570,25 @@ impl CallBridge {
                                             st.extra_legs.remove(0);
                                             continue;
                                         }
+                                        if st.is_group {
+                                            if let Some(fid) = data
+                                                .get("fromId")
+                                                .and_then(|v| {
+                                                    v.as_u64().or_else(|| {
+                                                        v.as_str().and_then(|s| s.parse().ok())
+                                                    })
+                                                })
+                                                .map(|v| v as u32)
+                                            {
+                                                st.group_pending_uids.retain(|&u| u != fid);
+                                                st.group_active_uids.retain(|&u| u != fid);
+                                            }
+                                            if !st.group_active_uids.is_empty()
+                                                || !st.group_pending_uids.is_empty()
+                                            {
+                                                continue;
+                                            }
+                                        }
                                     }
                                     let taken = guard.take();
                                     let reason = match status {
@@ -3068,12 +3605,72 @@ impl CallBridge {
                                     if let Some(st) = taken {
                                         let _ = gui_tx.send(GuiEvent::MessageSent {
                                             thread_id: st.thread_id.clone(),
-                                            text: format!("📞 Cuộc gọi đi (0s) — {reason}"),
+                                            text: if st.is_video {
+                                                format!("📹 Cuộc gọi video đi (0s) — {reason}")
+                                            } else {
+                                                format!("📞 Cuộc gọi đi (0s) — {reason}")
+                                            },
                                             msg_id: format!("call_{}", crate::login::unix_now()),
                                         });
                                     }
                                 }
                                 egui_ctx.request_repaint();
+                            }
+                            "group_broadcast" => {
+                                let mut guard = active_call.lock().await;
+                                let Some(st) = guard.as_mut() else {
+                                    continue;
+                                };
+                                if ev_call_id != 0 && ev_call_id != st.call_id {
+                                    continue;
+                                }
+                                let call_state = data
+                                    .get("callState")
+                                    .and_then(Value::as_i64)
+                                    .unwrap_or(0);
+                                if let Some(uid) =
+                                    data.get("userId").and_then(Value::as_u64).map(|v| v as u32)
+                                {
+                                    if uid != 0 && uid != st.from_uid_u32 {
+                                        st.group_pending_uids.retain(|&u| u != uid);
+                                        if call_state == 3 && !st.group_active_uids.contains(&uid) {
+                                            st.group_active_uids.push(uid);
+                                        }
+                                        if st.partner_uid_u32 == 0
+                                            || st.partner_uid_u32 == st.from_uid_u32
+                                        {
+                                            st.partner_uid_u32 = uid;
+                                        }
+                                        if let (Some(rsock), Ok(target)) = (
+                                            &st.udp_rtp_sock,
+                                            st.rtp_ip.parse::<std::net::SocketAddr>(),
+                                        ) {
+                                            let sub_list = if st.group_active_uids.is_empty() {
+                                                vec![uid, st.partner_uid_u32]
+                                            } else {
+                                                st.group_active_uids.clone()
+                                            };
+                                            let pkt_sub = build_zrtp_group_subscribe_video_packet(
+                                                st.from_uid_u32,
+                                                st.relay_token,
+                                                1,
+                                                &sub_list,
+                                            );
+                                            let _ = rsock.try_send_to(&pkt_sub, target);
+                                        }
+                                    }
+                                }
+                                if call_state == 3 && !st.is_connected {
+                                    st.is_connected = true;
+                                    st.started_at = std::time::Instant::now();
+                                    let _ =
+                                        gui_tx.send(GuiEvent::CallStateChanged("connected".into()));
+                                    let _ = gui_tx.send(GuiEvent::StatusUpdate(format!(
+                                        "🟢 Đang trong cuộc gọi nhóm {}",
+                                        st.partner_name
+                                    )));
+                                    egui_ctx.request_repaint();
+                                }
                             }
                             "end_call" | "cancel" | "group_end_call" | "group_cancel" => {
                                 let mut guard = active_call.lock().await;
@@ -3101,6 +3698,41 @@ impl CallBridge {
                                         st.extra_legs.remove(0);
                                         continue;
                                     }
+                                    if st.is_group && act == "group_end_call" {
+                                        let leaver_uid = data
+                                            .get("fromId")
+                                            .and_then(|v| {
+                                                v.as_u64().or_else(|| {
+                                                    v.as_str().and_then(|s| s.parse().ok())
+                                                })
+                                            })
+                                            .map(|v| v as u32)
+                                            .unwrap_or(0);
+                                        if leaver_uid != 0 && leaver_uid != st.from_uid_u32 {
+                                            st.group_pending_uids.retain(|&u| u != leaver_uid);
+                                            st.group_active_uids.retain(|&u| u != leaver_uid);
+                                            // Keep the group call open while other members are active or still ringing,
+                                            // or if we are the host of the group call room (`ZaloCall.exe` `0x0092BE79`).
+                                            let we_are_host = st
+                                                .group_host_call
+                                                .parse::<u32>()
+                                                .map(|h| h == st.from_uid_u32)
+                                                .unwrap_or(st.is_caller);
+                                            if !st.group_active_uids.is_empty()
+                                                || !st.group_pending_uids.is_empty()
+                                                || we_are_host
+                                            {
+                                                if let Some(&next_uid) = st.group_active_uids.first() {
+                                                    st.partner_uid_u32 = next_uid;
+                                                }
+                                                let _ = gui_tx.send(GuiEvent::StatusUpdate(format!(
+                                                    "🟢 Thành viên #{leaver_uid} đã rời — Cuộc gọi nhóm vẫn tiếp tục"
+                                                )));
+                                                egui_ctx.request_repaint();
+                                                continue;
+                                            }
+                                        }
+                                    }
                                 }
                                 if let Some(st) = guard.take() {
                                     let duration_sec = if st.is_connected {
@@ -3108,12 +3740,23 @@ impl CallBridge {
                                     } else {
                                         0
                                     };
-                                    let label = if st.is_caller {
-                                        format!("📞 Cuộc gọi đi ({duration_sec}s)")
-                                    } else if st.is_connected {
-                                        format!("📞 Cuộc gọi đến ({duration_sec}s)")
-                                    } else {
-                                        "📞 Cuộc gọi nhỡ".to_string()
+                                    let label = match (st.is_caller, st.is_connected, st.is_video) {
+                                        (true, _, true) => {
+                                            format!("📹 Cuộc gọi video đi ({duration_sec}s)")
+                                        }
+                                        (true, _, false) => {
+                                            format!("📞 Cuộc gọi đi ({duration_sec}s)")
+                                        }
+                                        (false, true, true) => {
+                                            format!("📹 Cuộc gọi video đến ({duration_sec}s)")
+                                        }
+                                        (false, true, false) => {
+                                            format!("📞 Cuộc gọi đến ({duration_sec}s)")
+                                        }
+                                        (false, false, true) => {
+                                            "📹 Cuộc gọi video nhỡ".to_string()
+                                        }
+                                        (false, false, false) => "📞 Cuộc gọi nhỡ".to_string(),
                                     };
                                     let _ = gui_tx.send(GuiEvent::MessageSent {
                                         thread_id: st.thread_id.clone(),
@@ -3285,6 +3928,11 @@ impl CallBridge {
                                             from_uid_u32,
                                             partner_uid_u32,
                                             relay_token: 0,
+                                            group_id_u32: 0,
+                                            group_host_call: String::new(),
+                                            group_partners_str: String::new(),
+                                            group_pending_uids: Vec::new(),
+                                            group_active_uids: Vec::new(),
                                             server_tokens: BTreeMap::new(),
                                             udp_rtp_sock: None,
                                             udp_rtcp_sock: None,
@@ -3328,6 +3976,7 @@ impl CallBridge {
                                             call_id as u32,
                                             false,
                                             &sess_id_raw,
+                                            None,
                                         )
                                         .await;
 
@@ -3840,5 +4489,100 @@ mod tests {
         assert_eq!(rtp, "171.244.128.62:4200");
         assert_eq!(rtcp, "171.244.128.62:4200");
         assert_eq!(sess, "sess_incoming_456");
+    }
+
+    #[test]
+    fn group_requestcall_nested_callsetting_extracts_servers_and_session() {
+        let resp_12433 = json!({
+            "hostCall": 435550501,
+            "callId": 845699558,
+            "groupId": 718256583,
+            "session": "",
+            "callSetting": {
+                "session": "grp_sess_token_123",
+                "servers": [
+                    {
+                        "rtpaddr": "58.187.8.76:3000",
+                        "rtcpaddr": "58.187.8.76:3500"
+                    },
+                    {
+                        "rtpaddr": "14.238.143.137:3000",
+                        "rtcpaddr": "14.238.143.137:3500"
+                    }
+                ]
+            }
+        });
+        let srvs = collect_relay_servers(&resp_12433);
+        assert_eq!(srvs.len(), 2);
+        assert_eq!(srvs[0].0, "58.187.8.76:3000");
+        assert_eq!(srvs[0].1, "58.187.8.76:3500");
+
+        let mut probe = ZrtpProbeResult {
+            local_port: 59350,
+            selected_rtp: Some("14.238.143.137:3000".into()),
+            ..Default::default()
+        };
+        probe.echo_stats.insert("58.187.8.76:3000".into(), (14, 22));
+        probe.echo_stats.insert("14.238.143.137:3000".into(), (14, 15));
+
+        let (rtp, rtcp, sess, _, ext_raw) =
+            build_pure_rust_invite_fields_with_probe(&resp_12433, false, Some(59350), Some(&probe));
+        assert_eq!(rtp, "14.238.143.137:3000");
+        assert_eq!(rtcp, "14.238.143.137:3500");
+        assert_eq!(sess, "grp_sess_token_123");
+        let ext: Value = serde_json::from_str(ext_raw.trim()).expect("group extendData JSON");
+        assert_eq!(ext["numServers"], 2);
+        assert_eq!(ext["serverAddr"][0]["rtp"], "14.238.143.137:3000");
+        assert_eq!(ext["serverAddr"][0]["rtcp"], "14.238.143.137:3500");
+    }
+
+    #[test]
+    fn zrtp_group_init_ping_and_end_packet_headers_match_zalocall_exe() {
+        let init = build_zrtp_group_init_packet(435550501, 845699558, 718256583, 4, "grp_sess");
+        assert_eq!(&init[0..2], &[0x01, 0x7E]);
+        assert_eq!(u32::from_le_bytes(init[10..14].try_into().unwrap()), 435550501);
+        assert_eq!(u32::from_le_bytes(init[14..18].try_into().unwrap()), 0);
+        assert_eq!(u16::from_le_bytes(init[18..20].try_into().unwrap()), 0x000B);
+        assert_eq!(init[20], 4);
+        assert_eq!(u32::from_le_bytes(init[21..25].try_into().unwrap()), 845699558);
+        assert_eq!(u32::from_le_bytes(init[25..29].try_into().unwrap()), 718256583);
+        assert_eq!(u16::from_le_bytes(init[29..31].try_into().unwrap()), 8);
+        assert_eq!(&init[31..39], b"grp_sess");
+        assert_eq!(u16::from_le_bytes(init[39..41].try_into().unwrap()), 4);
+        assert_eq!(&init[41..45], &[0x00, 0x03, 0x01, 0x01]);
+
+        let ping =
+            build_zrtp_group_ping_packet(435550501, 310699996, 845699558, 718256583, "grp_sess");
+        assert_eq!(&ping[0..2], &[0x01, 0x7E]);
+        assert_eq!(u32::from_le_bytes(ping[14..18].try_into().unwrap()), 310699996);
+        assert_eq!(u16::from_le_bytes(ping[18..20].try_into().unwrap()), 0x0033);
+        assert_eq!(ping[20], 1);
+        assert_eq!(u32::from_le_bytes(ping[21..25].try_into().unwrap()), 845699558);
+        assert_eq!(u32::from_le_bytes(ping[25..29].try_into().unwrap()), 718256583);
+
+        let sub = build_zrtp_group_subscribe_video_packet(435550501, 310699996, 1, &[465181026]);
+        assert_eq!(&sub[0..2], &[0x01, 0x01]);
+        assert_eq!(u16::from_le_bytes(sub[18..20].try_into().unwrap()), 0x0020);
+        assert_eq!(sub[20], 0x0D);
+        assert_eq!(u16::from_le_bytes(sub[21..23].try_into().unwrap()), 6);
+        assert_eq!(sub[23], 1);
+        assert_eq!(u32::from_le_bytes(sub[24..28].try_into().unwrap()), 465181026);
+        assert_eq!(sub[28], 0);
+
+        let layers = build_zrtp_group_video_layers_packet(435550501, 310699996, 1);
+        assert_eq!(&layers[0..2], &[0x01, 0x01]);
+        assert_eq!(u16::from_le_bytes(layers[18..20].try_into().unwrap()), 0x0020);
+        assert_eq!(layers[20], 0x0C);
+        assert_eq!(u16::from_le_bytes(layers[21..23].try_into().unwrap()), 28);
+        assert_eq!(layers[23], 3);
+        assert_eq!(layers[24], 0);
+        assert_eq!(layers[33], 3);
+        assert_eq!(layers[42], 6);
+
+        let end = build_zrtp_group_end_packet(435550501, 310699996, 845699558);
+        assert_eq!(&end[0..2], &[0x01, 0x7E]);
+        assert_eq!(u16::from_le_bytes(end[18..20].try_into().unwrap()), 0x0003);
+        assert_eq!(end[20], 0x01);
+        assert_eq!(u32::from_le_bytes(end[21..25].try_into().unwrap()), 845699558);
     }
 }

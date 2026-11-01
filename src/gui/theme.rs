@@ -524,6 +524,7 @@ pub mod lucide {
     pub const CHEVRON_RIGHT: &str = "\u{e06f}";
     pub const CHEVRON_DOWN: &str = "\u{e06d}";
     pub const USER: &str = "\u{e19f}";
+    pub const NEWSPAPER: &str = "\u{e124}";
 }
 
 pub(super) fn draw_lucide_icon(painter: &egui::Painter, center: Pos2, icon: &str, size: f32, color: Color32) {
@@ -583,6 +584,10 @@ pub(super) fn draw_icon_cloud(painter: &egui::Painter, center: Pos2, size: f32, 
 pub(super) fn draw_icon_settings(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     draw_lucide_icon(painter, center, lucide::SETTINGS, size, color);
 }
+pub(super) fn draw_icon_feed(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    draw_lucide_icon(painter, center, lucide::NEWSPAPER, size, color);
+}
+
 
 pub(super) fn draw_icon_drawer(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     draw_lucide_icon(painter, center, lucide::PANEL_RIGHT, size, color);

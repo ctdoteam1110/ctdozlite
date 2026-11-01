@@ -2172,12 +2172,30 @@ fn open_external_url(url: &str) {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("rundll32.exe")
-            .args(["url.dll,FileProtocolHandler", trimmed])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                lp_operation: *const u16,
+                lp_file: *const u16,
+                lp_parameters: *const u16,
+                lp_directory: *const u16,
+                n_show_cmd: i32,
+            ) -> isize;
+        }
+        let op: Vec<u16> = "open\0".encode_utf16().collect();
+        let mut file: Vec<u16> = trimmed.encode_utf16().collect();
+        file.push(0);
+        unsafe {
+            let _ = ShellExecuteW(
+                std::ptr::null_mut(),
+                op.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                5,
+            );
+        }
     }
     #[cfg(not(target_os = "windows"))]
     {

@@ -3,30 +3,12 @@
 //! Protocol reimplemented from Zalo PC 26.10.11.
 
 #![allow(dead_code)]
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
-mod audio;
-mod call;
-mod chat;
-mod clock;
-mod crypto;
-mod data_dir;
-mod endpoints;
-mod gui;
-mod logger;
-mod login;
-mod media;
-mod message_model;
-mod param_cipher;
-mod qr;
-mod reactions;
-mod session;
-mod socket;
-mod store;
-mod tui;
-mod ui;
-mod unread;
-mod voip_log;
-
+pub use zalo_rust::{
+    audio, call, chat, clock, crypto, data_dir, endpoints, feed, gui, logger, login, media,
+    message_model, param_cipher, qr, reactions, session, socket, store, tui, ui, unread, voip_log,
+};
 use anyhow::Result;
 use session::Session;
 
@@ -111,20 +93,13 @@ async fn main() -> Result<()> {
     if force_gui || (!force_tui && !force_qr && !args.iter().any(|a| a.starts_with("--phone"))) {
         println!("🚀 Đang khởi chạy giao diện đồ họa ctdozlite (egui)…");
         #[cfg(target_os = "windows")]
-        if !dev_mode {
+        if dev_mode {
             #[link(name = "kernel32")]
             extern "system" {
-                fn GetConsoleWindow() -> *mut std::ffi::c_void;
-            }
-            #[link(name = "user32")]
-            extern "system" {
-                fn ShowWindow(hwnd: *mut std::ffi::c_void, n_cmd_show: i32) -> i32;
+                fn AttachConsole(dw_process_id: u32) -> i32;
             }
             unsafe {
-                let hwnd = GetConsoleWindow();
-                if !hwnd.is_null() {
-                    ShowWindow(hwnd, 0); // SW_HIDE
-                }
+                let _ = AttachConsole(0xFFFF_FFFF); // ATTACH_PARENT_PROCESS
             }
         }
         let mut viewport = eframe::egui::ViewportBuilder::default()

@@ -3,7 +3,7 @@
 ;   iscc /DMyAppVersion=<version> packaging/windows/installer.iss
 ; A local build without that flag intentionally gets 0.0.0 instead of a stale version.
 #ifndef MyAppVersion
-#define MyAppVersion "0.0.3"
+#define MyAppVersion "0.0.4"
 #endif
 #define MyAppPublisher "ctdoteam1110"
 #define MyAppURL "https://github.com/ctdoteam1110/ctdozlite"
@@ -25,8 +25,13 @@ PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=..\..\dist
 OutputBaseFilename=ctdozlite-setup-windows-x86_64
 SetupIconFile=..\..\src\assets\app_icon.ico
-Compression=lzma2
-SolidCompression=yes
+Compression=zip
+SolidCompression=no
+VersionInfoVersion={#MyAppVersion}.0
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription=ctdozlite Native Zalo Desktop Client Installer
+VersionInfoProductName={#MyAppName}
+VersionInfoProductVersion={#MyAppVersion}
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible

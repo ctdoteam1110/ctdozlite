@@ -17,7 +17,16 @@ impl Fixture {
             std::process::id()
         ));
         std::fs::create_dir(&path).unwrap();
-        Self(path.canonicalize().unwrap())
+        let canon = path.canonicalize().unwrap();
+        #[cfg(windows)]
+        let canon = PathBuf::from(
+            canon
+                .to_str()
+                .unwrap_or_default()
+                .strip_prefix(r"\\?\")
+                .unwrap_or(canon.to_str().unwrap_or_default()),
+        );
+        Self(canon)
     }
 }
 impl Drop for Fixture {
@@ -156,7 +165,7 @@ fn legacy_cli_keeps_cwd_and_version_does_not_prepare_storage() {
     assert!(result.status.success());
     assert_eq!(
         String::from_utf8_lossy(&result.stdout).trim(),
-        "ctdozlite v0.0.3"
+        "ctdozlite v0.0.4"
     );
     assert!(!data.exists());
     assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 0);

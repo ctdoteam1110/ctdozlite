@@ -129,6 +129,43 @@ pub enum WorkerCmd {
     /// Delete local message data (`zalo_history.db` + `threads_cache.json`) without
     /// touching credentials. Separate from [`WorkerCmd::Logout`] by design (#21).
     WipeLocalData,
+    PinThread {
+        thread_id: String,
+        is_group: bool,
+        pin: bool,
+    },
+    MarkThreadUnread {
+        thread_id: String,
+        is_group: bool,
+        unread: bool,
+    },
+    MuteThread {
+        thread_id: String,
+        is_group: bool,
+        duration_sec: i64,
+        mute: bool,
+    },
+    HideThread {
+        thread_id: String,
+        is_group: bool,
+        hide: bool,
+    },
+    DeleteThread {
+        thread_id: String,
+        is_group: bool,
+        last_cli_msg_id: String,
+    },
+    FetchSocialProfile {
+        target_uid: String,
+    },
+    FetchMySocialAvatars {
+        page: u32,
+        count: u32,
+    },
+    FetchTimelineFeed {
+        friend_uids: Vec<String>,
+        shared_media_by_uid: std::collections::HashMap<String, Vec<crate::feed::FeedMedia>>,
+    },
 }
 
 pub(super) static WORKER_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<WorkerCmd>> =
@@ -446,6 +483,83 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let _ = std::fs::remove_file("threads_cache.json");
                             let _ = gui_tx.send(GuiEvent::LocalDataWiped);
                             egui_ctx.request_repaint();
+                        }
+                        WorkerCmd::PinThread {
+                            thread_id,
+                            is_group,
+                            pin,
+                        } => {
+                            let session_clone = session.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let _ = crate::chat::update_pinned_conversation(
+                                    &s, &thread_id, is_group, pin,
+                                )
+                                .await;
+                            });
+                        }
+                        WorkerCmd::MarkThreadUnread {
+                            thread_id,
+                            is_group,
+                            unread,
+                        } => {
+                            let session_clone = session.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let _ =
+                                    crate::chat::set_unread_mark(&s, &thread_id, is_group, unread)
+                                        .await;
+                            });
+                        }
+                        WorkerCmd::MuteThread {
+                            thread_id,
+                            is_group,
+                            duration_sec,
+                            mute,
+                        } => {
+                            let session_clone = session.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let _ = crate::chat::set_mute_conversation(
+                                    &s,
+                                    &thread_id,
+                                    is_group,
+                                    duration_sec,
+                                    mute,
+                                )
+                                .await;
+                            });
+                        }
+                        WorkerCmd::HideThread {
+                            thread_id,
+                            is_group,
+                            hide,
+                        } => {
+                            let session_clone = session.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let _ = crate::chat::set_hidden_conversation(
+                                    &s, &thread_id, is_group, hide,
+                                )
+                                .await;
+                            });
+                        }
+                        WorkerCmd::DeleteThread {
+                            thread_id,
+                            is_group,
+                            last_cli_msg_id,
+                        } => {
+                            let session_clone = session.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let _ = crate::chat::delete_conversation(
+                                    &s,
+                                    &thread_id,
+                                    is_group,
+                                    &last_cli_msg_id,
+                                )
+                                .await;
+                            });
                         }
                         WorkerCmd::RequestQr => {
                             if let Some(task) = current_qr_task.take() {
@@ -2110,6 +2224,51 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         });
                                     }
                                 }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchSocialProfile { target_uid } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let res = s
+                                    .get_friend_social_profile(&target_uid)
+                                    .await
+                                    .map_err(|e| e.to_string());
+                                let _ = gui_tx_clone.send(GuiEvent::SocialProfileLoaded(res));
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchMySocialAvatars { page, count } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let res = s
+                                    .get_my_social_avatar_list(page, count)
+                                    .await
+                                    .map_err(|e| e.to_string());
+                                let _ = gui_tx_clone.send(GuiEvent::SocialAvatarsLoaded(res));
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchTimelineFeed {
+                            friend_uids,
+                            shared_media_by_uid,
+                        } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let res = s
+                                    .fetch_timeline_feed(&friend_uids, &shared_media_by_uid)
+                                    .await
+                                    .map_err(|e| e.to_string());
+                                let _ = gui_tx_clone.send(GuiEvent::SocialTimelineLoaded(res));
                                 ctx_clone.request_repaint();
                             });
                         }

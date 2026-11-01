@@ -285,12 +285,30 @@ pub(super) fn open_external_url(url: &str) {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let _ = std::process::Command::new("rundll32.exe")
-            .args(["url.dll,FileProtocolHandler", trimmed])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                lp_operation: *const u16,
+                lp_file: *const u16,
+                lp_parameters: *const u16,
+                lp_directory: *const u16,
+                n_show_cmd: i32,
+            ) -> isize;
+        }
+        let op: Vec<u16> = "open\0".encode_utf16().collect();
+        let mut file: Vec<u16> = trimmed.encode_utf16().collect();
+        file.push(0);
+        unsafe {
+            let _ = ShellExecuteW(
+                std::ptr::null_mut(),
+                op.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                5, // SW_SHOW
+            );
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -305,38 +323,86 @@ pub(super) fn open_external_url(url: &str) {
 pub(super) fn pick_native_file_dialog(images_only: bool) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let filter = if images_only {
-            "Image Files (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp)|*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp|All Files (*.*)|*.*"
+        #[repr(C)]
+        struct OpenFileNameW {
+            l_struct_size: u32,
+            hwnd_owner: *mut std::ffi::c_void,
+            h_instance: *mut std::ffi::c_void,
+            lpstr_filter: *const u16,
+            lpstr_custom_filter: *mut u16,
+            n_max_cust_filter: u32,
+            n_filter_index: u32,
+            lpstr_file: *mut u16,
+            n_max_file: u32,
+            lpstr_file_title: *mut u16,
+            n_max_file_title: u32,
+            lpstr_initial_dir: *const u16,
+            lpstr_title: *const u16,
+            flags: u32,
+            n_file_offset: u16,
+            n_file_extension: u16,
+            lpstr_def_ext: *const u16,
+            l_cust_data: usize,
+            lpfn_hook: *const std::ffi::c_void,
+            lp_template_name: *const u16,
+            pv_reserved: *mut std::ffi::c_void,
+            dw_reserved: u32,
+            flags_ex: u32,
+        }
+        #[link(name = "comdlg32")]
+        extern "system" {
+            fn GetOpenFileNameW(lpofn: *mut OpenFileNameW) -> i32;
+        }
+        let filter_raw = if images_only {
+            "Image Files (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp)\0*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp\0All Files (*.*)\0*.*\0\0"
         } else {
-            "All Files (*.*)|*.*|Video & Media (*.mp4;*.mov;*.mkv;*.mp3;*.wav)|*.mp4;*.mov;*.mkv;*.mp3;*.wav|Documents (*.pdf;*.zip;*.docx;*.xlsx;*.txt)|*.pdf;*.zip;*.docx;*.xlsx;*.txt"
+            "All Files (*.*)\0*.*\0Video & Media (*.mp4;*.mov;*.mkv;*.mp3;*.wav)\0*.mp4;*.mov;*.mkv;*.mp3;*.wav\0Documents (*.pdf;*.zip;*.docx;*.xlsx;*.txt)\0*.pdf;*.zip;*.docx;*.xlsx;*.txt\0\0"
         };
-        let title = if images_only {
-            "Chọn hình ảnh để gửi qua Zalo"
+        let title_raw = if images_only {
+            "Chọn hình ảnh để gửi qua Zalo\0"
         } else {
-            "Chọn video hoặc tập tin đính kèm để gửi qua Zalo"
+            "Chọn video hoặc tập tin đính kèm để gửi qua Zalo\0"
         };
-        let script = format!(
-            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
-             Add-Type -AssemblyName System.Windows.Forms; \
-             $f = New-Object System.Windows.Forms.OpenFileDialog; \
-             $f.Title = '{title}'; \
-             $f.Filter = '{filter}'; \
-             $top = New-Object System.Windows.Forms.Form; \
-             $top.TopMost = $true; \
-             if ($f.ShowDialog($top) -eq [System.Windows.Forms.DialogResult]::OK) {{ Write-Output $f.FileName }}"
-        );
-        let out = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-STA", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .ok()?;
-        let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if path_str.is_empty() {
+        let filter_u16: Vec<u16> = filter_raw.encode_utf16().collect();
+        let title_u16: Vec<u16> = title_raw.encode_utf16().collect();
+        let mut file_buf = vec![0u16; 1024];
+        // OFN_EXPLORER (0x00080000) | OFN_FILEMUSTEXIST (0x00001000) | OFN_PATHMUSTEXIST (0x00000800) | OFN_NOCHANGEDIR (0x00000008)
+        let mut ofn = OpenFileNameW {
+            l_struct_size: std::mem::size_of::<OpenFileNameW>() as u32,
+            hwnd_owner: std::ptr::null_mut(),
+            h_instance: std::ptr::null_mut(),
+            lpstr_filter: filter_u16.as_ptr(),
+            lpstr_custom_filter: std::ptr::null_mut(),
+            n_max_cust_filter: 0,
+            n_filter_index: 1,
+            lpstr_file: file_buf.as_mut_ptr(),
+            n_max_file: file_buf.len() as u32,
+            lpstr_file_title: std::ptr::null_mut(),
+            n_max_file_title: 0,
+            lpstr_initial_dir: std::ptr::null(),
+            lpstr_title: title_u16.as_ptr(),
+            flags: 0x0008_0000 | 0x0000_1000 | 0x0000_0800 | 0x0000_0008,
+            n_file_offset: 0,
+            n_file_extension: 0,
+            lpstr_def_ext: std::ptr::null(),
+            l_cust_data: 0,
+            lpfn_hook: std::ptr::null(),
+            lp_template_name: std::ptr::null(),
+            pv_reserved: std::ptr::null_mut(),
+            dw_reserved: 0,
+            flags_ex: 0,
+        };
+        let ok = unsafe { GetOpenFileNameW(&mut ofn) };
+        if ok != 0 {
+            let end = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+            let s = String::from_utf16_lossy(&file_buf[..end]);
+            if !s.is_empty() {
+                Some(std::path::PathBuf::from(s))
+            } else {
+                None
+            }
+        } else {
             None
-        } else {
-            Some(std::path::PathBuf::from(path_str))
         }
     }
     #[cfg(target_os = "macos")]

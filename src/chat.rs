@@ -5192,6 +5192,223 @@ pub async fn find_user_by_phone(s: &Session, raw_phone: &str) -> Result<PhoneLoo
     })
 }
 
+/// Pin or unpin a conversation (`updatePinnedConversationsV2` @ `compact-app-pc.js:14354215`, cmd `12122`).
+pub async fn update_pinned_conversation(
+    s: &Session,
+    thread_id: &str,
+    is_group: bool,
+    pin: bool,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let clean = thread_id
+        .trim_start_matches("group_")
+        .trim_start_matches('g')
+        .trim_start_matches('G')
+        .trim_start_matches('u')
+        .trim();
+    let prefixed = if is_group {
+        format!("g{clean}")
+    } else {
+        format!("u{clean}")
+    };
+    let body = json!({
+        "actionType": if pin { 1 } else { 2 },
+        "conversations": [prefixed],
+        "tab": 0
+    });
+    let params = s.encoded_params(&body)?;
+    let url = format!(
+        "{}/api/pinconvers/updatev2?{}",
+        s.domains.conversation,
+        s.common_params()
+    );
+    let resp = s.post_form(&url, format!("params={params}")).await?;
+    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+}
+
+/// Mark a conversation as unread or read (`addMarkAsUnread` / `removeMarkAsUnread` @ `compact-app-pc.js:14299958`, cmd `12013` / `12014`).
+pub async fn set_unread_mark(
+    s: &Session,
+    thread_id: &str,
+    is_group: bool,
+    unread: bool,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let clean = thread_id
+        .trim_start_matches("group_")
+        .trim_start_matches('g')
+        .trim_start_matches('G')
+        .trim();
+    let (convs_group, convs_user) = if is_group {
+        (vec![clean], Vec::<&str>::new())
+    } else {
+        (Vec::<&str>::new(), vec![clean])
+    };
+    let (path, inner) = if unread {
+        (
+            "/api/conv/addUnreadMark",
+            json!({
+                "convsGroup": convs_group,
+                "convsUser": convs_user,
+                "imei": s.imei
+            }),
+        )
+    } else {
+        (
+            "/api/conv/removeUnreadMark",
+            json!({
+                "convsGroup": convs_group,
+                "convsUser": convs_user,
+                "convsGroupData": [],
+                "convsUserData": []
+            }),
+        )
+    };
+    let outer = json!({ "param": inner.to_string() });
+    let params = s.encoded_params(&outer)?;
+    let url = format!(
+        "{}{path}?{}",
+        s.domains.conversation,
+        s.common_params()
+    );
+    let resp = s.post_form(&url, format!("params={params}")).await?;
+    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+}
+
+/// Mute or unmute notifications for a conversation (`setMuteConversation` @ `compact-app-pc.js:14304409`, cmd `11288`).
+/// `duration_sec`: `3600` (1h), `14400` (4h), seconds until 8:00 AM, or `-1` (until reopened).
+/// `mute`: `true` -> `action = 1`, `false` -> `action = 2`.
+pub async fn set_mute_conversation(
+    s: &Session,
+    thread_id: &str,
+    is_group: bool,
+    duration_sec: i64,
+    mute: bool,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let clean = thread_id
+        .trim_start_matches("group_")
+        .trim_start_matches('g')
+        .trim_start_matches('G')
+        .trim();
+    let body = json!({
+        "toid": clean,
+        "duration": duration_sec,
+        "action": if mute { 1 } else { 2 },
+        "startTime": crate::login::unix_now(),
+        "muteType": if is_group { 2 } else { 1 },
+        "imei": s.imei
+    });
+    let params = s.encoded_params(&body)?;
+    let url = format!(
+        "{}/api/social/profile/setmute?{}",
+        s.domains.profile,
+        s.common_params()
+    );
+    let resp = s.post_form(&url, format!("params={params}")).await?;
+    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+}
+
+/// Hide or unhide a conversation (`updateItemHiddenChat` @ `compact-app-pc.js:14384423`, cmd `10049`).
+pub async fn set_hidden_conversation(
+    s: &Session,
+    thread_id: &str,
+    is_group: bool,
+    hide: bool,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let clean = thread_id
+        .trim_start_matches("group_")
+        .trim_start_matches('g')
+        .trim_start_matches('G')
+        .trim();
+    let entry = json!([{
+        "thread_id": clean,
+        "is_group": if is_group { 1 } else { 0 }
+    }]);
+    let (add_str, del_str) = if hide {
+        (entry.to_string(), "[]".to_string())
+    } else {
+        ("[]".to_string(), entry.to_string())
+    };
+    let body = json!({
+        "del_threads": del_str,
+        "add_threads": add_str,
+        "imei": s.imei
+    });
+    let params = s.encoded_params(&body)?;
+    let url = format!(
+        "{}/api/hiddenconvers/add-remove?{}",
+        s.domains.conversation,
+        s.common_params()
+    );
+    let resp = s.post_form(&url, format!("params={params}")).await?;
+    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+}
+
+/// Delete conversation history for me (`deleteOneOneConversationV2` / `deleteGroupConversationV2` @ `compact-app-pc.js:14374881`, cmd `11778` / `11835`).
+pub async fn delete_conversation(
+    s: &Session,
+    thread_id: &str,
+    is_group: bool,
+    last_cli_msg_id: &str,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let clean = thread_id
+        .trim_start_matches("group_")
+        .trim_start_matches('g')
+        .trim_start_matches('G')
+        .trim();
+    let cli_id = if last_cli_msg_id.is_empty() {
+        format!("{}", crate::login::unix_now() * 1000)
+    } else {
+        last_cli_msg_id.to_string()
+    };
+    if is_group {
+        let body = json!({
+            "grid": clean,
+            "cliMsgId": cli_id,
+            "conver": {},
+            "onlyMe": 1,
+            "imei": s.imei
+        });
+        let params = s.encoded_params(&body)?;
+        let url = format!(
+            "{}/api/group/deleteconver?{}",
+            s.domains.group,
+            s.common_params()
+        );
+        let resp = s.post_form(&url, format!("params={params}")).await?;
+        Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    } else {
+        let body = json!({
+            "toid": clean,
+            "cliMsgId": cli_id,
+            "conver": {},
+            "onlyMe": 1,
+            "imei": s.imei
+        });
+        let params = s.encoded_params(&body)?;
+        let url = format!(
+            "{}/api/message/deleteconver?{}",
+            s.domains.chat,
+            s.common_params()
+        );
+        let resp = s.post_form(&url, format!("params={params}")).await?;
+        Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

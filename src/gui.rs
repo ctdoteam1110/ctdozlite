@@ -152,6 +152,11 @@ pub enum GuiEvent {
         total: u64,
     },
     UpdateAppliedAndRestarting(String),
+    SocialProfileLoaded(Result<crate::feed::SocialUserProfile, String>),
+    SocialAvatarsLoaded(Result<Vec<crate::feed::FeedMedia>, String>),
+    SocialTimelineLoaded(
+        Result<(Vec<crate::feed::SocialUserProfile>, Vec<crate::feed::FeedItem>), String>,
+    ),
     LoggedOut,
 }
 
@@ -216,6 +221,13 @@ struct ImageViewerModal {
     pan: Vec2,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedModalTab {
+    Profile,
+    Avatars,
+    Packet50001,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
     General,
     Privacy,
@@ -267,6 +279,11 @@ struct AppSettings {
     // 7. Thiết bị cuộc gọi (Mic & Camera)
     selected_mic_device: String,
     selected_camera_device: String,
+    // 8. Quản lý hội thoại (Context menu: Ghim, Phân loại, Tắt thông báo, Ẩn)
+    pinned_threads: Vec<String>,
+    muted_threads: HashMap<String, i64>,
+    hidden_threads: HashSet<String>,
+    thread_labels: HashMap<String, String>,
 }
 
 impl Default for AppSettings {
@@ -311,6 +328,10 @@ impl Default for AppSettings {
             enable_sticker_keyword_search: true,
             selected_mic_device: String::new(),
             selected_camera_device: String::new(),
+            pinned_threads: Vec::new(),
+            muted_threads: HashMap::new(),
+            hidden_threads: HashSet::new(),
+            thread_labels: HashMap::new(),
         }
     }
 }
@@ -435,6 +456,25 @@ pub struct ZaloGuiApp {
     dev_tab: DevTab,
     selected_log: Option<LogEntry>,
     scanner_findings: Vec<ScanFinding>,
+    feed_modal_open: bool,
+    feed_modal_tab: FeedModalTab,
+    feed_target_uid: String,
+    feed_loading_profile: bool,
+    feed_profile: Option<crate::feed::SocialUserProfile>,
+    feed_profile_error: Option<String>,
+    feed_loading_avatars: bool,
+    feed_avatars: Vec<crate::feed::FeedMedia>,
+    feed_avatars_error: Option<String>,
+    feed_loading_timeline: bool,
+    feed_items: Vec<crate::feed::FeedItem>,
+    feed_friend_profiles: Vec<crate::feed::SocialUserProfile>,
+    feed_composer_text: String,
+    feed_search_query: String,
+    feed_pkt_owner_id: String,
+    feed_pkt_viewer_id: String,
+    feed_pkt_tab: u32,
+    feed_pkt_page: u32,
+    feed_pkt_count: u32,
 
     // Background channels
     event_rx: Receiver<GuiEvent>,
@@ -620,6 +660,25 @@ impl ZaloGuiApp {
             dev_tab: DevTab::Logs,
             selected_log: None,
             scanner_findings: Vec::new(),
+            feed_modal_open: false,
+            feed_modal_tab: FeedModalTab::Profile,
+            feed_target_uid: String::new(),
+            feed_loading_profile: false,
+            feed_profile: None,
+            feed_profile_error: None,
+            feed_loading_avatars: false,
+            feed_avatars: Vec::new(),
+            feed_avatars_error: None,
+            feed_loading_timeline: false,
+            feed_items: Vec::new(),
+            feed_friend_profiles: Vec::new(),
+            feed_composer_text: String::new(),
+            feed_search_query: String::new(),
+            feed_pkt_owner_id: String::new(),
+            feed_pkt_viewer_id: String::new(),
+            feed_pkt_tab: 0,
+            feed_pkt_page: 1,
+            feed_pkt_count: 20,
             event_rx: rx,
             event_tx: tx.clone(),
             chat_render_window: (String::new(), CHAT_RENDER_STEP),
@@ -1251,6 +1310,42 @@ impl ZaloGuiApp {
                     self.allow_quit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     std::process::exit(0);
+                }
+                GuiEvent::SocialProfileLoaded(res) => {
+                    self.feed_loading_profile = false;
+                    match res {
+                        Ok(prof) => {
+                            self.feed_profile = Some(prof);
+                            self.feed_profile_error = None;
+                        }
+                        Err(e) => {
+                            self.feed_profile_error = Some(e);
+                        }
+                    }
+                }
+                GuiEvent::SocialAvatarsLoaded(res) => {
+                    self.feed_loading_avatars = false;
+                    match res {
+                        Ok(photos) => {
+                            self.feed_avatars = photos;
+                            self.feed_avatars_error = None;
+                        }
+                        Err(e) => {
+                            self.feed_avatars_error = Some(e);
+                        }
+                    }
+                }
+                GuiEvent::SocialTimelineLoaded(res) => {
+                    self.feed_loading_timeline = false;
+                    match res {
+                        Ok((profiles, items)) => {
+                            self.feed_friend_profiles = profiles;
+                            self.feed_items = items;
+                        }
+                        Err(e) => {
+                            self.feed_profile_error = Some(e);
+                        }
+                    }
                 }
             }
         }

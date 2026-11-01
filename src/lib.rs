@@ -4,6 +4,7 @@ pub mod chat;
 pub mod clock;
 pub mod crypto;
 pub mod endpoints;
+pub mod feed;
 pub mod gui;
 pub mod logger;
 pub mod login;

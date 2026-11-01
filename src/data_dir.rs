@@ -44,7 +44,7 @@ pub fn resolve(
     }
     if let Some(path) = explicit {
         return Ok((
-            if path.is_absolute() {
+            if path.is_absolute() || path.to_str().is_some_and(|s| s.starts_with('/')) {
                 path
             } else {
                 cwd.join(path)
@@ -61,7 +61,7 @@ pub fn resolve(
         .is_some_and(|p| p.extension().is_some_and(|e| e == "app"));
     if macos && bundled {
         let home = home.context("Cần HOME để xác định Application Support")?;
-        if !home.is_absolute() {
+        if !home.is_absolute() && !home.to_str().is_some_and(|s| s.starts_with('/')) {
             bail!("HOME phải là đường dẫn tuyệt đối");
         }
         return Ok((home.join("Library/Application Support/ctdozlite"), true));

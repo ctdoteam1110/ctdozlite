@@ -61,6 +61,24 @@ impl ZaloGuiApp {
                             .add_sized(
                                 [200.0, 28.0],
                                 egui::Button::new(
+                                    RichText::new(format!("{}  Nhật ký & Hồ sơ Social", lucide::NEWSPAPER))
+                                        .size(12.2)
+                                        .color(pal.text_primary),
+                                )
+                                .fill(Color32::TRANSPARENT),
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            self.feed_modal_open = true;
+                            self.trigger_feed_timeline_load();
+                            close_menu = true;
+                        }
+
+                        if ui
+                            .add_sized(
+                                [200.0, 28.0],
+                                egui::Button::new(
                                     RichText::new(format!("{}  Đã đồng bộ đám mây", lucide::CHECK))
                                         .size(12.2)
                                         .color(pal.text_primary),
@@ -4229,6 +4247,906 @@ impl ZaloGuiApp {
                     ui.code("md5('zsecure' + tag + sorted_values)");
                     ui.end_row();
                 });
+            });
+    }
+
+    pub(super) fn trigger_feed_timeline_load(&mut self) {
+        if self.feed_loading_timeline {
+            return;
+        }
+        self.feed_loading_timeline = true;
+        let mut friend_uids = Vec::new();
+        let mut shared_media_by_uid: HashMap<String, Vec<crate::feed::FeedMedia>> = HashMap::new();
+        for t in &self.threads {
+            if !t.is_group && !t.name.contains("Cloud của tôi") {
+                friend_uids.push(t.id.clone());
+                let mut photos = Vec::new();
+                for m in t.messages.iter().rev() {
+                    let is_photo = m.link_src.as_deref() == Some("Hình ảnh Zalo")
+                        || m.text.trim() == "[Hình ảnh]"
+                        || m.text.trim().starts_with("[Hình ảnh] ");
+                    if !is_photo {
+                        continue;
+                    }
+                    if let Some(thumb) = m
+                        .link_thumb
+                        .as_deref()
+                        .or(m.link_url.as_deref())
+                        .filter(|u| !u.is_empty())
+                    {
+                        let full = m.link_url.as_deref().unwrap_or(thumb).to_string();
+                        photos.push(crate::feed::FeedMedia {
+                            photo_id: m.id.clone(),
+                            media_type: "image".to_string(),
+                            url: full,
+                            thumbnail: thumb.to_string(),
+                            width: 640,
+                            height: 480,
+                        });
+                        if photos.len() >= 6 {
+                            break;
+                        }
+                    }
+                }
+                if !photos.is_empty() {
+                    shared_media_by_uid.insert(t.id.clone(), photos);
+                }
+            }
+        }
+        if let Some(tx) = WORKER_TX.get() {
+            let _ = tx.send(WorkerCmd::FetchTimelineFeed {
+                friend_uids,
+                shared_media_by_uid,
+            });
+        }
+    }
+
+    pub(super) fn render_feed_page(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        // Left Friends / Filter Sidebar (280px)
+        egui::SidePanel::left("feed_friends_sidebar")
+            .resizable(false)
+            .exact_width(280.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(pal.bg_sidebar)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .inner_margin(Margin::symmetric(14.0, 14.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Tường nhà")
+                            .size(17.0)
+                            .color(pal.text_primary)
+                            .strong(),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                !self.feed_loading_timeline,
+                                egui::Button::new(
+                                    RichText::new(format!("{} Làm mới", lucide::REFRESH)).size(11.5),
+                                ),
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            self.trigger_feed_timeline_load();
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+
+                ui.add_sized(
+                    [ui.available_width(), 32.0],
+                    egui::TextEdit::singleline(&mut self.feed_search_query)
+                        .hint_text("🔍 Tìm kiếm bạn bè trên Nhật ký…"),
+                );
+                ui.add_space(10.0);
+
+                // All Timeline button
+                let all_selected = self.feed_target_uid.is_empty();
+                let all_btn = egui::Button::new(
+                    RichText::new(format!("{}  Nhật ký tất cả mọi người", lucide::NEWSPAPER))
+                        .size(12.8)
+                        .color(if all_selected {
+                            Color32::WHITE
+                        } else {
+                            pal.text_primary
+                        })
+                        .strong(),
+                )
+                .fill(if all_selected {
+                    pal.primary
+                } else {
+                    pal.bg_elevated
+                })
+                .rounding(Rounding::same(8.0))
+                .min_size(Vec2::new(ui.available_width(), 34.0));
+                if ui
+                    .add(all_btn)
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.feed_target_uid.clear();
+                    self.feed_profile = None;
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "BẠN BÈ TRÊN TƯỜNG NHÀ ({})",
+                        self.feed_friend_profiles.len()
+                    ))
+                    .size(11.0)
+                    .color(pal.text_muted)
+                    .strong(),
+                );
+                ui.add_space(6.0);
+
+                let q_low = self.feed_search_query.trim().to_lowercase();
+                let q_fold = fold_vn_search(&q_low);
+                let profiles_snap = self.feed_friend_profiles.clone();
+                egui::ScrollArea::vertical()
+                    .id_salt("feed_friends_scroll")
+                    .show(ui, |ui| {
+                        for prof in &profiles_snap {
+                            if !matches_vn_query(&prof.display_name, &q_low, &q_fold)
+                                && !matches_vn_query(&prof.status, &q_low, &q_fold)
+                            {
+                                continue;
+                            }
+                            let is_sel = self.feed_target_uid == prof.uid;
+                            let (row_rect, row_resp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 48.0),
+                                Sense::click(),
+                            );
+                            if is_sel {
+                                ui.painter().rect_filled(
+                                    row_rect,
+                                    Rounding::same(8.0),
+                                    pal.bg_selected,
+                                );
+                            } else if row_resp.hovered() {
+                                ui.painter().rect_filled(
+                                    row_rect,
+                                    Rounding::same(8.0),
+                                    pal.bg_hover,
+                                );
+                            }
+                            let av_c = Pos2::new(row_rect.left() + 24.0, row_rect.center().y);
+                            paint_user_avatar(
+                                ui.painter(),
+                                av_c,
+                                17.0,
+                                &prof.display_name,
+                                false,
+                                Some(&prof.avatar_url),
+                                &self.sticker_textures,
+                                &mut self.loading_stickers,
+                            );
+                            ui.painter().text(
+                                Pos2::new(row_rect.left() + 48.0, row_rect.top() + 15.0),
+                                egui::Align2::LEFT_CENTER,
+                                truncate_chars(&prof.display_name, 22),
+                                FontId::proportional(13.0),
+                                pal.text_primary,
+                            );
+                            let sub_line = if !prof.status.is_empty() {
+                                truncate_chars(&prof.status, 26).into_owned()
+                            } else if !prof.sdob.is_empty() {
+                                format!("🎂 {}", prof.sdob)
+                            } else {
+                                "Xem tường cá nhân".to_string()
+                            };
+                            ui.painter().text(
+                                Pos2::new(row_rect.left() + 48.0, row_rect.top() + 33.0),
+                                egui::Align2::LEFT_CENTER,
+                                sub_line,
+                                FontId::proportional(11.2),
+                                pal.text_secondary,
+                            );
+                            if row_resp
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                self.feed_target_uid = prof.uid.clone();
+                                self.feed_profile = Some(prof.clone());
+                            }
+                        }
+                    });
+            });
+
+        // Main Central Panel — Mobile-style Social Timeline Stream
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
+            .show(ctx, |ui| {
+                // Top Tab Bar: "Nhật Ký" | "Kho Ảnh Cá Nhân" | "Cấu trúc Cmd 50001"
+                egui::Frame::none()
+                    .fill(pal.bg_sidebar)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .inner_margin(Margin::symmetric(24.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (tab, title) in [
+                                (FeedModalTab::Profile, "Nhật Ký"),
+                                (FeedModalTab::Avatars, "Kho Ảnh Cá Nhân"),
+                                (FeedModalTab::Packet50001, "Giao thức Feed (Cmd 50001)"),
+                            ] {
+                                let active = self.feed_modal_tab == tab;
+                                let btn = egui::Button::new(
+                                    RichText::new(title)
+                                        .size(13.5)
+                                        .color(if active {
+                                            Color32::WHITE
+                                        } else {
+                                            pal.text_secondary
+                                        })
+                                        .strong(),
+                                )
+                                .fill(if active {
+                                    pal.primary
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .stroke(Stroke::NONE)
+                                .rounding(Rounding::same(8.0))
+                                .min_size(Vec2::new(150.0, 32.0));
+                                if ui
+                                    .add(btn)
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    self.feed_modal_tab = tab;
+                                    if tab == FeedModalTab::Avatars
+                                        && self.feed_avatars.is_empty()
+                                        && !self.feed_loading_avatars
+                                    {
+                                        self.feed_loading_avatars = true;
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let _ = tx.send(WorkerCmd::FetchMySocialAvatars {
+                                                page: 1,
+                                                count: 20,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    });
+
+                egui::ScrollArea::vertical()
+                    .id_salt("main_social_feed_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            let feed_col_w = (ui.available_width() - 40.0).clamp(380.0, 620.0);
+                            ui.set_max_width(feed_col_w);
+                            ui.add_space(16.0);
+
+                            match self.feed_modal_tab {
+                                FeedModalTab::Profile => {
+                                    self.render_feed_timeline_column(ui, pal, feed_col_w);
+                                }
+                                FeedModalTab::Avatars => {
+                                    self.render_feed_avatars_column(ui, pal, feed_col_w);
+                                }
+                                FeedModalTab::Packet50001 => {
+                                    self.render_feed_packet_column(ui, pal, feed_col_w);
+                                }
+                            }
+                            ui.add_space(32.0);
+                        });
+                    });
+            });
+    }
+
+    fn render_feed_timeline_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        pal: &ThemePalette,
+        col_w: f32,
+    ) {
+        // 1. Selected Friend Header Banner (if filtering by a specific friend)
+        if let Some(prof) = self.feed_profile.clone() {
+            egui::Frame::none()
+                .fill(pal.bg_elevated)
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .rounding(Rounding::same(14.0))
+                .inner_margin(Margin::same(16.0))
+                .show(ui, |ui| {
+                    ui.set_width(col_w - 32.0);
+                    if !prof.cover_url.is_empty() && !prof.cover_url.ends_with("/default") {
+                        let ckey = format!("cov_{}", crate::crypto::md5_hex(&prof.cover_url));
+                        if !self.sticker_textures.contains_key(&ckey)
+                            && self.loading_stickers.insert(ckey.clone())
+                        {
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(WorkerCmd::FetchStickerImage {
+                                    key: ckey.clone(),
+                                    url: prof.cover_url.clone(),
+                                });
+                            }
+                        }
+                        if let Some(tex) = self.sticker_textures.get(&ckey) {
+                            let w = ui.available_width();
+                            let resp = ui.add(
+                                egui::Image::new((tex.id(), Vec2::new(w, 180.0)))
+                                    .sense(Sense::click()),
+                            );
+                            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                let hd = self.request_hd_texture(&prof.cover_url);
+                                self.image_viewer = Some(ImageViewerModal {
+                                    tex_key: ckey,
+                                    hd_tex_key: hd,
+                                    full_url: prof.cover_url.clone(),
+                                    title: format!("Ảnh bìa của {}", prof.display_name),
+                                    sender: prof.display_name.clone(),
+                                    time: String::new(),
+                                    zoom: 1.0,
+                                    pan: Vec2::ZERO,
+                                });
+                            }
+                            ui.add_space(10.0);
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        let (av_r, _) =
+                            ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
+                        paint_user_avatar(
+                            ui.painter(),
+                            av_r.center(),
+                            28.0,
+                            &prof.display_name,
+                            false,
+                            Some(&prof.avatar_url),
+                            &self.sticker_textures,
+                            &mut self.loading_stickers,
+                        );
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(&prof.display_name)
+                                    .size(16.5)
+                                    .color(pal.text_primary)
+                                    .strong(),
+                            );
+                            if !prof.status.is_empty() {
+                                ui.label(
+                                    RichText::new(&prof.status)
+                                        .size(13.0)
+                                        .color(pal.text_secondary),
+                                );
+                            }
+                            ui.label(
+                                RichText::new(format!(
+                                    "UID: {} · Ngày sinh: {}",
+                                    prof.uid,
+                                    if prof.sdob.is_empty() {
+                                        "Ẩn"
+                                    } else {
+                                        &prof.sdob
+                                    }
+                                ))
+                                .size(11.5)
+                                .color(pal.text_muted),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Xem tất cả mọi người").clicked() {
+                                self.feed_target_uid.clear();
+                                self.feed_profile = None;
+                            }
+                        });
+                    });
+                });
+            ui.add_space(14.0);
+        }
+
+        // 2. "Hôm nay bạn thế nào?" Composer Card (matching Zalo Mobile screenshot)
+        egui::Frame::none()
+            .fill(pal.bg_elevated)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(14.0))
+            .inner_margin(Margin::same(14.0))
+            .show(ui, |ui| {
+                ui.set_width(col_w - 28.0);
+                ui.horizontal(|ui| {
+                    let (av_r, _) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
+                    let my_disp = if self.user_name.is_empty() {
+                        "Tôi"
+                    } else {
+                        &self.user_name
+                    };
+                    paint_user_avatar(
+                        ui.painter(),
+                        av_r.center(),
+                        19.0,
+                        my_disp,
+                        false,
+                        self.user_avatar.as_deref(),
+                        &self.sticker_textures,
+                        &mut self.loading_stickers,
+                    );
+                    ui.add_sized(
+                        [ui.available_width() - 90.0, 34.0],
+                        egui::TextEdit::singleline(&mut self.feed_composer_text)
+                            .hint_text("Hôm nay bạn thế nào?"),
+                    );
+                    let post_btn = egui::Button::new(
+                        RichText::new("Đăng bài")
+                            .size(12.2)
+                            .color(Color32::WHITE)
+                            .strong(),
+                    )
+                    .fill(pal.primary)
+                    .rounding(Rounding::same(8.0));
+                    if ui
+                        .add_enabled(!self.feed_composer_text.trim().is_empty(), post_btn)
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        let txt = self.feed_composer_text.trim().to_string();
+                        self.feed_composer_text.clear();
+                        self.feed_items.insert(
+                            0,
+                            crate::feed::FeedItem {
+                                feed_id: format!("local_{}", crate::login::unix_now()),
+                                author: crate::feed::FeedAuthor {
+                                    uid: self.user_uin.clone(),
+                                    display_name: self.user_name.clone(),
+                                    avatar_url: self.user_avatar.clone().unwrap_or_default(),
+                                },
+                                date_str: "Vừa xong".to_string(),
+                                content: txt,
+                                status_badge: None,
+                                media_list: Vec::new(),
+                                reaction: crate::feed::FeedReaction {
+                                    like_count: 1,
+                                    comment_count: 0,
+                                    is_liked: true,
+                                    top_reactions: vec!["❤️".to_string()],
+                                },
+                                comments: Vec::new(),
+                            },
+                        );
+                    }
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    for (badge_lbl, badge_col) in [
+                        ("🖼 Ảnh", Color32::from_rgb(76, 175, 80)),
+                        ("📹 Video", Color32::from_rgb(233, 30, 99)),
+                        ("📁 Album", Color32::from_rgb(33, 150, 243)),
+                        ("🎨 Nền chữ", Color32::from_rgb(156, 39, 176)),
+                    ] {
+                        let b = egui::Button::new(
+                            RichText::new(badge_lbl).size(11.8).color(pal.text_primary),
+                        )
+                        .fill(pal.bg_input)
+                        .stroke(Stroke::new(1.0_f32, badge_col.linear_multiply(0.5)))
+                        .rounding(Rounding::same(16.0));
+                        if ui.add(b).clicked() {
+                            self.feed_modal_tab = FeedModalTab::Avatars;
+                            if self.feed_avatars.is_empty() && !self.feed_loading_avatars {
+                                self.feed_loading_avatars = true;
+                                if let Some(tx) = WORKER_TX.get() {
+                                    let _ = tx.send(WorkerCmd::FetchMySocialAvatars {
+                                        page: 1,
+                                        count: 20,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+
+        ui.add_space(14.0);
+
+        if self.feed_loading_timeline && self.feed_items.is_empty() {
+            ui.label(
+                RichText::new("⏳ Đang đồng bộ Nhật ký & bài đăng của bạn bè…")
+                    .size(13.5)
+                    .color(pal.text_secondary),
+            );
+            return;
+        }
+
+        let q_low = self.feed_search_query.trim().to_lowercase();
+        let q_fold = fold_vn_search(&q_low);
+        let target_filter = self.feed_target_uid.clone();
+        let mut clicked_image: Option<(String, String, String, String)> = None;
+        let mut liked_idx: Option<usize> = None;
+        let mut select_uid: Option<String> = None;
+
+        let items_len = self.feed_items.len();
+        for idx in 0..items_len {
+            let item = self.feed_items[idx].clone();
+            if !target_filter.is_empty() && item.author.uid != target_filter {
+                continue;
+            }
+            if !matches_vn_query(&item.author.display_name, &q_low, &q_fold)
+                && !matches_vn_query(&item.content, &q_low, &q_fold)
+            {
+                continue;
+            }
+
+            egui::Frame::none()
+                .fill(pal.bg_elevated)
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .rounding(Rounding::same(14.0))
+                .inner_margin(Margin::same(16.0))
+                .show(ui, |ui| {
+                    ui.set_width(col_w - 32.0);
+
+                    // Author Row
+                    ui.horizontal(|ui| {
+                        let (av_r, av_resp) =
+                            ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
+                        paint_user_avatar(
+                            ui.painter(),
+                            av_r.center(),
+                            20.0,
+                            &item.author.display_name,
+                            false,
+                            Some(&item.author.avatar_url),
+                            &self.sticker_textures,
+                            &mut self.loading_stickers,
+                        );
+                        if av_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            select_uid = Some(item.author.uid.clone());
+                        }
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                let name_resp = ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&item.author.display_name)
+                                            .size(14.2)
+                                            .color(pal.primary_hover)
+                                            .strong(),
+                                    )
+                                    .sense(Sense::click()),
+                                );
+                                if name_resp
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    select_uid = Some(item.author.uid.clone());
+                                }
+                                if let Some(badge) = &item.status_badge {
+                                    ui.label(
+                                        RichText::new(format!("· {badge}"))
+                                            .size(11.5)
+                                            .color(pal.text_muted),
+                                    );
+                                }
+                            });
+                            ui.label(
+                                RichText::new(&item.date_str)
+                                    .size(11.5)
+                                    .color(pal.text_muted),
+                            );
+                        });
+                    });
+
+                    ui.add_space(10.0);
+
+                    // Post Content
+                    ui.label(
+                        RichText::new(&item.content)
+                            .size(13.8)
+                            .color(pal.text_primary),
+                    );
+
+                    // Media Collage Grid
+                    if !item.media_list.is_empty() {
+                        ui.add_space(10.0);
+                        let media_cnt = item.media_list.len();
+                        let avail_w = ui.available_width();
+                        if media_cnt == 1 {
+                            let m = &item.media_list[0];
+                            let mkey = format!("fmed_{}", crate::crypto::md5_hex(&m.thumbnail));
+                            if !self.sticker_textures.contains_key(&mkey)
+                                && self.loading_stickers.insert(mkey.clone())
+                            {
+                                if let Some(tx) = WORKER_TX.get() {
+                                    let _ = tx.send(WorkerCmd::FetchStickerImage {
+                                        key: mkey.clone(),
+                                        url: m.thumbnail.clone(),
+                                    });
+                                }
+                            }
+                            let (r, resp) = ui.allocate_exact_size(
+                                Vec2::new(avail_w, 260.0),
+                                Sense::click(),
+                            );
+                            if let Some(tex) = self.sticker_textures.get(&mkey) {
+                                ui.painter().image(
+                                    tex.id(),
+                                    r,
+                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+                            } else {
+                                ui.painter()
+                                    .rect_filled(r, Rounding::same(10.0), pal.bg_input);
+                            }
+                            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                clicked_image = Some((
+                                    mkey,
+                                    m.url.clone(),
+                                    item.content.clone(),
+                                    item.author.display_name.clone(),
+                                ));
+                            }
+                        } else {
+                            let cell_w = ((avail_w - 12.0) / 3.0).max(96.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                                for m in item.media_list.iter().take(6) {
+                                    let mkey =
+                                        format!("fmed_{}", crate::crypto::md5_hex(&m.thumbnail));
+                                    if !self.sticker_textures.contains_key(&mkey)
+                                        && self.loading_stickers.insert(mkey.clone())
+                                    {
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let _ = tx.send(WorkerCmd::FetchStickerImage {
+                                                key: mkey.clone(),
+                                                url: m.thumbnail.clone(),
+                                            });
+                                        }
+                                    }
+                                    let (r, resp) = ui.allocate_exact_size(
+                                        Vec2::new(cell_w, cell_w),
+                                        Sense::click(),
+                                    );
+                                    if let Some(tex) = self.sticker_textures.get(&mkey) {
+                                        ui.painter().image(
+                                            tex.id(),
+                                            r,
+                                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                            Color32::WHITE,
+                                        );
+                                    } else {
+                                        ui.painter().rect_filled(
+                                            r,
+                                            Rounding::same(8.0),
+                                            pal.bg_input,
+                                        );
+                                    }
+                                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                        clicked_image = Some((
+                                            mkey,
+                                            m.url.clone(),
+                                            item.content.clone(),
+                                            item.author.display_name.clone(),
+                                        ));
+                                    }
+                                }
+                            });
+                        }
+                    }
+
+                    ui.add_space(12.0);
+
+                    // Reaction & Comment Footer Bar (matching Zalo Mobile pills)
+                    ui.horizontal(|ui| {
+                        let like_lbl = if item.reaction.is_liked {
+                            format!("❤️ Đã thích · {}", item.reaction.like_count)
+                        } else {
+                            format!("🤍 Thích  |  ❤️ {}", item.reaction.like_count)
+                        };
+                        let like_btn = egui::Button::new(
+                            RichText::new(like_lbl).size(12.0).color(if item.reaction.is_liked {
+                                pal.danger
+                            } else {
+                                pal.text_primary
+                            }),
+                        )
+                        .fill(pal.bg_input)
+                        .rounding(Rounding::same(16.0));
+                        if ui
+                            .add(like_btn)
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            liked_idx = Some(idx);
+                        }
+
+                        let cmt_btn = egui::Button::new(
+                            RichText::new(format!(
+                                "{} {}",
+                                lucide::MESSAGE_SQUARE,
+                                item.reaction.comment_count
+                            ))
+                            .size(12.0)
+                            .color(pal.text_secondary),
+                        )
+                        .fill(pal.bg_input)
+                        .rounding(Rounding::same(16.0));
+                        let _ = ui.add(cmt_btn);
+                    });
+                });
+
+            ui.add_space(14.0);
+        }
+
+        if let Some(i) = liked_idx {
+            if let Some(it) = self.feed_items.get_mut(i) {
+                it.reaction.is_liked = !it.reaction.is_liked;
+                if it.reaction.is_liked {
+                    it.reaction.like_count = it.reaction.like_count.saturating_add(1);
+                } else {
+                    it.reaction.like_count = it.reaction.like_count.saturating_sub(1);
+                }
+            }
+        }
+        if let Some(uid) = select_uid {
+            self.feed_target_uid = uid.clone();
+            if let Some(p) = self
+                .feed_friend_profiles
+                .iter()
+                .find(|p| p.uid == uid)
+                .cloned()
+            {
+                self.feed_profile = Some(p);
+            }
+        }
+        if let Some((tkey, full_u, title, sender)) = clicked_image {
+            let hd = self.request_hd_texture(&full_u);
+            self.image_viewer = Some(ImageViewerModal {
+                tex_key: tkey,
+                hd_tex_key: hd,
+                full_url: full_u,
+                title,
+                sender,
+                time: String::new(),
+                zoom: 1.0,
+                pan: Vec2::ZERO,
+            });
+        }
+    }
+
+    fn render_feed_avatars_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        pal: &ThemePalette,
+        col_w: f32,
+    ) {
+        egui::Frame::none()
+            .fill(pal.bg_elevated)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(14.0))
+            .inner_margin(Margin::same(16.0))
+            .show(ui, |ui| {
+                ui.set_width(col_w - 32.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "Kho ảnh Nhật ký cá nhân ({} ảnh)",
+                            self.feed_avatars.len()
+                        ))
+                        .size(14.5)
+                        .color(pal.text_primary)
+                        .strong(),
+                    );
+                    if ui
+                        .add_enabled(
+                            !self.feed_loading_avatars,
+                            egui::Button::new(RichText::new("Làm mới").size(12.0)),
+                        )
+                        .clicked()
+                    {
+                        self.feed_loading_avatars = true;
+                        if let Some(tx) = WORKER_TX.get() {
+                            let _ = tx.send(WorkerCmd::FetchMySocialAvatars {
+                                page: 1,
+                                count: 20,
+                            });
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+                let avatars_snap = self.feed_avatars.clone();
+                ui.horizontal_wrapped(|ui| {
+                    for item in &avatars_snap {
+                        let tkey = format!("fava_{}", crate::crypto::md5_hex(&item.thumbnail));
+                        if !self.sticker_textures.contains_key(&tkey)
+                            && self.loading_stickers.insert(tkey.clone())
+                        {
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(WorkerCmd::FetchStickerImage {
+                                    key: tkey.clone(),
+                                    url: item.thumbnail.clone(),
+                                });
+                            }
+                        }
+                        let (r, resp) =
+                            ui.allocate_exact_size(Vec2::splat(130.0), Sense::click());
+                        if let Some(tex) = self.sticker_textures.get(&tkey) {
+                            ui.painter().image(
+                                tex.id(),
+                                r,
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        } else {
+                            ui.painter()
+                                .rect_filled(r, Rounding::same(8.0), pal.bg_input);
+                        }
+                        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            let hd = self.request_hd_texture(&item.url);
+                            self.image_viewer = Some(ImageViewerModal {
+                                tex_key: tkey,
+                                hd_tex_key: hd,
+                                full_url: item.url.clone(),
+                                title: format!("Ảnh Nhật ký ({})", item.photo_id),
+                                sender: self.user_name.clone(),
+                                time: String::new(),
+                                zoom: 1.0,
+                                pan: Vec2::ZERO,
+                            });
+                        }
+                    }
+                });
+            });
+    }
+
+    fn render_feed_packet_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        pal: &ThemePalette,
+        col_w: f32,
+    ) {
+        egui::Frame::none()
+            .fill(pal.bg_elevated)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(14.0))
+            .inner_margin(Margin::same(16.0))
+            .show(ui, |ui| {
+                ui.set_width(col_w - 32.0);
+                ui.horizontal(|ui| {
+                    ui.label("Owner UID:");
+                    ui.add_sized(
+                        [140.0, 26.0],
+                        egui::TextEdit::singleline(&mut self.feed_pkt_owner_id),
+                    );
+                    ui.label("Viewer UID:");
+                    ui.add_sized(
+                        [140.0, 26.0],
+                        egui::TextEdit::singleline(&mut self.feed_pkt_viewer_id),
+                    );
+                });
+                ui.add_space(6.0);
+                let owner_u64 = self.feed_pkt_owner_id.trim().parse::<u64>().unwrap_or(0);
+                let viewer_u64 = self.feed_pkt_viewer_id.trim().parse::<u64>().unwrap_or(0);
+                let payload = crate::feed::packet::build_get_feed_payload(
+                    owner_u64,
+                    viewer_u64,
+                    self.feed_pkt_tab,
+                    self.feed_pkt_page,
+                    self.feed_pkt_count,
+                );
+                let req_pkt = crate::feed::packet::build_request_packet(
+                    crate::feed::packet::CMD_FEED_TIMELINE,
+                    crate::feed::packet::SUBCMD_GET_FEED,
+                    &payload,
+                );
+                let hex_str: String = req_pkt
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                ui.code(&hex_str);
+                if ui
+                    .button(format!("{} Sao chép Hex Packet", lucide::COPY))
+                    .clicked()
+                {
+                    ui.ctx().copy_text(hex_str);
+                    self.show_toast("Đã sao chép gói tin Command 50001 vào clipboard");
+                }
             });
     }
 }
