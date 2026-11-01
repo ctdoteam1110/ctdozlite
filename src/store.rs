@@ -128,14 +128,19 @@ impl MessageStore {
         Ok(())
     }
 
-    /// Retrieve up to `limit` messages for a thread ordered by timestamp ascending.
+    /// Retrieve the newest `limit` messages for a thread, ordered by timestamp ascending.
     pub fn messages_for(&self, thread_id: &str, limit: usize) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
+            // Newest `limit` rows, returned oldest-first. `ORDER BY ts ASC LIMIT` handed back the
+            // *oldest* rows, so a thread longer than the limit reopened on stale messages.
             "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
-             FROM messages
-             WHERE thread_id = ?1
-             ORDER BY ts ASC
-             LIMIT ?2",
+             FROM (
+                 SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
+                 FROM messages
+                 WHERE thread_id = ?1
+                 ORDER BY ts DESC
+                 LIMIT ?2
+             ) ORDER BY ts ASC",
         )?;
 
         let rows = stmt.query_map(params![thread_id, limit as i64], |row| {
@@ -503,6 +508,16 @@ impl From<&ChatMessage> for StoredMessage {
 
 /// Persist threads and their messages to SQLite store, returning the count of newly inserted messages.
 pub fn persist_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
+    // One transaction for the whole snapshot: in autocommit every row was its own fsync.
+    store.conn.execute_batch("BEGIN")?;
+    let res = persist_threads_inner(store, threads);
+    store
+        .conn
+        .execute_batch(if res.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+    res
+}
+
+fn persist_threads_inner(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
     let mut new_count = 0;
     for t in threads {
         let last_ts = t.messages.iter().map(|m| m.ts).max().unwrap_or(0);
@@ -609,6 +624,10 @@ mod tests {
         assert_eq!(msgs[1].msg_id, "m1");
         assert_eq!(msgs[2].ts, 300);
         assert_eq!(msgs[2].msg_id, "m3");
+
+        // A limit keeps the *newest* rows, still returned oldest-first.
+        let newest = store.messages_for(thread_id, 2).unwrap();
+        assert_eq!(newest.iter().map(|m| m.ts).collect::<Vec<_>>(), vec![200, 300]);
     }
 
     #[test]
