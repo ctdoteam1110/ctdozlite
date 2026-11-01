@@ -228,6 +228,7 @@ impl ZaloGuiApp {
                                     let _ = tx.send(WorkerCmd::LoadGroupHistory {
                                         group_id: gid,
                                         is_group: true,
+                                        have: 0,
                                     });
                                 }
                             }
@@ -291,6 +292,7 @@ impl ZaloGuiApp {
                                 let _ = tx.send(WorkerCmd::LoadGroupHistory {
                                     group_id: cid,
                                     is_group: false,
+                                    have: 0,
                                 });
                             }
                         }
@@ -684,6 +686,7 @@ impl ZaloGuiApp {
                                                 let _ = tx.send(WorkerCmd::LoadGroupHistory {
                                                     group_id: gid,
                                                     is_group: true,
+                                                    have: 0,
                                                 });
                                             }
                                         }
@@ -1210,6 +1213,7 @@ impl ZaloGuiApp {
                             let _ = tx.send(WorkerCmd::LoadGroupHistory {
                                 group_id: tid,
                                 is_group,
+                                have: 0,
                             });
                         }
                     }
@@ -1380,6 +1384,7 @@ impl ZaloGuiApp {
                                                 let _ = tx.send(WorkerCmd::LoadGroupHistory {
                                                     group_id: d_id.clone(),
                                                     is_group: d_is_group,
+                                                    have: d_msg_count,
                                                 });
                                             }
                                             self.show_toast("Đang đồng bộ lịch sử hội thoại…");
@@ -2525,6 +2530,7 @@ impl ZaloGuiApp {
                                                                 WorkerCmd::LoadGroupHistory {
                                                                     group_id: thread_id.clone(),
                                                                     is_group,
+                                                                    have: thread.messages.len(),
                                                                 },
                                                             );
                                                         }

@@ -1188,12 +1188,19 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::same(14.0))
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Zalo lưu trữ và đồng bộ dữ liệu lịch sử tin nhắn với đám mây Zalo và SQLite cục bộ (zalo_history.db).").color(pal.text_primary).size(13.0));
+                                                        ui.label(RichText::new("Tải lịch sử cũ của các nhóm và Cloud của tôi từ máy chủ Zalo về zalo_history.db, mỗi lần tối đa 1.000 tin/hội thoại; bấm lần nữa để lùi xa hơn.").color(pal.text_primary).size(13.0));
+                                                        ui.add_space(4.0);
+                                                        ui.label(RichText::new("Zalo không cho tải lịch sử cũ của chat 1-1 qua máy chủ; tin 1-1 chỉ có từ lúc đăng nhập app.").color(pal.text_secondary).size(12.2));
                                                         ui.add_space(4.0);
                                                         let total_msgs: usize = self.threads.iter().map(|t| t.messages.len()).sum();
                                                         ui.label(RichText::new(format!("Hiện có {} hội thoại ({total_msgs} tin nhắn) trong bộ nhớ.", self.threads.len())).color(pal.text_secondary).size(12.2));
                                                         ui.add_space(10.0);
-                                                        if ui.button(RichText::new(format!("{} Đồng bộ ngay", lucide::REFRESH)).size(13.0).strong()).clicked() {
+                                                        if crate::history_sync::RUNNING.load(std::sync::atomic::Ordering::Relaxed) {
+                                                            ui.label(RichText::new(&self.status_msg).color(pal.primary_hover).size(12.5));
+                                                            if ui.button(RichText::new("Dừng").size(13.0)).clicked() {
+                                                                crate::history_sync::CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+                                                            }
+                                                        } else if ui.button(RichText::new(format!("{} Đồng bộ ngay", lucide::REFRESH)).size(13.0).strong()).clicked() {
                                                             trigger_sync = true;
                                                         }
                                                     });
@@ -2136,10 +2143,17 @@ impl ZaloGuiApp {
             });
         }
         if trigger_sync {
+            let threads: Vec<(String, String, bool)> = self
+                .threads
+                .iter()
+                .filter(|t| t.is_group || t.name.contains("Cloud của tôi"))
+                .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
+                .collect();
+            let n = threads.len();
             if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::RefreshThreads);
+                let _ = tx.send(WorkerCmd::SyncHistory { threads });
             }
-            self.show_toast("Đang đồng bộ dữ liệu hội thoại từ máy chủ Zalo…");
+            self.show_toast(format!("Bắt đầu đồng bộ lịch sử {n} hội thoại nhóm/Cloud…"));
         }
         if pick_dl_dir {
             if let Some(folder) = pick_native_file_dialog(false) {

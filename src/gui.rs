@@ -139,6 +139,11 @@ pub enum GuiEvent {
         reason: String,
     },
     StatusUpdate(String),
+    SyncFinished {
+        added: usize,
+        errors: Vec<String>,
+        cancelled: bool,
+    },
     UpdateCheckFinished {
         result: Result<UpdateCheckResult, String>,
         silent: bool,
@@ -1200,6 +1205,23 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::StatusUpdate(msg) => {
                     self.status_msg = msg;
+                }
+                GuiEvent::SyncFinished {
+                    added,
+                    errors,
+                    cancelled,
+                } => {
+                    let head = if cancelled {
+                        "Đã dừng đồng bộ"
+                    } else {
+                        "Đồng bộ xong"
+                    };
+                    let mut msg = format!("{head}: lưu thêm {added} tin cũ");
+                    if let Some(first) = errors.first() {
+                        msg.push_str(&format!(" · {} lỗi (vd. {first})", errors.len()));
+                    }
+                    self.status_msg = msg.clone();
+                    self.show_toast(msg);
                 }
                 GuiEvent::UpdateCheckFinished { result, silent } => {
                     self.update_checking = false;

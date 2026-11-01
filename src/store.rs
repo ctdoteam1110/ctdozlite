@@ -117,7 +117,7 @@ impl MessageStore {
              ON CONFLICT(thread_id) DO UPDATE SET
                  name = excluded.name,
                  is_group = excluded.is_group,
-                 last_ts = excluded.last_ts",
+                 last_ts = MAX(COALESCE(last_ts, 0), excluded.last_ts)",
             params![
                 t.thread_id,
                 t.name,
@@ -126,6 +126,20 @@ impl MessageStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Id of the oldest stored server message in a thread, where a history sync resumes from.
+    /// Local ids (`out_*`, `{thread}_{ts}`) are skipped: the server rejects them as cursors.
+    pub fn oldest_msg_id(&self, thread_id: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT msg_id FROM messages
+                 WHERE thread_id = ?1 AND msg_id <> '' AND msg_id NOT GLOB '*[^0-9]*'
+                 ORDER BY ts ASC LIMIT 1",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .ok()
     }
 
     /// Retrieve the newest `limit` messages for a thread, ordered by timestamp ascending.
@@ -628,6 +642,39 @@ mod tests {
         // A limit keeps the *newest* rows, still returned oldest-first.
         let newest = store.messages_for(thread_id, 2).unwrap();
         assert_eq!(newest.iter().map(|m| m.ts).collect::<Vec<_>>(), vec![200, 300]);
+    }
+
+    #[test]
+    fn oldest_msg_id_skips_local_ids_and_last_ts_never_goes_back() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        for (id, ts) in [("out_1", 50), ("g1_60", 60), ("1002", 100), ("1003", 300)] {
+            store
+                .upsert_message(&StoredMessage {
+                    msg_id: id.into(),
+                    thread_id: "g1".into(),
+                    sender_id: "u1".into(),
+                    sender_name: "User".into(),
+                    text: id.into(),
+                    msg_type: "chat.text".into(),
+                    ts,
+                    is_outgoing: false,
+                    raw_json: "".into(),
+                })
+                .unwrap();
+        }
+        assert_eq!(store.oldest_msg_id("g1").as_deref(), Some("1002"));
+        assert_eq!(store.oldest_msg_id("missing"), None);
+
+        // Persisting a page of older history must not move the thread down the list.
+        let st = |last_ts| StoredThread {
+            thread_id: "g1".into(),
+            name: "Nhóm".into(),
+            is_group: true,
+            last_ts,
+        };
+        store.upsert_thread(&st(300)).unwrap();
+        store.upsert_thread(&st(100)).unwrap();
+        assert_eq!(store.all_threads().unwrap()[0].last_ts, 300);
     }
 
     #[test]

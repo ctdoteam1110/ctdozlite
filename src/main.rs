@@ -10,6 +10,7 @@ mod chat;
 mod crypto;
 mod endpoints;
 mod gui;
+mod history_sync;
 mod logger;
 mod login;
 mod media;
