@@ -465,14 +465,14 @@ pub(crate) mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let task = run(scope, async {
-            spawn_blocking(move || {
+            (spawn_blocking(move || {
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 crate::store::MessageStore::open(stale_path.to_str().unwrap()).is_err()
-            })
+            }),)
         })
         .await
-        .unwrap();
+        .unwrap().0;
         started_rx.await.unwrap();
         registry().invalidate_now();
         transition("account-b").unwrap();
@@ -490,7 +490,7 @@ pub(crate) mod tests {
         let effects = Arc::new(Mutex::new(Vec::new()));
         let writes = effects.clone();
         let task = run(scope, async {
-            spawn_blocking(move || {
+            (spawn_blocking(move || {
                 let _guard = mutation().unwrap();
                 // Reentrant store calls cannot deadlock behind a transition waiting on the barrier.
                 let mut store = crate::store::MessageStore::open(":memory:").unwrap();
@@ -498,10 +498,10 @@ pub(crate) mod tests {
                 release_rx.recv().unwrap();
                 crate::store::persist_threads(&mut store, &[]).unwrap();
                 writes.lock().unwrap().push("write");
-            })
+            }),)
         })
         .await
-        .unwrap();
+        .unwrap().0;
         started_rx.await.unwrap();
         let cleanup = effects.clone();
         let transition_task = tokio::task::spawn_blocking(move || {

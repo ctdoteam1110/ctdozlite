@@ -72,8 +72,11 @@ fn catalog() -> &'static Catalog {
         }
     })
 }
+fn original_pack() -> &'static [u8] {
+    PACK
+}
 fn sprite_image(sprite: u16) -> Option<ImageKey> {
-    if !PACK.is_empty() && catalog().index.sprites.get(sprite as usize).is_some() {
+    if !original_pack().is_empty() && catalog().index.sprites.get(sprite as usize).is_some() {
         Some(ImageKey::Original(sprite))
     } else {
         catalog()
@@ -153,7 +156,7 @@ fn unicode_image(cluster: &str) -> Option<ImageKey> {
         return None;
     } // Explicit text presentation.
     if let Some(&sprite) = catalog().index.unicode.get(cluster) {
-        return if PACK.is_empty() {
+        return if original_pack().is_empty() {
             Some(ImageKey::Native(cluster.to_owned()))
         } else {
             sprite_image(sprite)
