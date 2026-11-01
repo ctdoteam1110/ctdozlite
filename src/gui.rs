@@ -360,6 +360,23 @@ impl AppSettings {
 }
 
 
+/// A loaded-message jump stays bound to its conversation and exact reference.
+struct QuoteJump {
+    thread_id: String,
+    reference: String,
+    highlight_until: std::time::Instant,
+    scroll_pending: bool,
+}
+
+impl QuoteJump {
+    fn target_index(&self, thread_id: &str, messages: &[ChatMessage]) -> Option<usize> {
+        if self.thread_id != thread_id || std::time::Instant::now() >= self.highlight_until {
+            return None;
+        }
+        crate::message_navigation::unique_reference_index(messages, &self.reference)
+    }
+}
+
 /// Bubbles rendered per step in the chat view; "Tải thêm tin nhắn cũ" adds another step.
 const CHAT_RENDER_STEP: usize = 150;
 
@@ -515,6 +532,7 @@ pub struct ZaloGuiApp {
     event_tx: Sender<GuiEvent>,
     /// (thread id, number of newest bubbles rendered) — see `CHAT_RENDER_STEP`.
     chat_render_window: (String, usize),
+    quote_jump: Option<QuoteJump>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -716,6 +734,7 @@ impl ZaloGuiApp {
             event_rx: rx,
             event_tx: tx.clone(),
             chat_render_window: (String::new(), CHAT_RENDER_STEP),
+            quote_jump: None,
         };
         let mut app = app;
         let _ = app.reload_custom_sticker_packs();
