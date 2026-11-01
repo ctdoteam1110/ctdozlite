@@ -52,3 +52,6 @@ pub mod store_v2;
 pub mod read_receipts;
 /// Strict source-derived remote delivery and read receipt parsing.
 pub mod delivery_receipts;
+
+/// Account-owned durable composer state without automatic resend.
+pub mod composer_store;
