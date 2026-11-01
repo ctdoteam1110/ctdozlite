@@ -25,6 +25,7 @@ pub(super) enum Request {
     Load(Vec<Thread>),
     Persist(Vec<Thread>),
     Reconcile(Vec<Thread>),
+    CachedDelta(Vec<Thread>),
     Page {
         thread: String,
         before: Option<HistoryCursor>,
@@ -133,6 +134,67 @@ pub(super) async fn execute(
             Request::Persist(threads) => {
                 let stats = store.persist_threads(&threads)?;
                 Ok(Reply::Written(stats.inserted))
+            }
+            Request::CachedDelta(threads) => {
+                // Reconcile transferred cache rows inside the serialized transaction lane.
+                // A transfer is enrichment, never a new network event or unread snapshot.
+                let metadata = store.all_thread_metadata()?;
+                let mut merged = Vec::with_capacity(threads.len());
+                for incoming in threads {
+                    let prior = metadata.iter().find(|thread| thread.id == incoming.id);
+                    let mut target = prior.cloned().unwrap_or_else(|| Thread {
+                        id: incoming.id.clone(),
+                        name: incoming.name.clone(),
+                        avatar: incoming.avatar.clone(),
+                        is_group: incoming.is_group,
+                        ..Default::default()
+                    });
+                    for mut message in incoming.messages {
+                        if let Some(existing) = store.message_for(&target.id, &message)? {
+                            // AccountStore validated the exact server/client namespace above.
+                            message.id = existing.id.clone();
+                            let mut holder = Thread {
+                                id: target.id.clone(),
+                                messages: vec![existing],
+                                ..Default::default()
+                            };
+                            crate::chat::merge_cached_messages(&mut holder, vec![message]);
+                            anyhow::ensure!(
+                                holder.messages.len() == 1,
+                                "Ambiguous cached identity"
+                            );
+                            target.messages.extend(holder.messages);
+                        } else {
+                            target.messages.push(message);
+                        }
+                    }
+                    merged.push(target);
+                }
+                store.persist_threads(&merged)?;
+                // Read the durable result, not the input, so tombstones cannot be resurrected.
+                let metadata = store.all_thread_metadata()?;
+                let mut projection = Vec::new();
+                for incoming in merged {
+                    let Some(mut thread) = metadata.iter().find(|t| t.id == incoming.id).cloned()
+                    else {
+                        continue;
+                    };
+                    for message in &incoming.messages {
+                        if let Some(message) = store.message_for(&thread.id, message)? {
+                            if !thread.messages.iter().any(|m| m.id == message.id) {
+                                thread.messages.push(message);
+                            }
+                        }
+                    }
+                    thread
+                        .messages
+                        .sort_by(|a, b| (a.ts, &a.id).cmp(&(b.ts, &b.id)));
+                    if thread.messages.len() > 200 {
+                        thread.messages.drain(..thread.messages.len() - 200);
+                    }
+                    projection.push(thread);
+                }
+                Ok(Reply::Threads(projection))
             }
             Request::Reconcile(mut threads) => {
                 store.persist_threads(&threads)?;
@@ -330,6 +392,185 @@ mod tests {
         .await
         .unwrap()
     }
+    #[tokio::test]
+    async fn cached_transfer_persists_full_page_without_rewinding_live_metadata() {
+        let root = Fixture::new();
+        let captured = session("account-a");
+        let live = Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let mut current = thread(3);
+        current.messages[0].text = "Live edited body".into();
+        current.messages[0].ts = 1_700_000_009_000;
+        current.messages[0].apply_reaction(&crate::reactions::ReactionEvent {
+            message_id: "00000".into(),
+            thread_id: "same-thread".into(),
+            sender_id: "actor".into(),
+            ts: 1_700_000_009_000,
+            event_id: "live-event".into(),
+            r_type: 5,
+            emoji: "❤️".into(),
+            ..Default::default()
+        });
+        current.messages[1].kind = crate::message_model::MessageKind::Recall;
+        current.messages[1].text = "[Tin nhắn đã thu hồi]".into();
+        current.unread.last_seen_id = Some("99999".into());
+        current.unread.fresh = true;
+        current.unread.settings_fresh = true;
+        current.unread.muted = true;
+        run(
+            &root,
+            &live,
+            &captured,
+            "account-a",
+            Request::Persist(vec![current]),
+        )
+        .await;
+        run(
+            &root,
+            &live,
+            &captured,
+            "account-a",
+            Request::Delete {
+                thread: "same-thread".into(),
+                message: "00002".into(),
+            },
+        )
+        .await;
+        let mut transfer = thread(605);
+        transfer.name = "Old cache name".into();
+        transfer.unread.last_seen_id = Some("0".into());
+        transfer.unread.fresh = true;
+        transfer.unread.settings_fresh = true;
+        let Reply::Threads(projection) = run(
+            &root,
+            &live,
+            &captured,
+            "account-a",
+            Request::CachedDelta(vec![transfer]),
+        )
+        .await
+        else {
+            panic!("projection missing")
+        };
+        assert_eq!(projection[0].messages.len(), 200);
+        assert_eq!(projection[0].name, "Fixture");
+        let store = AccountStore::open(&root.0, "account-a").unwrap();
+        let body = store.get_message("same-thread", "00000").unwrap().unwrap();
+        assert_eq!(body.text, "Live edited body");
+        assert_eq!(body.ts, 1_700_000_009_000);
+        assert_eq!(body.reactions, vec!["❤️"]);
+        assert_eq!(body.reaction_versions["actor"].ts, 1_700_000_009_000);
+        assert_eq!(body.reaction_versions["actor"].event_id, "live-event");
+        assert_eq!(
+            store
+                .get_message("same-thread", "00001")
+                .unwrap()
+                .unwrap()
+                .kind,
+            crate::message_model::MessageKind::Recall
+        );
+        assert!(store.get_message("same-thread", "00002").unwrap().is_none());
+        assert!(store.get_message("same-thread", "00003").unwrap().is_some());
+        assert!(store.get_message("same-thread", "00604").unwrap().is_some());
+        let unread = store.unread("same-thread").unwrap();
+        assert_eq!(unread.last_seen_id.as_deref(), Some("99999"));
+        assert!(unread.unread_ids.is_empty());
+        assert!(unread.muted);
+        drop(store);
+        let b = session("account-b");
+        *live.lock().await = b.clone();
+        assert!(execute(
+            root.0.clone(),
+            live.clone(),
+            captured.clone(),
+            "account-a".into(),
+            Request::CachedDelta(vec![thread(606)])
+        )
+        .await
+        .is_err());
+        let Reply::Threads(empty) = run(&root, &live, &b, "account-b", Request::Load(vec![])).await
+        else {
+            panic!("load missing")
+        };
+        assert!(empty.is_empty());
+        *live.lock().await = captured.clone();
+        let Reply::Threads(reopened) =
+            run(&root, &live, &captured, "account-a", Request::Load(vec![])).await
+        else {
+            panic!("load missing")
+        };
+        assert_eq!(reopened[0].messages.len(), 200);
+        assert!(AccountStore::open(&root.0, "account-a")
+            .unwrap()
+            .get_message("same-thread", "00605")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn cached_transfer_retains_failed_page_until_storage_acknowledges() {
+        let root = Fixture::new();
+        let blocked = root.0.join("blocked-root");
+        std::fs::write(&blocked, b"fixture blocks account directory").unwrap();
+        let captured = session("account-a");
+        let live = Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let pending = super::super::worker::persist_cached_transfer_at(
+            Ok(blocked.clone()),
+            live,
+            captured,
+            "account-a",
+            vec![thread(605)],
+        );
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending)
+                .await
+                .is_err()
+        );
+        std::fs::remove_file(&blocked).unwrap();
+        let projection = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .unwrap();
+        assert_eq!(projection[0].messages.len(), 200);
+        let store = AccountStore::open(&blocked, "account-a").unwrap();
+        assert!(store.get_message("same-thread", "00000").unwrap().is_some());
+        assert!(store.get_message("same-thread", "00604").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn cached_transfer_cannot_recreate_tombstoned_conversation() {
+        let root = Fixture::new();
+        let captured = session("account-a");
+        let live = Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        run(
+            &root,
+            &live,
+            &captured,
+            "account-a",
+            Request::Persist(vec![thread(3)]),
+        )
+        .await;
+        run(
+            &root,
+            &live,
+            &captured,
+            "account-a",
+            Request::DeleteThread("same-thread".into()),
+        )
+        .await;
+        let Reply::Threads(projection) = run(
+            &root,
+            &live,
+            &captured,
+            "account-a",
+            Request::CachedDelta(vec![thread(3)]),
+        )
+        .await
+        else {
+            panic!("projection missing")
+        };
+        assert!(projection.is_empty());
+    }
+
     #[tokio::test]
     async fn consumer_loads_a_b_a_without_implicit_legacy_import_and_reopens() {
         let root = Fixture::new();
@@ -701,7 +942,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn actual_consumer_blocks_same_key_a_b_a_and_orphaned_blocking_writes() {
         let _lock = crate::runtime_scope::tests::TEST_LOCK.lock().await;
-        for abort in [false, true] {
+        for (abort, cached) in [(false, false), (true, false), (false, true), (true, true)] {
             let root = Fixture::new();
             let captured = session("account-a");
             let live = Arc::new(tokio::sync::Mutex::new(captured.clone()));
@@ -719,7 +960,11 @@ mod tests {
                         Request::PauseBeforeMutation {
                             entered: entered_tx,
                             release: release_rx,
-                            request: Box::new(Request::Persist(vec![thread(1)])),
+                            request: Box::new(if cached {
+                                Request::CachedDelta(vec![thread(1)])
+                            } else {
+                                Request::Persist(vec![thread(1)])
+                            }),
                         },
                     )
                     .await

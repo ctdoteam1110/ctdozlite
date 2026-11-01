@@ -1212,7 +1212,7 @@ async fn run_inner(
         generation,
         account,
     );
-    let mut codec = Codec::start(live, &s).await?;
+    let mut codec = Codec::start(live.clone(), &s).await?;
     let mut active = ActiveSessions {
         commands,
         ids: HashSet::new(),
@@ -1356,13 +1356,9 @@ async fn run_inner(
         if count > MAX_RECORDS {
             bail!("Phiên đồng bộ vượt giới hạn số tin; hãy đồng bộ tiếp trong lần sau");
         }
-        let _ = tx.send(GuiEvent::PhoneHistoryThreads {
-            generation,
-            account: account.into(),
-            threads: threads.clone(),
-        });
-        ctx.request_repaint();
         crate::chat::resolve_thread_names(&s, &mut threads).await;
+        let threads =
+            super::worker::persist_cached_transfer(live.clone(), s.clone(), account, threads).await;
         let _ = tx.send(GuiEvent::PhoneHistoryThreads {
             generation,
             account: account.into(),

@@ -918,6 +918,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                         let mut threads = Vec::new();
                                                         crate::chat::merge_previews(&mut threads, &page.normalized_payload(account));
                                                         if !threads.is_empty() {
+                                                            let threads = persist_cached_transfer(
+                                                                s_ws.clone(), s_snap.clone(), account, threads,
+                                                            ).await;
                                                             let _ = gui_tx_ws.send(GuiEvent::GroupHistoryThreads {
                                                                 account: account.into(),
                                                                 threads,
@@ -4318,5 +4321,45 @@ mod visible_read_worker_tests {
         assert_eq!(reopened.unread("fixture-thread").unwrap().last_seen_id.as_deref(), Some("10"));
         drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Keep the bounded accepted transfer in the producer until account storage acknowledges it.
+/// The enclosing runtime scope cancels stale producers before another account can adopt it.
+pub(super) async fn persist_cached_transfer(
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
+    captured: Session,
+    account: &str,
+    threads: Vec<Thread>,
+) -> Vec<Thread> {
+    persist_cached_transfer_at(history::root(), session, captured, account, threads).await
+}
+
+pub(super) async fn persist_cached_transfer_at(
+    root: Result<std::path::PathBuf, String>,
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
+    captured: Session,
+    account: &str,
+    threads: Vec<Thread>,
+) -> Vec<Thread> {
+    loop {
+        let result = match &root {
+            Ok(root) => {
+                history::execute(
+                    root.clone(),
+                    session.clone(),
+                    captured.clone(),
+                    account.to_owned(),
+                    history::Request::CachedDelta(threads.clone()),
+                )
+                .await
+            }
+            Err(error) => Err(error.clone()),
+        };
+        if let Ok(history::Reply::Threads(projection)) = result {
+            return projection;
+        }
+        // Retain the full page rather than advancing the transfer cursor on write failure.
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }

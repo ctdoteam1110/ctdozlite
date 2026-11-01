@@ -1431,7 +1431,6 @@ impl ZaloGuiApp {
                         &account,
                     ) {
                         apply_import_delta(&mut self.threads, threads);
-                        self.persist_threads_async();
                         self.replay_reactions_async();
                     }
                 }
@@ -1439,7 +1438,6 @@ impl ZaloGuiApp {
                 GuiEvent::GroupHistoryThreads { account, threads } => {
                     if self.is_logged_in && self.user_uin == account {
                         apply_import_delta(&mut self.threads, threads);
-                        self.persist_threads_async();
                         self.replay_reactions_async();
                     }
                 }
