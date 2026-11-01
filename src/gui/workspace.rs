@@ -3639,7 +3639,7 @@ impl ZaloGuiApp {
                                     time,
                                 } => {
                                     let hd_tex_key = if tex_key.starts_with("photo_") {
-                                        let mut key = super::media_preview::photo_key(&self.user_uin, &thread_id, &m.id);
+                                        let mut key = super::media_preview::photo_key_for_message(&self.user_uin, &thread_id, &m);
                                         key.quality = crate::media_resources::MediaQuality::Original;
                                         let texture = format!("photo_{}", key.cache_id());
                                         if !self.sticker_textures.contains_key(&texture) && self.loading_stickers.insert(texture.clone()) {

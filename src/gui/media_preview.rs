@@ -192,6 +192,26 @@ pub(super) fn is_photo_message(message: &crate::chat::ChatMessage) -> bool {
             || text.starts_with("[Hình ảnh] "))
 }
 
+/// Prefer namespaced authoritative wire identity over a potentially shared canonical alias.
+pub(super) fn message_identity(message: &crate::chat::ChatMessage) -> Option<String> {
+    fn scalar(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        }
+    }
+    for (namespace, value) in [("server", message.wire_ref.server_id.as_ref()), ("client", message.wire_ref.client_id.as_ref())] {
+        if let Some(value) = value.and_then(scalar) { return Some(format!("{namespace}:{value}")); }
+    }
+    (!message.id.is_empty()).then(|| format!("canonical:{}",message.id))
+}
+
+/// Build a photo resource identity consistently for thumbnail and original requests.
+pub(super) fn photo_key_for_message(account: &str, thread: &str, message: &crate::chat::ChatMessage) -> crate::media_resources::MediaKey {
+    photo_key(account, thread, &message_identity(message).unwrap_or_default())
+}
+
 /// Build the account/thread/message/quality texture identity, independent of signed URLs.
 pub(super) fn photo_key(
     account: &str,
@@ -436,5 +456,45 @@ mod delivery_regressions {
         let mut preview = first.clone();
         preview.quality = crate::media_resources::MediaQuality::Preview;
         assert_ne!(first.cache_id(), preview.cache_id());
+    }
+}
+
+#[cfg(test)]
+mod authoritative_identity_regressions {
+    use super::*;
+    #[tokio::test]
+    async fn shared_canonical_alias_with_distinct_server_ids_fetches_both_photos() {
+        use std::io::{Read,Write};
+        let first = crate::chat::ChatMessage { id: "shared-client-alias".into(), wire_ref: crate::message_model::WireMessageRef { server_id: Some(serde_json::json!("server-A")), ..Default::default() }, ..Default::default() };
+        let mut second = first.clone(); second.wire_ref.server_id = Some(serde_json::json!("server-B"));
+        let key_a = photo_key_for_message("account", "thread", &first);
+        let key_b = photo_key_for_message("account", "thread", &second);
+        assert_ne!(key_a.cache_id(), key_b.cache_id());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut png = Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(4,3).write_to(&mut png, ImageFormat::Png).unwrap();
+            let bytes = png.into_inner();
+            let mut paths = Vec::new();
+            for _ in 0..2 {
+                let (mut socket,_) = listener.accept().unwrap(); let mut request=[0;1024];
+                let size = socket.read(&mut request).unwrap();
+                paths.push(String::from_utf8_lossy(&request[..size]).lines().next().unwrap().to_owned());
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len()).unwrap();
+                socket.write_all(&bytes).unwrap();
+            }
+            paths
+        });
+        let root = std::env::temp_dir().join(format!("zl-photo-alias-{}-{}",std::process::id(),address.port()));
+        let generation = crate::media_resources::RequestGeneration::default();
+        let client = reqwest::Client::new();
+        for (key, suffix) in [(key_a,"a"),(key_b,"b")] {
+            let url = format!("http://{address}/{suffix}");
+            load_photo_at(&client,&key,&url,None,&generation,generation.capture(),&root).await.unwrap();
+        }
+        assert_eq!(server.join().unwrap(),vec!["GET /a HTTP/1.1","GET /b HTTP/1.1"]);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(message_identity(&crate::chat::ChatMessage::default()).is_none());
     }
 }

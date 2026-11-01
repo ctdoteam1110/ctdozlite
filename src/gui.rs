@@ -91,6 +91,8 @@ pub enum GuiEvent {
         account: String,
         threads: Vec<Thread>,
     },
+    /// Explicit live socket/poll arrivals, never bootstrap, refresh or history snapshots.
+    LiveThreadsUpdated(Vec<Thread>),
     MessageSent {
         client_message_id: String,
         thread_id: String,
@@ -447,6 +449,33 @@ impl GuiTx {
         self.ctx.request_repaint();
         res
     }
+}
+
+fn apply_import_delta(current: &mut Vec<Thread>, delta: Vec<Thread>) {
+    for imported in delta {
+        if let Some(existing) = current.iter_mut().find(|thread| thread.id == imported.id) {
+            crate::chat::merge_thread_into(existing, imported, false);
+        } else { current.push(imported); }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn incoming_notification_commands(current: &[Thread], updates: &[Thread], account: &str, settings: &AppSettings, foreground: bool, live: bool, gate: &mut crate::native_notifications::DeliveryGate) -> Vec<WorkerCmd> {
+    if !live { return Vec::new(); }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let mut commands = Vec::new();
+    for update in updates {
+        let existing = current.iter().find(|thread| thread.id == update.id);
+        let muted = update.presentation.muted || existing.is_some_and(|thread| thread.presentation.muted) || settings.muted_threads.get(&update.id).is_some_and(|until| *until == -1 || *until > now);
+        let old_ids: HashSet<_> = existing.into_iter().flat_map(|thread| &thread.messages).filter_map(media_preview::message_identity).collect();
+        for message in &update.messages {
+            let Some(identity) = media_preview::message_identity(message) else { continue; };
+            if !old_ids.contains(&identity) && gate.admit(account, account, &update.id, &identity, settings.enable_notifications, muted, foreground, message.is_outgoing) {
+                commands.push(WorkerCmd::DeliverIncomingNotification { account: account.into(), thread: update.id.clone(), message: identity, sound: settings.play_notification_sound });
+            }
+        }
+    }
+    commands
 }
 
 pub struct ZaloGuiApp {
@@ -891,22 +920,13 @@ impl ZaloGuiApp {
 
     fn check_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.event_rx.try_recv() {
+            let live_arrival = matches!(&event, GuiEvent::LiveThreadsUpdated(_));
             match event {
                 GuiEvent::HistoryImported { account, result } => {
                     if self.is_logged_in && account == self.user_uin {
                         match result {
                             Ok((report, threads)) => {
-                                for imported in threads {
-                                    if let Some(existing) = self
-                                        .threads
-                                        .iter_mut()
-                                        .find(|thread| thread.id == imported.id)
-                                    {
-                                        crate::chat::merge_thread_into(existing, imported, false);
-                                    } else {
-                                        self.threads.push(imported);
-                                    }
-                                }
+                                apply_import_delta(&mut self.threads, threads);
                                 self.persist_threads_async();
                                 self.show_toast(format!(
                                     "Đã nhập {} tin nhắn từ {} hội thoại",
@@ -994,7 +1014,7 @@ impl ZaloGuiApp {
                         self.persist_threads_async();
                     }
                 }
-                GuiEvent::ThreadsUpdated(updates) => {
+                GuiEvent::ThreadsUpdated(updates) | GuiEvent::LiveThreadsUpdated(updates) => {
                     ensure_cjk_font(ctx, thread_texts(&updates));
                     if self.is_logged_in && !updates.is_empty() {
                         let prev_selected_name = self
@@ -1014,48 +1034,15 @@ impl ZaloGuiApp {
                             .unwrap_or_default();
                         let is_focused = ctx.input(|i| i.focused);
                         let mut new_incoming_alert = false;
+                        for command in incoming_notification_commands(&self.threads, &updates, &self.user_uin, &self.settings, is_focused, live_arrival, &mut self.notification_delivery) {
+                            if let Some(tx) = WORKER_TX.get() { let _ = tx.send(command); }
+                        }
+
 
                         for nt in updates {
                             if let Some(existing) = self.threads.iter_mut().find(|t| t.id == nt.id)
                             {
                                 let old_len = existing.messages.len();
-                                let old_ids: HashSet<_> =
-                                    existing.messages.iter().map(|m| m.id.as_str()).collect();
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs() as i64;
-                                let muted = existing.presentation.muted
-                                    || nt.presentation.muted
-                                    || self
-                                        .settings
-                                        .muted_threads
-                                        .get(&nt.id)
-                                        .is_some_and(|until| *until == -1 || *until > now);
-                                for message in &nt.messages {
-                                    if !old_ids.contains(message.id.as_str())
-                                        && self.notification_delivery.admit(
-                                            &self.user_uin,
-                                            &self.user_uin,
-                                            &nt.id,
-                                            &message.id,
-                                            self.settings.enable_notifications,
-                                            muted,
-                                            is_focused,
-                                            message.is_outgoing,
-                                        )
-                                    {
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ =
-                                                tx.send(WorkerCmd::DeliverIncomingNotification {
-                                                    account: self.user_uin.clone(),
-                                                    thread: nt.id.clone(),
-                                                    message: message.id.clone(),
-                                                    sound: self.settings.play_notification_sound,
-                                                });
-                                        }
-                                    }
-                                }
                                 crate::chat::merge_thread_into(existing, nt, true);
                                 let added = existing.messages.len().saturating_sub(old_len);
                                 if added > 0 {
@@ -2469,5 +2456,21 @@ mod tests {
         assert!(is_newer_semver("V1.0.0-beta.1", "0.9.9"));
         assert!(!is_newer_semver("v0.0.1", "0.0.1"));
         assert!(!is_newer_semver("0.0.1", "0.0.2"));
+    }
+}
+
+#[cfg(test)]
+mod media_delivery_revision_tests {
+    use super::*;
+    #[test]
+    fn first_live_message_in_unknown_thread_notifies_once_but_snapshots_do_not() {
+        let updates = vec![Thread { id: "new-thread".into(), messages: vec![ChatMessage { id: "message-1".into(), ..Default::default() }], ..Default::default() }];
+        let settings = AppSettings::default();
+        let mut gate = crate::native_notifications::DeliveryGate::default();
+        assert!(incoming_notification_commands(&[], &updates, "account", &settings, false, false, &mut gate).is_empty());
+        assert_eq!(incoming_notification_commands(&[], &updates, "account", &settings, false, true, &mut gate).len(), 1);
+        assert!(incoming_notification_commands(&[], &updates, "account", &settings, false, true, &mut gate).is_empty());
+        let mut gate = crate::native_notifications::DeliveryGate::default();
+        assert!(incoming_notification_commands(&[], &updates, "account", &settings, false, false, &mut gate).is_empty());
     }
 }

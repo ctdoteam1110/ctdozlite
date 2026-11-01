@@ -1098,7 +1098,11 @@ pub(super) fn render_message_body(
             .or(msg.link_url.as_deref())
             .filter(|u| !u.is_empty())
         {
-            let media_key = super::media_preview::photo_key(account, thread_id, &msg.id);
+            let media_key = super::media_preview::photo_key_for_message(account, thread_id, msg);
+            if media_key.message.is_empty() {
+                ui.label("Ảnh thiếu mã nhận diện.");
+                return None;
+            }
             let key = format!("photo_{}", media_key.cache_id());
             if !failed_photos.contains(&key)
                 && !sticker_textures.contains_key(&key)
@@ -1491,7 +1495,7 @@ pub(super) fn render_chat_bubble(
     } else if is_photo_card {
         let tkey = format!(
             "photo_{}",
-            super::media_preview::photo_key(account, thread_id, &msg.id).cache_id()
+            super::media_preview::photo_key_for_message(account, thread_id, msg).cache_id()
         );
         let photo_w = if let Some(tex) = sticker_textures.get(&tkey) {
             let [tw, th] = tex.size();
@@ -2379,6 +2383,9 @@ mod inline_mention_tests {
                                 false,
                                 false,
                                 "Thread",
+                                "fixture-account",
+                                "fixture-thread",
+                                &mut HashSet::new(),
                                 None,
                                 &ThemePalette::light(),
                                 &HashMap::new(),

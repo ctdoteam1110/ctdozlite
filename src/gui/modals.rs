@@ -2323,7 +2323,7 @@ impl ZaloGuiApp {
         if pick_migrate_file {
             if let Some(src_path) = pick_native_file_dialog(false) {
                 let sent = WORKER_TX.get().is_some_and(|tx| tx.send(WorkerCmd::ImportHistory {
-                    account: self.user_uin.clone(), path: src_path, threads: self.threads.clone(),
+                    account: self.user_uin.clone(), path: src_path,
                 }).is_ok());
                 self.show_toast(if sent { "Đang nhập lịch sử trong nền…" } else { "Lỗi khởi động nhập lịch sử." });
             }

@@ -12,7 +12,6 @@ pub enum WorkerCmd {
     ImportHistory {
         account: String,
         path: std::path::PathBuf,
-        threads: Vec<Thread>,
     },
     /// Fetch only photo cards with a bounded original-source fallback.
     FetchPhotoPreview {
@@ -621,7 +620,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                     )
                                                     .await;
                                                     let _ = gui_tx_ws.send(
-                                                        GuiEvent::ThreadsUpdated(ws_threads),
+                                                        GuiEvent::LiveThreadsUpdated(ws_threads),
                                                     );
                                                     ctx_ws.request_repaint();
                                                 }
@@ -703,7 +702,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 process_reaction_journal(session.clone(), captured, gui_tx.clone(), Vec::new(), threads).await;
                             }
                         }
-                        WorkerCmd::ImportHistory { account, path, threads } => {
+                        WorkerCmd::ImportHistory { account, path } => {
                             let tx = gui_tx.clone();
                             let ctx = egui_ctx.clone();
                             let current = session.lock().await.login.as_ref().map(|info| info.uin.clone()).unwrap_or_default();
@@ -711,7 +710,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 let result = if current != account || account.is_empty() {
                                     Err("Account mismatch".to_owned())
                                 } else {
-                                    import_history_async(path, "zalo_history.db".to_owned(), threads).await
+                                    import_history_async(path, "zalo_history.db".to_owned()).await
                                 };
                                 let _ = tx.send(GuiEvent::HistoryImported { account, result });
                                 ctx.request_repaint();
@@ -1358,7 +1357,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                     }
                                                 }
                                                 let _ = gui_tx_clone
-                                                    .send(GuiEvent::ThreadsUpdated(temp_threads));
+                                                    .send(GuiEvent::LiveThreadsUpdated(temp_threads));
                                                 ctx_clone.request_repaint();
                                             }
                                         }
@@ -3113,35 +3112,59 @@ mod reaction_consumer_tests {
 }
 
 
-fn import_history(
-    path: &std::path::Path,
-    database: &str,
-    threads: &mut Vec<Thread>,
-) -> Result<(crate::store::ImportReport, Vec<Thread>), String> {
-    let report = crate::store::import_history_from_path(path, database)
-        .map_err(|_| "History import failed".to_owned())?;
-    let store =
-        crate::store::MessageStore::open(database).map_err(|_| "History open failed".to_owned())?;
-    store
-        .hydrate_threads(threads, crate::store::MessageStore::PRELOAD_MSGS)
-        .map_err(|_| "History hydration failed".to_owned())?;
-    Ok((report, std::mem::take(threads)))
-}
-
-async fn import_history_async(
-    path: std::path::PathBuf,
-    database: String,
-    mut threads: Vec<Thread>,
-) -> Result<(crate::store::ImportReport, Vec<Thread>), String> {
-    tokio::task::spawn_blocking(move || import_history(&path, &database, &mut threads))
-        .await
-        .map_err(|_| "Import task failed".to_owned())
-        .and_then(|result| result)
+async fn import_history_async(path: std::path::PathBuf, database: String) -> Result<(crate::store::ImportReport, Vec<Thread>), String> {
+    tokio::task::spawn_blocking(move || crate::store::import_history_delta_from_path(&path, &database).map_err(|_| "History import failed".to_owned()))
+        .await.map_err(|_| "Import task failed".to_owned()).and_then(|result| result)
 }
 
 #[cfg(test)]
 mod media_import_regressions {
     use super::*;
+    #[tokio::test]
+    async fn import_delta_never_resurrects_unrelated_deleted_snapshot_records() {
+        for format in ["json", "sqlite"] {
+            let root = std::env::temp_dir().join(format!("zl-import-delta-{}-{format}",std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let destination = root.join("destination.db").to_string_lossy().into_owned();
+            let json = root.join("input.json");
+            let thread = |id: &str| Thread { id: id.into(), name: id.into(), messages: vec![ChatMessage { id: format!("message-{id}"), text: "fixture".into(), ..Default::default() }], ..Default::default() };
+            let a = thread("thread-A");
+            std::fs::write(&json, serde_json::to_vec(&vec![a.clone()]).unwrap()).unwrap();
+            let (_, mut current) = import_history_async(json.clone(), destination.clone()).await.unwrap();
+            std::fs::write(&json, serde_json::to_vec(&vec![thread("thread-B")]).unwrap()).unwrap();
+            let source = if format == "sqlite" {
+                let source = root.join("source.db");
+                crate::store::import_history_from_path(&json, source.to_str().unwrap()).unwrap();
+                source
+            } else { json };
+            let (_, delta) = import_history_async(source, destination.clone()).await.unwrap();
+            // The destination still contains A; only the user's current UI state deleted it.
+            assert_eq!(crate::store::MessageStore::open(&destination).unwrap().all_threads().unwrap().len(),2);
+            current.clear();
+            super::super::apply_import_delta(&mut current, delta);
+            assert_eq!(current.len(),1);
+            assert_eq!(current[0].id,"thread-B");
+            assert_eq!(current[0].messages.len(),1);
+            assert_eq!(current[0].messages[0].id,"message-thread-B");
+            let mut same_thread_input = a.clone();
+            same_thread_input.messages[0].id = "message-B-in-A".into();
+            let same_json = root.join("same-thread.json");
+            std::fs::write(&same_json,serde_json::to_vec(&vec![same_thread_input]).unwrap()).unwrap();
+            let source = if format == "sqlite" {
+                let source = root.join("same-thread.db");
+                crate::store::import_history_from_path(&same_json,source.to_str().unwrap()).unwrap(); source
+            } else { same_json };
+            let (_, delta) = import_history_async(source,destination).await.unwrap();
+            let mut current = vec![a];
+            current[0].messages.clear();
+            super::super::apply_import_delta(&mut current,delta);
+            assert_eq!(current.len(),1);
+            assert_eq!(current[0].messages.len(),1);
+            assert_eq!(current[0].messages[0].id,"message-B-in-A");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn history_import_hydrates_off_runtime_thread_and_returns_terminal_errors() {
         let root = std::env::temp_dir().join(format!(
@@ -3156,14 +3179,14 @@ mod media_import_regressions {
         let input = root.join("fixture.json");
         let database = root.join("history.db").to_string_lossy().into_owned();
         std::fs::write(&input, r#"[{"id":"thread-1","name":"Fixture","preview":"fixture","time":"","avatar":null,"is_group":false,"messages":[{"id":"message-1","sender":"Fixture","text":"fixture","time":"","is_outgoing":false,"ts":123}]}]"#).unwrap();
-        let (report, threads) = import_history_async(input, database.clone(), Vec::new())
+        let (report, threads) = import_history_async(input, database.clone())
             .await
             .unwrap();
         assert_eq!(report.messages_imported, 1);
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].messages[0].text, "fixture");
         assert!(
-            import_history_async(root.join("missing.json"), database, threads)
+            import_history_async(root.join("missing.json"), database)
                 .await
                 .is_err()
         );

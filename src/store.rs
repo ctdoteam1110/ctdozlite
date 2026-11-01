@@ -720,11 +720,24 @@ pub fn import_history_from_path(
     src: &std::path::Path,
     dst_db_path: &str,
 ) -> Result<ImportReport> {
+    import_history_impl(src, dst_db_path, false).map(|(report, _)| report)
+}
+
+/// Import history and return only source-owned thread/message records for UI merging.
+///
+/// # Errors
+/// Returns source parsing, persistence or source hydration errors without a destination snapshot.
+pub fn import_history_delta_from_path(src: &std::path::Path, dst_db_path: &str) -> Result<(ImportReport, Vec<Thread>)> {
+    import_history_impl(src, dst_db_path, true)
+}
+
+fn import_history_impl(src: &std::path::Path, dst_db_path: &str, capture_delta: bool) -> Result<(ImportReport, Vec<Thread>)> {
     if !src.exists() {
         anyhow::bail!("Đường dẫn nguồn không tồn tại: {}", src.display());
     }
     let mut dst = MessageStore::open(dst_db_path)?;
     let mut report = ImportReport::default();
+    let mut imported_threads = Vec::new();
 
     let mut files_to_import = Vec::new();
     if src.is_dir() {
@@ -815,6 +828,11 @@ pub fn import_history_from_path(
             })();
             match step {
                 Ok((tc, mc)) => {
+                    if capture_delta {
+                        let mut source_threads = Vec::new();
+                        src_store.hydrate_threads(&mut source_threads, i64::MAX as usize)?;
+                        imported_threads.extend(source_threads);
+                    }
                     dst.conn.execute_batch("COMMIT")?;
                     report.threads_imported += tc;
                     report.messages_imported += mc;
@@ -830,6 +848,7 @@ pub fn import_history_from_path(
         } else if let Ok(text) = std::str::from_utf8(&bytes) {
             if let Ok(threads) = serde_json::from_str::<Vec<Thread>>(text) {
                 let added = persist_threads(&mut dst, &threads)?;
+                if capture_delta { imported_threads.extend(threads.iter().cloned()); }
                 report.threads_imported += threads.len();
                 report.messages_imported += added;
                 report
@@ -843,6 +862,7 @@ pub fn import_history_from_path(
                         .collect();
                     if !threads.is_empty() {
                         let added = persist_threads(&mut dst, &threads)?;
+                        if capture_delta { imported_threads.extend(threads.iter().cloned()); }
                         report.threads_imported += threads.len();
                         report.messages_imported += added;
                         report
@@ -854,7 +874,7 @@ pub fn import_history_from_path(
         }
     }
 
-    Ok(report)
+    Ok((report, imported_threads))
 }
 
 #[cfg(test)]
