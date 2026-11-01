@@ -702,7 +702,30 @@ pub(super) fn render_toggle_switch(ui: &mut egui::Ui, value: &mut bool, pal: &Th
 }
 
 
+static CJK_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x11FF | 0x3040..=0x30FF | 0x3130..=0x318F | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF)
+}
+
+/// Load the CJK fallback the first time Han / Kana / Hangul text shows up. msyh.ttc alone is
+/// ~20 MB held in memory for the whole run, which a Vietnamese-only user never needs.
+pub(super) fn ensure_cjk_font<'a>(ctx: &egui::Context, mut texts: impl Iterator<Item = &'a str>) {
+    use std::sync::atomic::Ordering;
+    if CJK_LOADED.load(Ordering::Relaxed) || !texts.any(|t| t.chars().any(is_cjk)) {
+        return;
+    }
+    CJK_LOADED.store(true, Ordering::Relaxed);
+    build_fonts(ctx, true);
+}
+
 pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
+    build_fonts(ctx, false);
+}
+
+fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
     let mut fonts = egui::FontDefinitions::default();
 
     // 1. Embed official Lucide Icon Font (vector glyphs for all UI icons)
@@ -760,7 +783,7 @@ pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
     ];
-    for path in cjk_candidates {
+    for path in cjk_candidates.into_iter().filter(|_| with_cjk) {
         if let Ok(font_data) = std::fs::read(path) {
             fonts.font_data.insert(
                 "cjk_font".to_owned(),
