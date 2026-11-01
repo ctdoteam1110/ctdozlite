@@ -68,7 +68,25 @@ fn embed_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
     let res_path = out_dir.join("app_icon.res");
     std::fs::write(&res_path, &res)?;
 
-    println!("cargo:rustc-link-arg-bin=zalo-rust={}", res_path.display());
+    // GNU ld cannot read a raw .res; windres (MinGW binutils) converts it to a COFF object.
+    let link_path = if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+        let obj_path = out_dir.join("app_icon.o");
+        let ok = std::process::Command::new("windres")
+            .args(["-J", "res", "-O", "coff", "-i"])
+            .arg(&res_path)
+            .arg("-o")
+            .arg(&obj_path)
+            .status()?
+            .success();
+        if !ok {
+            return Err("windres failed".into());
+        }
+        obj_path
+    } else {
+        res_path
+    };
+
+    println!("cargo:rustc-link-arg-bin=zalo-rust={}", link_path.display());
     Ok(())
 }
 
