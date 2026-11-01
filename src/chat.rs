@@ -428,17 +428,20 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
         }
     }
 
-    // Merge user groups into threads list
+    // Hydrate with locally persisted history from SQLite (`zalo_history.db`)
+    crate::store::load_history_into_threads("zalo_history.db", &mut threads, 200);
+
+    // Merge user groups (`getlg/v4` + `getmg-v2`) into threads list, upgrading any placeholder group names
     if let Ok(mut groups) = get_groups(s).await {
         for g in groups.drain(..) {
-            if !threads.iter().any(|t| t.id == g.id) {
+            if let Some(existing) = threads.iter_mut().find(|t| t.id == g.id) {
+                merge_thread_into(existing, g, true);
+            } else {
                 threads.push(g);
             }
         }
     }
 
-    // Hydrate with locally persisted history from SQLite (`zalo_history.db`)
-    crate::store::load_history_into_threads("zalo_history.db", &mut threads, 200);
     resolve_thread_names(s, &mut threads).await;
 
     Ok(threads)
@@ -2595,6 +2598,149 @@ pub async fn get_group_history_raw(s: &Session, grid: &str, count: u32) -> Resul
     Ok(resp)
 }
 
+/// Fetch group metadata (`name`, `avt`/`fullAvt`, `totalMember`, `removedsGroup`) from
+/// `POST /api/group/getmg-v2` by sending `gridVerMap: {"<grid>": 0}` so the server always
+/// returns `gridInfoMap` instead of putting groups into `unchangedsGroup`.
+pub async fn fetch_group_profiles(
+    s: &Session,
+    group_ids: &[String],
+) -> Result<(serde_json::Map<String, Value>, std::collections::HashSet<String>)> {
+    if s.login.is_none() || group_ids.is_empty() {
+        return Ok((serde_json::Map::new(), std::collections::HashSet::new()));
+    }
+    let mut gv_zero = serde_json::Map::new();
+    for gid in group_ids {
+        let clean = gid
+            .trim_start_matches("group_")
+            .trim_start_matches('g')
+            .trim_start_matches('G')
+            .trim();
+        if !clean.is_empty() {
+            gv_zero.insert(clean.to_string(), json!(0));
+        }
+    }
+    let gv_str = serde_json::to_string(&gv_zero)?;
+    let body = obj(&[("gridVerMap", json!(gv_str)), ("imei", json!(s.imei))]);
+    let params = s.encoded_params(&body)?;
+    let mg_url = format!("{}/api/group/getmg-v2?{}", s.domains.group, s.common_params());
+    let mg_resp = s.post_form(&mg_url, format!("params={params}")).await?;
+    let mut mg_dec = s.maybe_decrypt(mg_resp, s.session_key_bytes()).await;
+    if let Some(d_str) = mg_dec.get("data").and_then(Value::as_str) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(d_str.trim()) {
+            mg_dec["data"] = parsed;
+        }
+    }
+    let data_node = mg_dec
+        .pointer("/data/data")
+        .or_else(|| mg_dec.get("data"))
+        .unwrap_or(&mg_dec);
+    let info_map = data_node
+        .get("gridInfoMap")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let removed: std::collections::HashSet<String> = data_node
+        .get("removedsGroup")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((info_map, removed))
+}
+
+/// Extract up to 4 sorted member UIDs (`creatorId` first, then `adminIds`, then `memVerList`)
+/// and total member count from a `getmg-v2` group info object.
+fn extract_group_member_ids(info: &Value) -> (Vec<String>, usize) {
+    let mut raw_ids: Vec<String> = Vec::new();
+    if let Some(arr) = info.get("memVerList").and_then(Value::as_array) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                let uid = s.split('_').next().unwrap_or("").trim();
+                if !uid.is_empty() && !raw_ids.iter().any(|x| x == uid) {
+                    raw_ids.push(uid.to_string());
+                }
+            }
+        }
+    }
+    let mut sorted: Vec<String> = Vec::new();
+    if let Some(creator) = pick_str(info, &["creatorId"]) {
+        if raw_ids.iter().any(|x| x == &creator) {
+            sorted.push(creator);
+        }
+    }
+    if let Some(admins) = info.get("adminIds").and_then(Value::as_array) {
+        for a in admins {
+            let aid = a
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| a.as_u64().map(|n| n.to_string()))
+                .unwrap_or_default();
+            if !aid.is_empty()
+                && raw_ids.iter().any(|x| x == &aid)
+                && !sorted.iter().any(|x| x == &aid)
+            {
+                sorted.push(aid);
+            }
+        }
+    }
+    for uid in &raw_ids {
+        if !sorted.iter().any(|x| x == uid) {
+            sorted.push(uid.clone());
+        }
+    }
+    let total = info
+        .get("totalMember")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or_else(|| sorted.len())
+        .max(sorted.len());
+    sorted.truncate(4);
+    (sorted, total)
+}
+
+/// Format a `multi:<total>;<name1>|<url1>;...` composite group avatar string.
+fn format_multi_group_avatar(
+    group_name: &str,
+    mem_ids: &[String],
+    total_members: usize,
+    profiles: &serde_json::Map<String, Value>,
+) -> Option<String> {
+    let fallback_names: Vec<&str> = group_name
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut slots: Vec<String> = Vec::new();
+    for (idx, uid) in mem_ids.iter().take(4).enumerate() {
+        let mut m_name = fallback_names.get(idx).copied().unwrap_or("Thành viên").to_string();
+        let mut m_ava = String::new();
+        if let Some(p) = profiles.get(uid) {
+            if let Some(n) = pick_str(p, &["zaloName", "displayName", "name", "display_name"]) {
+                if !n.is_empty() {
+                    m_name = n;
+                }
+            }
+            if let Some(a) = pick_str(p, &["avatar", "avt", "profile_avatar"]) {
+                if !a.is_empty() && !a.ends_with("/default") {
+                    m_ava = a;
+                }
+            }
+        }
+        let clean_name = m_name.replace(';', " ").replace('|', " ");
+        let clean_ava = m_ava.replace(';', "").replace('|', "");
+        slots.push(format!("{clean_name}|{clean_ava}"));
+    }
+    if slots.is_empty() {
+        return None;
+    }
+    let tot = total_members.max(slots.len());
+    Some(format!("multi:{tot};{}", slots.join(";")))
+}
+
 /// `GET /api/group/getlg/v4` (cmd 12027) — list of all groups user belongs to.
 pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
     if s.login.is_none() {
@@ -2602,48 +2748,80 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
     }
     let url = format!("{}/api/group/getlg/v4?{}", s.domains.group, s.common_params());
     let resp = s.get(&url).await?;
-    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    let mut resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(d_str) = resp.get("data").and_then(Value::as_str) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(d_str.trim()) {
+            resp["data"] = parsed;
+        }
+    }
+    let data_node = resp
+        .pointer("/data/data")
+        .or_else(|| resp.get("data"))
+        .unwrap_or(&resp);
 
     let mut groups = Vec::new();
-    if let Some(data) = resp.get("data") {
-        if let Some(map) = data.get("gridVerMap").and_then(Value::as_object) {
-            for (grid, _ver) in map {
-                groups.push(Thread {
-                    id: grid.clone(),
-                    name: format!("Nhóm {}", grid),
-                    preview: String::new(),
-                    time: crate::ui::clock(),
-                    avatar: None,
-                    is_group: true,
-                    messages: Vec::new(),
-                });
-            }
-            if !groups.is_empty() {
-                if let Ok(gv_str) = serde_json::to_string(map) {
-                    let body = obj(&[("gridVerMap", json!(gv_str))]);
-                    if let Ok(params) = s.encoded_params(&body) {
-                        let mg_url = format!("{}/api/group/getmg-v2?{}", s.domains.group, s.common_params());
-                        if let Ok(mg_resp) = s.post_form(&mg_url, format!("params={params}")).await {
-                            let mg_dec = s.maybe_decrypt(mg_resp, s.session_key_bytes()).await;
-                            if let Some(info_map) = mg_dec.pointer("/data/gridInfoMap").and_then(Value::as_object) {
-                                for g in &mut groups {
-                                    if let Some(info) = info_map.get(&g.id) {
-                                        if let Some(name) = pick_str(info, &["name", "groupName", "displayName"]) {
-                                            g.name = name;
-                                        }
-                                        if let Some(avt) = pick_str(info, &["avt", "fullAvt", "avatar"]) {
-                                            g.avatar = Some(avt);
-                                        }
-                                    }
+    if let Some(map) = data_node.get("gridVerMap").and_then(Value::as_object) {
+        for (grid, _ver) in map {
+            groups.push(Thread {
+                id: grid.clone(),
+                name: format!("Nhóm {}", grid),
+                preview: String::new(),
+                time: crate::ui::clock(),
+                avatar: None,
+                is_group: true,
+                messages: Vec::new(),
+            });
+        }
+        if !groups.is_empty() {
+            let gids: Vec<String> = groups.iter().map(|g| g.id.clone()).collect();
+            if let Ok((info_map, rem_ids)) = fetch_group_profiles(s, &gids).await {
+                let mut need_mem_uids: Vec<String> = Vec::new();
+                for g in &mut groups {
+                    if let Some(info) = info_map.get(&g.id) {
+                        if let Some(name) = pick_str(info, &["name", "groupName", "displayName"]) {
+                            g.name = name;
+                        }
+                        if let Some(avt) = pick_str(info, &["fullAvt", "avt", "avatar"])
+                            .filter(|u| !u.is_empty() && !u.ends_with("/default"))
+                        {
+                            g.avatar = Some(avt);
+                        } else {
+                            let (mids, _) = extract_group_member_ids(info);
+                            for uid in mids {
+                                if !need_mem_uids.iter().any(|x| x == &uid) {
+                                    need_mem_uids.push(uid);
                                 }
                             }
-                            if let Some(removed) = mg_dec.pointer("/data/removedsGroup").and_then(Value::as_array) {
-                                let rem_ids: std::collections::HashSet<&str> =
-                                    removed.iter().filter_map(Value::as_str).collect();
-                                groups.retain(|g| !rem_ids.contains(g.id.as_str()));
+                        }
+                        if g.preview.is_empty() {
+                            if let Some(n_mem) = info.get("totalMember").and_then(Value::as_u64) {
+                                if n_mem > 0 {
+                                    g.preview = format!("Nhóm · {n_mem} thành viên");
+                                }
                             }
                         }
                     }
+                }
+                if !need_mem_uids.is_empty() {
+                    let mut all_profiles = serde_json::Map::new();
+                    for chunk in need_mem_uids.chunks(50) {
+                        if let Ok(mp) = get_mini_profiles(s, chunk).await {
+                            for (k, v) in mp {
+                                all_profiles.insert(k, v);
+                            }
+                        }
+                    }
+                    for g in &mut groups {
+                        if g.avatar.is_none() {
+                            if let Some(info) = info_map.get(&g.id) {
+                                let (mids, tot) = extract_group_member_ids(info);
+                                g.avatar = format_multi_group_avatar(&g.name, &mids, tot, &all_profiles);
+                            }
+                        }
+                    }
+                }
+                if !rem_ids.is_empty() {
+                    groups.retain(|g| !rem_ids.contains(&g.id));
                 }
             }
         }
@@ -2673,7 +2851,7 @@ pub async fn get_mini_profiles(s: &Session, user_ids: &[String]) -> Result<serde
     }
 }
 
-/// Automatically resolve real display names and avatars for threads that only have placeholder names.
+/// Automatically resolve real display names and avatars for 1-1 and group threads that only have placeholder names.
 pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
     let unknown_ids: Vec<String> = threads
         .iter()
@@ -2708,6 +2886,141 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    let unknown_group_ids: Vec<String> = threads
+        .iter()
+        .filter(|t| {
+            t.is_group
+                && (is_generic_thread_name(&t.name)
+                    || t.preview.is_empty()
+                    || t.avatar.as_deref().unwrap_or("").is_empty())
+        })
+        .map(|t| t.id.clone())
+        .collect();
+
+    if !unknown_group_ids.is_empty() {
+        for chunk in unknown_group_ids.chunks(50) {
+            if let Ok((info_map, _)) = fetch_group_profiles(s, chunk).await {
+                let mut need_mem_uids: Vec<String> = Vec::new();
+                for t in threads.iter_mut() {
+                    let clean_id = t
+                        .id
+                        .trim_start_matches("group_")
+                        .trim_start_matches('g')
+                        .trim_start_matches('G');
+                    if let Some(info) = info_map.get(&t.id).or_else(|| info_map.get(clean_id)) {
+                        if let Some(name) = pick_str(info, &["name", "groupName", "displayName"]) {
+                            if !name.is_empty() {
+                                t.name = name;
+                            }
+                        }
+                        if let Some(avt) = pick_str(info, &["fullAvt", "avt", "avatar"])
+                            .filter(|u| !u.is_empty() && !u.ends_with("/default"))
+                        {
+                            t.avatar = Some(avt);
+                        } else {
+                            let (mids, _) = extract_group_member_ids(info);
+                            for uid in mids {
+                                if !need_mem_uids.iter().any(|x| x == &uid) {
+                                    need_mem_uids.push(uid);
+                                }
+                            }
+                        }
+                        if t.preview.is_empty() {
+                            if let Some(n_mem) = info.get("totalMember").and_then(Value::as_u64) {
+                                if n_mem > 0 {
+                                    t.preview = format!("Nhóm · {n_mem} thành viên");
+                                }
+                            }
+                        }
+                    }
+                }
+                if !need_mem_uids.is_empty() {
+                    let mut all_profiles = serde_json::Map::new();
+                    for mchunk in need_mem_uids.chunks(50) {
+                        if let Ok(mp) = get_mini_profiles(s, mchunk).await {
+                            for (k, v) in mp {
+                                all_profiles.insert(k, v);
+                            }
+                        }
+                    }
+                    for t in threads.iter_mut() {
+                        if !t.is_group {
+                            continue;
+                        }
+                        let clean_id = t
+                            .id
+                            .trim_start_matches("group_")
+                            .trim_start_matches('g')
+                            .trim_start_matches('G');
+                        if let Some(info) = info_map.get(&t.id).or_else(|| info_map.get(clean_id)) {
+                            if t.avatar.as_deref().unwrap_or("").is_empty()
+                                || t.avatar.as_deref().unwrap_or("").starts_with("multi:")
+                            {
+                                let (mids, tot) = extract_group_member_ids(info);
+                                if let Some(multi_s) =
+                                    format_multi_group_avatar(&t.name, &mids, tot, &all_profiles)
+                                {
+                                    t.avatar = Some(multi_s);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Offline / local contact fallback for composite group avatars: match comma-separated member names
+    // against known 1-1 contact threads so group avatars display real member photos even without network.
+    let known_contacts: Vec<(String, String)> = threads
+        .iter()
+        .filter(|t| {
+            !t.is_group
+                && !t.name.contains("Cloud của tôi")
+                && !t.avatar.as_deref().unwrap_or("").is_empty()
+                && !t.avatar.as_deref().unwrap_or("").ends_with("/default")
+        })
+        .map(|t| (t.name.clone(), t.avatar.clone().unwrap_or_default()))
+        .collect();
+
+    for t in threads.iter_mut() {
+        if !t.is_group {
+            continue;
+        }
+        let cur_ava = t.avatar.as_deref().unwrap_or("");
+        if cur_ava.starts_with("http://") || cur_ava.starts_with("https://") {
+            continue;
+        }
+        let parts: Vec<&str> = t
+            .name
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.len() >= 2 {
+            let mut slots: Vec<String> = Vec::new();
+            for p in parts.iter().take(4) {
+                let p_low = p.to_lowercase();
+                let p_tokens: Vec<&str> = p_low.split_whitespace().collect();
+                let matched_url = known_contacts
+                    .iter()
+                    .find(|(cname, _)| {
+                        let c_low = cname.to_lowercase();
+                        c_low == p_low
+                            || (!p_tokens.is_empty()
+                                && p_tokens.iter().all(|tok| c_low.contains(tok)))
+                    })
+                    .map(|(_, url)| url.as_str())
+                    .unwrap_or("");
+                slots.push(format!("{}|{}", p.replace(';', " ").replace('|', " "), matched_url));
+            }
+            let new_multi = format!("multi:{};{}", parts.len(), slots.join(";"));
+            if cur_ava.is_empty() || (!cur_ava.contains("http") && new_multi.contains("http")) {
+                t.avatar = Some(new_multi);
             }
         }
     }
@@ -2872,12 +3185,8 @@ pub async fn get_cloud_messages(
     map.insert("groupId".into(), json!(clean_id));
     map.insert(
         "globalMsgId".into(),
-        json!(if global_msg_id.is_empty() {
-            if is_old {
-                "10000000000000000"
-            } else {
-                "0"
-            }
+        json!(if global_msg_id.is_empty() || global_msg_id == "0" {
+            "9223372036854775808"
         } else {
             global_msg_id
         }),
@@ -2988,9 +3297,25 @@ pub async fn poll_new_messages(
             break;
         }
     }
-    // 2. Poll conversation previews via `get-last-msgs`
+    // 2. Poll conversation previews via `get-last-msgs` (both empty map and populated known thread IDs)
     if let Ok(preview_resp) = get_last_msgs(s, &[]).await {
         merge_previews(threads, &preview_resp);
+    }
+    let known_ids: Vec<String> = threads
+        .iter()
+        .filter(|t| !t.id.is_empty())
+        .map(|t| {
+            if t.is_group && !t.id.starts_with('g') && !t.id.starts_with("group_") {
+                format!("g{}", t.id)
+            } else {
+                t.id.clone()
+            }
+        })
+        .collect();
+    for chunk in known_ids.chunks(25) {
+        if let Ok(preview_resp) = get_last_msgs(s, chunk).await {
+            merge_previews(threads, &preview_resp);
+        }
     }
     // 2b. Sync Cloud của tôi (`send2me_id`) and group conversations via `/api/cm/getrecentv2`
     let send2me_id = s
@@ -3832,6 +4157,78 @@ pub async fn get_friend_request_status(s: &Session, fid: &str) -> Result<Value> 
     );
     let resp = s.get(&url).await?;
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+}
+
+/// Query `/api/social/profile/lastOnline` (`cmd 12090`) and return `(is_online, label)`
+/// matching Zalo PC's `getLastActiveText` (`user_active_time = 5 minutes`).
+pub async fn get_user_online_status(s: &Session, uid: &str) -> Result<(bool, String)> {
+    if s.login.is_none() || uid.trim().is_empty() {
+        return Ok((false, String::new()));
+    }
+    let body = obj(&[
+        ("uid", json!(uid.trim())),
+        ("conv_type", json!(1)),
+        ("imei", json!(s.imei)),
+    ]);
+    let enc = s.encoded_params(&body)?;
+    let host = if s.domains.profile.is_empty() {
+        "https://tt-profile-wpa.chat.zalo.me"
+    } else {
+        &s.domains.profile
+    };
+    let url = format!(
+        "{}/api/social/profile/lastOnline?{}&params={enc}",
+        host.trim_end_matches('/'),
+        s.common_params()
+    );
+    let resp = s.get(&url).await?;
+    let mut dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(d_str) = dec.get("data").and_then(Value::as_str) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(d_str.trim()) {
+            dec["data"] = parsed;
+        }
+    }
+    let d = dec
+        .pointer("/data/data")
+        .or_else(|| dec.get("data"))
+        .unwrap_or(&dec);
+    let show_online = d
+        .pointer("/settings/show_online_status")
+        .and_then(|v| v.as_bool().or_else(|| v.as_i64().map(|n| n != 0)))
+        .unwrap_or(true);
+    if !show_online {
+        return Ok((false, String::new()));
+    }
+    let last_onl_raw = d
+        .get("lastOnline")
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+        })
+        .unwrap_or(0);
+    if last_onl_raw <= 0 {
+        return Ok((false, String::new()));
+    }
+    let last_sec = if last_onl_raw > 10_000_000_000 {
+        last_onl_raw / 1000
+    } else {
+        last_onl_raw
+    };
+    let now_sec = crate::login::unix_now() as i64;
+    let diff_sec = (now_sec - last_sec).max(0);
+    if diff_sec <= 300 {
+        return Ok((true, "Vừa mới truy cập".into()));
+    }
+    let mins = diff_sec / 60;
+    if mins < 60 {
+        return Ok((false, format!("Truy cập {mins} phút trước")));
+    }
+    let hours = diff_sec / 3600;
+    if hours < 24 {
+        return Ok((false, format!("Truy cập {hours} giờ trước")));
+    }
+    let days = (diff_sec / 86400).min(7);
+    Ok((false, format!("Truy cập {days} ngày trước")))
 }
 
 /// Send a friend request to a target user (`/api/friend/sendreq`, cmd `11424`).

@@ -45,7 +45,7 @@ Bản Zalo PC chính thức đóng gói trên Electron thường chiếm 350–6
   - Hỗ trợ tìm kiếm theo cụm từ cuối câu và tải trước (prefetch) ảnh sticker song song ở luồng nền, lưu cache tại `stickers_cache/`.
 - **Lưu trữ cục bộ 2 tầng (`src/store.rs`)**
   - `threads_cache.json`: Snapshot danh sách hội thoại giúp hiển thị giao diện ngay khi mở app.
-  - `zalo_history.db` (SQLite): Lưu trữ lịch sử tin nhắn lâu dài, khử trùng lặp theo `msg_id` và mốc thời gian.
+  - `zalo_history.db` (SQLite): Lưu trữ lịch sử tin nhắn cục bộ trên máy, khử trùng lặp theo `msg_id` và mốc thời gian. Ứng dụng không gửi dữ liệu sang bất kỳ máy chủ bên thứ ba nào ngoài hệ thống Zalo; khuyến nghị bật mã hóa ổ đĩa hệ điều hành (BitLocker / FileVault / LUKS) nếu dùng trên máy chung.
 - **Gọi thoại & Gọi video 1-1 (`src/call.rs`, `src/media.rs`, `src/audio.rs`)**
   - Triển khai trực tiếp luồng báo hiệu cuộc gọi (`401`/`416`/`407`/`402`/`408`/`409`) và bắt tay ZRTP relay bằng Rust, không phụ thuộc `ZaloCall.exe`.
   - Audio hai chiều qua `cpal` + `opus`; video H.264 đóng gói theo khung relay của Zalo (RTP PT 97/98, RTCP SR/PLI/REMB) kết hợp `ffmpeg` để thu webcam và giải mã khung hình.
@@ -118,7 +118,10 @@ Toàn bộ gói cài đặt dựng sẵn cho từng hệ điều hành và các 
 
 ### 2. Cài đặt trên Windows & macOS
 - **Windows (x64):** Chạy bộ cài `ctdozlite-0.0.1-setup-windows-x86_64.exe` hoặc bản chạy ngay `ctdozlite-0.0.1-portable-windows-x86_64.exe`.
-- **macOS:** Mở `ctdozlite-0.0.1-macos.dmg` và kéo `ctdozlite.app` vào `/Applications`.
+- **macOS (Apple Silicon M1/M2/M3/M4 & Intel):**
+  - **Apple Silicon (Chip M1 / M2 / M3 / M4 — ARM64):** Mở `ctdozlite-0.0.1-macos-arm64.dmg` và kéo `ctdozlite.app` vào `/Applications`.
+  - **Mac Intel (`x86_64`):** Mở `ctdozlite-0.0.1-macos-x86_64.dmg` và kéo `ctdozlite.app` vào `/Applications`.
+  - **Bản Universal (Chạy chung cho cả Mac chip M & Mac Intel):** `ctdozlite-0.0.1-macos.dmg`.
 
 > [!IMPORTANT]
 > **Phiên bản iOS — Dùng 1 tài khoản Zalo song song trên 2 máy (Sắp ra mắt):**
@@ -178,15 +181,15 @@ CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo build --release
 ```
 Binary đầu ra: `target/release/zalo-rust`
 
-### 4. macOS (Apple Silicon & Intel)
+### 4. macOS (Apple Silicon ARM64 & Intel x86_64)
 ```bash
 xcode-select --install
-brew install cmake pkg-config opus ffmpeg
+brew install cmake ffmpeg
 git clone https://github.com/ctdoteam1110/ctdozlite.git
 cd ctdozlite
 cargo build --release
 ```
-Binary đầu ra: `target/release/zalo-rust`
+Binary đầu ra: `target/release/zalo-rust` *(Tự động liên kết tĩnh `libopus.a` qua `.cargo/config.toml` + `packaging/macos/toolchain-*.cmake`, không cần cài `opus` rời qua Homebrew)*.
 
 ---
 
@@ -229,7 +232,7 @@ Workflow GitHub Actions tại [`.github/workflows/ci-release.yml`](.github/workf
   - `ctdozlite-0.0.1-x86_64.AppImage` (Gói thực thi độc lập chạy trên mọi bản Linux)
   - `ctdozlite-0.0.1-linux-x86_64.tar.gz` & `ctdozlite-0.0.1-linux-x86_64-legacy-glibc2.31.tar.gz` (kèm script `install.sh` / `uninstall.sh`)
 - **Windows:** `ctdozlite-0.0.1-portable-windows-x86_64.exe` và `ctdozlite-0.0.1-setup-windows-x86_64.exe` ([`packaging/windows/installer.iss`](packaging/windows/installer.iss))
-- **macOS:** `ctdozlite-0.0.1-macos.dmg` đóng gói `ctdozlite.app` ([`packaging/macos/Info.plist`](packaging/macos/Info.plist))
+- **macOS (Apple Silicon + Intel + Universal):** `ctdozlite-0.0.1-macos-arm64.dmg` (Chip M1/M2/M3/M4), `ctdozlite-0.0.1-macos-x86_64.dmg` (Mac Intel), và `ctdozlite-0.0.1-macos.dmg` (Universal Binary `lipo`) ([`packaging/macos/Info.plist`](packaging/macos/Info.plist))
 
 ---
 

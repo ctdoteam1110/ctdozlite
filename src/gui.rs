@@ -92,6 +92,7 @@ pub enum GuiEvent {
     FriendStatusChecked {
         user_id: String,
         status: crate::chat::FriendshipStatus,
+        online: Option<(bool, String)>,
     },
     QuoteSent {
         thread_id: String,
@@ -134,7 +135,54 @@ pub enum GuiEvent {
         reason: String,
     },
     StatusUpdate(String),
+    UpdateCheckFinished {
+        result: Result<UpdateCheckResult, String>,
+        silent: bool,
+    },
+    UpdateDownloadStatus {
+        downloading: bool,
+        message: String,
+    },
+    UpdateDownloadProgress {
+        downloaded: u64,
+        total: u64,
+    },
+    UpdateAppliedAndRestarting(String),
     LoggedOut,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateCheckResult {
+    pub current_version: String,
+    pub latest_version: String,
+    pub has_update: bool,
+    pub release_title: String,
+    pub release_notes: String,
+    pub html_url: String,
+    pub download_url: Option<String>,
+    pub asset_name: Option<String>,
+    pub asset_size: u64,
+    pub expected_sha256: Option<String>,
+    pub published_at: String,
+}
+
+/// Compare semantic versions (`"v0.0.2"` > `"0.0.1"`).
+pub fn is_newer_semver(remote: &str, current: &str) -> bool {
+    let parse = |s: &str| -> (u64, u64, u64) {
+        let clean = s
+            .trim()
+            .trim_start_matches(['v', 'V'])
+            .split(['-', '+'])
+            .next()
+            .unwrap_or("");
+        let mut parts = clean.split('.').filter_map(|p| p.trim().parse::<u64>().ok());
+        (
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        )
+    };
+    parse(remote) > parse(current)
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +220,7 @@ enum SettingsTab {
     Notifications,
     Messages,
     Utilities,
+    Update,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -360,12 +409,18 @@ pub struct ZaloGuiApp {
     dismissed_link_preview_for: String,
     friend_status_map: HashMap<String, crate::chat::FriendshipStatus>,
     checking_friend_status: HashSet<String>,
+    user_online_map: HashMap<String, (bool, String)>,
     allow_quit: bool,
     settings_modal_open: bool,
     settings_tab: SettingsTab,
     settings: AppSettings,
-
-    // Dev Inspector state
+    settings_blur_tex: Option<TextureHandle>,
+    settings_blur_req_at: Option<std::time::Instant>,
+    update_checking: bool,
+    update_downloading: bool,
+    update_progress: Option<(u64, u64)>,
+    update_status: String,
+    update_info: Option<UpdateCheckResult>,
     dev_mode: bool,
     dev_panel_open: bool,
     dev_tab: DevTab,
@@ -543,10 +598,18 @@ impl ZaloGuiApp {
             dismissed_link_preview_for: String::new(),
             friend_status_map: HashMap::new(),
             checking_friend_status: HashSet::new(),
+            user_online_map: HashMap::new(),
             allow_quit: false,
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
             settings: loaded_settings,
+            settings_blur_tex: None,
+            settings_blur_req_at: None,
+            update_checking: false,
+            update_downloading: false,
+            update_progress: None,
+            update_status: String::new(),
+            update_info: None,
             dev_mode,
             dev_panel_open: false,
             dev_tab: DevTab::Logs,
@@ -557,6 +620,14 @@ impl ZaloGuiApp {
             last_poll: std::time::Instant::now(),
         };
 
+        // Clean up any leftover `.old` executable from a previous in-place self-update
+        if let Ok(exe_path) = std::env::current_exe() {
+            let old_path = exe_path.with_extension("exe.old");
+            let _ = std::fs::remove_file(&old_path);
+            let old_unix = exe_path.with_extension("old");
+            let _ = std::fs::remove_file(&old_unix);
+        }
+
         spawn_session_worker(session, tx, cc.egui_ctx.clone());
 
         if let Some(wtx) = WORKER_TX.get() {
@@ -565,8 +636,8 @@ impl ZaloGuiApp {
             } else {
                 let _ = wtx.send(WorkerCmd::RequestQr);
             }
+            let _ = wtx.send(WorkerCmd::CheckForUpdates { silent: true });
         }
-
         app
     }
 
@@ -991,9 +1062,16 @@ impl ZaloGuiApp {
                         self.persist_threads_async();
                     }
                 }
-                GuiEvent::FriendStatusChecked { user_id, status } => {
+                GuiEvent::FriendStatusChecked {
+                    user_id,
+                    status,
+                    online,
+                } => {
                     self.checking_friend_status.remove(&user_id);
                     self.friend_status_map.insert(user_id.clone(), status);
+                    if let Some(onl) = online {
+                        self.user_online_map.insert(user_id.clone(), onl);
+                    }
                     if let Some(ref mut prof) = self.phone_lookup_result {
                         if prof.user_id == user_id {
                             prof.friendship = status;
@@ -1037,6 +1115,9 @@ impl ZaloGuiApp {
                             .and_then(|c| c.error_reason.as_ref())
                             .is_some();
                         self.sticker_textures.remove("call_remote_video");
+                        self.sticker_textures.remove("call_remote_video_1");
+                        self.sticker_textures.remove("call_remote_video_2");
+                        self.sticker_textures.remove("call_remote_video_3");
                         self.sticker_textures.remove("call_local_video");
                         if !has_error {
                             self.active_call = None;
@@ -1101,6 +1182,58 @@ impl ZaloGuiApp {
                 GuiEvent::StatusUpdate(msg) => {
                     self.status_msg = msg;
                 }
+                GuiEvent::UpdateCheckFinished { result, silent } => {
+                    self.update_checking = false;
+                    match result {
+                        Ok(info) => {
+                            if info.has_update {
+                                let msg = format!(
+                                    "🚀 Có bản cập nhật mới v{} trên GitHub (hiện tại: v{})",
+                                    info.latest_version, info.current_version
+                                );
+                                self.update_status = msg.clone();
+                                self.show_toast(msg);
+                            } else {
+                                self.update_status = format!(
+                                    "✅ Bạn đang sử dụng phiên bản mới nhất (v{})",
+                                    info.current_version
+                                );
+                                if !silent {
+                                    self.show_toast(&self.update_status.clone());
+                                }
+                            }
+                            self.update_info = Some(info);
+                        }
+                        Err(e) => {
+                            self.update_status = format!("⚠️ Không kiểm tra được cập nhật: {e}");
+                            if !silent {
+                                self.show_toast(&self.update_status.clone());
+                            }
+                        }
+                    }
+                }
+                GuiEvent::UpdateDownloadStatus {
+                    downloading,
+                    message,
+                } => {
+                    self.update_downloading = downloading;
+                    if !downloading {
+                        self.update_progress = None;
+                    }
+                    self.update_status = message.clone();
+                    self.show_toast(message);
+                }
+                GuiEvent::UpdateDownloadProgress { downloaded, total } => {
+                    self.update_downloading = true;
+                    self.update_progress = Some((downloaded, total));
+                }
+                GuiEvent::UpdateAppliedAndRestarting(ver) => {
+                    self.update_downloading = false;
+                    self.show_toast(format!("✅ Đã cập nhật lên v{ver} — Đang khởi động lại…"));
+                    self.allow_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    std::process::exit(0);
+                }
             }
         }
     }
@@ -1117,13 +1250,14 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q)) {
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
+            || ctx.input(|i| i.viewport().close_requested())
+        {
             self.allow_quit = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_quit {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::EndCall);
+            }
+            std::process::exit(0);
         }
         if self.theme_dirty {
             self.palette().apply_to_ctx(ctx);
@@ -1222,6 +1356,10 @@ impl eframe::App for ZaloGuiApp {
                 Stroke::new(1.0_f32, pal.border),
             );
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        std::process::exit(0);
     }
 }
 
@@ -1389,22 +1527,14 @@ impl ZaloGuiApp {
                             [Pos2::new(cc.x + d, cc.y - d), Pos2::new(cc.x - d, cc.y + d)],
                             Stroke::new(1.4_f32, close_fg),
                         );
-                        let close_shift = ctx.input(|i| i.modifiers.shift);
-                        if close_resp.secondary_clicked() {
+                        let close_resp = close_resp.on_hover_text("Đóng ứng dụng (Ctrl+Q)");
+                        if close_resp.clicked() || close_resp.secondary_clicked() {
                             self.allow_quit = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        } else if close_resp
-                            .on_hover_text(
-                                "Thu nhỏ xuống thanh tác vụ (Giữ Shift + Bấm hoặc Chuột phải để thoát hẳn)",
-                            )
-                            .clicked()
-                        {
-                            if close_shift {
-                                self.allow_quit = true;
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            } else {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(WorkerCmd::EndCall);
                             }
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            std::process::exit(0);
                         }
 
                         // Maximize / Restore Button (46x32)
@@ -1769,5 +1899,19 @@ impl ZaloGuiApp {
         let text = msg.into();
         self.status_msg = text.clone();
         self.toast_notice = Some((text, std::time::Instant::now()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_newer_semver;
+
+    #[test]
+    fn semver_comparison_handles_v_prefix_and_prerelease() {
+        assert!(is_newer_semver("v0.0.2", "0.0.1"));
+        assert!(is_newer_semver("0.1.0", "0.0.9"));
+        assert!(is_newer_semver("V1.0.0-beta.1", "0.9.9"));
+        assert!(!is_newer_semver("v0.0.1", "0.0.1"));
+        assert!(!is_newer_semver("0.0.1", "0.0.2"));
     }
 }

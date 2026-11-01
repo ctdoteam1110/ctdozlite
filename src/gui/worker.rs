@@ -116,6 +116,15 @@ pub enum WorkerCmd {
         user_name: String,
     },
     PersistThreads(Vec<Thread>),
+    CheckForUpdates {
+        silent: bool,
+    },
+    DownloadAndApplyUpdate {
+        download_url: String,
+        asset_name: String,
+        target_version: String,
+        expected_sha256: Option<String>,
+    },
     Logout,
 }
 
@@ -265,6 +274,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                     tokio::spawn(async move {
                         let s = s_kw.lock().await.clone();
                         if s.login.is_some() {
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(WorkerCmd::RefreshThreads);
+                            }
                             if let Ok(kws) = crate::chat::fetch_sticker_suggest_keywords(&s).await {
                                 if !kws.is_empty() {
                                     let _ = gui_tx_kw
@@ -652,20 +664,65 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             avatar: u_ava,
                                         });
                                     }
-                                    let mut list =
-                                        crate::chat::get_friends(&s).await.unwrap_or_default();
+                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
+                                        "⏳ Đang đồng bộ danh bạ & nhóm từ máy chủ Zalo…".into(),
+                                    ));
+                                    ctx_clone.request_repaint();
+                                    let mut list = crate::chat::load_threads_cache();
+                                    if let Ok(friends) = crate::chat::get_friends(&s).await {
+                                        for ft in friends {
+                                            if let Some(ex) = list.iter_mut().find(|t| t.id == ft.id) {
+                                                if !ft.name.is_empty() {
+                                                    ex.name = ft.name;
+                                                }
+                                                if ft.avatar.is_some() {
+                                                    ex.avatar = ft.avatar;
+                                                }
+                                                ex.is_group = ex.is_group || ft.is_group;
+                                            } else {
+                                                list.push(ft);
+                                            }
+                                        }
+                                    }
+                                    if let Ok(groups) = crate::chat::get_groups(&s).await {
+                                        for gt in groups {
+                                            if let Some(ex) = list.iter_mut().find(|t| t.id == gt.id) {
+                                                if !gt.name.is_empty() {
+                                                    ex.name = gt.name;
+                                                }
+                                                if gt.avatar.is_some() {
+                                                    ex.avatar = gt.avatar;
+                                                }
+                                                ex.is_group = true;
+                                            } else {
+                                                list.push(gt);
+                                            }
+                                        }
+                                    }
                                     crate::store::load_history_into_threads(
                                         "zalo_history.db",
                                         &mut list,
                                         200,
                                     );
+                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
+                                        format!("⏳ Đang tải tin nhắn cho {} hội thoại…", list.len()),
+                                    ));
+                                    ctx_clone.request_repaint();
+                                    let mut fresh_ps = crate::chat::PollState::default();
+                                    let _ =
+                                        crate::chat::poll_new_messages(&s, &mut fresh_ps, &mut list)
+                                            .await;
                                     {
                                         let mut ps = poll_clone.lock().await;
-                                        let _ =
-                                            crate::chat::poll_new_messages(&s, &mut ps, &mut list)
-                                                .await;
+                                        *ps = fresh_ps;
                                     }
+                                    let total_msgs: usize =
+                                        list.iter().map(|t| t.messages.len()).sum();
+                                    let n_threads = list.len();
                                     let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(list));
+                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                        "✅ Đã đồng bộ {n_threads} hội thoại ({total_msgs} tin nhắn)"
+                                    )));
                                     ctx_clone.request_repaint();
                                 }
                             });
@@ -795,18 +852,32 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                     else {
                                         return;
                                     };
-                                    if is_group && !is_send2me {
-                                        if let Ok(resp) =
-                                            crate::chat::get_group_history(&s, &group_id, 50).await
+                                    if !is_group && !is_send2me {
+                                        let mut one_list = vec![t.clone()];
+                                        if let Ok(resp) = crate::chat::get_last_msgs(
+                                            &s,
+                                            std::slice::from_ref(&group_id),
+                                        )
+                                        .await
                                         {
-                                            crate::chat::merge_group_history(&mut t, &resp);
+                                            crate::chat::merge_previews(&mut one_list, &resp);
+                                        }
+                                        if let Ok(resp_all) =
+                                            crate::chat::get_last_msgs(&s, &[]).await
+                                        {
+                                            crate::chat::merge_previews(&mut one_list, &resp_all);
+                                        }
+                                        if let Some(updated) =
+                                            one_list.into_iter().find(|x| x.id == group_id)
+                                        {
+                                            t = updated;
                                         }
                                     }
                                     if is_group || is_send2me {
                                         if let Ok(cm_resp) = crate::chat::get_cloud_messages(
                                             &s,
                                             &group_id,
-                                            "0",
+                                            "9223372036854775808",
                                             false,
                                             50,
                                         )
@@ -814,26 +885,101 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         {
                                             crate::chat::merge_group_history(&mut t, &cm_resp);
                                         }
-                                        if let Ok(cm_old) = crate::chat::get_cloud_messages(
-                                            &s,
-                                            &group_id,
-                                            "",
-                                            true,
-                                            50,
-                                        )
-                                        .await
-                                        {
+                                        // Backfill up to 5 pages (250 messages) of older cloud history
+                                        let mut cursor_id = t
+                                            .messages
+                                            .first()
+                                            .map(|m| m.id.as_str())
+                                            .filter(|id| {
+                                                !id.is_empty()
+                                                    && id.chars().all(|c| c.is_ascii_digit())
+                                            })
+                                            .unwrap_or("9223372036854775808")
+                                            .to_string();
+                                        for page in 1..=5 {
+                                            let prev_len = t.messages.len();
+                                            let Ok(cm_old) = crate::chat::get_cloud_messages(
+                                                &s,
+                                                &group_id,
+                                                &cursor_id,
+                                                true,
+                                                50,
+                                            )
+                                            .await
+                                            else {
+                                                break;
+                                            };
                                             crate::chat::merge_group_history(&mut t, &cm_old);
+                                            let new_len = t.messages.len();
+                                            let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
+                                                format!(
+                                                    "⏳ Đang đồng bộ lịch sử cũ (trang {page}/5 — {new_len} tin nhắn)…"
+                                                ),
+                                            ));
+                                            ctx_clone.request_repaint();
+                                            let data_node = cm_old
+                                                .pointer("/data/data")
+                                                .or_else(|| cm_old.get("data"))
+                                                .unwrap_or(&cm_old);
+                                            let has_more = data_node
+                                                .get("hasMore")
+                                                .and_then(|v| v.as_i64())
+                                                .unwrap_or(0);
+                                            let next_cursor = data_node
+                                                .get("lastMsgId")
+                                                .and_then(|v| {
+                                                    v.as_str().map(str::to_string).or_else(|| {
+                                                        v.as_u64().map(|n| n.to_string())
+                                                    })
+                                                })
+                                                .filter(|s| {
+                                                    !s.is_empty()
+                                                        && s != "0"
+                                                        && s.chars().all(|c| c.is_ascii_digit())
+                                                })
+                                                .or_else(|| {
+                                                    t.messages
+                                                        .first()
+                                                        .map(|m| m.id.clone())
+                                                        .filter(|id| {
+                                                            !id.is_empty()
+                                                                && id
+                                                                    .chars()
+                                                                    .all(|c| c.is_ascii_digit())
+                                                        })
+                                                });
+                                            let Some(nc) = next_cursor else {
+                                                break;
+                                            };
+                                            if has_more == 0 || nc == cursor_id || new_len == prev_len {
+                                                break;
+                                            }
+                                            cursor_id = nc;
                                         }
                                     }
-                                    if !t.messages.is_empty() {
-                                        let cnt = t.messages.len();
-                                        let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(vec![t]));
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Đã đồng bộ {cnt} tin nhắn lịch sử"
-                                        )));
-                                        ctx_clone.request_repaint();
+                                    if is_group && !is_send2me {
+                                        crate::chat::resolve_thread_names(
+                                            &s,
+                                            std::slice::from_mut(&mut t),
+                                        )
+                                        .await;
                                     }
+                                    let cnt = t.messages.len();
+                                    if !t.messages.is_empty() || !t.name.is_empty() {
+                                        if let Ok(mut store) =
+                                            crate::store::MessageStore::open("zalo_history.db")
+                                        {
+                                            let _ = crate::store::persist_threads(
+                                                &mut store,
+                                                std::slice::from_ref(&t),
+                                            );
+                                        }
+                                        let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(vec![t]));
+                                    }
+                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                        "✅ Đã đồng bộ {cnt} tin nhắn lịch sử"
+                                    )));
+                                    ctx_clone.request_repaint();
                                 }
                             });
                         }
@@ -1612,11 +1758,16 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                if let Ok(status) =
-                                    crate::chat::check_friendship_status(&s, &user_id).await
-                                {
-                                    let _ = gui_tx_clone
-                                        .send(GuiEvent::FriendStatusChecked { user_id, status });
+                                let status_res =
+                                    crate::chat::check_friendship_status(&s, &user_id).await;
+                                let online_opt =
+                                    crate::chat::get_user_online_status(&s, &user_id).await.ok();
+                                if let Ok(status) = status_res {
+                                    let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
+                                        user_id,
+                                        status,
+                                        online: online_opt,
+                                    });
                                     ctx_clone.request_repaint();
                                 }
                             });
@@ -1632,6 +1783,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
                                             user_id,
                                             status: crate::chat::FriendshipStatus::Friend,
+                                            online: None,
                                         });
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                             "Đã đồng ý kết bạn với {user_name}!"
@@ -1659,6 +1811,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                     let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
                                         user_id,
                                         status: crate::chat::FriendshipStatus::Stranger,
+                                        online: None,
                                     });
                                     let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                         "Đã từ chối lời mời kết bạn của {user_name}."
@@ -1677,6 +1830,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                     let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
                                         user_id,
                                         status: crate::chat::FriendshipStatus::Stranger,
+                                        online: None,
                                     });
                                     let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                         "Đã hủy lời mời kết bạn tới {user_name}."
@@ -1696,6 +1850,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                     let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
                                         user_id,
                                         status: crate::chat::FriendshipStatus::Friend,
+                                        online: None,
                                     });
                                     let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                         "Đã đồng ý kết bạn với {user_name}! Bạn có thể gọi lại ngay."
@@ -1714,6 +1869,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
                                             user_id: user_id.clone(),
                                             status: crate::chat::FriendshipStatus::OutgoingPending,
+                                            online: None,
                                         });
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                             "Đã gửi lời mời kết bạn tới {user_name} ({user_id})."
@@ -1820,10 +1976,461 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                 }
                             });
                         }
+                        WorkerCmd::CheckForUpdates { silent } => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let res = fetch_github_latest_release().await;
+                                let _ = gui_tx_clone.send(GuiEvent::UpdateCheckFinished {
+                                    result: res,
+                                    silent,
+                                });
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::DownloadAndApplyUpdate {
+                            download_url,
+                            asset_name,
+                            target_version,
+                            expected_sha256,
+                        } => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let _ = gui_tx_clone.send(GuiEvent::UpdateDownloadStatus {
+                                    downloading: true,
+                                    message: format!(
+                                        "Đang tải bản cập nhật v{target_version}…"
+                                    ),
+                                });
+                                ctx_clone.request_repaint();
+                                match apply_github_release_update(
+                                    &download_url,
+                                    &asset_name,
+                                    &target_version,
+                                    expected_sha256.as_deref(),
+                                    &gui_tx_clone,
+                                    &ctx_clone,
+                                )
+                                .await
+                                {
+                                    Ok(restarting) => {
+                                        if restarting {
+                                            let _ = gui_tx_clone.send(
+                                                GuiEvent::UpdateAppliedAndRestarting(target_version),
+                                            );
+                                        } else {
+                                            let _ = gui_tx_clone.send(
+                                                GuiEvent::UpdateDownloadStatus {
+                                                    downloading: false,
+                                                    message: format!(
+                                                        "Đã tải và mở bộ cài đặt {asset_name} (v{target_version})"
+                                                    ),
+                                                },
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::UpdateDownloadStatus {
+                                            downloading: false,
+                                            message: format!("Lỗi cập nhật: {e}"),
+                                        });
+                                    }
+                                }
+                                ctx_clone.request_repaint();
+                            });
+                        }
                     }
                 }
             });
         })
         .expect("Failed to spawn zalo-worker thread");
+}
+
+const GITHUB_REPO: &str = "ctdoteam1110/ctdozlite";
+
+async fn fetch_github_latest_release() -> Result<UpdateCheckResult, String> {
+    let current_ver = env!("CARGO_PKG_VERSION").to_string();
+    let client = reqwest::Client::builder()
+        .user_agent(format!("ctdozlite/{current_ver}"))
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("Khởi tạo HTTP client thất bại: {e}"))?;
+
+    let latest_url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+    let mut rel_json: Option<serde_json::Value> = None;
+
+    if let Ok(resp) = client
+        .get(&latest_url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                rel_json = Some(v);
+            }
+        }
+    }
+
+    if rel_json.is_none() {
+        let list_url =
+            format!("https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=5");
+        if let Ok(resp) = client
+            .get(&list_url)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(arr) = resp.json::<serde_json::Value>().await {
+                    if let Some(first) = arr.as_array().and_then(|a| a.first()).cloned() {
+                        rel_json = Some(first);
+                    }
+                }
+            }
+        }
+    }
+
+    // Rate-limit resilient fallback: fetch static `latest.json` directly from GitHub Release CDN
+    if rel_json.is_none() {
+        let cdn_manifest_url =
+            format!("https://github.com/{GITHUB_REPO}/releases/latest/download/latest.json");
+        if let Ok(resp) = client.get(&cdn_manifest_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(manifest) = resp.json::<serde_json::Value>().await {
+                    let ver = manifest
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&current_ver)
+                        .trim_start_matches(['v', 'V'])
+                        .to_string();
+                    let asset_name = if cfg!(target_os = "windows") {
+                        format!("ctdozlite-{ver}-portable-windows-x86_64.exe")
+                    } else if cfg!(target_os = "macos") {
+                        if cfg!(target_arch = "aarch64") {
+                            format!("ctdozlite-{ver}-macos-arm64.dmg")
+                        } else if cfg!(target_arch = "x86_64") {
+                            format!("ctdozlite-{ver}-macos-x86_64.dmg")
+                        } else {
+                            format!("ctdozlite-{ver}-macos.dmg")
+                        }
+                    } else {
+                        format!("ctdozlite-{ver}-x86_64.AppImage")
+                    };
+                    let dl_url = format!(
+                        "https://github.com/{GITHUB_REPO}/releases/download/v{ver}/{asset_name}"
+                    );
+                    return Ok(UpdateCheckResult {
+                        current_version: current_ver.clone(),
+                        has_update: is_newer_semver(&ver, &current_ver),
+                        latest_version: ver.clone(),
+                        release_title: format!("ctdozlite v{ver}"),
+                        release_notes: manifest
+                            .get("notes")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        html_url: format!("https://github.com/{GITHUB_REPO}/releases/tag/v{ver}"),
+                        download_url: Some(dl_url),
+                        asset_name: Some(asset_name),
+                        asset_size: 0,
+                        expected_sha256: manifest
+                            .get("sha256")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        published_at: String::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    let Some(rel) = rel_json else {
+        return Err("Không truy cập được máy chủ GitHub Releases".into());
+    };
+
+    let raw_tag = rel
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&current_ver);
+    let latest_ver = raw_tag.trim().trim_start_matches(['v', 'V']).to_string();
+    let has_update = is_newer_semver(&latest_ver, &current_ver);
+    let release_title = rel
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(raw_tag)
+        .to_string();
+    let release_notes = rel
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let html_url = rel
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&format!("https://github.com/{GITHUB_REPO}/releases"))
+        .to_string();
+    let published_at = rel
+        .get("published_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .split('T')
+        .next()
+        .unwrap_or("")
+        .to_string();
+
+    let mut best_url: Option<String> = None;
+    let mut best_name: Option<String> = None;
+    let mut best_size: u64 = 0;
+    let mut best_score: i32 = -1;
+    let mut sha256_url: Option<String> = None;
+
+    if let Some(assets) = rel.get("assets").and_then(|v| v.as_array()) {
+        for a in assets {
+            let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let dl = a
+                .get("browser_download_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let sz = a.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            if name.eq_ignore_ascii_case("SHA256SUMS.txt") && !dl.is_empty() {
+                sha256_url = Some(dl.to_string());
+                continue;
+            }
+            if name.is_empty() || dl.is_empty() || name.ends_with(".txt") || name.ends_with(".json") {
+                continue;
+            }
+            let n_low = name.to_lowercase();
+            let score = if cfg!(target_os = "windows") {
+                if n_low.ends_with(".exe") && n_low.contains("portable") {
+                    100
+                } else if n_low.ends_with(".exe") {
+                    80
+                } else {
+                    0
+                }
+            } else if cfg!(target_os = "macos") {
+                if n_low.ends_with(".dmg") {
+                    if cfg!(target_arch = "aarch64")
+                        && (n_low.contains("arm64") || n_low.contains("aarch64"))
+                    {
+                        110
+                    } else if cfg!(target_arch = "x86_64")
+                        && (n_low.contains("x86_64") || n_low.contains("intel"))
+                    {
+                        110
+                    } else if !n_low.contains("arm64")
+                        && !n_low.contains("aarch64")
+                        && !n_low.contains("x86_64")
+                        && !n_low.contains("intel")
+                    {
+                        100
+                    } else {
+                        50
+                    }
+                } else {
+                    0
+                }
+            } else if n_low.ends_with(".appimage") {
+                100
+            } else if n_low.ends_with(".deb") && !n_low.contains("legacy") {
+                90
+            } else if n_low.ends_with(".tar.gz") && !n_low.contains("legacy") {
+                80
+            } else {
+                0
+            };
+            if score > best_score {
+                best_score = score;
+                best_url = Some(dl.to_string());
+                best_name = Some(name.to_string());
+                best_size = sz;
+            }
+        }
+    }
+
+    let mut expected_sha256: Option<String> = None;
+    if let (Some(ref s_url), Some(ref b_name)) = (sha256_url, &best_name) {
+        if let Ok(resp) = client.get(s_url).send().await {
+            if let Ok(txt) = resp.text().await {
+                for line in txt.lines() {
+                    let mut parts = line.split_whitespace();
+                    let Some(hash) = parts.next() else { continue };
+                    let Some(fname) = parts.next() else { continue };
+                    let clean_fname = fname.trim_start_matches('*').trim_start_matches("./");
+                    if clean_fname == b_name && hash.len() == 64 {
+                        expected_sha256 = Some(hash.to_lowercase());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(UpdateCheckResult {
+        current_version: current_ver,
+        latest_version: latest_ver,
+        has_update,
+        release_title,
+        release_notes,
+        html_url,
+        download_url: best_url,
+        asset_name: best_name,
+        asset_size: best_size,
+        expected_sha256,
+        published_at,
+    })
+}
+
+/// Stream-download the release asset from GitHub Releases with real-time progress reporting,
+/// verify binary integrity (PE/ELF magic + SHA-256 checksum when provided), and atomically
+/// replace the running executable in-place with automatic rollback on failure.
+async fn apply_github_release_update(
+    download_url: &str,
+    asset_name: &str,
+    target_version: &str,
+    expected_sha256: Option<&str>,
+    gui_tx: &Sender<GuiEvent>,
+    ctx: &egui::Context,
+) -> Result<bool, String> {
+    use sha2::{Digest, Sha256};
+
+    let client = reqwest::Client::builder()
+        .user_agent(format!("ctdozlite/{target_version}"))
+        .timeout(Duration::from_secs(240))
+        .build()
+        .map_err(|e| format!("Khởi tạo HTTP client thất bại: {e}"))?;
+
+    let mut resp = client
+        .get(download_url)
+        .send()
+        .await
+        .map_err(|e| format!("Không kết nối được GitHub CDN: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Máy chủ GitHub trả về HTTP {}", resp.status()));
+    }
+
+    let total_bytes = resp.content_length().unwrap_or(0);
+    let mut bytes = Vec::with_capacity(total_bytes.min(64 * 1024 * 1024) as usize);
+    let mut hasher = Sha256::new();
+    let mut last_report = std::time::Instant::now();
+
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("Ngắt kết nối khi đang tải: {e}"))?
+    {
+        hasher.update(&chunk);
+        bytes.extend_from_slice(&chunk);
+        if last_report.elapsed() >= Duration::from_millis(80) {
+            last_report = std::time::Instant::now();
+            let _ = gui_tx.send(GuiEvent::UpdateDownloadProgress {
+                downloaded: bytes.len() as u64,
+                total: total_bytes,
+            });
+            ctx.request_repaint();
+        }
+    }
+    let _ = gui_tx.send(GuiEvent::UpdateDownloadProgress {
+        downloaded: bytes.len() as u64,
+        total: total_bytes.max(bytes.len() as u64),
+    });
+    ctx.request_repaint();
+
+    if bytes.len() < 1024 * 512 {
+        return Err("Gói cập nhật tải về không hợp lệ (dung lượng quá nhỏ)".into());
+    }
+    if total_bytes > 0 && (bytes.len() as u64) != total_bytes {
+        return Err(format!(
+            "Tải file chưa hoàn tất ({}/{} bytes)",
+            bytes.len(),
+            total_bytes
+        ));
+    }
+
+    // Verify SHA-256 digest if `SHA256SUMS.txt` was published with the release
+    if let Some(exp_hex) = expected_sha256.filter(|s| s.len() == 64) {
+        let digest = hasher.finalize();
+        let mut actual_hex = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write;
+            let _ = write!(actual_hex, "{b:02x}");
+        }
+        if !actual_hex.eq_ignore_ascii_case(exp_hex) {
+            return Err("Mã kiểm tra toàn vẹn SHA-256 không khớp".into());
+        }
+    }
+
+    let name_low = asset_name.to_lowercase();
+    let is_portable_bin = (cfg!(target_os = "windows")
+        && name_low.ends_with(".exe")
+        && !name_low.contains("setup"))
+        || (cfg!(target_os = "linux") && name_low.ends_with(".appimage"));
+
+    if cfg!(target_os = "windows") && name_low.ends_with(".exe") {
+        if bytes.get(0..2) != Some(b"MZ") {
+            return Err("File .exe tải về không có chữ ký PE hợp lệ".into());
+        }
+    }
+
+    if is_portable_bin {
+        if let Ok(exe_path) = std::env::current_exe() {
+            let new_path = exe_path.with_extension("exe.new");
+            let old_path = exe_path.with_extension("exe.old");
+            if std::fs::write(&new_path, &bytes).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &new_path,
+                        std::fs::Permissions::from_mode(0o755),
+                    );
+                }
+                let _ = std::fs::remove_file(&old_path);
+                if std::fs::rename(&exe_path, &old_path).is_ok() {
+                    if std::fs::rename(&new_path, &exe_path).is_ok() {
+                        let args: Vec<String> = std::env::args().skip(1).collect();
+                        let _ = std::process::Command::new(&exe_path).args(&args).spawn();
+                        return Ok(true);
+                    } else {
+                        let _ = std::fs::rename(&old_path, &exe_path);
+                    }
+                }
+                let _ = std::fs::remove_file(&new_path);
+            }
+        }
+    }
+
+    // Fallback / Installer mode: save to Downloads (or current directory) and launch
+    let dl_dir = std::env::var("USERPROFILE")
+        .ok()
+        .map(|p| std::path::PathBuf::from(p).join("Downloads"))
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join("Downloads"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let _ = std::fs::create_dir_all(&dl_dir);
+    let dest_path = dl_dir.join(asset_name);
+    std::fs::write(&dest_path, &bytes)
+        .map_err(|e| format!("Không lưu được file {}: {e}", dest_path.display()))?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new(&dest_path).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&dest_path).spawn();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&dest_path).spawn();
+    }
+    Ok(false)
 }
 

@@ -9,4 +9,4 @@ Icon=ctdozlite
 Terminal=false
 Categories=Network;InstantMessaging;Chat;VideoConference;
 Keywords=zalo;chat;messenger;voip;rust;ctdozlite;
-StartupWMClass=zalo-rust
+StartupWMClass=ctdozlite
