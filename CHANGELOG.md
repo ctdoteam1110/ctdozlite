@@ -10,11 +10,52 @@ Phiên bản đầu tiên của QTzalo.
 
 ### Bảo mật
 
-<!-- Điền khi tích hợp: lưu trữ dữ liệu an toàn, tắt log mặc định, link preview, RNG, WebSocket, mật khẩu, dependency. -->
+- **Lưu dữ liệu an toàn**
+  - `session.json`, lịch sử `zalo_history.db`, `threads_cache.json`, `app_settings.json`, cache ảnh, log và dump nay nằm trong một thư mục riêng của người dùng:
+    - Windows: `%APPDATA%\QTzalo`
+    - Linux: `~/.local/share/qtzalo`
+    - macOS: `~/Library/Application Support/QTzalo`
+  - Trước đây các file này nằm ở thư mục đang đứng khi chạy app.
+  - File chứa thông tin đăng nhập được ghi nguyên tử với quyền `0600`, thư mục có quyền `0700`.
+  - File của bản cũ được tự động chuyển sang khi khởi động.
+  - Đặt biến `QTZALO_DATA_DIR` để đổi vị trí lưu.
+- **Tắt log chẩn đoán mặc định:** `call_trace.log` (chứa payload báo hiệu cuộc gọi đã giải mã) và `voip.log` chỉ được ghi khi chạy `--dev` hoặc đặt `ZALO_CALL_TRACE=1` / `ZALO_VOIP_LOG`.
+- **Link preview không còn làm lộ IP**
+  - Tin nhắn đến chỉ dùng kết quả `parselink` phía máy chủ Zalo.
+  - App chỉ truy cập trực tiếp với link do chính bạn gửi: chỉ `https`, chặn IP nội bộ/loopback, ghim DNS, kiểm tra lại từng lần chuyển hướng, giới hạn 256 KiB.
+  - Ảnh: chỉ tải qua `https` (`http` chỉ cho CDN Zalo), giới hạn 15 MiB, không đọc đường dẫn mạng/UNC.
+- **Sinh số ngẫu nhiên an toàn:** IMEI/device-id, session cuộc gọi, salt mật khẩu và khoá tham số dùng nguồn ngẫu nhiên của hệ điều hành (`getrandom`) thay cho bộ sinh theo thời gian.
+- **WebSocket**
+  - Cookie phiên chỉ gửi tới `wss://` thuộc domain Zalo; địa chỉ `ws://` không mã hoá bị loại.
+  - `ZCALL_WS` chỉ có hiệu lực ở chế độ `--dev`.
+  - Dữ liệu giải nén giới hạn 32 MiB.
+  - Cookie HTTP thêm cờ `Secure`.
+- **Mật khẩu**
+  - Bỏ tham số `--pass <mật khẩu>` (lộ trong danh sách tiến trình), thêm `--pass-stdin`.
+  - Ô nhập mật khẩu trong terminal không còn hiện ký tự.
+- **Dependency**
+  - Nâng `tokio` lên 1.54.1 (vá RUSTSEC-2026-0384) và `clipboard-win` lên 5.4.3 (bản cũ đã bị yank).
+  - `cargo audit` báo 0 lỗ hổng.
+  - Còn 5 cảnh báo: `lru` unsound qua ratatui 0.29; `audiopus_sys`, `paste`, `ttf-parser` hết bảo trì.
+- Xoá đường dẫn máy phát triển còn sót (`F:\CODE\...`) và các đường dẫn ZaloCall.exe tương đối.
 
 ### Sửa lỗi
 
-<!-- Điền khi tích hợp: #21, #22, #4, #5/#6, #23, khoá gọi thử nghiệm. -->
+- **Mất phiên đăng nhập khi rớt mạng (#21, #3)**
+  - Chỉ mã lỗi xác thực rõ ràng (`600`, `-102`) mới bị coi là hết hạn.
+  - Lỗi mạng, lỗi HTTP hay phản hồi không đọc được: giữ nguyên phiên và báo "Không kết nối được máy chủ Zalo".
+  - Phiên hết hạn chỉ bị thay thế khi đăng nhập mới thành công.
+- **Đăng xuất không còn xoá lịch sử tin nhắn cục bộ** (`zalo_history.db`).
+- **Danh sách bạn bè lỗi 404 (#22, #3)**
+  - Domain đã kiểm chứng luôn được ưu tiên; `zpw_service_map_v3` từ máy chủ chỉ bổ sung domain còn thiếu.
+  - Khi nạp phiên, toàn bộ domain được khôi phục (trước chỉ 3/13).
+  - `get_friends` thử host `friend` trước và hiện lỗi thật thay vì danh sách rỗng.
+- **Sai giờ hiển thị (#4):** giờ tin nhắn, danh sách hội thoại và log dùng múi giờ của máy (có xử lý giờ mùa hè) thay vì UTC.
+- **Gỡ khoá gọi thử nghiệm**
+  - Trước đây chỉ gọi được liên hệ có tên chứa "hoang", "do thanh" hoặc "dtc"; nay gọi được mọi liên hệ 1-1.
+  - Gọi nhóm báo rõ "Chưa hỗ trợ gọi nhóm".
+- Đăng nhập bằng mật khẩu ở chế độ TUI giờ lưu phiên đăng nhập.
+- Sửa lỗi tràn số khi cắt ảnh đại diện.
 
 ### Giao diện
 
