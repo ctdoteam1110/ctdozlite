@@ -133,6 +133,14 @@ Trong lúc QTzalo tắt (23:01:56 → khoảng 23:11:50), người dùng nhận 
 
 Khi đối phương gõ: socket nhận `602_0`, và `lp_control` trả `actions: [{act: "typing", act_type: "typing", data: <chuỗi 59 ký tự>}]`. Đây là bằng chứng giao thức cho mục tồn đọng "chỉ báo đang nhập".
 
+## Lượt 4–5 — bản có con trỏ bền (commit `2db7d5e`, 23:54–23:57)
+
+### 11. Con trỏ đã lưu được máy chủ chấp nhận [O]
+
+- Lượt 4 (chưa có file con trỏ): vẫn kéo từ `lastId: 1`; `510_1` trả 26 tin (toàn bộ từ lúc đăng nhập). Sau đó app ghi `sync_state_<uin>.json` (1,3 KB, chỉ có con trỏ).
+- Lượt 5 (mở lại ngay): mọi queue kéo bằng `{first: true, lastId: <đã lưu>, preIds: [...]}`. `510_1` trả **0 tin**, `more = 0`, `evict = 0`, không có `resetLastActionId`. `603_1` không còn trả lại 2 control `transfer_after_login`. Long-poll bắt đầu từ `lastActionId` đã lưu và cũng không bị reset.
+- → `lastId` đã lưu có đúng nghĩa "chỉ lấy phần sau mốc này". Còn phải kiểm tra trường hợp có tin mới trong lúc tắt (nghiệm thu A7).
+
 ## Kết luận theo giả thiết
 
 | Giả thiết (nguồn) | Kết luận |
@@ -147,3 +155,4 @@ Khi đối phương gõ: socket nhận `602_0`, và `lp_control` trả `actions:
 | Lịch sử nhóm từ `getrecentv2` nối được khoảng thiếu (A4) | **Bác bỏ** trên thiết bị này: 0 tin ở cả 60 nhóm, có cờ `isFiltered` |
 | Tin E2EE đến qua `513/713` | **Bác bỏ** queue: phiên này dùng `515/517`. Có tin E2EE thật hay không: chưa rõ |
 | PC nhận `temp_key` sau đăng nhập QR (Phần B) | **Xác nhận**: `transfer_after_login` / `transfer_sync2` trong `603_1` |
+| Kéo với `lastId` đã lưu chỉ trả phần mới (A1) | **Xác nhận** khi không có tin mới (lượt 5); trường hợp có tin mới chờ A7 |
