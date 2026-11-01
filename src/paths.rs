@@ -110,6 +110,13 @@ pub fn cache_dir() -> PathBuf {
     dir
 }
 
+/// Per-account sync cursors (`sync_state_<uin>.json`, see `crate::sync_state`). `None` when
+/// `uin` is not a plain digit string, so it can never escape the data directory.
+pub fn sync_state_file(uin: &str) -> Option<PathBuf> {
+    let uin = crate::sync_state::sanitize_uin(uin)?;
+    Some(data_dir().join(format!("sync_state_{uin}.json")))
+}
+
 /// Videos fetched for in-app playback (`stickers_cache/videos/`, one `<md5(url)>.mp4` per
 /// video). Lives under [`cache_dir`] so "Xoá cache" and the cache size include it. Created on demand.
 pub fn video_cache_dir() -> PathBuf {

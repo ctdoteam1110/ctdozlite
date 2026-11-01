@@ -344,12 +344,40 @@ fn queues_from_auth(auth: &Value) -> Vec<(u16, u8)> {
     out
 }
 
-fn pull_frame(cmd: u16, sub_cmd: u8, req_id: &str) -> Vec<u8> {
+/// Socket queue cursors by queue name (`"510_1"`), shared with the worker which persists them
+/// (`crate::sync_state`): read when (re)connecting, advanced from every `queueStatus`.
+pub type WsCursors = std::sync::Arc<
+    std::sync::Mutex<std::collections::BTreeMap<String, crate::chat::QueueCursor>>,
+>;
+
+/// An action id as JSON: a number while it is exact in JavaScript (≤ 2^53), else a string.
+fn id_value(s: &str) -> Value {
+    match s.parse::<u64>() {
+        Ok(n) if n <= (1u64 << 53) => json!(n),
+        _ => json!(s),
+    }
+}
+
+/// First pull of a queue: from the saved cursor when there is one, else from the start
+/// (`lastId: 1`, which returns everything the server kept since login).
+fn pull_frame(
+    cmd: u16,
+    sub_cmd: u8,
+    req_id: &str,
+    cursor: Option<&crate::chat::QueueCursor>,
+) -> Vec<u8> {
+    let (last_id, pre_ids) = match cursor {
+        Some(c) if c.last_id.parse::<u128>().unwrap_or(0) > 1 => (
+            id_value(&c.last_id),
+            Value::Array(c.ids.iter().map(|s| id_value(s)).collect()),
+        ),
+        _ => (json!(1), json!([])),
+    };
     let data = json!({
         "first": true,
         "reqId": req_id,
-        "lastId": 1,
-        "preIds": [],
+        "lastId": last_id,
+        "preIds": pre_ids,
     });
     encode_frame(cmd, sub_cmd, 1, Some(&data))
 }
@@ -374,12 +402,17 @@ fn pull_next_frame(
 ///
 /// Reconnects forever with capped backoff. Dropping the returned receiver stops the task.
 pub fn spawn(sess: Session) -> mpsc::UnboundedReceiver<WsEvent> {
+    spawn_with_cursors(sess, WsCursors::default())
+}
+
+/// [`spawn`] with persisted queue cursors (see [`WsCursors`]).
+pub fn spawn_with_cursors(sess: Session, cursors: WsCursors) -> mpsc::UnboundedReceiver<WsEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut backoff = 2u64;
         let mut endpoint_idx = 0usize;
         loop {
-            match run_once(&sess, &tx, endpoint_idx).await {
+            match run_once(&sess, &tx, endpoint_idx, &cursors).await {
                 Ok(reason) => trace(format!("closed: {reason}")),
                 Err(e) => trace(format!("error: {e:#}")),
             }
@@ -399,6 +432,7 @@ async fn run_once(
     sess: &Session,
     tx: &mpsc::UnboundedSender<WsEvent>,
     endpoint_idx: usize,
+    cursors: &WsCursors,
 ) -> Result<String> {
     let url = build_url(sess, endpoint_idx);
     trace(format!("connect {url}"));
@@ -510,8 +544,19 @@ async fn run_once(
                     for (qcmd, qsub) in queues_from_auth(&auth) {
                         let id = format!("req_{req_id}");
                         req_id += 1;
-                        ws.send(Message::Binary(pull_frame(qcmd, qsub, &id).into())).await?;
-                        trace(format!("-> pull {qcmd}_{qsub} {id} first=true lastId=1"));
+                        let cursor = cursors
+                            .lock()
+                            .ok()
+                            .and_then(|c| c.get(&format!("{qcmd}_{qsub}")).cloned());
+                        ws.send(Message::Binary(
+                            pull_frame(qcmd, qsub, &id, cursor.as_ref()).into(),
+                        ))
+                        .await?;
+                        trace(format!(
+                            "-> pull {qcmd}_{qsub} {id} first=true lastId={} preIds={}",
+                            cursor.as_ref().map(|c| c.last_id.as_str()).unwrap_or("1"),
+                            cursor.as_ref().map(|c| c.ids.len()).unwrap_or(0)
+                        ));
                     }
                     continue;
                 }
@@ -532,6 +577,9 @@ async fn run_once(
                         "   shape {cmd}_{sub_cmd} {}",
                         crate::trace_shape::shape(&payload)
                     ));
+                }
+                if let Ok(mut c) = cursors.lock() {
+                    crate::sync_state::merge_ws_queue_status(&mut c, &payload);
                 }
                 if cmd == CMD_HAS_MSG {
                     if let (Some(qid), Some(ids)) = (

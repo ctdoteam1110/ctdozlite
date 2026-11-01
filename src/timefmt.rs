@@ -69,6 +69,12 @@ pub fn local_ymd(ts_ms: i64) -> (i32, u32, u32) {
     }
 }
 
+/// `HH:MM dd/mm` in local time for a timestamp in milliseconds.
+pub fn dm_hm_from_ms(ts_ms: i64) -> String {
+    let (_, m, d) = local_ymd(ts_ms);
+    format!("{} {d:02}/{m:02}", hm_from_ms(ts_ms))
+}
+
 /// Local weekday, Monday = 1 … Sunday = 7.
 pub fn local_weekday(ts_ms: i64) -> u32 {
     use chrono::Datelike;
@@ -81,6 +87,13 @@ pub fn local_weekday(ts_ms: i64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn day_month_label_matches_local_parts() {
+        let ts_ms = 1_793_503_800_000;
+        let (_, m, d) = local_ymd(ts_ms);
+        assert_eq!(dm_hm_from_ms(ts_ms), format!("{} {d:02}/{m:02}", hm_from_ms(ts_ms)));
+    }
 
     #[test]
     fn utc_plus_seven_shows_vietnam_time() {

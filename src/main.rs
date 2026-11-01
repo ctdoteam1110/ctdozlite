@@ -20,6 +20,7 @@ mod qr;
 mod session;
 mod socket;
 mod store;
+mod sync_state;
 mod timefmt;
 mod trace_shape;
 mod tui;

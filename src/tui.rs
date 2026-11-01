@@ -504,7 +504,7 @@ impl<'a> TuiApp<'a> {
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             match chat::poll_new_messages(&session, &mut state, &mut threads).await {
-                Ok(()) => {
+                Ok(_) => {
                     let _ = tx.send(BgEvent::PollDone { threads, state });
                 }
                 Err(e) => {

@@ -104,6 +104,151 @@ impl ZaloGuiApp {
             .unwrap_or(crate::chat::FriendshipStatus::Unknown)
     }
 
+    /// Last activity of a conversation (ms): its newest loaded message, or the time estimated
+    /// from `get-last-msgs` (`conv_activity`), whichever is later. 0 when there is none.
+    pub(super) fn thread_activity_ms(&self, t: &Thread) -> i64 {
+        let last_msg = t.messages.last().map(|m| normalize_ts_ms(m.ts)).unwrap_or(0);
+        last_msg.max(self.conv_activity.get(&t.id).copied().unwrap_or(0))
+    }
+
+    /// Would the phone list this conversation? Yes when it has messages here, server-side
+    /// activity, unread messages, or it is "Cloud của tôi".
+    fn thread_has_activity(&self, t: &Thread) -> bool {
+        !t.messages.is_empty()
+            || self.conv_activity.contains_key(&t.id)
+            || self.unread_counts.get(&t.id).copied().unwrap_or(0) > 0
+            || Self::is_cloud_thread(t)
+    }
+
+    /// Thin strip under the list header while the offline catch-up runs, then "Đã đồng bộ N
+    /// tin" for a few seconds.
+    fn render_sync_strip(&mut self, ui: &mut egui::Ui, pal: &ThemePalette) {
+        let Some((fetched, done, at)) = self.sync_progress else {
+            return;
+        };
+        const SHOW_DONE: Duration = Duration::from_secs(4);
+        if done && (fetched == 0 || at.elapsed() > SHOW_DONE) {
+            if at.elapsed() > SHOW_DONE {
+                self.sync_progress = None;
+            }
+            return;
+        }
+        let text = if done {
+            format!("Đã đồng bộ {fetched} tin nhắn")
+        } else if fetched == 0 {
+            "Đang đồng bộ tin nhắn…".to_string()
+        } else {
+            format!("Đang đồng bộ tin nhắn… {fetched} tin")
+        };
+        let resp = egui::Frame::none()
+            .fill(pal.primary.linear_multiply(0.08))
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::symmetric(10.0, 6.0))
+            .outer_margin(Margin {
+                left: 12.0,
+                right: 12.0,
+                top: 0.0,
+                bottom: 6.0,
+            })
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let (icon, color) = if done {
+                        (lucide::CHECK, pal.accent_online)
+                    } else {
+                        (lucide::REFRESH, pal.primary)
+                    };
+                    let (ir, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                    draw_lucide_icon(ui.painter(), ir.center(), icon, 13.0, color);
+                    ui.label(RichText::new(text).size(12.0).color(pal.text_secondary));
+                });
+            });
+        if !done {
+            // Indeterminate progress line along the bottom edge of the strip.
+            let r = resp.response.rect;
+            let line = Rect::from_min_max(Pos2::new(r.left() + 8.0, r.bottom() - 2.0), Pos2::new(r.right() - 8.0, r.bottom()));
+            let t = (ui.ctx().input(|i| i.time) * 0.8).fract() as f32;
+            let seg_w = line.width() * 0.3;
+            let x0 = line.left() + (line.width() + seg_w) * t - seg_w;
+            let seg = Rect::from_min_max(
+                Pos2::new(x0.max(line.left()), line.top()),
+                Pos2::new((x0 + seg_w).min(line.right()), line.bottom()),
+            );
+            if seg.width() > 0.0 {
+                ui.painter().rect_filled(seg, Rounding::same(1.0), pal.primary);
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(40));
+        } else {
+            ui.ctx().request_repaint_after(SHOW_DONE);
+        }
+    }
+
+    /// Banner when the server dropped part of an offline queue (`missing_ranges`), like Zalo's
+    /// "Tin nhắn chưa được đồng bộ". QTzalo cannot fetch those messages, so it points to the
+    /// phone; "Đóng" dismisses the current ranges.
+    fn render_missing_banner(&mut self, ui: &mut egui::Ui, pal: &ThemePalette) {
+        if self.missing_ranges.is_empty() {
+            return;
+        }
+        let from = self.missing_ranges.iter().map(|r| r.from_ts).min().unwrap_or(0);
+        let to = self.missing_ranges.iter().map(|r| r.to_ts).max().unwrap_or(0);
+        let span = if from > 0 {
+            format!(
+                "Có thể thiếu tin từ {} đến {}.",
+                crate::timefmt::dm_hm_from_ms(from),
+                crate::timefmt::dm_hm_from_ms(to)
+            )
+        } else {
+            format!("Có thể thiếu tin trước {}.", crate::timefmt::dm_hm_from_ms(to))
+        };
+        let mut dismiss = false;
+        egui::Frame::none()
+            .fill(pal.warning.linear_multiply(0.12))
+            .stroke(Stroke::new(1.0_f32, pal.warning.linear_multiply(0.55)))
+            .rounding(Rounding::same(10.0))
+            .inner_margin(Margin::symmetric(10.0, 8.0))
+            .outer_margin(Margin {
+                left: 12.0,
+                right: 12.0,
+                top: 0.0,
+                bottom: 6.0,
+            })
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                    draw_lucide_icon(ui.painter(), ir.center(), lucide::INBOX, 14.0, pal.warning);
+                    let text_w = (ui.available_width() - 26.0).max(60.0);
+                    ui.allocate_ui_with_layout(Vec2::new(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(
+                            RichText::new("Tin nhắn chưa được đồng bộ đủ")
+                                .size(12.5)
+                                .strong()
+                                .color(pal.text_primary),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{span} Xem đầy đủ trên điện thoại."))
+                                    .size(11.5)
+                                    .color(pal.text_secondary),
+                            )
+                            .wrap(),
+                        );
+                    });
+                    if icon_button(ui, lucide::X, 22.0, 12.0, false, pal, "Đóng").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+        if dismiss {
+            self.missing_ranges.clear();
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::DismissMissingRanges);
+            }
+        }
+    }
+
     /// Does thread `t` belong to the active navigation section (before search filtering)?
     pub(super) fn thread_in_section(&self, t: &Thread) -> bool {
         use crate::chat::FriendshipStatus as F;
@@ -789,6 +934,11 @@ impl ZaloGuiApp {
             ui.add_space(6.0);
         }
 
+        if full {
+            self.render_sync_strip(ui, pal);
+            self.render_missing_banner(ui, pal);
+        }
+
         if let Some(phone_str) = trigger_phone_lookup {
             self.start_phone_lookup(phone_str);
         }
@@ -826,12 +976,20 @@ impl ZaloGuiApp {
         }
 
         // --- Filtering & ordering ----------------------------------------
+        let selected_id = self.threads.get(self.selected_thread_index).map(|t| t.id.clone());
         let mut filtered: Vec<usize> = self
             .threads
             .iter()
             .enumerate()
             .filter(|(_, t)| {
-                self.thread_in_section(t)
+                // "Tin nhắn" lists conversations with activity, like the phone; a search looks
+                // through every contact and group.
+                let listed = self.thread_in_section(t)
+                    && (self.nav_section != NavSection::Messages
+                        || !query.is_empty()
+                        || self.thread_has_activity(t)
+                        || selected_id.as_deref() == Some(t.id.as_str()));
+                listed
                     && (query.is_empty() || matches_vn_query(&t.name, &query, &query_folded) || t.id.contains(&query))
             })
             .map(|(i, _)| i)
@@ -840,12 +998,9 @@ impl ZaloGuiApp {
             let ta = &self.threads[a];
             let tb = &self.threads[b];
             let (ac, bc) = (Self::is_cloud_thread(ta), Self::is_cloud_thread(tb));
-            if ac != bc && self.nav_section == NavSection::Messages && query.is_empty() {
-                // Keep "Cloud của tôi" visible but ordered by recency like the reference.
-            }
-            let ts_a = ta.messages.last().map(|m| normalize_ts_ms(m.ts)).unwrap_or(0);
-            let ts_b = tb.messages.last().map(|m| normalize_ts_ms(m.ts)).unwrap_or(0);
-            ts_b.cmp(&ts_a).then(bc.cmp(&ac))
+            self.thread_activity_ms(tb)
+                .cmp(&self.thread_activity_ms(ta))
+                .then(bc.cmp(&ac))
         });
 
         let msg_hits: Vec<(usize, String, String, String, bool)> = if full && query.chars().count() >= 2 {
