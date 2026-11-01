@@ -130,3 +130,31 @@ Có rủi ro: dữ liệu mã hoá đầu cuối, xác nhận thiết bị tin c
 2. Trong lúc tắt, nhận khoảng 20 tin 1-1 và 20 tin nhóm trên điện thoại, và tự gửi vài tin từ điện thoại.
 3. Mở lại QTzalo (chạy với `ZCALL_WS_TRACE=1 --dev`): tất cả tin phải hiện đúng thứ tự, không trùng lặp. Log phải có các đợt `more=1` cho tới `more=0`.
 4. Lặp lại với thời gian tắt 1 ngày và 7 ngày; ghi lại lúc nào máy chủ trả `resetLastActionId`.
+
+## 8. Đối chiếu với tài liệu "Đồng bộ & Sao lưu tin nhắn trên Zalo PC" (Zalo PC 26.10.20)
+
+Người dùng cung cấp ngày 2026-11-01 một tài liệu phân tích Zalo PC 26.10.20, quét 143 file JS cùng các module WASM/native. Tài liệu không được commit vào repo; dưới đây chỉ ghi những điểm đã đối chiếu và hệ quả cho QTzalo.
+
+**Khớp với §2–§4 ở trên:** `queue_actionid_map`, `evict_broadcast_queues`, máy trạng thái transfer (`SYNC_DB_STATE`) và `missing_message_range` đều trùng. Khác biệt nhỏ: tài liệu ghi `offline_timeout = 48.000 ms`, bundle cũ trong repo ghi `48e4` (480.000 ms). Có thể do khác phiên bản, hoặc đọc nhầm số mũ.
+
+**Điểm mới, dùng được ngay cho Bước 1:**
+- Kéo bù offline theo từng trang cho tới cờ `isLastQueue`. Mỗi queue `<cmd>_<subCmd>` giữ `lastActionId` và `queueLastMsgIds`, và các con trỏ này được lưu bền.
+- `queueStatus[q].evict = true` nghĩa là máy chủ đã đẩy bỏ một phần hàng đợi (overflow). Zalo phát `QUEUE_OVERFLOW` và gợi ý đồng bộ từ điện thoại (nguồn `OVERFLOW`). → QTzalo nên coi `evict` giống `resetLastActionId`: ghi lại khoảng thiếu và hiện banner.
+- Tải bù tin bị thiếu: `532 VERIFY_MSG` (gửi danh sách `actionId`), `534 PUSH_MISS_MSG`, `570 GET_MSG` (`max_msg_get = 20`, `timeout_retry_miss = 30 s`).
+- ACK hàng đợi: `ackOfflineQueue` (`DELETE_QUEUE_ACK_ONEONE/GROUP`) để máy chủ xoá phần đã giao. **Chỉ làm sau khi có trace thật**: chưa rõ việc không ACK có làm hàng đợi của QTzalo bị evict sớm hay không, và ACK sai thì mất tin không lấy lại được.
+- Lịch sử: thêm `/api/cm/rgetv2` (12508) và `/api/cm/mget` (12503) bên cạnh `getoldv2`/`getrecentv2`.
+- Gắn nhãn nguồn tin (`MsgSources`: `SOCKET=10`, `POLL=1`, `MISS_MSG=11`, `CLOUD=3`, `SYNC_MOBILE_*=2/7`) để biết tin đến từ đâu khi gỡ lỗi.
+
+**Điểm mới quan trọng — E2EE:**
+- Tin 1-1/nhóm có thể được mã hoá đầu cuối bằng Signal (libsignal, SenderKey cho nhóm). Hàng đợi offline E2EE: PC dùng `513`/`713`, web dùng `515`/`715`; `516`/`517` là phiên khởi tạo.
+- QTzalo đang kéo `513/514/515/517/518` (`src/socket.rs:266-282`) nhưng **không có phần giải mã Signal**. Nội dung các tin E2EE vì thế không đọc được.
+- Muốn đọc E2EE thì phải đăng ký QTzalo làm thiết bị E2EE (prekey/bundle, `INIT_SESSION`…) và có thể cần liên kết thiết bị tin cậy (`trusted_device_protocol`). Đây là việc lớn và nhạy cảm về bảo mật.
+- Việc trước mắt: **nhận diện** tin E2EE (`e2eeStatus` hoặc cmd của queue) và hiện chỗ giữ chỗ "Tin nhắn mã hoá đầu cuối — xem trên điện thoại" thay vì bỏ qua hay hiện rác.
+
+**Đồng bộ từ điện thoại:**
+- **Sync v2** (WS `590/591/592` + task `{syncId, ussidx, ik, payload}`): dữ liệu được mã hoá bằng Sync2 (Ed25519, ChaCha20, phiên kiểu Signal, zstd + protobuf), chạy trong WASM `libzproto_wasm`. Tài liệu tự ghi AEAD/KDF là "chưa xác định" → **chưa làm được**.
+- **Sync v1 / transfer** (HTTP `GET /api/message/pull_mobile_msg` cmd 12000 với `public_key` RSA-2048, `from_seq_id`, `min_seq_id`, `temp_key`):
+  - Điện thoại tạo file backup; PC nhận sự kiện `BACKUP_SUCCESS {url, checksum, encrypted_key, db_format}`.
+  - PC giải `encrypted_key` bằng RSA PKCS#1, rồi giải nén và giải mã bằng native `db-cross-v4 decompressAndDecryptDb(input, output, password)`. Bước khôi phục dùng `password: uin`.
+  - Phần RSA là chuẩn. **Ẩn số còn lại là định dạng của `db-cross-v4`** (module native). Đây là hướng khả thi nhất nếu có module native (`resources/` trong thư mục cài Zalo PC) để phân tích.
+  - Hạn chế: điện thoại phải mở Zalo và người dùng phải xác nhận; có thể bị từ chối nếu client không được nhận diện là Zalo PC.
