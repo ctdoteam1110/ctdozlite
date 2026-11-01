@@ -969,6 +969,18 @@ pub async fn poll_voip_controls(s: &Session, state: &mut CtrlPollState) -> Resul
     );
     let resp = s.get(&url).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if crate::trace_shape::enabled() {
+        // Every control action, not only VoIP: the sync investigation looks for transfer /
+        // "after login" events here (including the initial-cursor replay that is discarded below).
+        crate::trace_shape::line(
+            "lpc",
+            format!(
+                "lastActionId={} initial={is_initial_cursor} <- {}",
+                state.last_action_id,
+                crate::trace_shape::shape(&decrypted)
+            ),
+        );
+    }
     let mut data_node = decrypted.get("data").unwrap_or(&decrypted);
     if let Some(inner) = data_node.get("data").filter(|v| v.is_object()) {
         data_node = inner;

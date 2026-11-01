@@ -75,13 +75,11 @@ fn now_ms() -> u64 {
 }
 
 fn trace_on() -> bool {
-    std::env::var("ZCALL_WS_TRACE").ok().as_deref() == Some("1")
+    crate::trace_shape::enabled()
 }
 
 fn trace(msg: impl std::fmt::Display) {
-    if trace_on() {
-        eprintln!("[ws] {msg}");
-    }
+    crate::trace_shape::line("ws", msg);
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -500,6 +498,9 @@ async fn run_once(
                     let text = String::from_utf8_lossy(&plain).into_owned();
                     trace(format!("auth body {}", truncate(&text, 1200)));
                     let auth: Value = serde_json::from_str(&text)?;
+                    if trace_on() {
+                        trace(format!("auth shape {}", crate::trace_shape::shape(&auth)));
+                    }
                     if auth.get("error_code").and_then(|v| v.as_i64()) != Some(0) {
                         return Err(anyhow!("auth rejected: {text}"));
                     }
@@ -510,7 +511,7 @@ async fn run_once(
                         let id = format!("req_{req_id}");
                         req_id += 1;
                         ws.send(Message::Binary(pull_frame(qcmd, qsub, &id).into())).await?;
-                        trace(format!("-> pull {qcmd}_{qsub} {id}"));
+                        trace(format!("-> pull {qcmd}_{qsub} {id} first=true lastId=1"));
                     }
                     continue;
                 }
@@ -526,6 +527,12 @@ async fn run_once(
                         None => envelope.clone(),
                     }
                 };
+                if trace_on() {
+                    trace(format!(
+                        "   shape {cmd}_{sub_cmd} {}",
+                        crate::trace_shape::shape(&payload)
+                    ));
+                }
                 if cmd == CMD_HAS_MSG {
                     if let (Some(qid), Some(ids)) = (
                         payload.pointer("/data/queueId").cloned(),
@@ -560,12 +567,16 @@ async fn run_once(
                         .unwrap_or_else(|| json!([]));
                     let id = format!("req_{req_id}");
                     req_id += 1;
+                    let cursor = format!(
+                        "lastId={last_id} preIds={}",
+                        pre_ids.as_array().map(Vec::len).unwrap_or(0)
+                    );
                     let _ = ws
                         .send(Message::Binary(
                             pull_next_frame(cmd, sub_cmd, &id, last_id, pre_ids).into(),
                         ))
                         .await;
-                    trace(format!("-> pull next {qkey} {id}"));
+                    trace(format!("-> pull next {qkey} {id} {cursor}"));
                 }
                 let _ = tx.send(WsEvent { cmd, sub_cmd, version, payload });
             }

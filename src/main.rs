@@ -21,6 +21,7 @@ mod session;
 mod socket;
 mod store;
 mod timefmt;
+mod trace_shape;
 mod tui;
 mod ui;
 mod voip_log;

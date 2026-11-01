@@ -2639,6 +2639,12 @@ pub async fn get_last_msgs(s: &Session, thread_ids: &[String]) -> Result<Value> 
     );
     let resp = s.get(&url).await?;
     let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if crate::trace_shape::enabled() {
+        crate::trace_shape::line(
+            "glm",
+            format!("get-last-msgs threads={} <- {}", map.len(), crate::trace_shape::shape(&resp)),
+        );
+    }
     Ok(resp)
 }
 
@@ -2909,12 +2915,36 @@ pub struct PollState {
     pub queues: std::collections::BTreeMap<String, QueueCursor>,
 }
 
+/// Long-poll MSG queue ids. In dev mode `QTZALO_LP_QUEUES=1,2,3,6` tries extra queues for the
+/// sync investigation — e.g. `"6"`, which `queue_actionid_map` pairs with socket queue `511_0`
+/// (group messages while offline). Not enabled by default: see `update_from_response`.
+fn lp_msg_queue_ids() -> Vec<String> {
+    let default = || vec!["1".to_string(), "2".to_string(), "3".to_string()];
+    if !crate::logger::is_dev_mode() {
+        return default();
+    }
+    let Ok(raw) = std::env::var("QTZALO_LP_QUEUES") else {
+        return default();
+    };
+    let ids: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 3 && s.bytes().all(|b| b.is_ascii_digit()))
+        .map(String::from)
+        .collect();
+    if ids.is_empty() {
+        default()
+    } else {
+        ids
+    }
+}
+
 impl Default for PollState {
     fn default() -> Self {
         let mut queues = std::collections::BTreeMap::new();
-        for qid in ["1", "2", "3"] {
+        for qid in lp_msg_queue_ids() {
             queues.insert(
-                qid.to_string(),
+                qid,
                 QueueCursor {
                     last_id: "1".into(),
                     ids: Vec::new(),
@@ -2981,8 +3011,9 @@ impl PollState {
         }
         if let Some(qs) = data_node.get("queueStatus").and_then(Value::as_object) {
             for (qid, qval) in qs {
-                // Only update configured HTTP long-polling MSG queues ("1", "2", "3").
-                // Adding socket-only queues ("15", "16", "7", "8") causes lp_chat to reject subsequent requests.
+                // Only update configured HTTP long-polling MSG queues ("1", "2", "3", plus any
+                // `QTZALO_LP_QUEUES` extras in dev mode). Adding socket-only queues ("15", "16",
+                // "7", "8") causes lp_chat to reject subsequent requests.
                 let Some(entry) = self.queues.get_mut(qid) else {
                     continue;
                 };
@@ -3092,6 +3123,13 @@ pub async fn get_cloud_messages(
             }
         }
     }
+    if crate::trace_shape::enabled() {
+        let kind = if is_send2me { "send2me" } else { "group" };
+        crate::trace_shape::line(
+            "cm",
+            format!("{ep} {kind} count={count} <- {}", crate::trace_shape::shape(&dec)),
+        );
+    }
     Ok(dec)
 }
 
@@ -3114,10 +3152,29 @@ pub async fn get_chat_from_polling(s: &Session, state: &mut PollState) -> Result
         s.common_params(),
         state.encode_params()
     );
+    if crate::trace_shape::enabled() {
+        let queues: Vec<String> = state
+            .queues
+            .iter()
+            .map(|(q, c)| format!("{q}:{}/{}", c.last_id, c.ids.len()))
+            .collect();
+        crate::trace_shape::line(
+            "lp",
+            format!(
+                "-> poll lastActionId={} other={} queues(lastId/ids)=[{}]",
+                state.last_action_id,
+                state.last_action_id_other,
+                queues.join(" ")
+            ),
+        );
+    }
     let fut = s.get(&url);
     match tokio::time::timeout(std::time::Duration::from_millis(12000), fut).await {
         Ok(Ok(resp)) => {
             let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+            if crate::trace_shape::enabled() {
+                crate::trace_shape::line("lp", format!("<- {}", crate::trace_shape::shape(&dec)));
+            }
             if let Some(code) = dec.get("error_code").and_then(Value::as_i64) {
                 if code != 0 {
                     let msg = dec
@@ -3130,8 +3187,14 @@ pub async fn get_chat_from_polling(s: &Session, state: &mut PollState) -> Result
             state.update_from_response(&dec);
             Ok(dec)
         }
-        Ok(Err(e)) => Err(e),
-        Err(_) => Ok(json!({"error_code": 0, "data": {}})),
+        Ok(Err(e)) => {
+            crate::trace_shape::line("lp", format!("<- error {e:#}"));
+            Err(e)
+        }
+        Err(_) => {
+            crate::trace_shape::line("lp", "<- timeout 12s (no new actions)");
+            Ok(json!({"error_code": 0, "data": {}}))
+        }
     }
 }
 
@@ -3147,7 +3210,7 @@ pub async fn poll_new_messages(
         anyhow::bail!("chưa đăng nhập");
     }
     // 1. Poll live/offline message queues via `getChatFromPolling` (follow `more == 1` / `resetLastActionId` up to 3 batches)
-    for _ in 0..3 {
+    for batch in 1..=3 {
         let Ok(lp_resp) = get_chat_from_polling(s, state).await else {
             break;
         };
@@ -3159,6 +3222,12 @@ pub async fn poll_new_messages(
             .unwrap_or(false);
         if more == 0 && !has_reset {
             break;
+        }
+        if batch == 3 {
+            crate::trace_shape::line(
+                "lp",
+                format!("stopped at the 3-batch cap with more={more} reset={has_reset}"),
+            );
         }
     }
     // 2. Poll conversation previews via `get-last-msgs`
