@@ -1378,6 +1378,7 @@ impl ZaloGuiApp {
                                                     &self.sticker_textures,
                                                     &mut self.loading_stickers,
                                                     &self.emoji_textures,
+                                                    &self.downloads,
                                                     idx,
                                                 ) {
                                                     pending_action = Some((idx, action));
@@ -1404,6 +1405,22 @@ impl ZaloGuiApp {
                             .cloned();
                         if let Some(m) = target {
                             match action {
+                                BubbleAction::Download {
+                                    url,
+                                    suggested_name,
+                                } => {
+                                    self.start_attachment_download(
+                                        url,
+                                        suggested_name,
+                                        thread_id.clone(),
+                                    );
+                                }
+                                BubbleAction::OpenDownloaded(path) => {
+                                    self.open_downloaded_path(&path);
+                                }
+                                BubbleAction::RevealDownloaded(path) => {
+                                    self.reveal_downloaded_path(&path);
+                                }
                                 BubbleAction::Reply => self.replying_to = Some(m),
                                 BubbleAction::Forward => {
                                     self.forward_msg = Some(m);

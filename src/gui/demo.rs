@@ -17,6 +17,11 @@ pub(super) struct DemoWorkspace {
     pub(super) friend_status: HashMap<String, FriendshipStatus>,
 }
 
+/// Demo attachment URLs (never requested; used as `downloads` keys by `QTZALO_DEMO_DOWNLOADS`).
+pub(super) const DEMO_FILE_URL: &str = "https://f21-zpc.zdn.vn/demo/QTzalo-landing.fig";
+pub(super) const DEMO_VIDEO_URL: &str = "https://video.zdn.vn/demo/demo-onboarding.mp4";
+pub(super) const DEMO_PHOTO_URL: &str = "https://photo-stal-1.zdn.vn/demo/bang-mau.jpg";
+
 fn msg(id: &str, sender: &str, text: &str, ts_ms: i64, outgoing: bool) -> ChatMessage {
     ChatMessage {
         id: id.to_string(),
@@ -75,14 +80,27 @@ impl DemoWorkspace {
                 now - 38 * min,
                 true,
             ),
+            msg("d6", "Anh Minh", "[Hình ảnh]", now - 30 * min, false),
+            msg("d7", "Bạn", "[Video] demo-onboarding.mp4", now - 21 * min, true),
             msg("d5", "Lan Phương", "[Tập tin] QTzalo-landing.fig", now - 12 * min, false),
         ];
         g1[1].reactions = vec!["❤️".into(), "❤️".into()];
         g1[2].reply_to_text = Some("Xem rồi, mượt hơn hẳn bản Electron".into());
         g1[2].reply_to_sender = Some("Bạn".into());
-        g1[4].link_src = Some("Tập tin Zalo".into());
-        g1[4].link_title = Some("QTzalo-landing.fig".into());
-        g1[4].link_desc = Some("24,1 MB".into());
+        // Attachments use the same fields as real messages (see `chat.rs`). The URLs are never
+        // fetched: demo mode has no worker, so thumbnails stay placeholders.
+        g1[4].link_src = Some("Hình ảnh Zalo".into());
+        g1[4].link_title = Some("Ảnh chụp màn hình bảng màu".into());
+        g1[4].link_url = Some(DEMO_PHOTO_URL.into());
+        g1[4].link_thumb = Some(DEMO_PHOTO_URL.into());
+        g1[5].link_src = Some("Video Zalo".into());
+        g1[5].link_title = Some("demo-onboarding.mp4".into());
+        g1[5].link_desc = Some("Video · 0:42 · 8,6 MB".into());
+        g1[5].link_url = Some(DEMO_VIDEO_URL.into());
+        g1[6].link_src = Some("Tập tin Zalo".into());
+        g1[6].link_title = Some("QTzalo-landing.fig".into());
+        g1[6].link_desc = Some("24,1 MB".into());
+        g1[6].link_url = Some(DEMO_FILE_URL.into());
 
         let threads = vec![
             thread("demo_tk", "Nhóm Thiết kế", true, "Lan Phương: QTzalo-landing.fig", g1),
@@ -204,6 +222,12 @@ mod tests {
         assert!(g.messages.iter().any(|m| m.reply_to_text.is_some()));
         assert!(g.messages.iter().any(|m| !m.reactions.is_empty()));
         assert!(g.messages.iter().any(|m| m.link_src.as_deref() == Some("Tập tin Zalo")));
+        assert!(g.messages.iter().any(|m| m.link_src.as_deref() == Some("Video Zalo")));
+        assert!(g.messages.iter().any(|m| m.link_src.as_deref() == Some("Hình ảnh Zalo")));
+        // Every attachment card has a download target.
+        for m in g.messages.iter().filter(|m| m.link_src.is_some()) {
+            assert!(super::super::messages::attachment_download_target(m).is_some());
+        }
         assert_eq!(d.typing.get("demo_tk").map(String::as_str), Some("Anh Minh"));
         // No remote avatars: rendering demo threads never asks the worker for images.
         assert!(d.threads.iter().all(|t| t.avatar.is_none()));

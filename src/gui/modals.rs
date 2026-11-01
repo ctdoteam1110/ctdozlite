@@ -213,7 +213,169 @@ impl ZaloGuiApp {
         }
     }
 
+    /// "Đã tải về" card (bottom-right, above the plain toast): file name, "Mở", "Mở thư mục", ×.
+    /// Stays ~8 s; hovering keeps it open.
+    fn render_download_toast(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        let Some((path, ts)) = self.download_toast.clone() else {
+            return;
+        };
+        if ts.elapsed() > Duration::from_secs(8) {
+            self.download_toast = None;
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(250));
+        let screen = ctx.screen_rect();
+        // Above the composer, clear of the plain one-line toast (bottom - 54).
+        let bottom = screen.bottom() - 72.0;
+        let card_w = 320.0_f32.min(screen.width() - 32.0).max(200.0);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let mut open = false;
+        let mut reveal = false;
+        let mut close = false;
+        let resp = egui::Area::new(Id::new("floating_download_toast"))
+            .order(egui::Order::Tooltip)
+            .pivot(egui::Align2::RIGHT_BOTTOM)
+            .fixed_pos(Pos2::new(screen.right() - 20.0, bottom))
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(pal.bg_elevated)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding::same(12.0))
+                    .shadow(egui::epaint::Shadow {
+                        offset: Vec2::new(0.0, 4.0),
+                        blur: 16.0,
+                        spread: 0.0,
+                        color: pal.shadow,
+                    })
+                    .inner_margin(Margin::symmetric(14.0, 12.0))
+                    .show(ui, |ui| {
+                        ui.set_width(card_w - 28.0);
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            let (tile, _) =
+                                ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
+                            ui.painter().rect_filled(
+                                tile,
+                                Rounding::same(10.0),
+                                pal.accent_online.linear_multiply(0.16),
+                            );
+                            draw_lucide_icon(
+                                ui.painter(),
+                                tile.center(),
+                                lucide::CHECK,
+                                18.0,
+                                pal.accent_online,
+                            );
+                            let text_w = (ui.available_width() - 30.0).max(80.0);
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(text_w, 36.0),
+                                Layout::top_down(Align::Min),
+                                |ui| {
+                                    ui.set_width(text_w);
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    ui.label(
+                                        RichText::new("Đã tải về")
+                                            .size(12.0)
+                                            .color(pal.text_muted),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&name)
+                                                .size(13.2)
+                                                .color(pal.text_primary)
+                                                .strong(),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(path.display().to_string());
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        let open_btn = egui::Button::new(
+                                            RichText::new("Mở")
+                                                .size(12.0)
+                                                .color(Color32::WHITE)
+                                                .strong(),
+                                        )
+                                        .fill(pal.primary)
+                                        .stroke(Stroke::NONE)
+                                        .rounding(Rounding::same(6.0))
+                                        .min_size(Vec2::new(56.0, 26.0));
+                                        if ui
+                                            .add(open_btn)
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .clicked()
+                                        {
+                                            open = true;
+                                        }
+                                        let dir_btn = egui::Button::new(
+                                            RichText::new(format!(
+                                                "{} Mở thư mục",
+                                                lucide::FOLDER_OPEN
+                                            ))
+                                            .size(12.0)
+                                            .color(pal.text_primary),
+                                        )
+                                        .fill(pal.bg_input)
+                                        .stroke(Stroke::new(1.0_f32, pal.border))
+                                        .rounding(Rounding::same(6.0))
+                                        .min_size(Vec2::new(0.0, 26.0));
+                                        if ui
+                                            .add(dir_btn)
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .clicked()
+                                        {
+                                            reveal = true;
+                                        }
+                                    });
+                                },
+                            );
+                            let (xr, xresp) =
+                                ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+                            if xresp.hovered() {
+                                ui.painter().rect_filled(xr, Rounding::same(6.0), pal.bg_hover);
+                            }
+                            draw_lucide_icon(
+                                ui.painter(),
+                                xr.center(),
+                                lucide::X,
+                                13.0,
+                                if xresp.hovered() {
+                                    pal.text_primary
+                                } else {
+                                    pal.text_muted
+                                },
+                            );
+                            if xresp
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .on_hover_text("Đóng")
+                                .clicked()
+                            {
+                                close = true;
+                            }
+                        });
+                    });
+            });
+        if resp.response.contains_pointer() {
+            // Keep it on screen while the pointer is over it.
+            self.download_toast = Some((path.clone(), std::time::Instant::now()));
+        }
+        if open {
+            self.download_toast = None;
+            self.open_downloaded_path(&path);
+        } else if reveal {
+            self.download_toast = None;
+            self.reveal_downloaded_path(&path);
+        } else if close {
+            self.download_toast = None;
+        }
+    }
+
     pub(super) fn render_toast_overlay(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        self.render_download_toast(ctx, pal);
         let Some((ref text, ts)) = self.toast_notice else {
             return;
         };
@@ -2306,6 +2468,11 @@ impl ZaloGuiApp {
             screen_rect.max,
         );
         let mut should_close = false;
+        // "Tải về" in the toolbar: only for real web URLs (the worker enforces the full policy).
+        let can_download = viewer.full_url.starts_with("https://")
+            || viewer.full_url.starts_with("http://");
+        let dl_state = self.downloads.get(&viewer.full_url).cloned();
+        let mut dl_action: Option<BubbleAction> = None;
 
         let active_tex = viewer
             .hd_tex_key
@@ -2552,6 +2719,68 @@ impl ZaloGuiApp {
                                     should_close = true;
                                 }
 
+                                if can_download {
+                                    let (label, fg, tip) = match &dl_state {
+                                        None => (
+                                            format!("{ICON_DOWNLOAD} Tải về"),
+                                            Color32::WHITE,
+                                            "Tải ảnh gốc về thư mục lưu file".to_string(),
+                                        ),
+                                        Some(s @ DownloadState::InProgress { .. }) => (
+                                            match s.fraction() {
+                                                Some(f) => format!("Đang tải {:.0}%", f * 100.0),
+                                                None => "Đang tải…".to_string(),
+                                            },
+                                            pal.text_secondary,
+                                            download_progress_label(s, false),
+                                        ),
+                                        Some(DownloadState::Done(p)) => (
+                                            format!("{} Mở ảnh đã tải", lucide::CHECK),
+                                            pal.text_primary,
+                                            p.display().to_string(),
+                                        ),
+                                        Some(DownloadState::Failed(e)) => (
+                                            format!("{ICON_RETRY} Tải lại"),
+                                            pal.danger,
+                                            format!("Tải về thất bại: {e}"),
+                                        ),
+                                    };
+                                    let busy = matches!(
+                                        dl_state,
+                                        Some(DownloadState::InProgress { .. })
+                                    );
+                                    let fill = if dl_state.is_none() {
+                                        pal.primary
+                                    } else {
+                                        pal.bg_elevated
+                                    };
+                                    let dl_btn = egui::Button::new(
+                                        RichText::new(label).size(11.8).color(fg).strong(),
+                                    )
+                                    .fill(fill)
+                                    .stroke(Stroke::new(
+                                        1.0_f32,
+                                        if dl_state.is_none() { pal.primary } else { pal.border },
+                                    ))
+                                    .rounding(Rounding::same(6.0))
+                                    .min_size(Vec2::new(76.0, 28.0));
+                                    let r = ui.add_enabled(!busy, dl_btn).on_hover_text(tip);
+                                    if busy {
+                                        ui.ctx().request_repaint_after(Duration::from_millis(120));
+                                    }
+                                    if r.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                        dl_action = Some(match &dl_state {
+                                            Some(DownloadState::Done(p)) => {
+                                                BubbleAction::OpenDownloaded(p.clone())
+                                            }
+                                            _ => BubbleAction::Download {
+                                                url: viewer.full_url.clone(),
+                                                suggested_name: String::new(),
+                                            },
+                                        });
+                                    }
+                                }
+
                                 if !viewer.full_url.is_empty() {
                                     let ext_btn = egui::Button::new(
                                         RichText::new(format!("{} Mở gốc", lucide::EXTERNAL_LINK))
@@ -2656,6 +2885,34 @@ impl ZaloGuiApp {
                         });
                     });
             });
+
+        match dl_action {
+            Some(BubbleAction::Download {
+                url,
+                suggested_name,
+            }) => {
+                let thread_id = self
+                    .threads
+                    .get(self.selected_thread_index)
+                    .map(|t| t.id.clone())
+                    .unwrap_or_default();
+                // Use the photo's title as the file name only when it is one (`IMG_01.jpg`);
+                // otherwise the worker names it from the URL.
+                let title = viewer.title.trim();
+                let lower = title.to_lowercase();
+                let looks_like_file = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"]
+                    .iter()
+                    .any(|ext| lower.ends_with(ext));
+                let name = if suggested_name.is_empty() && looks_like_file {
+                    title.to_string()
+                } else {
+                    suggested_name
+                };
+                self.start_attachment_download(url, name, thread_id);
+            }
+            Some(BubbleAction::OpenDownloaded(p)) => self.open_downloaded_path(&p),
+            _ => {}
+        }
 
         if should_close {
             self.image_viewer = None;
