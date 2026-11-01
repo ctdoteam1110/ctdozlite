@@ -8,6 +8,9 @@ Client Zalo Desktop viết bằng Rust (`eframe`/`egui` + `ratatui`), giao tiế
 
 > Chưa rõ tính năng bạn cần đã hoạt động chưa? Đọc [Tính năng & giới hạn](docs/TINH_NANG.md) **trước khi** mở issue — bảng đó ghi rõ cái gì đang chạy, cái gì chỉ chạy một phần và issue nào đang theo dõi.
 
+
+> [!NOTE]
+> **Tuyên bố miễn trừ trách nhiệm (Disclaimer):** Dự án này là một nghiên cứu kỹ thuật hệ thống độc lập mã nguồn mở vì mục đích học tập, giáo dục và tương thích giao thức (*Educational & Interoperability Research Purposes Only*). Dự án **KHÔNG** có bất kỳ mối liên hệ, hợp tác, tài trợ hay bảo trợ nào từ VNG Corporation hay Zalo, và hoàn toàn phi thương mại (100% mã nguồn mở, không thu phí, không quảng cáo, không đóng gói tài nguyên độc quyền). Người dùng tự chịu mọi trách nhiệm khi sử dụng phần mềm này.
 [![Website](https://img.shields.io/badge/website-ctdozlite.ctdo.net-0068FF.svg)](https://ctdozlite.ctdo.net/)
 [![Release](https://img.shields.io/github/v/release/ctdoteam1110/ctdozlite?label=release)](https://github.com/ctdoteam1110/ctdozlite/releases)
 [![CI & Release](https://github.com/ctdoteam1110/ctdozlite/actions/workflows/ci-release.yml/badge.svg)](https://github.com/ctdoteam1110/ctdozlite/actions/workflows/ci-release.yml)
@@ -48,7 +51,7 @@ Bản Zalo PC chính thức đóng gói trên Electron thường chiếm 350–6
   - Hỗ trợ tìm kiếm theo cụm từ cuối câu và tải trước (prefetch) ảnh sticker song song ở luồng nền, lưu cache tại `stickers_cache/`.
 - **Lưu trữ cục bộ 2 tầng (`src/store.rs`)**
   - `threads_cache.json`: Snapshot danh sách hội thoại giúp hiển thị giao diện ngay khi mở app.
-  - `zalo_history.db` (SQLite): Lưu trữ lịch sử tin nhắn lâu dài, khử trùng lặp theo `msg_id` và mốc thời gian.
+  - `zalo_history.db` (SQLite): Lưu trữ lịch sử tin nhắn cục bộ trên máy, khử trùng lặp theo `msg_id` và mốc thời gian. Ứng dụng không gửi dữ liệu sang bất kỳ máy chủ bên thứ ba nào ngoài hệ thống Zalo; khuyến nghị bật mã hóa ổ đĩa hệ điều hành (BitLocker / FileVault / LUKS) nếu dùng trên máy chung.
 - **Gọi thoại & Gọi video 1-1 (`src/call.rs`, `src/media.rs`, `src/audio.rs`)**
   - Triển khai trực tiếp luồng báo hiệu cuộc gọi (`401`/`416`/`407`/`402`/`408`/`409`) và bắt tay ZRTP relay bằng Rust, không phụ thuộc `ZaloCall.exe`.
   - Audio hai chiều qua `cpal` + `opus`; video H.264 đóng gói theo khung relay của Zalo (RTP PT 97/98, RTCP SR/PLI/REMB) kết hợp `ffmpeg` để thu webcam và giải mã khung hình.
@@ -93,7 +96,7 @@ src/
 
 Toàn bộ gói cài đặt cho từng hệ điều hành và bản phân phối Linux nằm tại **[GitHub Releases](https://github.com/ctdoteam1110/ctdozlite/releases)**. Trang này luôn hiển thị bản mới nhất, không cần sửa link khi phát hành phiên bản tiếp theo.
 
-Hướng dẫn cài đặt chi tiết (Linux, Windows, macOS, kiểm tra SHA-256 và gỡ cài đặt): **[docs/CAI_DAT.md](docs/CAI_DAT.md)**.
+Hướng dẫn cài đặt chi tiết (Linux, Windows, macOS Apple Silicon `arm64` / Intel `x86_64` / Universal `.dmg`, kiểm tra SHA-256 và gỡ cài đặt): **[docs/CAI_DAT.md](docs/CAI_DAT.md)**.
 
 > [!IMPORTANT]
 > **Phiên bản iOS — Dùng 1 tài khoản Zalo song song trên 2 máy (Sắp ra mắt):**
@@ -153,15 +156,15 @@ CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo build --release
 ```
 Binary đầu ra: `target/release/zalo-rust`
 
-### 4. macOS (Apple Silicon & Intel)
+### 4. macOS (Apple Silicon ARM64 & Intel x86_64)
 ```bash
 xcode-select --install
-brew install cmake pkg-config opus ffmpeg
+brew install cmake ffmpeg
 git clone https://github.com/ctdoteam1110/ctdozlite.git
 cd ctdozlite
 cargo build --release
 ```
-Binary đầu ra: `target/release/zalo-rust`
+Binary đầu ra: `target/release/zalo-rust` *(Tự động liên kết tĩnh `libopus.a` qua `.cargo/config.toml` + `packaging/macos/toolchain-*.cmake`, không cần cài `opus` rời qua Homebrew)*.
 
 ---
 
@@ -204,7 +207,7 @@ Workflow GitHub Actions tại [`.github/workflows/ci-release.yml`](.github/workf
   - `.AppImage` (gói thực thi độc lập chạy trên mọi bản Linux)
   - `.tar.gz` bản chuẩn và legacy (kèm script `install.sh` / `uninstall.sh`)
 - **Windows:** bộ cài `.exe` và bản portable `.exe` ([`packaging/windows/installer.iss`](packaging/windows/installer.iss))
-- **macOS:** `.dmg` đóng gói `ctdozlite.app` ([`packaging/macos/Info.plist`](packaging/macos/Info.plist))
+- **macOS (Apple Silicon + Intel + Universal):** `ctdozlite-<version>-macos-arm64.dmg` (Chip M1/M2/M3/M4), `ctdozlite-<version>-macos-x86_64.dmg` (Mac Intel), và `ctdozlite-<version>-macos.dmg` (Universal Binary `lipo`) ([`packaging/macos/Info.plist`](packaging/macos/Info.plist))
 
 ---
 

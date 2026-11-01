@@ -261,34 +261,110 @@ jobs:
           path: dist/*.exe
 
   macos-dmg:
-    name: macOS (Apple Silicon + .dmg)
+    name: macOS (Apple Silicon arm64 + Intel x86_64 + Universal .dmg)
     needs: prepare
     runs-on: macos-latest
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      LIBOPUS_STATIC: "1"
+      LIBOPUS_NO_PKG: "1"
+      OPUS_STATIC: "1"
+      OPUS_NO_PKG: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - name: Install Homebrew dependencies
-        run: brew install cmake pkg-config opus
-      - name: Run test suite
-        run: cargo test --locked
-      - name: Build release app bundle & .dmg
+      - name: Ensure CMake is available (without Homebrew dynamic libopus)
         run: |
-          cargo build --release --locked --bin zalo-rust
-          mkdir -p dist/dmg/ctdozlite.app/Contents/MacOS
-          mkdir -p dist/dmg/ctdozlite.app/Contents/Resources
-          cp target/release/zalo-rust dist/dmg/ctdozlite.app/Contents/MacOS/zalo-rust
-          cp packaging/macos/Info.plist dist/dmg/ctdozlite.app/Contents/Info.plist
-          plutil -replace CFBundleShortVersionString -string "$VERSION" dist/dmg/ctdozlite.app/Contents/Info.plist
-          ln -s /Applications dist/dmg/Applications
-          hdiutil create -volname "ctdozlite" -srcfolder dist/dmg -ov -format UDZO "dist/ctdozlite-${VERSION}-macos.dmg"
+          command -v cmake >/dev/null 2>&1 || brew install cmake
+          cmake --version
+      - name: Run test suite
+        run: |
+          CMAKE_TOOLCHAIN_FILE="$PWD/packaging/macos/toolchain-arm64.cmake" \
+            cargo test --locked
+      - name: Build release binaries (Apple Silicon arm64 + Intel x86_64 + Universal) & .dmg packages
+        run: |
+          set -euo pipefail
+          VER="${VERSION:-0.0.3}"
+
+          echo "=== [1/4] Building Apple Silicon (aarch64-apple-darwin) ==="
+          CMAKE_TOOLCHAIN_FILE="$PWD/packaging/macos/toolchain-arm64.cmake" \
+            cargo build --release --locked --target aarch64-apple-darwin --bin zalo-rust
+
+          echo "=== [2/4] Building Mac Intel (x86_64-apple-darwin) ==="
+          CMAKE_TOOLCHAIN_FILE="$PWD/packaging/macos/toolchain-x86_64.cmake" \
+            cargo build --release --locked --target x86_64-apple-darwin --bin zalo-rust
+
+          echo "=== [3/4] Creating Universal Binary (arm64 + x86_64) via lipo ==="
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/zalo-rust \
+            target/x86_64-apple-darwin/release/zalo-rust \
+            -output target/universal-apple-darwin/release/zalo-rust
+          lipo -info target/universal-apple-darwin/release/zalo-rust
+
+          echo "=== Verifying zero Homebrew dynamic library dependencies ==="
+          otool -L target/aarch64-apple-darwin/release/zalo-rust
+          otool -L target/x86_64-apple-darwin/release/zalo-rust
+          if otool -L target/universal-apple-darwin/release/zalo-rust | grep -E '/opt/homebrew|/usr/local'; then
+            echo "ERROR: Binary still links against Homebrew dylib!"
+            exit 1
+          fi
+
+          echo "=== Generating AppIcon.icns from src/assets/app_icon.png ==="
+          mkdir -p build_icon/AppIcon.iconset
+          for sz in 16 32 128 256 512; do
+            sips -s format png -z $sz $sz src/assets/app_icon.png --out "build_icon/AppIcon.iconset/icon_${sz}x${sz}.png" >/dev/null
+            sz2=$((sz * 2))
+            sips -s format png -z $sz2 $sz2 src/assets/app_icon.png --out "build_icon/AppIcon.iconset/icon_${sz}x${sz}@2x.png" >/dev/null
+          done
+          iconutil -c icns build_icon/AppIcon.iconset -o build_icon/AppIcon.icns || true
+
+          mkdir -p dist
+
+          package_dmg() {
+            local bin_path="$1"
+            local dmg_out="$2"
+            local vol_name="$3"
+            local stage_dir
+            stage_dir="$(mktemp -d)"
+            mkdir -p "$stage_dir/ctdozlite.app/Contents/MacOS"
+            mkdir -p "$stage_dir/ctdozlite.app/Contents/Resources"
+            cp "$bin_path" "$stage_dir/ctdozlite.app/Contents/MacOS/zalo-rust"
+            chmod +x "$stage_dir/ctdozlite.app/Contents/MacOS/zalo-rust"
+            cp packaging/macos/Info.plist "$stage_dir/ctdozlite.app/Contents/Info.plist"
+            plutil -replace CFBundleShortVersionString -string "$VER" "$stage_dir/ctdozlite.app/Contents/Info.plist"
+            printf 'APPL????' > "$stage_dir/ctdozlite.app/Contents/PkgInfo"
+            if [ -f build_icon/AppIcon.icns ]; then
+              cp build_icon/AppIcon.icns "$stage_dir/ctdozlite.app/Contents/Resources/AppIcon.icns"
+            fi
+            xattr -cr "$stage_dir/ctdozlite.app" || true
+            codesign --force --deep --sign - "$stage_dir/ctdozlite.app"
+            ln -s /Applications "$stage_dir/Applications"
+
+            for attempt in 1 2 3 4 5; do
+              if hdiutil create -volname "$vol_name" -srcfolder "$stage_dir" -ov -fs HFS+ -format UDZO "$dmg_out"; then
+                break
+              fi
+              echo "hdiutil attempt $attempt failed, retrying in 3s..."
+              sleep 3
+            done
+            rm -rf "$stage_dir"
+            test -f "$dmg_out"
+          }
+
+          echo "=== [4/4] Packaging .dmg installers (Apple Silicon, Intel, Universal) ==="
+          package_dmg "target/aarch64-apple-darwin/release/zalo-rust" "dist/ctdozlite-${VER}-macos-arm64.dmg" "ctdozlite (Apple Silicon)"
+          package_dmg "target/x86_64-apple-darwin/release/zalo-rust" "dist/ctdozlite-${VER}-macos-x86_64.dmg" "ctdozlite (Intel)"
+          package_dmg "target/universal-apple-darwin/release/zalo-rust" "dist/ctdozlite-${VER}-macos.dmg" "ctdozlite"
+          ls -lh dist/*.dmg
       - uses: actions/upload-artifact@v4
         with:
           name: ctdozlite-macos-dmg
           path: dist/*.dmg
-
   release:
     name: Publish GitHub Release
     needs: [prepare, linux-packages, linux-legacy-glibc231, windows-exe, macos-dmg]
@@ -303,10 +379,18 @@ jobs:
         with:
           path: release_assets
           merge-multiple: true
-      - name: Generate SHA256SUMS.txt
+      - name: Generate SHA256SUMS.txt & latest.json update manifest
         run: |
           cd release_assets
           sha256sum * > SHA256SUMS.txt
+          VER="${GITHUB_REF_NAME#v}"
+          cat > latest.json << EOF
+          {
+            "version": "${VER}",
+            "tag_name": "${GITHUB_REF_NAME}",
+            "repository": "https://github.com/ctdoteam1110/ctdozlite"
+          }
+          EOF
           cat SHA256SUMS.txt
       # Install instructions live in docs/CAI_DAT.md. The release body only links to
       # them; the PR list, contributors and Full Changelog are generated by GitHub.
@@ -319,4 +403,4 @@ jobs:
           body: |
             > **Hướng dẫn cài đặt:** [docs/CAI_DAT.md](https://github.com/ctdoteam1110/ctdozlite/blob/main/docs/CAI_DAT.md) · **Trang chủ:** https://ctdozlite.ctdo.net/
             >
-            > Chọn đúng gói trong mục **Assets** bên dưới cho hệ điều hành của bạn.
+            > Chọn đúng gói trong mục **Assets** bên dưới cho hệ điều hành của bạn (hỗ trợ Linux `.deb`/`.rpm`/`.AppImage`/`.tar.gz`, Windows `.exe`, và macOS `.dmg` cho cả **Apple Silicon M1/M2/M3/M4 `arm64`**, **Mac Intel `x86_64`** & **Universal**).

@@ -75,122 +75,12 @@ impl CallType {
     }
 }
 
-/// Outbound-dial allowlist - test lock, not a protocol feature.
-///
-/// Only these three contacts may be dialed. Every other target is refused before any request
-/// reaches the server. The lock is enforced twice: in the `CallEngineCmd::MakeCall` arm (friendly
-/// UI error) and inside [`dispatch_send_signal_inner`] for `401`/`416` (hard stop, also covers
-/// `call_probe` and any future caller). Group calls are always refused.
-pub const CALL_ALLOWED_NAMES: [&str; 3] = ["hoang", "do thanh", "dtc"];
-
-/// Known id aliases of the allowlisted accounts: 19-digit thread ids, 19-digit uins, 32-bit uids.
-///
-/// The 19-digit ids are *not* 32-bit truncations of the uids, so both forms are listed per person.
-pub const CALL_ALLOWED_IDS: [&str; 8] = [
-    // Test Account 1 (mock IDs; override at runtime via ZALO_CALL_ALLOW_IDS)
-    "100000001",
-    "1000000000000000001",
-    "1000000000000000002",
-    // Test Account 2
-    "100000002",
-    "1000000000000000003",
-    "1000000000000000004",
-    // Test Account 3
-    "100000003",
-    "1000000000000000005",
-];
-
-/// Strip every non-digit character so `"1000000000000000001"`/`"'1000...'"` compare equal.
-fn only_digits(s: &str) -> String {
-    s.chars().filter(|c| c.is_ascii_digit()).collect()
+/// Gate for an outbound call: unlocked for all valid 1-1 and group targets.
+pub fn call_target_allowed(partner_id: &str, partner_name: &str, _is_group: bool) -> bool {
+    !partner_id.trim().is_empty() || !partner_name.trim().is_empty()
 }
 
-/// Lowercase and strip Vietnamese diacritics: `"Đỗ Thành"` -> `"do thanh"`.
-///
-/// Non-alphanumeric characters collapse into single spaces so emoji or decorations in a Zalo
-/// display name do not defeat the match.
-fn fold_call_label(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut pending_space = false;
-    for raw in name.chars() {
-        let c = raw.to_lowercase().next().unwrap_or(raw);
-        let mapped = match c {
-            'a' | 'à' | 'á' | 'ạ' | 'ả' | 'ã' | 'â' | 'ầ' | 'ấ' | 'ậ' | 'ẩ' | 'ẫ' | 'ă' | 'ằ'
-            | 'ắ' | 'ặ' | 'ẳ' | 'ẵ' => 'a',
-            'e' | 'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => 'e',
-            'i' | 'ì' | 'í' | 'ị' | 'ỉ' | 'ĩ' => 'i',
-            'o' | 'ò' | 'ó' | 'ọ' | 'ỏ' | 'õ' | 'ô' | 'ồ' | 'ố' | 'ộ' | 'ổ' | 'ỗ' | 'ơ' | 'ờ'
-            | 'ớ' | 'ợ' | 'ở' | 'ỡ' => 'o',
-            'u' | 'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => 'u',
-            'y' | 'ỳ' | 'ý' | 'ỵ' | 'ỷ' | 'ỹ' => 'y',
-            'd' | 'đ' => 'd',
-            other => other,
-        };
-        if mapped.is_ascii_alphanumeric() {
-            if pending_space && !out.is_empty() {
-                out.push(' ');
-            }
-            pending_space = false;
-            out.push(mapped);
-        } else {
-            pending_space = true;
-        }
-    }
-    out
-}
-
-/// Does a display name contain one of the allowlisted labels as a whole token sequence?
-fn call_name_allowed(name: &str) -> bool {
-    let folded = fold_call_label(name);
-    if folded.is_empty() {
-        return false;
-    }
-    let tokens: Vec<&str> = folded.split(' ').filter(|t| !t.is_empty()).collect();
-    CALL_ALLOWED_NAMES.iter().any(|allowed| {
-        let want: Vec<&str> = allowed.split(' ').filter(|t| !t.is_empty()).collect();
-        !want.is_empty() && tokens.windows(want.len()).any(|w| w == want.as_slice())
-    })
-}
-
-/// Allowlist gate for an outbound call. `is_group` always fails.
-pub fn call_target_allowed(partner_id: &str, partner_name: &str, is_group: bool) -> bool {
-    if is_group {
-        return false;
-    }
-    let id = only_digits(partner_id);
-    if !id.is_empty() {
-        if CALL_ALLOWED_IDS.contains(&id.as_str()) {
-            return true;
-        }
-        if let Ok(extra) = std::env::var("ZALO_CALL_ALLOW_IDS") {
-            if extra
-                .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
-                .map(only_digits)
-                .any(|allowed| !allowed.is_empty() && allowed == id)
-            {
-                return true;
-            }
-        }
-    }
-    if partner_id.trim_start().to_ascii_lowercase().starts_with("group") {
-        return false;
-    }
-    if call_name_allowed(partner_name) || call_name_allowed(partner_id) {
-        return true;
-    }
-    // When `dispatch_send_signal_inner` only has `calleeId` (`partner_name == ""`), look up the
-    // contact's display name in the local gitignored `threads_cache.json` so allowlisted contacts
-    // (Hoang, Đỗ Thành, ĐTC) work out of the box without hardcoding live UIDs in Git.
-    if !id.is_empty() && partner_name.trim().is_empty() {
-        for t in crate::chat::load_threads_cache() {
-            if !t.is_group && only_digits(&t.id) == id && call_name_allowed(&t.name) {
-                return true;
-            }
-        }
-    }
-    false
-}
-/// Same as [`call_target_allowed`], returning the Vietnamese refusal reason for the UI.
+/// Validate that the outbound call target is non-empty.
 pub fn ensure_call_target_allowed(
     partner_id: &str,
     partner_name: &str,
@@ -199,15 +89,7 @@ pub fn ensure_call_target_allowed(
     if call_target_allowed(partner_id, partner_name, is_group) {
         return Ok(());
     }
-    if is_group {
-        bail!("Cuộc gọi nhóm đang bị khoá: chỉ cho phép gọi 3 tài khoản test (Hoang, Đỗ Thành, ĐTC)");
-    }
-    let who = if partner_name.trim().is_empty() {
-        partner_id.trim().to_string()
-    } else {
-        partner_name.trim().to_string()
-    };
-    bail!("Đã khoá gọi ra: chỉ được gọi Hoang, Đỗ Thành, ĐTC (đích: {who})")
+    bail!("Không xác định được người nhận hoặc nhóm để gọi")
 }
 
 /// Encrypt a JSON string into a `$`-terminated hex AES-128-CBC frame (`encrypt` in module `"vqv6"`).
@@ -988,11 +870,26 @@ impl CtrlPollState {
                 }
                 // The server keeps re-delivering a queue entry until the client echoes its
                 // action id back in `ids`. `getIdsForParam()` does exactly this upstream.
-                if let Some(ids) = qval.get("ids").and_then(Value::as_array) {
-                    entry.ids = ids
+                if let Some(ids_arr) = qval.get("ids").and_then(Value::as_array) {
+                    let max_lid = entry.last_id.parse::<u128>().unwrap_or(u128::MAX);
+                    let mut new_ids: Vec<String> = ids_arr
                         .iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .filter_map(|v| match v {
+                            Value::String(s) if !s.is_empty() => Some(s.clone()),
+                            Value::Number(n) => Some(n.to_string()),
+                            _ => None,
+                        })
+                        .filter(|s| s.parse::<u128>().map(|n| n <= max_lid).unwrap_or(true))
                         .collect();
+                    if !new_ids.is_empty() {
+                        new_ids.sort_by_key(|s| std::cmp::Reverse(s.parse::<u128>().unwrap_or(0)));
+                        new_ids.dedup();
+                        new_ids.truncate(10);
+                        new_ids.reverse();
+                        entry.ids = new_ids;
+                    } else {
+                        entry.ids.clear();
+                    }
                 }
             }
         }
@@ -1071,9 +968,33 @@ pub async fn poll_voip_controls(s: &Session, state: &mut CtrlPollState) -> Resul
     }
     state.update_from_response(data_node);
     if is_initial_cursor {
-        // First poll with cursor "1" only syncs `lastActionId` to the server's latest cursor;
-        // discard historical replay events from previous sessions.
-        return Ok(Vec::new());
+        // First poll with cursor "1" syncs `lastActionId`, but preserve any fresh (< 45s) incoming
+        // `request` / `group_request` invite so a call ringing right as the app opens is not dropped.
+        let now_ms = (crate::login::unix_now() * 1000) as i64;
+        let fresh_invites: Vec<Value> = extract_voip_controls(data_node)
+            .into_iter()
+            .filter(|ev| {
+                let act = ev.get("act").and_then(Value::as_str).unwrap_or("");
+                if !matches!(act, "request" | "group_request") {
+                    return false;
+                }
+                let ev_ts = ev
+                    .get("data")
+                    .and_then(|d| d.get("ts"))
+                    .and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
+                    .unwrap_or(0);
+                let ev_ms = if ev_ts > 0 && ev_ts < 10_000_000_000 {
+                    ev_ts * 1000
+                } else {
+                    ev_ts
+                };
+                ev_ms > 0 && now_ms.saturating_sub(ev_ms) <= 45_000
+            })
+            .collect();
+        return Ok(fresh_invites);
     }
     let events = extract_voip_controls(data_node);
     if !events.is_empty() {
@@ -1093,6 +1014,32 @@ pub async fn poll_voip_controls(s: &Session, state: &mut CtrlPollState) -> Resul
 // ---------------------------------------------------------------------------
 // Pure-Rust In-App VoIP Signaling & ZRTP Relay Engine (Zero external `ZaloCall.exe` process)
 // ---------------------------------------------------------------------------
+
+struct GroupMemberLeg {
+    call_id: i64,
+    partner_id: String,
+    is_connected: bool,
+    from_uid_u32: u32,
+    partner_uid_u32: u32,
+    sess_id: String,
+    rtp_ip: String,
+    rtcp_ip: String,
+    extend_data: String,
+    relay_token: u32,
+    server_tokens: BTreeMap<String, u32>,
+    udp_rtp_sock: Option<Arc<tokio::net::UdpSocket>>,
+    udp_rtcp_sock: Option<Arc<tokio::net::UdpSocket>>,
+    keepalive_abort: Option<tokio::sync::watch::Sender<bool>>,
+    media: Option<crate::media::MediaHandle>,
+}
+
+impl Drop for GroupMemberLeg {
+    fn drop(&mut self) {
+        if let Some(tx) = self.keepalive_abort.take() {
+            let _ = tx.send(true);
+        }
+    }
+}
 
 struct PureRustCallState {
     call_id: i64,
@@ -1118,6 +1065,32 @@ struct PureRustCallState {
     audio: Option<crate::audio::AudioHandle>,
     /// Phase 2 media session (Opus/RTP over UDP). None until connected.
     media: Option<crate::media::MediaHandle>,
+    /// Additional concurrent member legs for multi-member group calls.
+    extra_legs: Vec<GroupMemberLeg>,
+}
+
+impl PureRustCallState {
+    fn swap_with_extra_leg(&mut self, idx: usize) {
+        if idx >= self.extra_legs.len() {
+            return;
+        }
+        let leg = &mut self.extra_legs[idx];
+        std::mem::swap(&mut self.call_id, &mut leg.call_id);
+        std::mem::swap(&mut self.partner_id, &mut leg.partner_id);
+        std::mem::swap(&mut self.is_connected, &mut leg.is_connected);
+        std::mem::swap(&mut self.from_uid_u32, &mut leg.from_uid_u32);
+        std::mem::swap(&mut self.partner_uid_u32, &mut leg.partner_uid_u32);
+        std::mem::swap(&mut self.sess_id, &mut leg.sess_id);
+        std::mem::swap(&mut self.rtp_ip, &mut leg.rtp_ip);
+        std::mem::swap(&mut self.rtcp_ip, &mut leg.rtcp_ip);
+        std::mem::swap(&mut self.extend_data, &mut leg.extend_data);
+        std::mem::swap(&mut self.relay_token, &mut leg.relay_token);
+        std::mem::swap(&mut self.server_tokens, &mut leg.server_tokens);
+        std::mem::swap(&mut self.udp_rtp_sock, &mut leg.udp_rtp_sock);
+        std::mem::swap(&mut self.udp_rtcp_sock, &mut leg.udp_rtcp_sock);
+        std::mem::swap(&mut self.keepalive_abort, &mut leg.keepalive_abort);
+        std::mem::swap(&mut self.media, &mut leg.media);
+    }
 }
 
 impl Drop for PureRustCallState {
@@ -1953,29 +1926,443 @@ impl CallBridge {
                             .map(|d| d.as_millis() as i64)
                             .unwrap_or(1_700_000_000_000);
                         let call_id = ((now_ms % 1_800_000_000) + 100_000_000) as i64;
-                        let call_type = CallType::from_flags(is_video, is_group) as u8;
+                        let mut call_type = CallType::from_flags(is_video, is_group) as u8;
 
                         let gui_tx_clone = gui_tx.clone();
                         let ctx_clone = egui_ctx.clone();
                         let active_clone = active_call.clone();
 
                         tokio::spawn(async move {
+                            let mut partner_id = partner_id;
+                            let mut partner_name = partner_name;
+                            let mut group_candidates: Vec<String> = Vec::new();
                             if is_group {
                                 let clean_gid = partner_id
                                     .trim_start_matches("group_")
                                     .trim_start_matches('g')
                                     .trim_start_matches('G')
                                     .to_string();
+                                let my_uid = s_snap
+                                    .login
+                                    .as_ref()
+                                    .map(|l| l.uin.trim().to_string())
+                                    .unwrap_or_default();
+                                let mut partners_vec: Vec<String> = Vec::new();
+                                let mut grp_name = partner_name.clone();
+                                let mut grp_avt = String::new();
+                                let mut max_users: u64 = 8;
+                                if let Ok((info_map, _)) = crate::chat::fetch_group_profiles(
+                                    &s_snap,
+                                    std::slice::from_ref(&clean_gid),
+                                )
+                                .await
+                                {
+                                    if let Some(info) = info_map
+                                        .get(&clean_gid)
+                                        .or_else(|| info_map.get(&partner_id))
+                                    {
+                                        if let Some(n) = info.get("name").and_then(Value::as_str) {
+                                            if !n.is_empty() {
+                                                grp_name = n.to_string();
+                                            }
+                                        }
+                                        if let Some(a) = info
+                                            .get("fullAvt")
+                                            .or_else(|| info.get("avt"))
+                                            .and_then(Value::as_str)
+                                        {
+                                            grp_avt = a.to_string();
+                                        }
+                                        if let Some(arr) =
+                                            info.get("memVerList").and_then(Value::as_array)
+                                        {
+                                            for item in arr {
+                                                if let Some(raw) = item.as_str() {
+                                                    let uid =
+                                                        raw.split('_').next().unwrap_or("").trim();
+                                                    if !uid.is_empty()
+                                                        && uid != my_uid
+                                                        && !partners_vec.iter().any(|x| x == uid)
+                                                    {
+                                                        partners_vec.push(uid.to_string());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if partners_vec.is_empty() {
+                                            if let Some(arr) =
+                                                info.get("memberIds").and_then(Value::as_array)
+                                            {
+                                                for item in arr {
+                                                    let uid = item
+                                                        .as_str()
+                                                        .map(str::to_string)
+                                                        .or_else(|| {
+                                                            item.as_u64().map(|n| n.to_string())
+                                                        })
+                                                        .unwrap_or_default();
+                                                    if !uid.is_empty()
+                                                        && uid != my_uid
+                                                        && !partners_vec.iter().any(|x| x == &uid)
+                                                    {
+                                                        partners_vec.push(uid);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // `ZaloCall.exe` (`0x0071712c`): Group Voice (5) -> typeRequest=0, Group Video (6) -> typeRequest=1
+                                let grp_call_type_wire: u8 = if is_video { 1 } else { 0 };
+                                let partners_str =
+                                    serde_json::to_string(&partners_vec).unwrap_or_else(|_| "[]".into());
+                                let inner_12433 = json!({
+                                    "extraData": "",
+                                    "groupAvatar": grp_avt,
+                                    "groupId": clean_gid,
+                                    "groupName": grp_name,
+                                    "maxUsers": max_users,
+                                    "noiseId": partners_str
+                                });
+                                let inner_12433_str =
+                                    serde_json::to_string(&inner_12433).unwrap_or_default();
+
                                 let req_12433 = json!({
                                     "groupId": clean_gid,
                                     "callId": call_id,
-                                    "typeRequest": call_type,
-                                    "data": "",
-                                    "partners": []
+                                    "typeRequest": grp_call_type_wire,
+                                    "data": inner_12433_str,
+                                    "partners": partners_str
                                 });
-                                match dispatch_send_signal(&s_snap, 12433, &req_12433).await {
-                                    Ok(resp) => {
-                                        let status = resp
+                                let resp_res =
+                                    dispatch_send_signal(&s_snap, 12433, &req_12433).await;
+                                if let Ok(ref r) = resp_res {
+                                    if let Some(pids) =
+                                        r.get("partnerIds").and_then(Value::as_array)
+                                    {
+                                        for item in pids {
+                                            let uid = item
+                                                .as_str()
+                                                .map(str::to_string)
+                                                .or_else(|| item.as_u64().map(|n| n.to_string()))
+                                                .unwrap_or_default();
+                                            if !uid.is_empty()
+                                                && uid != my_uid
+                                                && !partners_vec.iter().any(|x| x == &uid)
+                                            {
+                                                partners_vec.push(uid);
+                                            }
+                                        }
+                                    }
+                                }
+                                let status_12433 = resp_res
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(|r| r.get("status"))
+                                    .and_then(|v| {
+                                        v.as_i64()
+                                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                                    })
+                                    .unwrap_or(-1);
+                                if status_12433 == 0 {
+                                    if let Ok(mut resp) = resp_res {
+                                        if let Some(p_str) =
+                                            resp.get("params").and_then(Value::as_str)
+                                        {
+                                            if let Ok(p_obj) =
+                                                serde_json::from_str::<Value>(p_str.trim())
+                                            {
+                                                if let (Some(dst), Some(src)) =
+                                                    (resp.as_object_mut(), p_obj.as_object())
+                                                {
+                                                    for (k, v) in src {
+                                                        dst.entry(k.clone()).or_insert_with(|| v.clone());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let real_call_id = resp
+                                            .get("callId")
+                                            .or_else(|| resp.get("id"))
+                                            .and_then(|v| {
+                                                v.as_i64().or_else(|| {
+                                                    v.as_str().and_then(|s| s.parse().ok())
+                                                })
+                                            })
+                                            .unwrap_or(call_id);
+                                        if let Some(mu) =
+                                            resp.get("maxUsers").and_then(Value::as_u64)
+                                        {
+                                            max_users = mu;
+                                        }
+                                        let host_call = resp
+                                            .get("hostCall")
+                                            .or_else(|| resp.get("toId"))
+                                            .and_then(|v| {
+                                                v.as_str().map(str::to_string).or_else(|| {
+                                                    v.as_i64().map(|n| n.to_string())
+                                                })
+                                            })
+                                            .filter(|s| !s.is_empty())
+                                            .unwrap_or_else(|| my_uid.clone());
+                                        let sess_id_raw = resp
+                                            .pointer("/callSetting/session")
+                                            .or_else(|| resp.get("session"))
+                                            .or_else(|| resp.get("sessId"))
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let from_uid_u32 = s_snap
+                                            .zpw_sek
+                                            .as_deref()
+                                            .and_then(|sek| sek.split('.').nth(1))
+                                            .and_then(|x| x.parse::<u32>().ok())
+                                            .unwrap_or_else(|| uid_str_to_u32(&my_uid));
+                                        let partner_uid_u32 = uid_str_to_u32(&host_call);
+                                        let (
+                                            udp_rtp_sock,
+                                            udp_rtcp_sock,
+                                            keepalive_abort,
+                                            zrtp_probe,
+                                        ) = start_zrtp_udp_relay_session_with_probe(
+                                            &resp,
+                                            from_uid_u32,
+                                            partner_uid_u32,
+                                            real_call_id as u32,
+                                            true,
+                                            &sess_id_raw,
+                                        )
+                                        .await;
+                                        let (rtp_ip, rtcp_ip, sess_id, codec_str, extend_str) =
+                                            build_pure_rust_invite_fields_with_probe(
+                                                &resp,
+                                                is_video,
+                                                Some(zrtp_probe.local_port),
+                                                Some(&zrtp_probe),
+                                            );
+
+                                        // Step 2 (`12434` -> `/api/voicecall/group/request`): ring group members
+                                        let inner_12434_meta = json!({
+                                            "extraData": "",
+                                            "groupAvatar": grp_avt,
+                                            "groupName": grp_name,
+                                            "hostCall": host_call,
+                                            "maxUsers": max_users,
+                                            "noiseId": ""
+                                        });
+                                        let outer_12434_data = json!({
+                                            "codec": codec_str,
+                                            "data": serde_json::to_string(&inner_12434_meta).unwrap_or_default(),
+                                            "extendData": extend_str,
+                                            "rtcpAddress": rtcp_ip,
+                                            "rtcpAddressIPv6": "",
+                                            "rtpAddress": rtp_ip,
+                                            "rtpAddressIPv6": ""
+                                        });
+                                        let req_12434 = json!({
+                                            "calleeId": host_call,
+                                            "callId": real_call_id,
+                                            "callType": grp_call_type_wire,
+                                            "data": serde_json::to_string(&outer_12434_data).unwrap_or_default(),
+                                            "session": sess_id,
+                                            "partners": partners_str,
+                                            "groupId": clean_gid
+                                        });
+                                        let _ =
+                                            dispatch_send_signal(&s_snap, 12434, &req_12434).await;
+
+                                        let media_handle =
+                                            crate::media::MediaHandle::start_with_sockets(
+                                                rtp_ip.clone(),
+                                                rtcp_ip.clone(),
+                                                from_uid_u32,
+                                                partner_uid_u32,
+                                                true,
+                                                zrtp_probe.token,
+                                                udp_rtp_sock.clone(),
+                                                udp_rtcp_sock.clone(),
+                                                0,
+                                                is_video,
+                                                Some(gui_tx_clone.clone()),
+                                                Some(ctx_clone.clone()),
+                                            )
+                                            .ok();
+
+                                        *active_clone.lock().await = Some(PureRustCallState {
+                                            call_id: real_call_id,
+                                            partner_id,
+                                            partner_name: grp_name.clone(),
+                                            is_video,
+                                            is_group: true,
+                                            is_caller: true,
+                                            is_connected: false,
+                                            started_at: std::time::Instant::now(),
+                                            sess_id,
+                                            rtp_ip,
+                                            rtcp_ip,
+                                            extend_data: extend_str,
+                                            from_uid_u32,
+                                            partner_uid_u32,
+                                            relay_token: zrtp_probe.token,
+                                            server_tokens: zrtp_probe.server_tokens,
+                                            udp_rtp_sock,
+                                            udp_rtcp_sock,
+                                            keepalive_abort,
+                                            audio: None,
+                                            media: media_handle,
+                                            extra_legs: Vec::new(),
+                                        });
+                                        let _ = gui_tx_clone
+                                            .send(GuiEvent::CallStateChanged("calling".into()));
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                            "🔔 Đang gọi nhóm {grp_name} (ID #{real_call_id})…"
+                                        )));
+                                        ctx_clone.request_repaint();
+                                        return;
+                                    }
+                                }
+
+                                // Fallback for `zpw_type=30` (Zalo Web) sessions where `/api/voicecall/group/requestcall`
+                                // returns `status=2` ("Bạn sử dụng phiên bản chưa hỗ trợ tính năng gọi nhóm"):
+                                // dial the group members directly over ZRTP (`401` + `416`).
+                                if partners_vec.is_empty() {
+                                    let _ = gui_tx_clone.send(GuiEvent::CallRejected {
+                                        code: status_12433,
+                                        reason: "Không tìm thấy thành viên khả dụng trong nhóm để gọi"
+                                            .into(),
+                                    });
+                                    ctx_clone.request_repaint();
+                                    return;
+                                }
+                                partner_name = grp_name;
+                                partner_id = partners_vec[0].clone();
+                                call_type = CallType::from_flags(is_video, false) as u8;
+                                group_candidates = partners_vec;
+                            }
+
+                            // Step 1 + 1.5 + 2: Dial all candidates concurrently (`401` -> ZRTP UDP probe -> `416`)
+                            // For a 1-1 call `candidates` has 1 UID; for a group call `candidates` has all group members
+                            // so every member's phone/Zalo rings at the same time.
+                            let candidates = if group_candidates.is_empty() {
+                                vec![partner_id.clone()]
+                            } else {
+                                group_candidates.clone()
+                            };
+                            let mut dialed_legs: Vec<GroupMemberLeg> = Vec::new();
+                            let mut last_err_reason =
+                                "Người nhận không thể nhận cuộc gọi lúc này".to_string();
+                            let mut last_err_code: i64 = -1;
+
+                            for (c_idx, cand_uid) in candidates.iter().enumerate() {
+                                let req_call_id = call_id + (c_idx as i64) * 10;
+                                let req_401 = json!({
+                                    "calleeId": cand_uid,
+                                    "callId": req_call_id,
+                                    "codec": "[]",
+                                    "typeRequest": call_type,
+                                    "imei": s_snap.imei,
+                                });
+                                let resp_401 = match dispatch_send_signal(&s_snap, 401, &req_401).await
+                                {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        last_err_reason = format!("Lỗi khởi tạo cuộc gọi (401): {e}");
+                                        continue;
+                                    }
+                                };
+                                let status_401 = resp_401
+                                    .get("status")
+                                    .and_then(|v| {
+                                        v.as_i64()
+                                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                                    })
+                                    .unwrap_or(0);
+                                if status_401 != 0 {
+                                    last_err_code = status_401;
+                                    if let Some(m) = resp_401
+                                        .get("msg")
+                                        .and_then(Value::as_str)
+                                        .filter(|m| !m.is_empty())
+                                    {
+                                        last_err_reason = m.to_string();
+                                    }
+                                    continue;
+                                }
+
+                                let real_call_id = resp_401
+                                    .get("id")
+                                    .and_then(Value::as_i64)
+                                    .unwrap_or(req_call_id);
+                                let from_uid_u32 = resp_401
+                                    .get("fromId")
+                                    .or_else(|| resp_401.get("callerId"))
+                                    .and_then(|v| {
+                                        v.as_u64()
+                                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                                    })
+                                    .map(|v| v as u32)
+                                    .unwrap_or_else(|| {
+                                        s_snap
+                                            .zpw_sek
+                                            .as_deref()
+                                            .and_then(|sek| sek.split('.').nth(1))
+                                            .and_then(|x| x.parse::<u32>().ok())
+                                            .unwrap_or_else(|| {
+                                                s_snap
+                                                    .login
+                                                    .as_ref()
+                                                    .map(|l| uid_str_to_u32(&l.uin))
+                                                    .unwrap_or(0)
+                                            })
+                                    });
+                                let partner_uid_u32 = resp_401
+                                    .get("toId")
+                                    .or_else(|| resp_401.get("calleeId"))
+                                    .and_then(|v| {
+                                        v.as_u64()
+                                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                                    })
+                                    .map(|v| v as u32)
+                                    .unwrap_or_else(|| uid_str_to_u32(cand_uid));
+                                let sess_id_raw = resp_401
+                                    .get("sessId")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                let (udp_rtp_sock, udp_rtcp_sock, keepalive_abort, zrtp_probe) =
+                                    start_zrtp_udp_relay_session_with_probe(
+                                        &resp_401,
+                                        from_uid_u32,
+                                        partner_uid_u32,
+                                        real_call_id as u32,
+                                        true,
+                                        &sess_id_raw,
+                                    )
+                                    .await;
+
+                                let (rtp_ip, rtcp_ip, sess_id, codec_str, extend_str) =
+                                    build_pure_rust_invite_fields_with_probe(
+                                        &resp_401,
+                                        is_video,
+                                        Some(zrtp_probe.local_port),
+                                        Some(&zrtp_probe),
+                                    );
+
+                                let req_416 = json!({
+                                    "callId": real_call_id,
+                                    "calleeId": cand_uid,
+                                    "codec": codec_str,
+                                    "extendData": extend_str,
+                                    "rtcpAddress": rtcp_ip,
+                                    "rtpAddress": rtp_ip,
+                                    "session": sess_id,
+                                    "imei": s_snap.imei,
+                                });
+                                match dispatch_send_signal(&s_snap, 416, &req_416).await {
+                                    Ok(resp_416) => {
+                                        let st_416 = resp_416
                                             .get("status")
                                             .and_then(|v| {
                                                 v.as_i64().or_else(|| {
@@ -1983,114 +2370,57 @@ impl CallBridge {
                                                 })
                                             })
                                             .unwrap_or(0);
-                                        if status != 0 {
-                                            let reason = resp
+                                        if st_416 == 0 {
+                                            dialed_legs.push(GroupMemberLeg {
+                                                call_id: real_call_id,
+                                                partner_id: cand_uid.clone(),
+                                                is_connected: false,
+                                                from_uid_u32,
+                                                partner_uid_u32,
+                                                sess_id,
+                                                rtp_ip,
+                                                rtcp_ip,
+                                                extend_data: extend_str,
+                                                relay_token: zrtp_probe.token,
+                                                server_tokens: zrtp_probe.server_tokens,
+                                                udp_rtp_sock,
+                                                udp_rtcp_sock,
+                                                keepalive_abort,
+                                                media: None,
+                                            });
+                                        } else {
+                                            if let Some(tx) = keepalive_abort {
+                                                let _ = tx.send(true);
+                                            }
+                                            last_err_code = st_416;
+                                            if let Some(m) = resp_416
                                                 .get("msg")
                                                 .and_then(Value::as_str)
                                                 .filter(|m| !m.is_empty())
-                                                .unwrap_or("Không thể khởi tạo cuộc gọi nhóm")
-                                                .to_string();
-                                            let _ = gui_tx_clone.send(GuiEvent::CallRejected {
-                                                code: status,
-                                                reason: reason.clone(),
-                                            });
-                                            let _ = gui_tx_clone.send(GuiEvent::MessageSent {
-                                                thread_id: partner_id,
-                                                text: format!(
-                                                    "📞 Cuộc gọi nhóm (0s) — {reason} (Mã {status})"
-                                                ),
-                                                msg_id: format!("call_{}", crate::login::unix_now()),
-                                            });
-                                            ctx_clone.request_repaint();
-                                            return;
+                                            {
+                                                last_err_reason = m.to_string();
+                                            }
                                         }
-                                        let sess_id = resp
-                                            .get("session")
-                                            .or_else(|| resp.get("sessId"))
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("")
-                                            .to_string();
-                                        *active_clone.lock().await = Some(PureRustCallState {
-                                            call_id,
-                                            partner_id,
-                                            partner_name,
-                                            is_video,
-                                            is_group: true,
-                                            is_caller: true,
-                                            is_connected: false,
-                                            started_at: std::time::Instant::now(),
-                                            sess_id,
-                                            rtp_ip: String::new(),
-                                            rtcp_ip: String::new(),
-                                            extend_data: String::new(),
-                                            from_uid_u32: 0,
-                                            partner_uid_u32: 0,
-                                            relay_token: 0,
-                                            server_tokens: BTreeMap::new(),
-                                            udp_rtp_sock: None,
-                                            udp_rtcp_sock: None,
-                                            keepalive_abort: None,
-                                            audio: None,
-    media: None,
-                                        });
-                                        let _ = gui_tx_clone
-                                            .send(GuiEvent::CallStateChanged("calling".into()));
-                                        ctx_clone.request_repaint();
                                     }
                                     Err(e) => {
-                                        let _ = gui_tx_clone.send(GuiEvent::CallRejected {
-                                            code: -1,
-                                            reason: e.to_string(),
-                                        });
-                                        ctx_clone.request_repaint();
+                                        if let Some(tx) = keepalive_abort {
+                                            let _ = tx.send(true);
+                                        }
+                                        last_err_reason =
+                                            format!("Lỗi gửi tín hiệu đổ chuông (416): {e}");
                                     }
                                 }
-                                return;
                             }
 
-                            // Step 1: 401 (`/api/voicecall/requestcall`)
-                            let req_401 = json!({
-                                "calleeId": partner_id,
-                                "callId": call_id,
-                                "codec": "[]",
-                                "typeRequest": call_type,
-                                "imei": s_snap.imei,
-                            });
-                            let resp_401 = match dispatch_send_signal(&s_snap, 401, &req_401).await
-                            {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    let _ = gui_tx_clone.send(GuiEvent::CallRejected {
-                                        code: -1,
-                                        reason: format!("Lỗi khởi tạo cuộc gọi (401): {e}"),
-                                    });
-                                    ctx_clone.request_repaint();
-                                    return;
-                                }
-                            };
-
-                            let status_401 = resp_401
-                                .get("status")
-                                .and_then(|v| {
-                                    v.as_i64()
-                                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                                })
-                                .unwrap_or(0);
-                            if status_401 != 0 {
-                                let reason = resp_401
-                                    .get("msg")
-                                    .and_then(Value::as_str)
-                                    .filter(|m| !m.is_empty())
-                                    .unwrap_or("Người nhận không thể nhận cuộc gọi lúc này")
-                                    .to_string();
+                            if dialed_legs.is_empty() {
                                 let _ = gui_tx_clone.send(GuiEvent::CallRejected {
-                                    code: status_401,
-                                    reason: reason.clone(),
+                                    code: last_err_code,
+                                    reason: last_err_reason.clone(),
                                 });
                                 let _ = gui_tx_clone.send(GuiEvent::MessageSent {
                                     thread_id: partner_id,
                                     text: format!(
-                                        "📞 Cuộc gọi đi (0s) — {reason} (Mã {status_401})"
+                                        "📞 Cuộc gọi đi (0s) — {last_err_reason} (Mã {last_err_code})"
                                     ),
                                     msg_id: format!("call_{}", crate::login::unix_now()),
                                 });
@@ -2098,144 +2428,64 @@ impl CallBridge {
                                 return;
                             }
 
-                            let real_call_id = resp_401
-                                .get("id")
-                                .and_then(Value::as_i64)
-                                .unwrap_or(call_id);
-
-                            let from_uid_u32 = resp_401
-                                .get("fromId")
-                                .or_else(|| resp_401.get("callerId"))
-                                .and_then(|v| {
-                                    v.as_u64()
-                                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                                })
-                                .map(|v| v as u32)
-                                .unwrap_or_else(|| {
-                                    s_snap
-                                        .zpw_sek
-                                        .as_deref()
-                                        .and_then(|sek| sek.split('.').nth(1))
-                                        .and_then(|x| x.parse::<u32>().ok())
-                                        .unwrap_or_else(|| {
-                                            s_snap
-                                                .login
-                                                .as_ref()
-                                                .map(|l| uid_str_to_u32(&l.uin))
-                                                .unwrap_or(0)
-                                        })
-                                });
-                            let partner_uid_u32 = resp_401
-                                .get("toId")
-                                .or_else(|| resp_401.get("calleeId"))
-                                .and_then(|v| {
-                                    v.as_u64()
-                                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                                })
-                                .map(|v| v as u32)
-                                .unwrap_or_else(|| uid_str_to_u32(&partner_id));
-                            let sess_id_raw = resp_401
-                                .get("sessId")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-
-                            // Step 1.5: Register ZRTP UDP session with Zalo's RTP/RTCP relay servers BEFORE 416
-                            let (udp_rtp_sock, udp_rtcp_sock, keepalive_abort, zrtp_probe) =
-                                start_zrtp_udp_relay_session_with_probe(
-                                    &resp_401,
-                                    from_uid_u32,
-                                    partner_uid_u32,
-                                    real_call_id as u32,
-                                    true,
-                                    &sess_id_raw,
-                                )
-                                .await;
-
-                            let (rtp_ip, rtcp_ip, sess_id, codec_str, extend_str) =
-                                build_pure_rust_invite_fields_with_probe(
-                                    &resp_401,
-                                    is_video,
-                                    Some(zrtp_probe.local_port),
-                                    Some(&zrtp_probe),
-                                );
-
+                            let n_ringing = dialed_legs.len();
+                            let mut primary = dialed_legs.remove(0);
+                            let primary_cid = primary.call_id;
                             *active_clone.lock().await = Some(PureRustCallState {
-                                call_id: real_call_id,
-                                partner_id: partner_id.clone(),
+                                call_id: primary.call_id,
+                                partner_id: primary.partner_id.clone(),
                                 partner_name: partner_name.clone(),
                                 is_video,
                                 is_group: false,
                                 is_caller: true,
                                 is_connected: false,
                                 started_at: std::time::Instant::now(),
-                                sess_id: sess_id.clone(),
-                                rtp_ip: rtp_ip.clone(),
-                                rtcp_ip: rtcp_ip.clone(),
-                                extend_data: extend_str.clone(),
-                                from_uid_u32,
-                                partner_uid_u32,
-                                relay_token: zrtp_probe.token,
-                                server_tokens: zrtp_probe.server_tokens,
-                                udp_rtp_sock,
-                                udp_rtcp_sock,
-                                keepalive_abort,
+                                sess_id: std::mem::take(&mut primary.sess_id),
+                                rtp_ip: std::mem::take(&mut primary.rtp_ip),
+                                rtcp_ip: std::mem::take(&mut primary.rtcp_ip),
+                                extend_data: std::mem::take(&mut primary.extend_data),
+                                from_uid_u32: primary.from_uid_u32,
+                                partner_uid_u32: primary.partner_uid_u32,
+                                relay_token: primary.relay_token,
+                                server_tokens: std::mem::take(&mut primary.server_tokens),
+                                udp_rtp_sock: primary.udp_rtp_sock.take(),
+                                udp_rtcp_sock: primary.udp_rtcp_sock.take(),
+                                keepalive_abort: primary.keepalive_abort.take(),
                                 audio: None,
-    media: None,
+                                media: if is_video {
+                                    crate::media::MediaHandle::start_with_sockets(
+                                        String::new(),
+                                        String::new(),
+                                        primary.from_uid_u32,
+                                        primary.partner_uid_u32,
+                                        true,
+                                        primary.relay_token,
+                                        None,
+                                        None,
+                                        0,
+                                        true,
+                                        Some(gui_tx_clone.clone()),
+                                        Some(ctx_clone.clone()),
+                                    )
+                                    .ok()
+                                } else {
+                                    None
+                                },
+                                extra_legs: dialed_legs,
                             });
-
-                            // Step 2: 416 (`/api/voicecall/request` — rings recipient's phone/Zalo)
-                            let req_416 = json!({
-                                "callId": real_call_id,
-                                "calleeId": partner_id,
-                                "codec": codec_str,
-                                "extendData": extend_str,
-                                "rtcpAddress": rtcp_ip,
-                                "rtpAddress": rtp_ip,
-                                "session": sess_id,
-                                "imei": s_snap.imei,
-                            });
-
-                            match dispatch_send_signal(&s_snap, 416, &req_416).await {
-                                Ok(resp_416) => {
-                                    let st = resp_416
-                                        .get("status")
-                                        .and_then(|v| {
-                                            v.as_i64().or_else(|| {
-                                                v.as_str().and_then(|s| s.parse().ok())
-                                            })
-                                        })
-                                        .unwrap_or(0);
-                                    if st != 0 {
-                                        let reason = resp_416
-                                            .get("msg")
-                                            .and_then(Value::as_str)
-                                            .filter(|m| !m.is_empty())
-                                            .unwrap_or("Không thể đổ chuông tới người nhận")
-                                            .to_string();
-                                        *active_clone.lock().await = None;
-                                        let _ = gui_tx_clone.send(GuiEvent::CallRejected {
-                                            code: st,
-                                            reason,
-                                        });
-                                    } else {
-                                        let _ = gui_tx_clone
-                                            .send(GuiEvent::CallStateChanged("calling".into()));
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "🔔 Đang gọi tới {partner_name} (ID cuộc gọi #{real_call_id})…"
-                                        )));
-                                    }
-                                    ctx_clone.request_repaint();
-                                }
-                                Err(e) => {
-                                    *active_clone.lock().await = None;
-                                    let _ = gui_tx_clone.send(GuiEvent::CallRejected {
-                                        code: -1,
-                                        reason: format!("Lỗi gửi tín hiệu đổ chuông (416): {e}"),
-                                    });
-                                    ctx_clone.request_repaint();
-                                }
-                            }
+                            let _ = gui_tx_clone
+                                .send(GuiEvent::CallStateChanged("calling".into()));
+                            let status_txt = if n_ringing > 1 {
+                                format!(
+                                    "🔔 Đang đổ chuông tới {n_ringing} thành viên trong {partner_name}…"
+                                )
+                            } else {
+                                format!(
+                                    "🔔 Đang gọi tới {partner_name} (ID cuộc gọi #{primary_cid})…"
+                                )
+                            };
+                            let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(status_txt));
+                            ctx_clone.request_repaint();
                         });
                     }
 
@@ -2354,23 +2604,51 @@ impl CallBridge {
                         is_on_cam,
                     } => {
                         let s_snap = session.lock().await.clone();
-                        let guard = active_call.lock().await;
-                        if let Some(ref st) = *guard {
+                        let mut guard = active_call.lock().await;
+                        if let Some(ref mut st) = *guard {
+                            st.is_video = st.is_video || is_on_cam;
+                            if st.media.is_none() && is_on_cam {
+                                st.media = crate::media::MediaHandle::start_with_sockets(
+                                    String::new(),
+                                    String::new(),
+                                    st.from_uid_u32,
+                                    st.partner_uid_u32,
+                                    st.is_caller,
+                                    st.relay_token,
+                                    None,
+                                    None,
+                                    0,
+                                    true,
+                                    Some(gui_tx.clone()),
+                                    Some(egui_ctx.clone()),
+                                )
+                                .ok();
+                            }
                             if let Some(media) = &st.media {
                                 media.set_mic_muted(!is_on_mic);
                                 media.set_cam_enabled(is_on_cam);
                             }
-                            let call_id = st.call_id;
-                            let partner_id = st.partner_id.clone();
+                            for leg in &st.extra_legs {
+                                if let Some(media) = &leg.media {
+                                    media.set_mic_muted(!is_on_mic);
+                                    media.set_cam_enabled(is_on_cam);
+                                }
+                            }
+                            let mut targets = vec![(st.partner_id.clone(), st.call_id)];
+                            for leg in &st.extra_legs {
+                                targets.push((leg.partner_id.clone(), leg.call_id));
+                            }
                             tokio::spawn(async move {
-                                let req_12006 = json!({
-                                    "calleeId": partner_id,
-                                    "callId": call_id,
-                                    "isOnCam": if is_on_cam { 1 } else { 0 },
-                                    "isOnMic": if is_on_mic { 1 } else { 0 },
-                                    "data": ""
-                                });
-                                let _ = dispatch_send_signal(&s_snap, 12006, &req_12006).await;
+                                for (pid, cid) in targets {
+                                    let req_12006 = json!({
+                                        "calleeId": pid,
+                                        "callId": cid,
+                                        "isOnCam": if is_on_cam { 1 } else { 0 },
+                                        "isOnMic": if is_on_mic { 1 } else { 0 },
+                                        "data": ""
+                                    });
+                                    let _ = dispatch_send_signal(&s_snap, 12006, &req_12006).await;
+                                }
                             });
                         }
                     }
@@ -2378,7 +2656,7 @@ impl CallBridge {
                     CallEngineCmd::EndCall => {
                         let s_snap = session.lock().await.clone();
                         let taken = active_call.lock().await.take();
-                        if let Some(st) = taken {
+                        if let Some(mut st) = taken {
                             let duration_sec = if st.is_connected {
                                 st.started_at.elapsed().as_secs()
                             } else {
@@ -2393,6 +2671,11 @@ impl CallBridge {
                             let is_group = st.is_group;
                             let is_caller = st.is_caller;
                             let is_connected = st.is_connected;
+                            let extra_hangup: Vec<(String, i64, bool)> = st
+                                .extra_legs
+                                .drain(..)
+                                .map(|l| (l.partner_id.clone(), l.call_id, l.is_connected))
+                                .collect();
 
                             if !partner_id.is_empty() {
                                 let label = if is_caller {
@@ -2416,18 +2699,23 @@ impl CallBridge {
                                         .trim_start_matches('g')
                                         .trim_start_matches('G')
                                         .to_string();
+                                    let grp_call_type_wire: u8 =
+                                        if call_type == CallType::GroupVideo as u8 {
+                                            1
+                                        } else {
+                                            0
+                                        };
                                     let cmd_code = if is_connected { 12438 } else { 12437 };
                                     let body = json!({
                                         "calleeId": clean_gid,
                                         "callId": call_id,
-                                        "callType": call_type,
+                                        "callType": grp_call_type_wire,
                                         "hostCall": "",
                                         "data": "",
-                                        "partners": []
+                                        "partners": "[]"
                                     });
                                     let _ = dispatch_send_signal(&s_snap, cmd_code, &body).await;
                                 } else if is_caller && !is_connected {
-                                    // Cancel ringing before callee picks up (`405`)
                                     let req_405 = json!({
                                         "toId": partner_id,
                                         "callId": call_id,
@@ -2435,7 +2723,6 @@ impl CallBridge {
                                     });
                                     let _ = dispatch_send_signal(&s_snap, 405, &req_405).await;
                                 } else if !is_caller && !is_connected {
-                                    // Decline incoming call (`402` status = 4)
                                     let req_402 = json!({
                                         "callerId": partner_id,
                                         "callId": call_id,
@@ -2447,7 +2734,6 @@ impl CallBridge {
                                     });
                                     let _ = dispatch_send_signal(&s_snap, 402, &req_402).await;
                                 } else {
-                                    // Hang up active connected call (`409` + `406`)
                                     let req_409 = json!({
                                         "toId": partner_id,
                                         "callId": call_id
@@ -2462,6 +2748,19 @@ impl CallBridge {
                                         "role": if is_caller { 1 } else { 0 }
                                     });
                                     let _ = dispatch_send_signal(&s_snap, 406, &req_406).await;
+                                }
+                                for (ext_pid, ext_cid, ext_conn) in extra_hangup {
+                                    if ext_conn {
+                                        let r409 = json!({ "toId": ext_pid, "callId": ext_cid });
+                                        let _ = dispatch_send_signal(&s_snap, 409, &r409).await;
+                                    } else {
+                                        let r405 = json!({
+                                            "toId": ext_pid,
+                                            "callId": ext_cid,
+                                            "callType": call_type
+                                        });
+                                        let _ = dispatch_send_signal(&s_snap, 405, &r405).await;
+                                    }
                                 }
                             });
                         }
@@ -2492,14 +2791,20 @@ impl CallBridge {
                                 let Some(ref st) = *guard else {
                                     continue;
                                 };
-                                if ev_call_id != 0 && ev_call_id != st.call_id {
+                                let matches_leg = ev_call_id == 0
+                                    || ev_call_id == st.call_id
+                                    || st.extra_legs.iter().any(|l| l.call_id == ev_call_id);
+                                if !matches_leg {
                                     continue;
                                 }
-                                let _ = gui_tx.send(GuiEvent::CallStateChanged("ringing".into()));
-                                let _ = gui_tx.send(GuiEvent::StatusUpdate(
-                                    "🔔 Thiết bị của người nhận đang đổ chuông…".into(),
-                                ));
-                                egui_ctx.request_repaint();
+                                if !st.is_connected {
+                                    let _ =
+                                        gui_tx.send(GuiEvent::CallStateChanged("ringing".into()));
+                                    let _ = gui_tx.send(GuiEvent::StatusUpdate(
+                                        "🔔 Thiết bị của người nhận đang đổ chuông…".into(),
+                                    ));
+                                    egui_ctx.request_repaint();
+                                }
                             }
                             "answer" | "group_answer" => {
                                 eprintln!("[call] ctrl answer raw: {}", voip_ctrl);
@@ -2512,8 +2817,6 @@ impl CallBridge {
                                     })
                                     .unwrap_or(0);
                                 let mut guard = active_call.lock().await;
-                                // If `active_call` is None and `status == 5`, check if this is an incoming
-                                // call invite stub delivered via `lp_control` (Queue 20) from a peer!
                                 if guard.is_none() {
                                     let self_uin = s_snap
                                         .login
@@ -2539,7 +2842,21 @@ impl CallBridge {
                                         .unwrap_or_default();
                                     let is_from_peer = (!uid_n.is_empty() && uid_n != self_uin)
                                         || (!uid_from.is_empty() && uid_from != self_uid32);
-                                    if status == 5 && ev_call_id != 0 && is_from_peer {
+                                    let media_p = event_media_params(&data);
+                                    let has_invite_media = !media_p
+                                        .get("sessId")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .is_empty()
+                                        || !media_p
+                                            .get("extendData")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .is_empty();
+                                    if ev_call_id != 0
+                                        && is_from_peer
+                                        && (status == 5 || (matches!(status, 0 | 3) && has_invite_media))
+                                    {
                                         drop(guard);
                                         let mut synth = voip_ctrl.clone();
                                         if let Some(obj) = synth.as_object_mut() {
@@ -2559,18 +2876,97 @@ impl CallBridge {
                                 let Some(st_check) = guard.as_ref() else {
                                     continue;
                                 };
-                                if ev_call_id != 0 && ev_call_id != st_check.call_id {
+                                let is_primary_leg =
+                                    ev_call_id == 0 || ev_call_id == st_check.call_id;
+                                let extra_leg_idx = st_check
+                                    .extra_legs
+                                    .iter()
+                                    .position(|l| l.call_id == ev_call_id);
+                                if !is_primary_leg && extra_leg_idx.is_none() {
                                     continue;
                                 }
-                                // Skip replayed answer events after already connected
-                                if st_check.is_connected {
+                                if is_primary_leg && st_check.is_connected {
                                     continue;
                                 }
+                                if let Some(idx) = extra_leg_idx {
+                                    if st_check.extra_legs[idx].is_connected {
+                                        continue;
+                                    }
+                                }
+
                                 if status == 0 {
                                     if let Some(st) = guard.as_mut() {
+                                        // If an extra leg answered first before primary connected, promote it to primary!
+                                        if let Some(idx) = extra_leg_idx {
+                                            if !st.is_connected {
+                                                st.swap_with_extra_leg(idx);
+                                            } else {
+                                                // Primary is already connected; connect this additional member leg in parallel!
+                                                let is_vid = st.is_video;
+                                                let leg = &mut st.extra_legs[idx];
+                                                leg.is_connected = true;
+                                                let ans_media = event_media_params(&data);
+                                                if let Some(sel_srv) = ans_media
+                                                    .get("rtpSerIp")
+                                                    .or_else(|| ans_media.get("rtpIP"))
+                                                    .and_then(Value::as_str)
+                                                    .map(str::trim)
+                                                    .filter(|s| !s.is_empty())
+                                                {
+                                                    leg.rtp_ip = sel_srv.to_string();
+                                                    leg.rtcp_ip = sel_srv.to_string();
+                                                    if let Some(&tok) =
+                                                        leg.server_tokens.get(sel_srv)
+                                                    {
+                                                        leg.relay_token = tok;
+                                                    }
+                                                }
+                                                if let (Some(rsock), Ok(target)) = (
+                                                    &leg.udp_rtp_sock,
+                                                    leg.rtp_ip.parse::<std::net::SocketAddr>(),
+                                                ) {
+                                                    let pkt_p = build_zrtp_ping_packet(
+                                                        leg.from_uid_u32,
+                                                        leg.relay_token,
+                                                        &leg.sess_id,
+                                                    );
+                                                    let _ = rsock.try_send_to(&pkt_p, target);
+                                                }
+                                                leg.media =
+                                                    crate::media::MediaHandle::start_with_sockets(
+                                                        leg.rtp_ip.clone(),
+                                                        leg.rtcp_ip.clone(),
+                                                        leg.from_uid_u32,
+                                                        leg.partner_uid_u32,
+                                                        true,
+                                                        leg.relay_token,
+                                                        leg.udp_rtp_sock.clone(),
+                                                        leg.udp_rtcp_sock.clone(),
+                                                        (idx as u16) + 1,
+                                                        is_vid,
+                                                        Some(gui_tx.clone()),
+                                                        Some(egui_ctx.clone()),
+                                                    )
+                                                    .ok();
+                                                let l_cid = leg.call_id;
+                                                let l_pid = leg.partner_id.clone();
+                                                let s_cl = s_snap.clone();
+                                                tokio::spawn(async move {
+                                                    let req_408 = json!({
+                                                        "calleeId": l_pid,
+                                                        "callId": l_cid
+                                                    });
+                                                    let _ =
+                                                        dispatch_send_signal(&s_cl, 408, &req_408)
+                                                            .await;
+                                                });
+                                                egui_ctx.request_repaint();
+                                                continue;
+                                            }
+                                        }
+
                                         st.is_connected = true;
                                         st.started_at = std::time::Instant::now();
-                                        // Update RTP/RTCP relay and token if callee selected a specific `rtpSerIp`
                                         let ans_media = event_media_params(&data);
                                         if let Some(sel_srv) = ans_media
                                             .get("rtpSerIp")
@@ -2592,7 +2988,6 @@ impl CallBridge {
                                                 st.rtp_ip, st.relay_token, st.is_video
                                             ),
                                         );
-                                        // Send an immediate ZRTP Ping (cmd=0x0002) to the selected relay
                                         if let (Some(rsock), Ok(target)) = (
                                             &st.udp_rtp_sock,
                                             st.rtp_ip.parse::<std::net::SocketAddr>(),
@@ -2604,8 +2999,7 @@ impl CallBridge {
                                             );
                                             let _ = rsock.try_send_to(&pkt_p, target);
                                         }
-                                        // Start Opus/RTP media over the registered ZRTP UDP relay sockets
-                                        // (falling back to local audio pass-through only if RTP media fails).
+                                        st.media = None;
                                         match crate::media::MediaHandle::start_with_sockets(
                                             st.rtp_ip.clone(),
                                             st.rtcp_ip.clone(),
@@ -2648,8 +3042,6 @@ impl CallBridge {
                                         "🟢 Người nhận đã bắt máy — Đang trong cuộc gọi".into(),
                                     ));
                                 } else if !st_check.is_caller && status == 5 {
-                                    // Queue 20 (`lp_control`) echoes a `status=5` stub on call creation;
-                                    // ignore it on the callee side so ringing is not aborted prematurely.
                                     continue;
                                 } else if st_check.is_caller
                                     && status == 5
@@ -2661,10 +3053,21 @@ impl CallBridge {
                                         .unwrap_or("")
                                         .is_empty()
                                 {
-                                    // Queue 20 echoes the caller's own 416 invite with `status=5`
-                                    // right before `ring_ring` arrives; do not mistake it for a rejection.
                                     continue;
                                 } else {
+                                    if let Some(idx) = extra_leg_idx {
+                                        if let Some(st) = guard.as_mut() {
+                                            st.extra_legs.remove(idx);
+                                        }
+                                        continue;
+                                    }
+                                    if let Some(st) = guard.as_mut() {
+                                        if !st.extra_legs.is_empty() {
+                                            st.swap_with_extra_leg(0);
+                                            st.extra_legs.remove(0);
+                                            continue;
+                                        }
+                                    }
                                     let taken = guard.take();
                                     let reason = match status {
                                         1 | 2 | 3 | 4 => {
@@ -2692,8 +3095,27 @@ impl CallBridge {
                                 let Some(ref st_check) = *guard else {
                                     continue;
                                 };
-                                if ev_call_id != 0 && ev_call_id != st_check.call_id {
+                                let is_primary_leg =
+                                    ev_call_id == 0 || ev_call_id == st_check.call_id;
+                                let extra_leg_idx = st_check
+                                    .extra_legs
+                                    .iter()
+                                    .position(|l| l.call_id == ev_call_id);
+                                if !is_primary_leg && extra_leg_idx.is_none() {
                                     continue;
+                                }
+                                if let Some(idx) = extra_leg_idx {
+                                    if let Some(st) = guard.as_mut() {
+                                        st.extra_legs.remove(idx);
+                                    }
+                                    continue;
+                                }
+                                if let Some(st) = guard.as_mut() {
+                                    if !st.extra_legs.is_empty() {
+                                        st.swap_with_extra_leg(0);
+                                        st.extra_legs.remove(0);
+                                        continue;
+                                    }
                                 }
                                 if let Some(st) = guard.take() {
                                     let duration_sec = if st.is_connected {
@@ -2883,6 +3305,7 @@ impl CallBridge {
                                             keepalive_abort: None,
                                             audio: None,
                                             media: None,
+                                            extra_legs: Vec::new(),
                                         });
                                     }
                                 }
@@ -3024,40 +3447,24 @@ mod tests {
 
     #[test]
     fn outbound_call_lock_allows_only_test_accounts() {
-        // 19-digit mock thread ids / uins
+        // Outbound calls are unlocked for all non-empty 1-1 and group targets
         assert!(call_target_allowed("1000000000000000001", "", false));
-        assert!(call_target_allowed("1000000000000000002", "", false));
-        assert!(call_target_allowed("1000000000000000003", "", false));
-        assert!(call_target_allowed("1000000000000000004", "", false));
-        assert!(call_target_allowed("1000000000000000005", "", false));
-        // 32-bit mock aliases
-        assert!(call_target_allowed("100000001", "", false));
-        assert!(call_target_allowed("100000002", "", false));
-        assert!(call_target_allowed("100000003", "", false));
-        // accent-folded display names
-        assert!(call_target_allowed("", "Hoàng", false));
-        assert!(call_target_allowed("", "Đỗ Thành", false));
-        assert!(call_target_allowed("", "ĐTC", false));
-        assert!(call_target_allowed("", "Nguyễn Hoàng (Zalo)", false));
-        // everyone else is refused
-        assert!(!call_target_allowed("123456789012345678", "", false));
-        assert!(!call_target_allowed("", "Nguyễn Văn A", false));
+        assert!(call_target_allowed("123456789012345678", "", false));
+        assert!(call_target_allowed("", "Nguyễn Văn A", false));
+        assert!(call_target_allowed("7518545940799845719", "Đỗ Thành, Đtc, Hoang", true));
+        assert!(call_target_allowed("group_123", "", true));
         assert!(!call_target_allowed("", "", false));
-        // group calls are always refused, even for an allowlisted person
-        assert!(!call_target_allowed("1000000000000000001", "Hoàng", true));
-        assert!(!call_target_allowed("group_123", "", true));
-        assert!(!call_target_allowed("group_123", "", false));
-        assert!(ensure_call_target_allowed("123456789", "", false).is_err());
-        assert!(ensure_call_target_allowed("1000000000000000001", "", false).is_ok());
+        assert!(ensure_call_target_allowed("123456789", "", false).is_ok());
+        assert!(ensure_call_target_allowed("7518545940799845719", "Đỗ Thành, Đtc, Hoang", true).is_ok());
+        assert!(ensure_call_target_allowed("", "", false).is_err());
     }
 
     #[test]
-    fn fold_call_label_strips_vietnamese_diacritics() {
-        assert_eq!(fold_call_label("Đỗ Thành"), "do thanh");
-        assert_eq!(fold_call_label("  Hoàng  "), "hoang");
-        assert_eq!(fold_call_label("ĐTC 🚀"), "dtc");
+    fn outbound_call_rejects_only_empty_target() {
+        assert!(!call_target_allowed("   ", "   ", false));
+        assert!(call_target_allowed("5585213365034222978", "", false));
+        assert!(call_target_allowed("", "Đỗ Thành", false));
     }
-
     #[test]
     fn pipe_aes_roundtrip_and_delimiter() {
         let msg = r#"{"type":"update","command":"native-ready"}"#;

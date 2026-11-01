@@ -76,16 +76,19 @@ Gói `.tar.gz` kèm sẵn `install.sh` và `uninstall.sh`.
 
 Nếu Windows SmartScreen cảnh báo ứng dụng chưa ký, chọn **More info → Run anyway**.
 
-## macOS
+## macOS (Apple Silicon M1/M2/M3/M4 & Intel)
 
-Tải `ctdozlite-<version>-macos.dmg`, mở file và kéo `ctdozlite.app` vào `/Applications`.
+- **Mac Apple Silicon (Chip M1 / M2 / M3 / M4 — ARM64):** Tải `ctdozlite-<version>-macos-arm64.dmg`.
+- **Mac Intel (`x86_64`):** Tải `ctdozlite-<version>-macos-x86_64.dmg`.
+- **Bản Universal (chạy chung cho cả chip M & Intel):** Tải `ctdozlite-<version>-macos.dmg`.
 
-Nếu macOS chặn ứng dụng chưa ký, bấm chuột phải vào app và chọn **Open**, hoặc chạy:
+Mở file `.dmg` vừa tải và kéo `ctdozlite.app` vào `/Applications`.
+
+Nếu macOS chặn ứng dụng chưa ký Apple Developer ID trả phí, bấm chuột phải vào app và chọn **Open**, hoặc chạy:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/ctdozlite.app
 ```
-
 ## Gỡ cài đặt
 
 | Nền tảng | Cách gỡ |
