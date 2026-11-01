@@ -265,7 +265,8 @@ pub fn take_new_gaps() -> bool {
 /// Estimated last-activity time (ms) of every conversation seen in `get-last-msgs`, from its
 /// `lastMsgId` and a [`MsgIdClock`] fitted on stored messages. Without enough stored messages
 /// to fit the clock, conversations keep their relative order with tiny placeholder times
-/// (below any real timestamp). Estimates are capped at `now`.
+/// (below any real timestamp). Estimates are not capped at `now`, so their order (= id order)
+/// is never flattened.
 pub fn load_conversation_activity(
     store: &crate::store::MessageStore,
 ) -> std::collections::HashMap<String, i64> {
@@ -274,13 +275,12 @@ pub fn load_conversation_activity(
     if rows.is_empty() {
         return out;
     }
-    let pairs = store.msg_id_ts_pairs(500).unwrap_or_default();
-    let now = crate::timefmt::now_ms();
+    let pairs = store.msg_id_ts_pairs(2000).unwrap_or_default();
     match MsgIdClock::fit(&pairs) {
         Some(clock) => {
             for (tid, last) in rows {
                 if let Ok(id) = last.parse::<u64>() {
-                    out.insert(tid, clock.estimate_ms(id).min(now).max(1));
+                    out.insert(tid, clock.estimate_ms(id).max(1));
                 }
             }
         }
@@ -298,52 +298,64 @@ pub fn load_conversation_activity(
     out
 }
 
-/// Message-id clock: Zalo `msgId`s grow almost linearly with server time (measured on a real
-/// account: ~41 ids per ms from 03/2026 to 11/2026, one inversion in 75 messages, 22 ms apart).
-/// Fitted on `(msgId, ts_ms)` pairs from stored messages, it turns a conversation's
-/// `lastMsgId` (from `get-last-msgs`) into an approximate time of its last activity.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Message-id clock: Zalo `msgId`s grow with server time (measured on a real account: ~41 ids
+/// per ms from 03/2026 to 11/2026, one inversion in 75 messages, 22 ms apart). Built from
+/// `(msgId, ts_ms)` pairs of stored messages, it turns a conversation's `lastMsgId` (from
+/// `get-last-msgs`) into an approximate time of its last activity.
+///
+/// The id rate varies over a day, so one straight line over months is hours off near the
+/// ends; the clock interpolates between neighbouring known messages instead and only
+/// extrapolates (with the overall rate) outside them. It is monotonic, so ordering by the
+/// estimate is the same as ordering by id.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MsgIdClock {
-    /// Reference point and slope (ids per millisecond).
-    id0: f64,
-    ts0: f64,
+    /// Anchors sorted by id, with strictly increasing id and non-decreasing ts.
+    anchors: Vec<(f64, f64)>,
+    /// Overall rate (ids per millisecond) between the first and last anchor.
     ids_per_ms: f64,
 }
 
 impl MsgIdClock {
-    /// Least-squares fit. Needs at least two pairs spanning ≥ 1 minute with a positive slope;
+    /// Needs at least two usable pairs spanning ≥ 1 minute with ids growing over time;
     /// `None` otherwise (callers then fall back to ordering by id).
     pub fn fit(pairs: &[(u64, i64)]) -> Option<Self> {
-        let pts: Vec<(f64, f64)> = pairs
+        let mut pts: Vec<(f64, f64)> = pairs
             .iter()
             .filter(|(id, ts)| *id > 0 && *ts > 0)
-            .map(|(id, ts)| (*ts as f64, *id as f64))
+            .map(|(id, ts)| (*id as f64, *ts as f64))
             .collect();
-        if pts.len() < 2 {
+        pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // Keep a monotonic chain: drop duplicates and points whose time goes backwards.
+        let mut anchors: Vec<(f64, f64)> = Vec::with_capacity(pts.len());
+        for p in pts {
+            match anchors.last() {
+                Some(&(id, ts)) if p.0 <= id || p.1 < ts => {}
+                _ => anchors.push(p),
+            }
+        }
+        let (&(id_a, ts_a), &(id_b, ts_b)) = (anchors.first()?, anchors.last()?);
+        if anchors.len() < 2 || ts_b - ts_a < 60_000.0 {
             return None;
         }
-        let (min_t, max_t) = pts.iter().fold((f64::MAX, f64::MIN), |(lo, hi), (t, _)| {
-            (lo.min(*t), hi.max(*t))
-        });
-        if max_t - min_t < 60_000.0 {
-            return None;
-        }
-        let n = pts.len() as f64;
-        let mt = pts.iter().map(|(t, _)| t).sum::<f64>() / n;
-        let mi = pts.iter().map(|(_, i)| i).sum::<f64>() / n;
-        let cov: f64 = pts.iter().map(|(t, i)| (t - mt) * (i - mi)).sum();
-        let var: f64 = pts.iter().map(|(t, _)| (t - mt) * (t - mt)).sum();
-        let slope = cov / var;
-        (slope.is_finite() && slope > 0.0).then_some(Self {
-            id0: mi,
-            ts0: mt,
-            ids_per_ms: slope,
-        })
+        let ids_per_ms = (id_b - id_a) / (ts_b - ts_a);
+        (ids_per_ms.is_finite() && ids_per_ms > 0.0).then_some(Self { anchors, ids_per_ms })
     }
 
     /// Estimated server time (ms) of a message id.
     pub fn estimate_ms(&self, msg_id: u64) -> i64 {
-        (self.ts0 + (msg_id as f64 - self.id0) / self.ids_per_ms).round() as i64
+        let id = msg_id as f64;
+        let first = self.anchors[0];
+        let last = self.anchors[self.anchors.len() - 1];
+        let ts = if id <= first.0 {
+            first.1 - (first.0 - id) / self.ids_per_ms
+        } else if id >= last.0 {
+            last.1 + (id - last.0) / self.ids_per_ms
+        } else {
+            let i = self.anchors.partition_point(|a| a.0 <= id);
+            let (a, b) = (self.anchors[i - 1], self.anchors[i]);
+            a.1 + (id - a.0) * (b.1 - a.1) / (b.0 - a.0)
+        };
+        ts.round() as i64
     }
 }
 
@@ -463,6 +475,23 @@ mod tests {
         let est = clock.estimate_ms(mid_id);
         assert!((est - mid_t).abs() < 1_000, "estimate off by {} ms", est - mid_t);
         assert!(clock.estimate_ms(8_000_000_000_000) < clock.estimate_ms(8_400_000_000_000));
+    }
+
+    #[test]
+    fn msg_id_clock_is_exact_at_anchors_and_follows_local_rate() {
+        // Rate changes: 10 ids/ms for the first hour, 50 ids/ms for the second.
+        let pairs = [(1_000_000u64, 0i64), (37_000_000, 3_600_000), (217_000_000, 7_200_000)];
+        let clock = MsgIdClock::fit(&[(pairs[0].0, 1), (pairs[1].0, 3_600_001), (pairs[2].0, 7_200_001)]).unwrap();
+        assert_eq!(clock.estimate_ms(37_000_000), 3_600_001);
+        // Halfway through the fast hour by id is halfway in time, not what one line would say.
+        assert_eq!(clock.estimate_ms(127_000_000), 5_400_001);
+        // Outside the anchors: overall rate, still monotonic.
+        assert!(clock.estimate_ms(300_000_000) > clock.estimate_ms(217_000_000));
+        assert!(clock.estimate_ms(500_000) < 1);
+        // Out-of-order and duplicate pairs are ignored.
+        let messy = MsgIdClock::fit(&[(10, 1_000), (20, 500), (20, 900), (30, 200_000)]).unwrap();
+        assert_eq!(messy.estimate_ms(10), 1_000);
+        assert_eq!(messy.estimate_ms(30), 200_000);
     }
 
     #[test]
