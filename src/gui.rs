@@ -73,6 +73,8 @@ fn profile_reply_matches(target: &str, request: u64, reply_target: &str, reply_r
 }
 
 pub enum GuiEvent {
+    /// Independent local persistence and wire outcomes for a dwell-admitted viewport.
+    VisibleReadFinished { account: String, thread_id: String, visible: Vec<ChatMessage>, unsent: Vec<ChatMessage>, local: Result<bool, String>, seen: Result<bool, String> },
     /// Terminal native-viewer result after its child closes or fails.
     NativePhotoViewerFinished { account: String, result: Result<(), crate::media_resources::MediaError> },
     /// Terminal result of background history import and hydration.
@@ -756,6 +758,10 @@ pub struct ZaloGuiApp {
     quote_jump: Option<QuoteJump>,
     quote_lookup_generation: u64,
     quote_lookup_thread: String,
+    read_visibility: crate::read_receipts::ReadVisibilityGate,
+    live_read_ledger: crate::read_receipts::LiveReadLedger,
+    visible_read_pending: bool,
+    read_last_attempt_ms: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -971,6 +977,10 @@ impl ZaloGuiApp {
             quote_jump: None,
             quote_lookup_generation: 0,
             quote_lookup_thread: String::new(),
+            read_visibility: Default::default(),
+            live_read_ledger: Default::default(),
+            visible_read_pending: false,
+            read_last_attempt_ms: 0,
         };
         let mut app = app;
         let _ = app.reload_custom_sticker_packs();
@@ -1053,6 +1063,10 @@ impl ZaloGuiApp {
         self.phone_history_status = "Phiên đồng bộ đã thay đổi; hãy yêu cầu lại".into();
         self.group_history_status = "Lịch sử nhóm: chờ yêu cầu của phiên hiện tại".into();
         emoji_text::reset_pending(ctx);
+        self.read_visibility.reset();
+        self.live_read_ledger = Default::default();
+        self.visible_read_pending = false;
+        self.read_last_attempt_ms = 0;
         self.native_photo_pending = false;
         self.original_reaction_import_pending = false;
         reset_epoch_loading(
@@ -1235,6 +1249,20 @@ impl ZaloGuiApp {
                         }
                     }
                 }
+                GuiEvent::VisibleReadFinished { account, thread_id, visible, unsent, local, seen } => {
+                    if account == self.user_uin {
+                        self.visible_read_pending = false;
+                        self.live_read_ledger.release_unsent(&thread_id, &unsent);
+                        if matches!(local, Ok(true)) {
+                            if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == thread_id) {
+                                crate::read_receipts::read_local_visible(&mut thread.unread, &visible);
+                                if thread.unread.has_badge() { self.unread_counts.insert(thread_id, thread.unread.count().max(1)); }
+                                else { self.unread_counts.remove(&thread_id); }
+                            }
+                        } else if local.is_err() { self.show_toast("Lỗi lưu trạng thái đọc local. Trạng thái chưa được xác nhận."); }
+                        if seen.is_err() { self.show_toast("Đã lưu trạng thái đọc local; kết quả gửi xác nhận xem chưa rõ."); }
+                    }
+                }
                 GuiEvent::NativePhotoViewerFinished { account, result } => {
                     if account == self.user_uin { self.native_photo_pending = false; }
                     if self.is_logged_in && account == self.user_uin && result.is_err() {
@@ -1287,6 +1315,9 @@ impl ZaloGuiApp {
                         format!("Đã quét bởi {name} — Vui lòng bấm 'Đăng nhập' trên điện thoại…");
                 }
                 GuiEvent::LoginSuccess { name, uin, avatar } => {
+                    self.read_visibility.reset();
+                    self.live_read_ledger = Default::default();
+                    self.visible_read_pending = false;
                     self.original_reaction_import_pending = false;
                     if self.user_uin != uin {
                         self.threads.clear();
@@ -1421,6 +1452,7 @@ impl ZaloGuiApp {
                             .unwrap_or_default();
                         let is_focused = ctx.input(|i| i.focused);
                         let mut new_incoming_alert = false;
+                        if live_arrival { self.live_read_ledger.observe(&self.user_uin, &self.threads, &updates); }
                         for command in incoming_notification_commands(&self.threads, &updates, &self.user_uin, &self.settings, is_focused, live_arrival, &mut self.notification_delivery) {
                             if let Some(tx) = WORKER_TX.get() { let _ = tx.send(command); }
                         }
@@ -1489,6 +1521,9 @@ impl ZaloGuiApp {
                     self.status_msg = format!("Trực tuyến · Cập nhật {}", crate::ui::clock());
                 }
                 GuiEvent::SessionExpired(reason) => {
+                    self.read_visibility.reset();
+                    self.live_read_ledger = Default::default();
+                    self.visible_read_pending = false;
                     self.original_reaction_import_pending = false;
                     self.phone_history_generation = self.phone_history_generation.wrapping_add(1);
                     self.phone_history_active = false;
@@ -1515,6 +1550,9 @@ impl ZaloGuiApp {
                     self.status_msg = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên)".into();
                 }
                 GuiEvent::LoggedOut => {
+                    self.read_visibility.reset();
+                    self.live_read_ledger = Default::default();
+                    self.visible_read_pending = false;
                     self.native_photo_pending = false;
                     self.local_history_tombstones.clear();
                     self.history_revisions.clear();
@@ -2189,6 +2227,9 @@ impl eframe::App for ZaloGuiApp {
         } else {
             self.render_chat_workspace(ctx, &pal);
         }
+
+        let now = ctx.input(|input| (input.time * 1000.0).max(0.0) as u64);
+        self.read_visibility.finish_frame(now);
 
         // Auto-notification modal for new GitHub Releases (works on both Login & Chat screens)
         self.render_update_notification_modal(ctx, &pal);

@@ -1,6 +1,36 @@
 use super::*;
 
 impl ZaloGuiApp {
+    fn observe_workspace_read(&mut self, ctx: &egui::Context, thread_id: &str, is_group: bool, at_bottom: bool, visible: Vec<ChatMessage>) {
+        let (logical, minimized, now) = ctx.input(|input| (input.focused, input.viewport().minimized.unwrap_or(false), (input.time * 1000.0).max(0.0) as u64));
+        let unobscured = !self.settings_modal_open && !self.feed_modal_open && self.image_viewer.is_none() && self.forward_msg.is_none() && !self.phone_modal_open && !self.wipe_confirm_open && !self.update_modal_open && !self.schedule_modal_open && !self.dev_panel_open && !self.profile_menu_open && self.active_call.is_none() && !ctx.memory(|memory| memory.any_popup_open());
+        let foreground = self.is_logged_in && logical && unobscured && crate::read_receipts::native_visible_window_foreground();
+        let key = serde_json::to_string(&(&self.user_uin, thread_id, visible.iter().map(|message| (&message.id, &message.wire_ref.server_id)).collect::<Vec<_>>())).unwrap_or_default();
+        let bottom = at_bottom && !visible.is_empty() && !self.in_chat_search_open && !self.filter_starred_only;
+        let eligible = self.read_visibility.observe(&key, foreground, minimized, bottom, now);
+        if foreground && !minimized && bottom && !eligible { ctx.request_repaint_after(Duration::from_millis(100)); }
+        if self.visible_read_pending { ctx.request_repaint_after(Duration::from_millis(100)); }
+        if !eligible || self.visible_read_pending { return; }
+        let local_needed = self.threads.iter().find(|thread| thread.id == thread_id).is_some_and(|thread| thread.unread.marked_unread || visible.iter().any(|message| {
+            crate::unread::compare_ids(&message.id, "0").is_some() && thread.unread.last_seen_id.as_ref().is_none_or(|point| crate::unread::compare_ids(&message.id, point).is_some_and(|order| order.is_gt()))
+        }));
+        if self.read_last_attempt_ms != 0 && now.saturating_sub(self.read_last_attempt_ms) < 1000 { ctx.request_repaint_after(Duration::from_millis(100)); return; }
+        let Some(ticket) = self.read_visibility.ticket() else { return; };
+        let receipts = self.live_read_ledger.claim(thread_id, is_group, &visible);
+        if self.live_read_ledger.take_capacity_notice() { self.show_toast("Đã đạt giới hạn 4096 xác nhận xem của phiên. Trạng thái đọc local vẫn được lưu; xác nhận mới sẽ tiếp tục ở phiên đăng nhập sau."); }
+        if !local_needed && receipts.is_empty() { return; }
+        self.read_last_attempt_ms = now;
+        let command = WorkerCmd::AcknowledgeVisibleRead { account: self.user_uin.clone(), thread_id: thread_id.into(), is_group, visible, receipts, ticket };
+        self.visible_read_pending = match WORKER_TX.get() {
+            Some(tx) => match tx.send(command) {
+                Ok(()) => true,
+                Err(error) => { if let WorkerCmd::AcknowledgeVisibleRead { receipts, .. } = error.0.1 { self.live_read_ledger.release_unsent(thread_id, &receipts); } false }
+            },
+            None => { if let WorkerCmd::AcknowledgeVisibleRead { receipts, .. } = command { self.live_read_ledger.release_unsent(thread_id, &receipts); } false }
+        };
+        if !self.visible_read_pending { self.show_toast("Lỗi chuyển trạng thái đọc sang xử lý nền."); }
+    }
+
     /// Start loading the full-resolution texture the image viewer shows. Message bubbles and
     /// the media grid keep a 480 px copy; the `hd_` key keeps this one (and its disk cache) apart.
     pub(super) fn request_hd_texture(&mut self, full_url: &str) -> Option<String> {
@@ -1644,15 +1674,6 @@ impl ZaloGuiApp {
                         self.filter_starred_only = false;
                     }
                     self.selected_thread_index = idx;
-                    if self.unread_counts.remove(&tid).is_some() {
-                        let total_unread: usize = self.unread_counts.values().sum();
-                        let title = if total_unread > 0 {
-                            format!("({total_unread}) Zalo Lite — Native Rust Client")
-                        } else {
-                            "Zalo Lite — Native Rust Client".to_string()
-                        };
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
-                    }
                     let is_cloud = self
                         .threads
                         .get(idx)
@@ -3255,7 +3276,8 @@ impl ZaloGuiApp {
                     let msg_area_height =
                         (ui.available_height() - 66.0 - picker_reserve).max(100.0);
 
-                    egui::ScrollArea::vertical()
+                    let mut visible_read = Vec::new();
+                    let read_scroll = egui::ScrollArea::vertical()
                         .id_salt(Id::new(("chat_scroll", &thread_id)))
                         .max_height(msg_area_height)
                         .auto_shrink([false, false])
@@ -3446,6 +3468,9 @@ impl ZaloGuiApp {
                                                         9.0
                                                     });
                                                 });
+                                                if visible_read_candidate(msg, row.response.rect, ui.clip_rect()) {
+                                                    visible_read.push(msg.clone());
+                                                }
                                                 if jump_index == Some(idx) {
                                                     render_quote_target(
                                                         ui,
@@ -3460,6 +3485,8 @@ impl ZaloGuiApp {
                                     }
                                 });
                         });
+                    let at_bottom = read_scroll.state.offset.y + read_scroll.inner_rect.height() >= read_scroll.content_size.y - 1.0;
+                    self.observe_workspace_read(ctx, &thread_id, is_group, at_bottom, visible_read);
                     if jump_scrolled {
                         if let Some(jump) = &mut self.quote_jump {
                             jump.scroll_pending = false;
@@ -4441,5 +4468,51 @@ mod quote_navigation_tests {
                 "Jump must center the older target, not remain at the bottom: {after}"
             );
         }
+    }
+}
+
+fn visible_read_candidate(message: &ChatMessage, row: Rect, clip: Rect) -> bool {
+    !message.is_outgoing && message.kind != crate::message_model::MessageKind::System && row.intersect(clip).is_positive()
+}
+
+#[cfg(test)]
+mod visible_read_tests {
+    use super::*;
+    #[test]
+    fn visible_read_scroll_collects_only_real_bottom_viewport_rows() {
+        let ctx = egui::Context::default();
+        let mut visible = Vec::new();
+        let mut bottom = false;
+        for frame in 0..3 {
+            visible.clear();
+            let _ = ctx.run(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0,200.0))), time: Some(frame as f64 * 0.1), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let scroll = egui::ScrollArea::vertical().id_salt("read_fixture").max_height(100.0).stick_to_bottom(true).show(ui, |ui| {
+                        for index in 0..30 {
+                            let message = ChatMessage { id: index.to_string(), kind: crate::message_model::MessageKind::Text, ..Default::default() };
+                            let (rect, _) = ui.allocate_exact_size(Vec2::new(200.0,30.0), Sense::hover());
+                            if visible_read_candidate(&message, rect, ui.clip_rect()) { visible.push(index); }
+                        }
+                    });
+                    bottom = scroll.state.offset.y + scroll.inner_rect.height() >= scroll.content_size.y - 1.0;
+                });
+            });
+        }
+        assert!(bottom);
+        assert_eq!(visible.last(), Some(&29));
+        assert!(visible.len() < 10 && !visible.contains(&0));
+    }
+    #[test]
+    fn visible_read_rows_require_actual_clip_intersection_and_incoming_content() {
+        let clip = Rect::from_min_max(Pos2::new(0.0, 10.0), Pos2::new(100.0, 100.0));
+        let row = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 20.0));
+        let mut message = ChatMessage { kind: crate::message_model::MessageKind::Text, ..Default::default() };
+        assert!(visible_read_candidate(&message, row, clip));
+        assert!(!visible_read_candidate(&message, row.translate(Vec2::new(0.0, -20.0)), clip));
+        message.is_outgoing = true;
+        assert!(!visible_read_candidate(&message, row, clip));
+        message.is_outgoing = false;
+        message.kind = crate::message_model::MessageKind::System;
+        assert!(!visible_read_candidate(&message, row, clip));
     }
 }

@@ -17,6 +17,11 @@ pub(super) enum Request {
         release: std::sync::mpsc::Receiver<()>,
         request: Box<Request>,
     },
+    VisibleRead {
+        thread: String,
+        messages: Vec<ChatMessage>,
+        ticket: crate::read_receipts::VisibilityTicket,
+    },
     Load(Vec<Thread>),
     Persist(Vec<Thread>),
     Reconcile(Vec<Thread>),
@@ -52,6 +57,7 @@ pub(super) enum Reply {
     Navigation(Option<(String, Vec<ChatMessage>)>),
     Imported(crate::store_v2::MigrationReport, Vec<Thread>),
     Cursor(String),
+    VisibleRead(bool),
     Done,
 }
 
@@ -107,6 +113,11 @@ pub(super) async fn execute(
             #[cfg(test)]
             Request::PauseBeforeMutation { .. } => unreachable!("fixture unwrapped above"),
 
+            Request::VisibleRead { thread, messages, ticket } => {
+                if !ticket.is_current() { return Ok(Reply::VisibleRead(false)); }
+                store.read_local_visible(&thread, &messages)?;
+                Ok(Reply::VisibleRead(true))
+            }
             Request::Load(live) => {
                 let mut threads = store.all_thread_metadata()?;
                 store.hydrate_recent(&mut threads)?;
@@ -750,5 +761,35 @@ mod tests {
         assert_eq!(threads[0].messages.len(), 1);
         assert_eq!(threads[0].messages[0].id, "new-server-id");
         assert!(revision_matches(&revisions, "same-thread", 1));
+    }
+}
+
+#[cfg(test)]
+mod visible_read_queue_tests {
+    use super::*;
+    #[tokio::test]
+    async fn visible_read_rechecks_ticket_after_blocking_queue_before_durable_mutation() {
+        let root = std::env::temp_dir().join(format!("zl-visible-lane-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut captured = Session::new(false, false, false).unwrap();
+        captured.login = Some(crate::session::LoginInfo { uin: "fixture-account".into(), ..Default::default() });
+        let session = Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let mut store = AccountStore::open(&root, "fixture-account").unwrap();
+        store.persist_threads(&[Thread { id: "fixture-thread".into(), unread: crate::unread::UnreadState { marked_unread: true, ..Default::default() }, ..Default::default() }]).unwrap();
+        drop(store);
+        let mut gate = crate::read_receipts::ReadVisibilityGate::default();
+        for now in [0,100,200,300,400,500] { gate.observe("fixture", true, false, true, now); }
+        let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        let request = Request::PauseBeforeMutation { entered, release: release_rx, request: Box::new(Request::VisibleRead { thread: "fixture-thread".into(), messages: vec![ChatMessage { id: "10".into(), ..Default::default() }], ticket: gate.ticket().unwrap() }) };
+        let future = tokio::spawn(execute(root.clone(), session, captured, "fixture-account".into(), request));
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()).await.unwrap();
+        gate.reset();
+        release.send(()).unwrap();
+        assert!(matches!(future.await.unwrap().unwrap(), Reply::VisibleRead(false)));
+        let reopened = AccountStore::open(&root, "fixture-account").unwrap();
+        let state = reopened.unread("fixture-thread").unwrap();
+        assert!(state.last_seen_id.is_none() && state.marked_unread);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

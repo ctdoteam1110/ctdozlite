@@ -7,6 +7,8 @@ pub(super) static KNOWN_THREADS: std::sync::Mutex<KnownThreadsSnapshot> =
     std::sync::Mutex::new((0, Vec::new()));
 
 pub enum WorkerCmd {
+    /// Persist the actual viewport read, then send only independently verified live receipts.
+    AcknowledgeVisibleRead { account: String, thread_id: String, is_group: bool, visible: Vec<ChatMessage>, receipts: Vec<ChatMessage>, ticket: crate::read_receipts::VisibilityTicket },
     /// Open a native photo viewer only following an explicit viewer-button click.
     OpenNativePhoto { key: crate::media_resources::MediaKey, url: String },
     /// Explicitly select and adopt a validated original reaction-cache export.
@@ -1021,6 +1023,15 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     if !application && generation != command_scope.generation { continue; }
                     if !lifecycle && !application && command_scope.account.is_empty() { continue; }
                     match cmd {
+                        command @ WorkerCmd::AcknowledgeVisibleRead { .. } => {
+                            let captured = session.lock().await.clone();
+                            let session = session.clone();
+                            let sender = gui_tx.clone();
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
+                                let event = process_visible_read_at(history::root(), session, captured, command).await;
+                                let _ = sender.send(event);
+                            });
+                        }
                         WorkerCmd::ImportOriginalReactions { account, path } => {
                             let captured = session.lock().await.clone();
                             let session = session.clone();
@@ -4197,5 +4208,64 @@ pub(super) async fn publish_account_threads_at(root: std::path::PathBuf, session
     match history::execute(root, session, captured, account.clone(), history::Request::Reconcile(threads)).await {
         Ok(history::Reply::Threads(threads)) => { let _ = sender.send(GuiEvent::AccountThreadsUpdated { account, threads, live }); }
         _ => { let _ = sender.send(GuiEvent::StatusUpdate("Chưa lưu được bản cập nhật lịch sử".into())); }
+    }
+}
+
+// Shared by the real worker arm and disposable persistence/queue fixtures.
+async fn process_visible_read_at(root: Result<std::path::PathBuf, String>, session: std::sync::Arc<tokio::sync::Mutex<Session>>, captured: Session, command: WorkerCmd) -> GuiEvent {
+    let WorkerCmd::AcknowledgeVisibleRead { account, thread_id, is_group, visible, receipts, ticket } = command else { unreachable!("visible-read command required"); };
+    let local = if !ticket.is_current() { Ok(false) } else {
+        match root { Ok(root) => history::execute(root, session.clone(), captured.clone(), account.clone(), history::Request::VisibleRead { thread: thread_id.clone(), messages: visible.clone(), ticket: ticket.clone() }).await.map(|reply| matches!(reply, history::Reply::VisibleRead(true))), Err(error) => Err(error) }
+    };
+    let mut unsent = receipts.clone();
+    let mut seen = Ok(false);
+    if matches!(local, Ok(true)) && !receipts.is_empty() && ticket.is_current() {
+        let verified = crate::read_receipts::verified_visible_receipts(&thread_id, is_group, &receipts);
+        let refs = verified.iter().map(|message| message.wire_ref.clone()).collect::<Vec<_>>();
+        if let Ok(batch) = crate::read_receipts::SeenBatch::from_wire(&thread_id, is_group, &refs, &captured.imei) {
+            let current = session.lock().await;
+            let same_account = current.login.as_ref().map(|login| login.uin.as_str()) == Some(account.as_str()) && current.zpw_sek == captured.zpw_sek;
+            drop(current);
+            let scope_current = crate::runtime_scope::execution_scope().is_some_and(|scope| crate::runtime_scope::registry().accepts(&scope));
+            if same_account && scope_current {
+                let (submitted, result) = crate::read_receipts::submit_visible(&ticket, crate::read_receipts::send_seen(&captured, &batch)).await;
+                if submitted { unsent.clear(); }
+                seen = result.map_err(|_| "Seen delivery outcome unknown".to_owned());
+            }
+        }
+    }
+    GuiEvent::VisibleReadFinished { account, thread_id, visible, unsent, local, seen }
+}
+
+#[cfg(test)]
+mod visible_read_worker_tests {
+    use super::*;
+    #[tokio::test]
+    async fn visible_read_worker_persists_local_without_automatic_wire_and_rejects_expired_queue() {
+        let root = std::env::temp_dir().join(format!("zl-visible-worker-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut captured = Session::new(false, false, false).unwrap();
+        captured.login = Some(crate::session::LoginInfo { uin: "fixture-account".into(), ..Default::default() });
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let mut store = crate::store_v2::AccountStore::open(&root, "fixture-account").unwrap();
+        let row = ChatMessage { id: "10".into(), kind: crate::message_model::MessageKind::Text, ..Default::default() };
+        let thread = Thread { id: "fixture-thread".into(), messages: vec![row.clone()], unread: crate::unread::UnreadState { marked_unread: true, ..Default::default() }, ..Default::default() };
+        store.persist_threads(&[thread]).unwrap();
+        drop(store);
+        let mut gate = crate::read_receipts::ReadVisibilityGate::default();
+        for now in [0,100,200,300,400,500] { gate.observe("fixture", true, false, true, now); }
+        let event = process_visible_read_at(Ok(root.clone()), session.clone(), captured.clone(), WorkerCmd::AcknowledgeVisibleRead { account: "fixture-account".into(), thread_id: "fixture-thread".into(), is_group: false, visible: vec![row.clone()], receipts: Vec::new(), ticket: gate.ticket().unwrap() }).await;
+        assert!(matches!(event, GuiEvent::VisibleReadFinished { local: Ok(true), seen: Ok(false), .. }));
+        let reopened = crate::store_v2::AccountStore::open(&root, "fixture-account").unwrap();
+        assert_eq!(reopened.unread("fixture-thread").unwrap().last_seen_id.as_deref(), Some("10"));
+        assert!(!reopened.unread("fixture-thread").unwrap().marked_unread);
+        drop(reopened);
+        let ticket = gate.ticket().unwrap();
+        gate.reset();
+        let event = process_visible_read_at(Ok(root.clone()), session, captured, WorkerCmd::AcknowledgeVisibleRead { account: "fixture-account".into(), thread_id: "fixture-thread".into(), is_group: false, visible: vec![ChatMessage { id: "20".into(), ..row }], receipts: Vec::new(), ticket }).await;
+        assert!(matches!(event, GuiEvent::VisibleReadFinished { local: Ok(false), seen: Ok(false), .. }));
+        let reopened = crate::store_v2::AccountStore::open(&root, "fixture-account").unwrap();
+        assert_eq!(reopened.unread("fixture-thread").unwrap().last_seen_id.as_deref(), Some("10"));
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

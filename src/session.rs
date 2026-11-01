@@ -1028,16 +1028,8 @@ impl Session {
         Ok(v)
     }
 
-    async fn send(&self, m: Method, url: &str, body: Option<String>) -> Result<Value> {
-        let start = std::time::Instant::now();
-        if self.verbose {
-            eprintln!("→ {} {}", m, if self.dump_raw { url.to_string() } else { redact_url(url) });
-            if let Some(b) = &body {
-                eprintln!("  body: {}", truncate(b, 400));
-            }
-        }
-        let method = m.as_str().to_string();
-        let mut rb = self.http.request(m, url);
+    fn authenticated_request(&self, method: Method, url: &str) -> reqwest::RequestBuilder {
+        let mut rb = self.http.request(method, url);
         if let Some(ref sek) = self.zpw_sek {
             if !sek.is_empty() {
                 let is_zalo_host = reqwest::Url::parse(url)
@@ -1060,6 +1052,83 @@ impl Session {
                 }
             }
         }
+        rb
+    }
+
+    /// Source seen-v2 uses session AES params, credentials, a ten-second deadline and no retries.
+    /// This exceptional legacy route must not manufacture an unsupported ParamCipher signing tag.
+    ///
+    /// # Errors
+    /// Returns generic transport/decode errors without request or response logging.
+    pub(crate) async fn post_receipt_params(
+        &self,
+        endpoint: &str,
+        path: &str,
+        payload: &Value,
+    ) -> Result<Value> {
+        let host = match (endpoint, path) {
+            ("chat", "/api/message/seenv2") => &self.domains.chat,
+            ("group", "/api/group/seenv2") => &self.domains.group,
+            _ => bail!("Invalid receipt endpoint"),
+        };
+        let url = format!(
+            "{}{}?{}",
+            host.trim_end_matches('/'),
+            path,
+            self.common_params()
+        );
+        let parsed =
+            reqwest::Url::parse(&url).map_err(|_| anyhow::anyhow!("Invalid receipt endpoint"))?;
+        let allowed = parsed.scheme() == "https"
+            && parsed
+                .host_str()
+                .is_some_and(|host| host.ends_with(".zalo.me") || host.ends_with(".zaloapp.com"));
+        #[cfg(test)]
+        let allowed =
+            allowed || (parsed.scheme() == "http" && parsed.host_str() == Some("127.0.0.1"));
+        if !allowed {
+            bail!("Invalid receipt endpoint");
+        }
+        let params = self.encoded_params(payload)?;
+        let operation = async {
+            let request = self
+                .authenticated_request(Method::POST, &url)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .timeout(std::time::Duration::from_secs(10))
+                .body(format!("params={params}"));
+            crate::runtime_scope::check()?;
+            let response = request.send().await
+                .map_err(|_| anyhow::anyhow!("Receipt delivery unknown"))?;
+            let bytes = crate::media_resources::read_bounded_response(response, 128 * 1024)
+                .await
+                .map_err(|_| anyhow::anyhow!("Receipt response failed"))?;
+            let value: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| anyhow::anyhow!("Invalid receipt response"))?;
+            Ok::<_, anyhow::Error>(self.maybe_decrypt(value, self.session_key_bytes()).await)
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), operation)
+            .await
+            .map_err(|_| anyhow::anyhow!("Receipt delivery unknown"))?
+    }
+
+    async fn send(&self, m: Method, url: &str, body: Option<String>) -> Result<Value> {
+        let start = std::time::Instant::now();
+        if self.verbose {
+            eprintln!(
+                "→ {} {}",
+                m,
+                if self.dump_raw {
+                    url.to_string()
+                } else {
+                    redact_url(url)
+                }
+            );
+            if let Some(b) = &body {
+                eprintln!("  body: {}", truncate(b, 400));
+            }
+        }
+        let method = m.as_str().to_string();
+        let mut rb = self.authenticated_request(m, url);
         if let Some(b) = &body {
             rb = rb
                 .header("Content-Type", "application/x-www-form-urlencoded")
@@ -1126,7 +1195,10 @@ impl Session {
         });
         let code = v.get("error_code").and_then(|c| c.as_i64()).unwrap_or(0);
         if code != 0 {
-            let msg = v.get("error_message").and_then(|m| m.as_str()).unwrap_or("");
+            let msg = v
+                .get("error_message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
             crate::logger::log_request(
                 &method,
                 url,
