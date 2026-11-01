@@ -331,8 +331,29 @@ impl AppSettings {
 }
 
 
+<<<<<<< HEAD
 /// Bubbles rendered per step in the chat view; "Tải thêm tin nhắn cũ" adds another step.
 const CHAT_RENDER_STEP: usize = 150;
+||||||| a133d01
+=======
+/// Worker → GUI channel that wakes the UI on every send. The GUI no longer repaints on a
+/// 1.2 s timer, so an event sent without a repaint would sit unseen until the next mouse move.
+#[derive(Clone)]
+pub struct GuiTx {
+    tx: Sender<GuiEvent>,
+    ctx: egui::Context,
+}
+
+impl GuiTx {
+    /// Same contract as `Sender::send` (callers already `let _ =` it), plus the wake-up.
+    #[allow(clippy::result_large_err)]
+    pub fn send(&self, ev: GuiEvent) -> Result<(), std::sync::mpsc::SendError<GuiEvent>> {
+        let res = self.tx.send(ev);
+        self.ctx.request_repaint();
+        res
+    }
+}
+>>>>>>> pr-46
 
 pub struct ZaloGuiApp {
     // Theme state
@@ -442,9 +463,6 @@ pub struct ZaloGuiApp {
     event_tx: Sender<GuiEvent>,
     /// (thread id, number of newest bubbles rendered) — see `CHAT_RENDER_STEP`.
     chat_render_window: (String, usize),
-
-    // Background poll trigger
-    last_poll: std::time::Instant,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -623,7 +641,6 @@ impl ZaloGuiApp {
             event_rx: rx,
             event_tx: tx.clone(),
             chat_render_window: (String::new(), CHAT_RENDER_STEP),
-            last_poll: std::time::Instant::now(),
         };
 
         // Clean up any leftover `.old` executable from a previous in-place self-update
@@ -634,7 +651,15 @@ impl ZaloGuiApp {
             let _ = std::fs::remove_file(&old_unix);
         }
 
-        spawn_session_worker(session, tx, cc.egui_ctx.clone());
+        app.publish_known_threads();
+        spawn_session_worker(
+            session,
+            GuiTx {
+                tx,
+                ctx: cc.egui_ctx.clone(),
+            },
+            cc.egui_ctx.clone(),
+        );
         ensure_cjk_font(&cc.egui_ctx, thread_texts(&app.threads));
 
         if let Some(wtx) = WORKER_TX.get() {
@@ -656,7 +681,19 @@ impl ZaloGuiApp {
         }
     }
 
+    /// Hand the worker's poll timer the thread ids/names it maps incoming messages onto.
+    fn publish_known_threads(&self) {
+        if let Ok(mut known) = KNOWN_THREADS.lock() {
+            *known = self
+                .threads
+                .iter()
+                .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
+                .collect();
+        }
+    }
+
     fn persist_threads_async(&self) {
+        self.publish_known_threads();
         let snapshot = self.threads.clone();
         if let Some(wtx) = WORKER_TX.get() {
             let _ = wtx.send(WorkerCmd::PersistThreads(snapshot));
@@ -1284,22 +1321,7 @@ impl eframe::App for ZaloGuiApp {
 
         self.check_events(ctx);
 
-        // Non-overlapping long-poll trigger; wakes only every 1.2s to keep idle CPU ~0%
-        if self.is_logged_in && self.last_poll.elapsed() >= Duration::from_millis(1200) {
-            self.last_poll = std::time::Instant::now();
-            if let Some(tx) = WORKER_TX.get() {
-                let known: Vec<(String, String, bool)> = self
-                    .threads
-                    .iter()
-                    .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
-                    .collect();
-                let _ = tx.send(WorkerCmd::PollMessages {
-                    known_threads: known,
-                });
-            }
-        }
-
-        ctx.request_repaint_after(Duration::from_millis(1200));
+        // No timer repaint: the worker owns the poll timer and every GuiTx send wakes the UI.
 
         let pal = self.palette();
 

@@ -1,5 +1,10 @@
 use super::*;
 
+/// Thread (id, name, is_group) list the poll timer maps incoming messages onto; the GUI
+/// republishes it whenever its threads change.
+pub(super) static KNOWN_THREADS: std::sync::Mutex<Vec<(String, String, bool)>> =
+    std::sync::Mutex::new(Vec::new());
+
 pub enum WorkerCmd {
     RequestQr,
     LoginPassword {
@@ -156,7 +161,7 @@ pub(super) fn resp_error_code(resp: &serde_json::Value) -> Option<i64> {
 /// missing `(key, url, cache_path)` entries for concurrent network prefetching.
 pub(super) fn preload_disk_sticker_thumbnails(
     items: &[crate::chat::StickerItem],
-    gui_tx: &Sender<GuiEvent>,
+    gui_tx: &GuiTx,
     limit: usize,
 ) -> Vec<(String, String, std::path::PathBuf)> {
     let cache_dir = std::path::Path::new("stickers_cache");
@@ -202,7 +207,7 @@ pub(super) fn preload_disk_sticker_thumbnails(
 async fn prefetch_missing_sticker_thumbnails(
     http: &reqwest::Client,
     missing: Vec<(String, String, std::path::PathBuf)>,
-    gui_tx: &Sender<GuiEvent>,
+    gui_tx: &GuiTx,
     egui_ctx: &egui::Context,
 ) {
     if missing.is_empty() {
@@ -238,7 +243,7 @@ async fn prefetch_missing_sticker_thumbnails(
     futures_util::future::join_all(futs).await;
 }
 
-pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: egui::Context) {
+pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: egui::Context) {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
     let _ = WORKER_TX.set(cmd_tx);
 
@@ -263,6 +268,21 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                     let s = session.lock().await.clone();
                     let _ = crate::login::get_server_info(&s).await;
                 }
+                // Message poll timer. It used to live in the GUI's update(), which forced a full
+                // repaint every 1.2 s just to fire it. The PollMessages handler skips while a
+                // long-poll is in flight and when logged out.
+                tokio::spawn(async {
+                    let mut tick = tokio::time::interval(Duration::from_millis(1200));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        let known_threads =
+                            KNOWN_THREADS.lock().map(|k| k.clone()).unwrap_or_default();
+                        if let Some(tx) = WORKER_TX.get() {
+                            let _ = tx.send(WorkerCmd::PollMessages { known_threads });
+                        }
+                    }
+                });
                 {
                     let s_kw = session.clone();
                     let gui_tx_kw = gui_tx.clone();
@@ -2366,7 +2386,7 @@ async fn apply_github_release_update(
     asset_name: &str,
     target_version: &str,
     expected_sha256: Option<&str>,
-    gui_tx: &Sender<GuiEvent>,
+    gui_tx: &GuiTx,
     ctx: &egui::Context,
 ) -> Result<bool, String> {
     use sha2::{Digest, Sha256};

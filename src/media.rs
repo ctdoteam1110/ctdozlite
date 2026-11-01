@@ -213,7 +213,7 @@ impl MediaHandle {
         udp_rtcp_sock: Option<Arc<tokio::net::UdpSocket>>,
         local_port: u16,
         is_video: bool,
-        gui_tx: Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
+        gui_tx: Option<crate::gui::GuiTx>,
         egui_ctx: Option<eframe::egui::Context>,
     ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
@@ -832,7 +832,7 @@ fn spawn_camera_capture_thread(
     cam_enabled: Arc<AtomicBool>,
     want_keyframe: Arc<AtomicBool>,
     cam_au_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
-    gui_tx: Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
+    gui_tx: Option<crate::gui::GuiTx>,
     egui_ctx: Option<eframe::egui::Context>,
 ) {
     thread::spawn(move || {
@@ -1055,7 +1055,7 @@ fn strip_leading_aud(au: &[u8]) -> Vec<u8> {
 fn run_local_preview_decoder(
     stop: Arc<AtomicBool>,
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    gui_tx: std::sync::mpsc::Sender<crate::gui::GuiEvent>,
+    gui_tx: crate::gui::GuiTx,
     egui_ctx: eframe::egui::Context,
 ) {
     use std::io::{Read, Write};
@@ -1234,7 +1234,7 @@ fn run_media_loop(
     relay_token: u32,
     slot_idx: u16,
     is_video: bool,
-    gui_tx: Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
+    gui_tx: Option<crate::gui::GuiTx>,
     egui_ctx: Option<eframe::egui::Context>,
 ) {
     let (h264_tx, h264_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(120);
@@ -1941,7 +1941,7 @@ fn trim_black_borders(rgba: &[u8], w: usize, h: usize) -> (usize, usize, Vec<u8>
 fn run_h264_ffmpeg_decoder(
     stop: Arc<AtomicBool>,
     h264_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    gui_tx: std::sync::mpsc::Sender<crate::gui::GuiEvent>,
+    gui_tx: crate::gui::GuiTx,
     egui_ctx: eframe::egui::Context,
     synced: Arc<AtomicBool>,
     tex_key: String,
