@@ -12,14 +12,23 @@ impl ZaloGuiApp {
 
         let mut close_menu = false;
         let mut do_logout = false;
+        // Anchored just above the profile footer at the bottom of the navigation sidebar.
+        let screen = ctx.screen_rect();
         let area_resp = egui::Area::new(Id::new("left_rail_profile_popover"))
             .order(egui::Order::Foreground)
-            .fixed_pos(Pos2::new(68.0, 44.0))
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .fixed_pos(Pos2::new(screen.left() + 10.0, screen.bottom() - 70.0))
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(pal.bg_elevated)
                     .stroke(Stroke::new(1.0_f32, pal.border))
-                    .rounding(Rounding::same(12.0))
+                    .rounding(Rounding::same(14.0))
+                    .shadow(egui::epaint::Shadow {
+                        offset: Vec2::new(0.0, 4.0),
+                        blur: 18.0,
+                        spread: 0.0,
+                        color: pal.shadow,
+                    })
                     .inner_margin(Margin::same(10.0))
                     .show(ui, |ui| {
                         ui.set_width(220.0);
@@ -60,7 +69,7 @@ impl ZaloGuiApp {
                             .add_sized(
                                 [200.0, 28.0],
                                 egui::Button::new(
-                                    RichText::new(format!("{}  Đã đồng bộ đám mây", lucide::CHECK))
+                                    RichText::new(format!("{}  Làm mới hội thoại", lucide::REFRESH))
                                         .size(12.2)
                                         .color(pal.text_primary),
                                 )
@@ -72,7 +81,7 @@ impl ZaloGuiApp {
                             if let Some(tx) = WORKER_TX.get() {
                                 let _ = tx.send(WorkerCmd::RefreshThreads);
                             }
-                            self.show_toast("Đang đồng bộ 20 hội thoại ngầm…");
+                            self.show_toast("Đang làm mới danh sách hội thoại…");
                             close_menu = true;
                         }
 
@@ -189,8 +198,11 @@ impl ZaloGuiApp {
             self.login_status_msg.clear();
             self.qr_status = "Đang xin mã QR mới…".into();
             self.status_msg = "Đã đăng xuất".into();
-            let _ = std::fs::remove_file("session.json");
-            let _ = std::fs::remove_file("threads_cache.json");
+            // Logout removes credentials + thread cache only; local history stays (own action).
+            if !self.demo_mode {
+                let _ = std::fs::remove_file(crate::paths::session_file());
+                let _ = std::fs::remove_file(crate::paths::threads_cache_file());
+            }
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::Logout);
                 let _ = tx.send(WorkerCmd::RequestQr);
@@ -621,7 +633,7 @@ impl ZaloGuiApp {
                                 let tabs = [
                                     (SettingsTab::General, lucide::SETTINGS, "Cài đặt chung"),
                                     (SettingsTab::Privacy, lucide::LOCK, "Quyền riêng tư"),
-                                    (SettingsTab::Sync, lucide::REFRESH, "Đồng bộ tin nhắn"),
+                                    (SettingsTab::Sync, lucide::REFRESH, "Dữ liệu & làm mới"),
                                     (SettingsTab::Appearance, lucide::PAINTBRUSH, "Giao diện"),
                                     (SettingsTab::Notifications, lucide::BELL, "Thông báo"),
                                     (SettingsTab::Messages, lucide::MESSAGE_SQUARE, "Tin nhắn"),
@@ -696,7 +708,7 @@ impl ZaloGuiApp {
                                 let tab_title = match self.settings_tab {
                                     SettingsTab::General => "Cài đặt chung",
                                     SettingsTab::Privacy => "Quyền riêng tư",
-                                    SettingsTab::Sync => "Đồng bộ tin nhắn",
+                                    SettingsTab::Sync => "Dữ liệu & làm mới",
                                     SettingsTab::Appearance => "Cài đặt giao diện",
                                     SettingsTab::Notifications => "Cài đặt thông báo",
                                     SettingsTab::Messages => "Cài đặt tin nhắn",
@@ -1008,7 +1020,7 @@ impl ZaloGuiApp {
                                                 });
                                         }
                                         SettingsTab::Sync => {
-                                            ui.label(RichText::new("Đồng bộ tin nhắn").color(pal.text_primary).size(13.5).strong());
+                                            ui.label(RichText::new("Làm mới hội thoại").color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(6.0);
                                             egui::Frame::none()
                                                 .fill(pal.bg_elevated)
@@ -1017,12 +1029,12 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::same(14.0))
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Zalo lưu trữ và đồng bộ dữ liệu lịch sử tin nhắn với đám mây Zalo và SQLite cục bộ (zalo_history.db).").color(pal.text_primary).size(13.0));
+                                                        ui.label(RichText::new("Làm mới tải lại danh sách hội thoại và khoảng 50 tin nhắn gần nhất của mỗi nhóm / Cloud. Tải toàn bộ lịch sử từ máy chủ chưa được hỗ trợ. Tin nhắn đã nhận được lưu cục bộ trong zalo_history.db (thư mục dữ liệu QTzalo).").color(pal.text_primary).size(13.0));
                                                         ui.add_space(4.0);
                                                         let total_msgs: usize = self.threads.iter().map(|t| t.messages.len()).sum();
                                                         ui.label(RichText::new(format!("Hiện có {} hội thoại ({total_msgs} tin nhắn) trong bộ nhớ.", self.threads.len())).color(pal.text_secondary).size(12.2));
                                                         ui.add_space(10.0);
-                                                        if ui.button(RichText::new(format!("{} Đồng bộ ngay", lucide::REFRESH)).size(13.0).strong()).clicked() {
+                                                        if ui.button(RichText::new(format!("{} Làm mới hội thoại", lucide::REFRESH)).size(13.0).strong()).clicked() {
                                                             trigger_sync = true;
                                                         }
                                                     });
@@ -1350,7 +1362,7 @@ impl ZaloGuiApp {
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::RefreshThreads);
             }
-            self.show_toast("Đang đồng bộ dữ liệu hội thoại từ máy chủ Zalo…");
+            self.show_toast("Đang làm mới danh sách hội thoại…");
         }
         if pick_dl_dir {
             if let Some(folder) = pick_native_file_dialog(false) {

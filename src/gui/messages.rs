@@ -761,21 +761,6 @@ pub(super) fn extract_message_link_view(msg: &ChatMessage) -> Option<(String, St
     Some((caption, url.to_string(), domain))
 }
 
-/// Convert days since 1970-01-01 into `(year, month, day)` (Howard Hinnant's algorithm).
-pub(super) fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = (y + if m <= 2 { 1 } else { 0 }) as i32;
-    (year, m, d)
-}
-
 /// Normalize a millisecond or second timestamp to milliseconds (`> 0`).
 pub(super) fn normalize_ts_ms(ts: i64) -> i64 {
     if ts <= 0 {
@@ -795,10 +780,8 @@ pub(super) fn should_show_time_divider(prev: Option<&ChatMessage>, curr: &ChatMe
     let prev_ms = normalize_ts_ms(prev.ts);
     let curr_ms = normalize_ts_ms(curr.ts);
     if prev_ms > 0 && curr_ms > 0 {
-        let tz_offset_sec = 7 * 3600; // UTC+7 (Vietnam)
-        let prev_day = (prev_ms / 1000 + tz_offset_sec) / 86_400;
-        let curr_day = (curr_ms / 1000 + tz_offset_sec) / 86_400;
-        if prev_day != curr_day {
+        // Local calendar days (OS time zone) — no hard-coded UTC offset.
+        if crate::timefmt::local_day_index(prev_ms) != crate::timefmt::local_day_index(curr_ms) {
             return true;
         }
         return (curr_ms - prev_ms).abs() >= 30 * 60 * 1000;
@@ -806,39 +789,46 @@ pub(super) fn should_show_time_divider(prev: Option<&ChatMessage>, curr: &ChatMe
     false
 }
 
-/// Format the label for a centered date/time separator pill.
-pub(super) fn format_time_divider_label(msg: &ChatMessage) -> String {
+/// Format the label for a centered date/time separator chip.
+///
+/// A new calendar day shows the day (`Hôm nay`, `Hôm qua`, `Thứ Hai, 27/10`, `27/10/2025`);
+/// a long pause within the same day shows just the time (`14:05`).
+pub(super) fn format_time_divider_label(prev: Option<&ChatMessage>, msg: &ChatMessage) -> String {
     let ts_ms = normalize_ts_ms(msg.ts);
     if ts_ms <= 0 {
         return if msg.time.is_empty() {
             "Cuộc trò chuyện".to_string()
         } else {
-            format!("Hôm nay • {}", msg.time)
+            msg.time.clone()
         };
     }
-    let tz_offset_sec = 7 * 3600;
-    let local_sec = ts_ms / 1000 + tz_offset_sec;
-    let msg_day = local_sec.div_euclid(86_400);
-    let sec_of_day = local_sec.rem_euclid(86_400);
-    let hh = sec_of_day / 3600;
-    let mm = (sec_of_day % 3600) / 60;
-
-    let now_sec = (crate::login::unix_now() as i64) + tz_offset_sec;
-    let today_day = now_sec.div_euclid(86_400);
-    let (y, m, d) = civil_from_days(msg_day);
-
-    if msg_day == today_day {
-        format!("Hôm nay • {hh:02}:{mm:02}")
-    } else if msg_day == today_day - 1 {
-        format!("Hôm qua • {hh:02}:{mm:02}")
-    } else {
-        format!("{d:02}/{m:02}/{y}")
+    let msg_day = crate::timefmt::local_day_index(ts_ms);
+    let same_day_as_prev = prev
+        .map(|p| normalize_ts_ms(p.ts))
+        .filter(|p| *p > 0)
+        .map(|p| crate::timefmt::local_day_index(p) == msg_day)
+        .unwrap_or(false);
+    if same_day_as_prev {
+        return crate::timefmt::hm_from_ms(ts_ms);
+    }
+    let today = crate::timefmt::local_day_index(crate::timefmt::now_ms());
+    let (y, m, d) = crate::timefmt::local_ymd(ts_ms);
+    match today - msg_day {
+        0 => "Hôm nay".to_string(),
+        1 => "Hôm qua".to_string(),
+        2..=6 => format!("{}, {d:02}/{m:02}", weekday_long(crate::timefmt::local_weekday(ts_ms))),
+        _ => format!("{d:02}/{m:02}/{y}"),
     }
 }
 
-/// Render a centered Zalo-style compact date pill (no side hairlines).
-pub(super) fn render_date_divider(ui: &mut egui::Ui, msg: &ChatMessage, pal: &ThemePalette) {
-    let label = format_time_divider_label(msg);
+/// Render a centered compact date chip (white pill with a hairline border).
+pub(super) fn render_date_divider(
+    ui: &mut egui::Ui,
+    prev: Option<&ChatMessage>,
+    msg: &ChatMessage,
+    pal: &ThemePalette,
+) {
+    let label = format_time_divider_label(prev, msg);
     let avail_w = ui.available_width();
     ui.horizontal(|ui| {
         let text_w = ui.fonts(|f| {
@@ -846,31 +836,24 @@ pub(super) fn render_date_divider(ui: &mut egui::Ui, msg: &ChatMessage, pal: &Th
                 .size()
                 .x
         });
-        let pill_w = text_w + 26.0;
+        let pill_w = text_w + 28.0;
         let left_space = ((avail_w - pill_w) * 0.5).max(0.0);
         if left_space > 0.0 {
             ui.add_space(left_space);
         }
-        let pill_bg = if pal.is_dark {
-            Color32::from_rgba_unmultiplied(30, 34, 41, 235)
-        } else {
-            Color32::from_rgba_unmultiplied(219, 228, 240, 215)
-        };
         egui::Frame::none()
-            .fill(pill_bg)
-            .rounding(Rounding::same(10.0))
-            .inner_margin(Margin::symmetric(13.0, 3.5))
+            .fill(pal.chip_bg)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(11.0))
+            .inner_margin(Margin::symmetric(13.0, 4.0))
+            .shadow(egui::epaint::Shadow {
+                offset: Vec2::new(0.0, 1.0),
+                blur: 6.0,
+                spread: 0.0,
+                color: pal.shadow,
+            })
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new(label)
-                        .size(11.4)
-                        .color(if pal.is_dark {
-                            Color32::from_rgb(215, 218, 224)
-                        } else {
-                            pal.text_secondary
-                        })
-                        .strong(),
-                );
+                ui.label(RichText::new(label).size(12.0).color(pal.text_secondary));
             });
     });
 }
@@ -1123,37 +1106,57 @@ pub(super) fn render_message_body(
             .as_deref()
             .filter(|s| !s.is_empty())
             .unwrap_or(trimmed_text);
+        let title_str = title_str
+            .trim_start_matches("[Tập tin]")
+            .trim_start_matches("[Video]")
+            .trim();
         let sub_str = msg
-            .link_src
+            .link_desc
             .as_deref()
+            .filter(|d| !d.trim().is_empty())
+            .or(msg.link_src.as_deref())
             .unwrap_or(if is_vid { "Video đính kèm" } else { "Tập tin đính kèm" });
-        let link_col = if pal.is_dark {
-            Color32::from_rgb(97, 175, 239)
+        // File card: rounded icon tile + bold name + size / source line.
+        let (tile_bg, tile_fg) = if outgoing {
+            (Color32::from_rgba_unmultiplied(255, 255, 255, 52), Color32::WHITE)
         } else {
-            pal.primary
+            (pal.primary, Color32::WHITE)
         };
-        let resp = ui
-            .add(
-                egui::Label::new(RichText::new(title_str).size(13.8).color(text_col).strong())
-                    .wrap()
-                    .sense(Sense::click()),
-            )
-            .on_hover_cursor(CursorIcon::PointingHand);
-        if resp.clicked() {
-            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-                open_external_url(url);
-            }
-        }
-        ui.add_space(2.0);
-        let dom_resp = ui
-            .add(
-                egui::Label::new(RichText::new(sub_str).size(12.5).color(link_col))
-                    .sense(Sense::click()),
-            )
-            .on_hover_cursor(CursorIcon::PointingHand);
-        if dom_resp.clicked() {
-            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-                open_external_url(url);
+        let row = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let (tile, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+            ui.painter().rect_filled(tile, Rounding::same(10.0), tile_bg);
+            draw_lucide_icon(
+                ui.painter(),
+                tile.center(),
+                if is_vid { lucide::FILM } else { lucide::FILE },
+                19.0,
+                tile_fg,
+            );
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.add_space(1.0);
+                ui.add(
+                    egui::Label::new(RichText::new(title_str).size(14.0).color(text_col).strong())
+                        .truncate(),
+                );
+                ui.label(RichText::new(sub_str).size(12.0).color(meta_col));
+            });
+        });
+        let can_open = msg.link_url.as_deref().map(|u| !u.is_empty()).unwrap_or(false);
+        let resp = ui.interact(
+            row.response.rect,
+            Id::new(("file_card", &msg.id, msg.ts)),
+            Sense::click(),
+        );
+        if can_open {
+            let resp = resp
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("Mở tệp trong trình duyệt");
+            if resp.clicked() {
+                if let Some(url) = msg.link_url.as_deref() {
+                    open_external_url(url);
+                }
             }
         }
         return None;
@@ -1166,7 +1169,10 @@ pub(super) fn render_message_body(
         return None;
     };
 
-    let link_col = if pal.is_dark {
+    let link_col = if outgoing {
+        // Solid blue outgoing bubbles: links stay white (underlined via the domain line).
+        pal.bubble_out_text
+    } else if pal.is_dark {
         Color32::from_rgb(97, 175, 239) // #61AFEF Zalo/Atom clean link blue
     } else {
         pal.primary
@@ -1444,12 +1450,18 @@ pub(super) fn render_chat_bubble(
                     })
                 }
             };
+            // File cards carry a 40px icon tile + gap in front of the text.
+            let tile_w = if is_file_card { 54.0 } else { 0.0 };
             let w = measure(title, 13.8)
                 .max(measure(&cap, 13.8))
                 .max(measure(desc, 12.3))
                 .max(measure(&dom, 12.6))
-                + 8.0;
-            w.clamp(135.0, max_text_width.min(340.0)).ceil()
+                + 8.0
+                + tile_w;
+            // Narrow chat panes can make the cap smaller than the preferred minimum; never
+            // call `clamp` with min > max (it panics).
+            let cap = max_text_width.min(340.0);
+            w.clamp(135.0_f32.min(cap), cap).ceil()
         }
     } else {
         let display_str = if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
@@ -1497,19 +1509,8 @@ pub(super) fn render_chat_bubble(
             }
             None => 0.0_f32,
         };
-        let sender_w = if show_group_sender {
-            ui.fonts(|f| {
-                f.layout_no_wrap(
-                    truncate_chars(&msg.sender, 22).into_owned(),
-                    FontId::proportional(12.0),
-                    Color32::WHITE,
-                )
-                .size()
-                .x
-            }) + 8.0
-        } else {
-            0.0_f32
-        };
+        // The group sender label is drawn above the bubble, so it never widens it.
+        let sender_w = 0.0_f32;
         let marks_w = if !msg.reactions.is_empty() || msg.is_pinned || msg.is_starred {
             78.0_f32
         } else {
@@ -1542,128 +1543,128 @@ pub(super) fn render_chat_bubble(
     };
     let total_bubble_w = content_width + h_margin * 2.0;
 
-    if msg.is_outgoing {
-        let out_resp = ui.vertical(|ui| {
-            let row_resp = ui.horizontal(|ui| {
-                let left_pad = (ui.available_width() - total_bubble_w - 6.0).max(0.0);
-                if left_pad > 0.0 {
-                    ui.add_space(left_pad);
-                }
-
-                let fill = if has_sticker || is_frameless_photo {
-                    Color32::TRANSPARENT
-                } else if let Some(card) = &call_card_opt {
-                    if card.is_missed_or_failed {
-                        if pal.is_dark {
-                            Color32::from_rgb(38, 23, 30)
-                        } else {
-                            Color32::from_rgb(254, 242, 242)
-                        }
-                    } else {
-                        pal.bg_elevated
-                    }
-                } else {
-                    pal.bubble_out_bg
-                };
-                let stroke = if has_sticker || is_frameless_photo {
-                    Stroke::NONE
-                } else if let Some(card) = &call_card_opt {
-                    let border_col = if card.is_missed_or_failed {
-                        Color32::from_rgb(239, 68, 68).linear_multiply(0.55)
-                    } else {
-                        Color32::from_rgb(34, 197, 94).linear_multiply(0.55)
-                    };
-                    Stroke::new(1.2_f32, border_col)
-                } else if !pal.is_dark {
-                    Stroke::new(1.0_f32, Color32::from_rgb(186, 214, 255))
-                } else {
-                    Stroke::new(1.0_f32, Color32::from_rgb(53, 76, 104))
-                };
-                let rounding = Rounding::same(8.0);
-
-                let mut card_action = None;
-                let fr = egui::Frame::none()
-                    .fill(fill)
-                    .stroke(stroke)
-                    .rounding(rounding)
-                    .inner_margin(Margin::symmetric(h_margin, v_margin))
-                    .show(ui, |ui| {
-                        ui.set_min_width(content_width);
-                        ui.set_max_width(content_width);
-                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            render_quote_block(ui, msg, pal, true, content_width);
-                            if let Some(card) = &call_card_opt {
-                                card_action =
-                                    render_call_card_widget(ui, card, pal, content_width);
-                            } else if !render_sticker_widget(
-                                ui,
-                                msg,
-                                sticker_textures,
-                                loading_stickers,
-                            ) {
-                                card_action = render_message_body(
-                                    ui,
-                                    msg,
-                                    thread_name,
-                                    pal,
-                                    true,
-                                    content_width,
-                                    sticker_textures,
-                                    loading_stickers,
-                                );
-                            }
-                            render_reactions(ui, msg, pal, emoji_textures);
-                            if show_timestamp && !has_sticker && !is_frameless_photo {
-                                ui.add_space(3.5);
-                                let ts_txt = if is_latest_outgoing {
-                                    format!("{} · Đã nhận", msg.time)
-                                } else {
-                                    msg.time.clone()
-                                };
-                                ui.label(
-                                    RichText::new(ts_txt)
-                                        .size(11.0)
-                                        .color(pal.bubble_out_meta),
-                                );
-                            }
-                        });
-                    });
-                if fr.response.double_clicked() {
-                    return Some(BubbleAction::Reply);
-                }
-                card_action.or_else(|| {
-                    bubble_context_menu(
-                        ui,
-                        &fr.response,
-                        msg,
-                        idx,
-                        pal,
-                        emoji_textures,
-                        has_interactive_card,
-                    )
-                })
-            });
-
-            row_resp.inner
-        });
-        out_resp.inner
+    // Cluster-aware corner radii: tighter corners where consecutive bubbles of one sender touch.
+    let big = 18.0_f32;
+    let small = 6.0_f32;
+    let rounding = if msg.is_outgoing {
+        Rounding {
+            nw: big,
+            ne: if prev_same_sender { small } else { big },
+            sw: big,
+            se: if next_same_sender { small } else { big },
+        }
     } else {
-        ui.horizontal_top(|ui| {
-            let display_sender = if sender_is_name {
-                &msg.sender
-            } else {
-                thread_name
-            };
-            let sender_accent = avatar_color_for(display_sender, false);
+        Rounding {
+            nw: if prev_same_sender { small } else { big },
+            ne: big,
+            sw: if next_same_sender { small } else { big },
+            se: big,
+        }
+    };
+    let frameless = has_sticker || is_frameless_photo;
+    // Leave room at the bottom for the reaction chip that overlaps the bubble edge.
+    let bubble_margin = Margin {
+        left: h_margin,
+        right: h_margin,
+        top: v_margin,
+        bottom: v_margin + if msg.reactions.is_empty() || frameless { 0.0 } else { 7.0 },
+    };
+    let (fill, stroke) = if frameless {
+        (Color32::TRANSPARENT, Stroke::NONE)
+    } else if let Some(card) = &call_card_opt {
+        let (bg, border) = if card.is_missed_or_failed {
+            (
+                if pal.is_dark {
+                    Color32::from_rgb(38, 23, 30)
+                } else {
+                    Color32::from_rgb(254, 242, 242)
+                },
+                Color32::from_rgb(239, 68, 68).linear_multiply(0.55),
+            )
+        } else {
+            (pal.bg_elevated, Color32::from_rgb(34, 197, 94).linear_multiply(0.55))
+        };
+        (bg, Stroke::new(1.2_f32, border))
+    } else if msg.is_outgoing {
+        (pal.bubble_out_bg, Stroke::NONE)
+    } else if is_file_card {
+        (pal.bg_elevated, Stroke::new(1.0_f32, pal.bubble_in_border))
+    } else if pal.is_dark {
+        (pal.bubble_in_bg, Stroke::new(1.0_f32, pal.bubble_in_border))
+    } else {
+        (pal.bubble_in_bg, Stroke::NONE)
+    };
 
-            // Sender Avatar (only on first message of a consecutive group)
+    if msg.is_outgoing {
+        let row = ui.horizontal(|ui| {
+            let left_pad = (ui.available_width() - total_bubble_w - 4.0).max(0.0);
+            if left_pad > 0.0 {
+                ui.add_space(left_pad);
+            }
+            let mut card_action = None;
+            let fr = egui::Frame::none()
+                .fill(fill)
+                .stroke(stroke)
+                .rounding(rounding)
+                .inner_margin(bubble_margin)
+                .show(ui, |ui| {
+                    card_action = bubble_contents(
+                        ui,
+                        msg,
+                        thread_name,
+                        pal,
+                        true,
+                        content_width,
+                        call_card_opt.as_ref(),
+                        show_timestamp && !frameless,
+                        is_latest_outgoing,
+                        sticker_textures,
+                        loading_stickers,
+                        emoji_textures,
+                    );
+                });
+            (fr.response, card_action)
+        });
+        let (bubble_resp, card_action) = row.inner;
+        if paint_reaction_chip(ui, bubble_resp.rect, msg, pal, emoji_textures) {
+            ui.add_space(10.0);
+        }
+        if bubble_resp.double_clicked() {
+            return Some(BubbleAction::Reply);
+        }
+        card_action.or_else(|| {
+            bubble_context_menu(
+                ui,
+                &bubble_resp,
+                msg,
+                idx,
+                pal,
+                emoji_textures,
+                has_interactive_card,
+            )
+        })
+    } else {
+        let display_sender = if sender_is_name { &msg.sender } else { thread_name };
+        // Group sender name sits above the first bubble of a cluster (not inside it).
+        if show_group_sender {
+            ui.horizontal(|ui| {
+                ui.add_space(44.0);
+                ui.label(
+                    RichText::new(truncate_chars(&msg.sender, 32))
+                        .size(12.5)
+                        .color(pal.text_muted),
+                );
+            });
+            ui.add_space(1.0);
+        }
+        let row = ui.horizontal_top(|ui| {
+            // Sender avatar (only on the first message of a consecutive group)
             if !prev_same_sender {
-                let (av_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(30.0, 30.0), Sense::hover());
+                let (av_rect, _) = ui.allocate_exact_size(Vec2::new(34.0, 34.0), Sense::hover());
                 paint_user_avatar(
                     ui.painter(),
                     av_rect.center(),
-                    15.0,
+                    16.0,
                     display_sender,
                     false,
                     sender_avatar,
@@ -1671,38 +1672,9 @@ pub(super) fn render_chat_bubble(
                     loading_stickers,
                 );
             } else {
-                ui.add_space(30.0);
+                ui.add_space(34.0);
             }
-
-            let fill = if has_sticker || is_frameless_photo {
-                Color32::TRANSPARENT
-            } else if let Some(card) = &call_card_opt {
-                if card.is_missed_or_failed {
-                    if pal.is_dark {
-                        Color32::from_rgb(38, 23, 30)
-                    } else {
-                        Color32::from_rgb(254, 242, 242)
-                    }
-                } else {
-                    pal.bg_elevated
-                }
-            } else {
-                pal.bubble_in_bg
-            };
-            let stroke = if has_sticker || is_frameless_photo {
-                Stroke::NONE
-            } else if let Some(card) = &call_card_opt {
-                let border_col = if card.is_missed_or_failed {
-                    Color32::from_rgb(239, 68, 68).linear_multiply(0.55)
-                } else {
-                    Color32::from_rgb(34, 197, 94).linear_multiply(0.55)
-                };
-                Stroke::new(1.2_f32, border_col)
-            } else {
-                Stroke::new(1.0_f32, pal.bubble_in_border)
-            };
-            let rounding = Rounding::same(8.0);
-
+            ui.add_space(2.0);
             ui.vertical(|ui| {
                 ui.set_max_width(total_bubble_w);
                 let mut card_action = None;
@@ -1710,71 +1682,184 @@ pub(super) fn render_chat_bubble(
                     .fill(fill)
                     .stroke(stroke)
                     .rounding(rounding)
-                    .inner_margin(Margin::symmetric(h_margin, v_margin))
+                    .inner_margin(bubble_margin)
                     .show(ui, |ui| {
-                        ui.set_min_width(content_width);
-                        ui.set_max_width(content_width);
-                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            if show_group_sender {
-                                ui.label(
-                                    RichText::new(truncate_chars(&msg.sender, 22))
-                                        .color(sender_accent)
-                                        .size(12.0)
-                                        .strong(),
-                                );
-                                ui.add_space(2.0);
-                            }
-                            render_quote_block(ui, msg, pal, false, content_width);
-                            if let Some(card) = &call_card_opt {
-                                card_action =
-                                    render_call_card_widget(ui, card, pal, content_width);
-                            } else if !render_sticker_widget(
-                                ui,
-                                msg,
-                                sticker_textures,
-                                loading_stickers,
-                            ) {
-                                card_action = render_message_body(
-                                    ui,
-                                    msg,
-                                    thread_name,
-                                    pal,
-                                    false,
-                                    content_width,
-                                    sticker_textures,
-                                    loading_stickers,
-                                );
-                            }
-                            render_reactions(ui, msg, pal, emoji_textures);
-                            if show_timestamp && !has_sticker && !is_frameless_photo {
-                                ui.add_space(3.5);
-                                ui.label(
-                                    RichText::new(&msg.time)
-                                        .color(pal.bubble_in_meta)
-                                        .size(11.0),
-                                );
-                            }
-                        });
+                        card_action = bubble_contents(
+                            ui,
+                            msg,
+                            thread_name,
+                            pal,
+                            false,
+                            content_width,
+                            call_card_opt.as_ref(),
+                            show_timestamp && !frameless,
+                            false,
+                            sticker_textures,
+                            loading_stickers,
+                            emoji_textures,
+                        );
                     });
-                if fr.response.double_clicked() {
-                    return Some(BubbleAction::Reply);
-                }
-                card_action.or_else(|| {
-                    bubble_context_menu(
-                        ui,
-                        &fr.response,
-                        msg,
-                        idx,
-                        pal,
-                        emoji_textures,
-                        has_interactive_card,
-                    )
-                })
+                (fr.response, card_action)
             })
             .inner
+        });
+        let (bubble_resp, card_action) = row.inner;
+        if paint_reaction_chip(ui, bubble_resp.rect, msg, pal, emoji_textures) {
+            ui.add_space(10.0);
+        }
+        if bubble_resp.double_clicked() {
+            return Some(BubbleAction::Reply);
+        }
+        card_action.or_else(|| {
+            bubble_context_menu(
+                ui,
+                &bubble_resp,
+                msg,
+                idx,
+                pal,
+                emoji_textures,
+                has_interactive_card,
+            )
         })
-        .inner
     }
+}
+
+/// Inner content of one bubble: quote, card / sticker / body, pins & stars, timestamp.
+#[allow(clippy::too_many_arguments)]
+fn bubble_contents(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    thread_name: &str,
+    pal: &ThemePalette,
+    outgoing: bool,
+    content_width: f32,
+    call_card: Option<&CallCardView>,
+    show_timestamp: bool,
+    is_latest_outgoing: bool,
+    sticker_textures: &HashMap<String, TextureHandle>,
+    loading_stickers: &mut HashSet<String>,
+    emoji_textures: &HashMap<String, TextureHandle>,
+) -> Option<BubbleAction> {
+    ui.set_min_width(content_width);
+    ui.set_max_width(content_width);
+    let mut action = None;
+    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+        render_quote_block(ui, msg, pal, outgoing, content_width);
+        if let Some(card) = call_card {
+            action = render_call_card_widget(ui, card, pal, content_width);
+        } else if !render_sticker_widget(ui, msg, sticker_textures, loading_stickers) {
+            action = render_message_body(
+                ui,
+                msg,
+                thread_name,
+                pal,
+                outgoing,
+                content_width,
+                sticker_textures,
+                loading_stickers,
+            );
+        }
+        render_reactions(ui, msg, pal, emoji_textures);
+        if show_timestamp {
+            ui.add_space(3.0);
+            let (txt, col) = if outgoing {
+                let t = if is_latest_outgoing {
+                    format!("{} · Đã nhận", msg.time)
+                } else {
+                    msg.time.clone()
+                };
+                (t, pal.bubble_out_meta)
+            } else {
+                (msg.time.clone(), pal.bubble_in_meta)
+            };
+            if outgoing {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(content_width, 14.0),
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
+                        ui.label(RichText::new(txt).size(10.8).color(col));
+                    },
+                );
+            } else {
+                ui.label(RichText::new(txt).size(10.8).color(col));
+            }
+        }
+    });
+    action
+}
+
+/// Reaction chip overlapping the bubble's bottom-right edge (`❤ 2`). Returns `true` if painted.
+fn paint_reaction_chip(
+    ui: &mut egui::Ui,
+    bubble: Rect,
+    msg: &ChatMessage,
+    pal: &ThemePalette,
+    emoji_textures: &HashMap<String, TextureHandle>,
+) -> bool {
+    if msg.reactions.is_empty() {
+        return false;
+    }
+    let mut unique: Vec<&str> = Vec::new();
+    for r in &msg.reactions {
+        let key = emoji_to_tex_key(r);
+        if !unique.contains(&key) {
+            unique.push(key);
+        }
+    }
+    unique.truncate(3);
+    let total = msg.reactions.len();
+    let count_txt = if total > 1 { total.to_string() } else { String::new() };
+    let icon = 15.0_f32;
+    let text_w = if count_txt.is_empty() {
+        0.0
+    } else {
+        ui.fonts(|f| {
+            f.layout_no_wrap(count_txt.clone(), FontId::proportional(11.5), pal.text_secondary)
+                .size()
+                .x
+        }) + 4.0
+    };
+    let w = 12.0 + unique.len() as f32 * (icon + 1.0) + text_w;
+    let h = 21.0_f32;
+    let chip = Rect::from_min_size(
+        Pos2::new(bubble.right() - w - 8.0, bubble.bottom() - 7.0),
+        Vec2::new(w, h),
+    );
+    let painter = ui.painter();
+    painter.add(egui::epaint::Shadow {
+        offset: Vec2::new(0.0, 1.0),
+        blur: 5.0,
+        spread: 0.0,
+        color: pal.shadow,
+    }
+    .as_shape(chip, Rounding::same(h / 2.0)));
+    painter.rect_filled(chip, Rounding::same(h / 2.0), pal.chip_bg);
+    painter.rect_stroke(chip, Rounding::same(h / 2.0), Stroke::new(1.0_f32, pal.border));
+    let mut x = chip.left() + 6.0;
+    for key in &unique {
+        let r = Rect::from_min_size(Pos2::new(x, chip.center().y - icon / 2.0), Vec2::splat(icon));
+        if let Some(tex) = emoji_textures.get(*key) {
+            painter.image(
+                tex.id(),
+                r,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            draw_lucide_icon(painter, r.center(), lucide::HEART, 12.0, pal.danger);
+        }
+        x += icon + 1.0;
+    }
+    if !count_txt.is_empty() {
+        painter.text(
+            Pos2::new(x + 2.0, chip.center().y),
+            egui::Align2::LEFT_CENTER,
+            count_txt,
+            FontId::proportional(11.5),
+            pal.text_secondary,
+        );
+    }
+    true
 }
 
 #[derive(Clone, PartialEq)]
@@ -1947,17 +2032,16 @@ pub(super) fn render_quote_block(
     } else {
         (pal.bubble_in_text, pal.bubble_in_meta)
     };
-    let bar_col = if outgoing && pal.is_dark {
-        Color32::from_rgb(147, 197, 253)
+    // Quote on a solid blue outgoing bubble: white bar on a translucent white well.
+    let bar_col = if outgoing {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 220)
     } else {
-        pal.primary
+        pal.text_muted
     };
-    let bg_col = if outgoing && pal.is_dark {
-        Color32::from_rgba_unmultiplied(0, 0, 0, 42)
-    } else if outgoing {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 150)
+    let bg_col = if outgoing {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 38)
     } else {
-        text_col.linear_multiply(0.06)
+        text_col.linear_multiply(0.05)
     };
     let inner_col_w = (max_w - 28.0).max(72.0);
     egui::Frame::none()
@@ -1999,7 +2083,9 @@ pub(super) fn render_reactions(
 ) {
     let has_pin = msg.is_pinned;
     let has_star = msg.is_starred;
-    let has_react = !msg.reactions.is_empty();
+    // Reactions are painted as a chip overlapping the bubble edge (`paint_reaction_chip`).
+    let has_react = false;
+    let _ = emoji_textures;
 
     if !has_pin && !has_star && !has_react {
         return;
