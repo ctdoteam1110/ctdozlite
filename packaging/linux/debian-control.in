@@ -1,0 +1,13 @@
+Package: qtzalo
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: libc6 (>= 2.35), libasound2 | libasound2t64, libx11-6, libxcb1, libxkbcommon0, libgl1
+Recommends: ffmpeg, zenity, xclip, wl-clipboard, fonts-noto-core, fonts-noto-cjk
+Maintainer: quangthoai1985 <quangthoai1985@users.noreply.github.com>
+Homepage: https://github.com/quangthoai1985/QTzalo
+Description: Native Zalo desktop client written in Rust (unofficial)
+ QTzalo is a lightweight, unofficial Zalo desktop client built with Rust
+ (eframe/egui + ratatui). Fork of ctdozlite by ctdoteam1110.
+ User data is stored in ~/.local/share/qtzalo.

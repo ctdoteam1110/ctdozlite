@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=QTzalo
+GenericName=Zalo Desktop Client
+Comment=Native Zalo desktop client written in Rust (unofficial)
+Comment[vi]=Ứng dụng Zalo desktop native viết bằng Rust (không chính thức)
+Exec=qtzalo --gui
+Icon=qtzalo
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=zalo;chat;messenger;qtzalo;
+StartupWMClass=zalo-rust
