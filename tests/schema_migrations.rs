@@ -69,7 +69,7 @@ impl Fixture {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO message_tombstones VALUES('thread-1','deleted')",
+            "INSERT INTO message_tombstones(thread_id,msg_id) VALUES('thread-1','deleted')",
             [],
         )
         .unwrap();
@@ -363,4 +363,33 @@ fn supported_version_with_missing_schema_is_rejected_without_repair_writes() {
     assert!(AccountStore::open(&fixture.0, "account-a").is_err());
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(version(&path), CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
+fn version_two_upgrade_preserves_rows_and_unknown_tombstone_provenance() {
+    let fixture=Fixture::new();let path=fixture.seeded();
+    let conn=Connection::open(&path).unwrap();
+    conn.execute_batch("DROP INDEX tombstone_server; ALTER TABLE message_tombstones DROP COLUMN server_id; PRAGMA user_version=2;").unwrap();
+    drop(conn);let mut before=snapshot(&path);
+    for (table,rows) in &mut before { if table == "message_tombstones" { for row in rows {row.push_str("|Null");} } }
+    drop(AccountStore::open(&fixture.0,"account-a").unwrap());
+    assert_eq!(version(&path),3);assert_eq!(snapshot(&path),before);
+    let conn=Connection::open(&path).unwrap();
+    let server:Option<String>=conn.query_row("SELECT server_id FROM message_tombstones WHERE msg_id='deleted'",[],|r|r.get(0)).unwrap();assert!(server.is_none());
+    drop(conn);drop(AccountStore::open(&fixture.0,"account-a").unwrap());assert_eq!(snapshot(&path),before);
+}
+
+#[test]
+fn version_two_upgrade_rolls_back_schema_when_owner_is_missing() {
+    let fixture = Fixture::new();
+    let path = fixture.seeded();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP INDEX tombstone_server; ALTER TABLE message_tombstones DROP COLUMN server_id; DELETE FROM owner; PRAGMA user_version=2;").unwrap();
+    drop(conn);
+    assert!(AccountStore::open(&fixture.0, "account-a").is_err());
+    assert_eq!(version(&path), 2);
+    let conn = Connection::open(&path).unwrap();
+    assert!(conn.prepare("SELECT server_id FROM message_tombstones").is_err());
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0)).unwrap();
+    assert_eq!(count, 1);
 }

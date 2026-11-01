@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Latest forward-only account history schema supported by this build.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 /// Maximum number of history bodies returned in one page.
 pub const HISTORY_PAGE_SIZE: usize = 200;
 /// Exclusive keyset boundary ordered by timestamp and exact message identity.
@@ -262,6 +262,11 @@ impl AccountStore {
                     tx.execute("INSERT INTO owner(account) SELECT ?1 WHERE NOT EXISTS(SELECT 1 FROM owner)", [account])?;
                 }
                 1 => Self::migrate_mentions(&tx, account)?,
+                2 => {
+                    let has_server = tx.prepare("PRAGMA table_info(message_tombstones)")?.query_map([], |row| row.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?.iter().any(|name| name == "server_id");
+                    if !has_server { tx.execute_batch("ALTER TABLE message_tombstones ADD COLUMN server_id TEXT;")?; }
+                    tx.execute_batch("CREATE INDEX IF NOT EXISTS tombstone_server ON message_tombstones(thread_id,server_id) WHERE server_id IS NOT NULL;")?;
+                },
                 _ => unreachable!("schema version was checked above"),
             }
             if version + 1 == CURRENT_SCHEMA_VERSION {
@@ -281,7 +286,7 @@ impl AccountStore {
             "SELECT msg_id,thread_id,sender_id,sender_name,text,msg_type,ts,is_outgoing,raw_json,fingerprint,chat_json,numeric_id,numeric_len,unread_eligible,mention_eligible FROM messages LIMIT 0",
             "SELECT old_id,canonical_id FROM aliases LIMIT 0",
             "SELECT source,report_json FROM migration_manifest LIMIT 0",
-            "SELECT thread_id,msg_id FROM message_tombstones LIMIT 0",
+            "SELECT thread_id,msg_id,server_id FROM message_tombstones LIMIT 0",
             "SELECT rowid,text FROM message_search LIMIT 0",
         ] {
             conn.prepare(query)?;
@@ -329,7 +334,8 @@ impl AccountStore {
         let _mutation = account_mutation(&self.account)?;
         ensure!(!thread_id.is_empty(), "Thread identity required");
         let tx = self.conn.transaction()?;
-        tx.execute("INSERT OR IGNORE INTO message_tombstones(thread_id,msg_id) SELECT thread_id,msg_id FROM messages WHERE thread_id=?1", [thread_id])?;
+        let sql = format!("INSERT INTO message_tombstones(thread_id,msg_id,server_id) SELECT thread_id,msg_id,{} FROM messages WHERE thread_id=?1 ON CONFLICT(thread_id,msg_id) DO UPDATE SET server_id=COALESCE(message_tombstones.server_id,excluded.server_id)", TOMBSTONE_SERVER_SQL);
+        tx.execute(&sql, [thread_id])?;
         tx.execute("DELETE FROM message_search WHERE rowid IN (SELECT rowid FROM messages WHERE thread_id=?1)", [thread_id])?;
         tx.execute("DELETE FROM messages WHERE thread_id=?1", [thread_id])?;
         tx.execute("DELETE FROM thread_unread WHERE thread_id=?1", [thread_id])?;
@@ -628,9 +634,10 @@ impl AccountStore {
             );
             // A local deletion is durable even when history has not loaded this row yet.
             // No cache/network/history replay may clear this exact account-owned identity.
+            let server = self.get_message(&key.thread_id, &key.msg_id)?.as_ref().and_then(verified_server_id);
             self.conn.execute(
-                "INSERT OR IGNORE INTO message_tombstones(thread_id,msg_id) VALUES(?1,?2)",
-                params![key.thread_id, key.msg_id],
+                "INSERT INTO message_tombstones(thread_id,msg_id,server_id) VALUES(?1,?2,?3) ON CONFLICT(thread_id,msg_id) DO UPDATE SET server_id=COALESCE(message_tombstones.server_id,excluded.server_id)",
+                params![key.thread_id, key.msg_id, server],
             )?;
             self.conn.execute("DELETE FROM message_search WHERE rowid IN (SELECT rowid FROM messages WHERE thread_id=?1 AND msg_id=?2)",params![key.thread_id,key.msg_id])?;
             stats.deleted += self.conn.execute(
@@ -810,10 +817,15 @@ impl AccountStore {
         let mut normalized = message.clone();
         let Some(server) = verified_server_id(message) else { return Ok(normalized); };
         let canonical = self.get_message(thread_id, &message.id)?;
-        // A deleted legacy canonical key has no retained wire provenance. Never silently
-        // discard a distinct server packet or guess that it is the deleted identity.
-        ensure!(canonical.is_some() || message.id == server || !self.is_deleted(thread_id, &message.id)?,
-            "Tombstoned canonical alias has no verified server provenance");
+        // Server tombstones survive canonical-key changes and reused client aliases.
+        let deleted_key: Option<String> = self.conn.query_row("SELECT msg_id FROM message_tombstones WHERE thread_id=?1 AND server_id=?2 LIMIT 1", params![thread_id,server], |row|row.get(0)).optional()?;
+        if let Some(key) = deleted_key { normalized.id = key; return Ok(normalized); }
+        if canonical.is_none() && self.is_deleted(thread_id, &message.id)? && message.id != server {
+            let prior_server: Option<String> = self.conn.query_row("SELECT server_id FROM message_tombstones WHERE thread_id=?1 AND msg_id=?2", params![thread_id,message.id], |row|row.get(0))?;
+            ensure!(prior_server.is_some(), "Tombstoned canonical alias has no verified server provenance");
+            normalized.id = server;
+            return Ok(normalized);
+        }
         let conflicting = canonical.as_ref().and_then(verified_server_id).is_some_and(|id| id != server);
         if conflicting {
             ensure!(message.id != server, "Conflicting server identity occupies the canonical key");
@@ -1388,6 +1400,9 @@ fn read_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
         raw_json: r.get(8)?,
     })
 }
+
+// Extract only the typed server identity for bulk thread deletion, without loading bodies.
+const TOMBSTONE_SERVER_SQL: &str = "CASE WHEN json_valid(chat_json) THEN CASE WHEN json_type(chat_json,'$.wire_ref.server_id')='text' AND trim(json_extract(chat_json,'$.wire_ref.server_id'))!='' AND trim(json_extract(chat_json,'$.wire_ref.server_id'),'0')!='' THEN json_extract(chat_json,'$.wire_ref.server_id') WHEN json_type(chat_json,'$.wire_ref.server_id')='integer' AND json_extract(chat_json,'$.wire_ref.server_id')>0 THEN CAST(json_extract(chat_json,'$.wire_ref.server_id') AS TEXT) END END";
 
 fn verified_server_id(message: &ChatMessage) -> Option<String> {
     match message.wire_ref.server_id.as_ref()? {

@@ -55,3 +55,11 @@ bảng hẹn giờ hoặc phiên đăng nhập. Đăng xuất giữ nguyên lị
   thử lại và flush khi chuyển phiên hoặc đóng ứng dụng thuộc bước A4 tiếp theo.
 - Các test consumer chứng minh luồng worker thực tế với dữ liệu disposable, không
   thay cho nghiệm thu thao tác GUI với tài khoản thật.
+
+### Dấu xóa có định danh máy chủ
+
+Schema 3 giữ thêm định danh máy chủ đã xác minh trong dấu xóa. Tin mới dùng lại
+client ID vẫn được giữ nếu máy chủ cấp ID khác; bản cũ bị xóa không xuất hiện lại
+khi đổi khóa canonical. Dấu xóa schema 2 thiếu nguồn định danh được giữ nguyên và
+báo lỗi mơ hồ thay vì đoán. Nâng cấp không xóa hàng hay sửa kho legacy.
+Xem [ADR-0005](adr/0005-server-aware-deletion-tombstones.md).

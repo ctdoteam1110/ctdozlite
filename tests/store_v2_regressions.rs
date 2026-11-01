@@ -1411,7 +1411,8 @@ fn verified_distinct_server_ids_survive_a_reused_client_canonical_key_and_restar
 #[test]
 fn tombstoned_canonical_alias_rejects_unproven_server_reuse_instead_of_silent_loss() {
     use zalo_rust::message_model::WireMessageRef;
-    let mut store = AccountStore::in_memory("deleted-alias").unwrap();
+    let root = temp("deleted-alias");
+    let mut store = AccountStore::open(&root,"deleted-alias").unwrap();
     let mut row = ChatMessage {
         id: "777".into(),
         client_message_id: "777".into(),
@@ -1426,9 +1427,32 @@ fn tombstoned_canonical_alias_rejects_unproven_server_reuse_instead_of_silent_lo
         deleted_messages: &[MessageKey { thread_id: "same".into(), msg_id: "777".into() }],
         ..Default::default()
     }).unwrap();
+    rusqlite::Connection::open(store.path.as_ref().unwrap()).unwrap().execute("UPDATE message_tombstones SET server_id=NULL", []).unwrap();
     row.wire_ref = WireMessageRef::from_raw(&serde_json::json!({"cliMsgId":"777","globalMsgId":"222"}));
     t.messages = vec![row];
     assert!(store.persist_threads(&[t]).is_err(), "A lost canonical/server provenance must produce an explicit error");
     assert!(store.get_message("same", "777").unwrap().is_none());
     assert!(store.navigation_page("same", "111").unwrap().is_none());
+    drop(store); std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn verified_tombstones_preserve_fresh_server_reuse_and_block_old_replays_after_reopen() {
+    use zalo_rust::message_model::WireMessageRef;
+    for whole_thread in [false,true] {
+        let root=temp("verified-tombstone");
+        let mut store=AccountStore::open(&root,"owner").unwrap();
+        let mut old=ChatMessage{id:"777".into(),client_message_id:"777".into(),text:"Old body".into(),wire_ref:WireMessageRef::from_raw(&serde_json::json!({"cliMsgId":"777","globalMsgId":"111"})),..Default::default()};
+        let mut t=thread("same");t.messages=vec![old.clone()];store.persist_threads(&[t.clone()]).unwrap();
+        if whole_thread { store.delete_thread_history("same").unwrap(); }
+        else {store.apply_delta(StoreDelta{deleted_messages:&[MessageKey{thread_id:"same".into(),msg_id:"777".into()}],..Default::default()}).unwrap();}
+        let mut fresh=old.clone();fresh.text="Fresh body".into();fresh.wire_ref=WireMessageRef::from_raw(&serde_json::json!({"cliMsgId":"777","globalMsgId":"222"}));
+        t.messages=vec![fresh];store.persist_threads(&[t.clone()]).unwrap();drop(store);
+        let mut store=AccountStore::open(&root,"owner").unwrap();
+        for id in ["777","111"] { old.id=id.into();t.messages=vec![old.clone()];store.persist_threads(&[t.clone()]).unwrap(); }
+        let page=store.history_page("same",None,PageDirection::Before).unwrap();assert_eq!(page.messages.len(),1);assert_eq!(page.messages[0].text,"Fresh body");
+        assert!(store.navigation_page("same","111").unwrap().is_none());
+        for id in ["222","777"] {assert_eq!(store.navigation_page("same",id).unwrap().unwrap().0,"222");}
+        drop(store);std::fs::remove_dir_all(root).unwrap();
+    }
 }
