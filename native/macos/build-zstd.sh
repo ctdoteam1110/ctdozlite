@@ -22,5 +22,5 @@ fi
 make -C "$SOURCE/lib" -j "$(sysctl -n hw.ncpu)" libzstd.a \
     CC="$(xcrun -f clang) -arch $ARCH -mmacosx-version-min=11.0 -isysroot $(xcrun --sdk macosx --show-sdk-path)" \
     AR="$(xcrun -f ar)" CFLAGS='-O2 -fPIC' ZSTD_LEGACY_SUPPORT=0 ZSTD_MULTITHREAD=0 >&2
-lipo -verify_arch "$ARCH" "$SOURCE/lib/libzstd.a"
+lipo "$SOURCE/lib/libzstd.a" -verify_arch "$ARCH"
 printf '%s\n' "$SOURCE/lib/libzstd.a"
