@@ -2117,6 +2117,24 @@ pub(super) fn render_quote_block(
 }
 
 
+// A known empty snapshot/ledger is a clear, not a reason to resurrect legacy icons.
+fn reaction_badges(msg: &ChatMessage) -> Vec<(String, String)> {
+    let summaries = if !msg.reaction_summaries.is_empty() {
+        msg.reaction_summaries.clone()
+    } else if msg.reaction_snapshot || msg.reaction_authoritative_snapshot || !msg.reaction_versions.is_empty() {
+        Vec::new()
+    } else {
+        crate::reactions::parse_reactions(&serde_json::json!({"reactions": msg.reactions}))
+    };
+    summaries.into_iter().filter(|summary| summary.count > 0).map(|summary| {
+        let emoji = if summary.emoji.is_empty() {
+            summary.r_type.map(crate::reactions::emoji_for_type).unwrap_or("◦").to_owned()
+        } else { summary.emoji };
+        let count = if summary.count_is_lower_bound { format!("≥{}",summary.count) } else { summary.count.to_string() };
+        (emoji,count)
+    }).collect()
+}
+
 pub(super) fn render_reactions(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
@@ -2125,7 +2143,8 @@ pub(super) fn render_reactions(
 ) {
     let has_pin = msg.is_pinned;
     let has_star = msg.is_starred;
-    let has_react = !msg.reactions.is_empty();
+    let badges = reaction_badges(msg);
+    let has_react = !badges.is_empty();
 
     if !has_pin && !has_star && !has_react {
         return;
@@ -2176,13 +2195,14 @@ pub(super) fn render_reactions(
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
-                        for r in &msg.reactions {
+                        for (r, count) in &badges {
                             let key = emoji_to_tex_key(r);
                             if let Some(tex) = emoji_textures.get(key) {
                                 ui.add(egui::Image::new(tex).fit_to_exact_size(Vec2::splat(18.0)));
                             } else {
                                 ui.label(RichText::new(r).size(13.0));
                             }
+                            ui.label(RichText::new(count).size(12.0).color(pal.text_primary));
                         }
                     });
                 });
@@ -2420,5 +2440,33 @@ mod inline_mention_tests {
                 matches!(action, Some(BubbleAction::OpenMention {user_id, ..}) if user_id == "22")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reaction_badge_tests {
+    use super::*;
+    #[test]
+    fn aggregate_counts_and_lower_bounds_reach_rendered_text() {
+        let msg=ChatMessage { reaction_summaries:vec![
+            crate::reactions::ReactionSummary { emoji:"❤️".into(),count:12,count_is_lower_bound:true,..Default::default() },
+            crate::reactions::ReactionSummary { emoji:"👍".into(),count:2,..Default::default() },
+            crate::reactions::ReactionSummary { emoji:"😢".into(),count:0,..Default::default() },
+        ],..Default::default() };
+        assert_eq!(reaction_badges(&msg),vec![("❤️".into(),"≥12".into()),("👍".into(),"2".into())]);
+        let ctx=egui::Context::default();
+        let output=ctx.run(egui::RawInput::default(),|ctx| { egui::CentralPanel::default().show(ctx,|ui| { render_reactions(ui,&msg,&ThemePalette::light(),&HashMap::new()); }); });
+        fn text(shape:&egui::epaint::Shape,out:&mut Vec<String>) {
+            match shape { egui::epaint::Shape::Text(t)=>out.push(t.galley.job.text.clone()),egui::epaint::Shape::Vec(v)=>for s in v { text(s,out); },_=>{} }
+        }
+        let mut labels=Vec::new(); for shape in output.shapes { text(&shape.shape,&mut labels); }
+        assert!(labels.iter().any(|s|s=="≥12")); assert!(labels.iter().any(|s|s=="2"));
+    }
+    #[test]
+    fn known_clear_never_falls_back_to_stale_legacy_icons() {
+        let mut msg=ChatMessage { reactions:vec!["❤️".into()],..Default::default() };
+        assert_eq!(reaction_badges(&msg).len(),1);
+        msg.reaction_authoritative_snapshot=true;
+        assert!(reaction_badges(&msg).is_empty());
     }
 }

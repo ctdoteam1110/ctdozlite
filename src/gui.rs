@@ -454,7 +454,15 @@ impl GuiTx {
 fn apply_import_delta(current: &mut Vec<Thread>, delta: Vec<Thread>) {
     for imported in delta {
         if let Some(existing) = current.iter_mut().find(|thread| thread.id == imported.id) {
-            crate::chat::merge_thread_into(existing, imported, false);
+            if crate::chat::is_generic_thread_name(&existing.name)
+                && !crate::chat::is_generic_thread_name(&imported.name)
+            {
+                existing.name = imported.name.clone();
+            }
+            if existing.avatar.is_none() {
+                existing.avatar = imported.avatar.clone();
+            }
+            crate::chat::merge_cached_messages(existing, imported.messages);
         } else { current.push(imported); }
     }
 }
@@ -2462,6 +2470,36 @@ mod tests {
 #[cfg(test)]
 mod media_delivery_revision_tests {
     use super::*;
+    #[test]
+    fn imported_old_row_never_rewinds_live_clock_or_recall_content() {
+        let live = ChatMessage {
+            id: "message-a".into(), text: "Live content".into(),
+            ts: 2000, time: "live-time".into(),
+            kind: crate::message_model::MessageKind::Text,
+            ..Default::default()
+        };
+        let old = ChatMessage {
+            id: "message-a".into(), text: "[Tin nhắn đã thu hồi]".into(),
+            ts: 1000, kind: crate::message_model::MessageKind::Recall,
+            ..Default::default()
+        };
+        let mut current = vec![Thread { id:"thread-a".into(), name:"Live name".into(), messages:vec![live], ..Default::default() }];
+        apply_import_delta(&mut current, vec![Thread { id:"thread-a".into(), name:"Old name".into(), messages:vec![old], ..Default::default() }]);
+        assert_eq!(current[0].name,"Live name");
+        let m=&current[0].messages[0];
+        assert_eq!((m.ts,m.time.as_str(),m.text.as_str()),(2000,"live-time","Live content"));
+        assert_eq!(m.kind,crate::message_model::MessageKind::Text);
+        let mut recalled = current[0].clone();
+        recalled.messages[0].kind=crate::message_model::MessageKind::Recall;
+        recalled.messages[0].text="[Tin nhắn đã thu hồi]".into();
+        let mut stale=current[0].clone();
+        stale.messages[0].link_url=Some("https://fixture.invalid/old-photo".into());
+        let mut current=vec![recalled];
+        apply_import_delta(&mut current,vec![stale]);
+        assert!(current[0].messages[0].link_url.is_none());
+        assert_eq!(current[0].messages[0].kind,crate::message_model::MessageKind::Recall);
+    }
+
     #[test]
     fn first_live_message_in_unknown_thread_notifies_once_but_snapshots_do_not() {
         let updates = vec![Thread { id: "new-thread".into(), messages: vec![ChatMessage { id: "message-1".into(), ..Default::default() }], ..Default::default() }];
