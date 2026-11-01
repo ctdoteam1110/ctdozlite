@@ -1,0 +1,161 @@
+name: PR Quality & Security Guard (Free Bot)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  pr-check:
+    name: Code & Security Guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run PR Verification Checks
+        id: check
+        shell: bash
+        run: |
+          set +e
+
+          # 1. Check for sensitive files (session.json, *.db, *.log, dump files, private keys)
+          echo "Checking for leaked sensitive files..."
+          LEAKED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '^(session\.json|.*\.db|.*\.log|dump/|.*\.pem|.*\.key|re-notes/voicecall_capture\.log|app_settings\.json)$' || true)
+          if [ -n "$LEAKED_FILES" ]; then
+            LEAK_STATUS="FAIL"
+            LEAK_MSG="Phát hiện file nhạy cảm trong commit diff:\n\`\`\`\n$LEAKED_FILES\n\`\`\`\n-> **Yêu cầu loại bỏ file nhạy cảm khỏi git history trước khi merge!**"
+          else
+            LEAK_STATUS="PASS"
+            LEAK_MSG="Không phát hiện file nhạy cảm hoặc credentials rò rỉ."
+          fi
+
+          # 2. Check PR Title format according to Conventional Commits
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          echo "Checking PR Title: $PR_TITLE"
+          if echo "$PR_TITLE" | grep -Eq '^(feat|fix|refactor|perf|test|docs|chore|ci|style)(\([a-z0-9_-]+\))?: .+'; then
+            TITLE_STATUS="PASS"
+            TITLE_MSG="Tiêu đề chuẩn Conventional Commits (\`$PR_TITLE\`)."
+          else
+            TITLE_STATUS="WARN"
+            TITLE_MSG="Tiêu đề chưa đúng chuẩn Conventional Commits (ví dụ: \`feat(ui): thêm nút...\` hoặc \`fix(chat): sửa lỗi...\`)."
+          fi
+
+          # 3. Check PR Description length
+          BODY="${{ github.event.pull_request.body }}"
+          BODY_LEN=${#BODY}
+          if [ $BODY_LEN -gt 40 ]; then
+            BODY_STATUS="PASS"
+            BODY_MSG="Mô tả PR đầy đủ thông tin ($BODY_LEN ký tự)."
+          else
+            BODY_STATUS="WARN"
+            BODY_MSG="Mô tả PR khá ngắn. Vui lòng bổ sung mục tiêu (\`## What\`) và lý do (\`## Why\`)."
+          fi
+
+          # 4. Check Rust Code Formatting (if Rust files touched)
+          RUST_TOUCHED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '\.rs$' || true)
+          if [ -n "$RUST_TOUCHED" ]; then
+            echo "Rust files changed. Checking cargo fmt..."
+            rustup component add rustfmt
+            if cargo fmt --all -- --check > /dev/null 2>&1; then
+              FMT_STATUS="PASS"
+              FMT_MSG="Định dạng mã nguồn Rust hoàn toàn chuẩn (\`cargo fmt\`)."
+            else
+              FMT_STATUS="WARN"
+              FMT_MSG="Có file Rust chưa chuẩn định dạng. Contributor hãy chạy \`cargo fmt\` tại local."
+            fi
+          else
+            FMT_STATUS="SKIP"
+            FMT_MSG="Không có file Rust nào thay đổi."
+          fi
+
+          # Export outputs
+          echo "leak_status=$LEAK_STATUS" >> $GITHUB_OUTPUT
+          echo "leak_msg<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$LEAK_MSG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "title_status=$TITLE_STATUS" >> $GITHUB_OUTPUT
+          echo "title_msg<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$TITLE_MSG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "body_status=$BODY_STATUS" >> $GITHUB_OUTPUT
+          echo "body_msg<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$BODY_MSG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "fmt_status=$FMT_STATUS" >> $GITHUB_OUTPUT
+          echo "fmt_msg<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$FMT_MSG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          if [ "$LEAK_STATUS" = "FAIL" ]; then
+            exit 1
+          fi
+
+      - name: Post Review Summary Comment to PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const leakStatus = "${{ steps.check.outputs.leak_status }}";
+            const leakMsg = `${{ steps.check.outputs.leak_msg }}`;
+            const titleStatus = "${{ steps.check.outputs.title_status }}";
+            const titleMsg = `${{ steps.check.outputs.title_msg }}`;
+            const bodyStatus = "${{ steps.check.outputs.body_status }}";
+            const bodyMsg = `${{ steps.check.outputs.body_msg }}`;
+            const fmtStatus = "${{ steps.check.outputs.fmt_status }}";
+            const fmtMsg = `${{ steps.check.outputs.fmt_msg }}`;
+
+            function icon(status) {
+              if (status === 'PASS') return '✅ **ĐẠT**';
+              if (status === 'WARN') return '⚠️ **LƯU Ý**';
+              if (status === 'FAIL') return '❌ **KHÔNG ĐẠT**';
+              return '➖ **BỎ QUA**';
+            }
+
+            const commentBody = `### 🤖 ctdozlite PR Check Bot (Miễn phí 100%)
+
+Chào bạn! Bot tự động đã phân tích Pull Request của bạn theo quy chuẩn của dự án:
+
+| Hạng mục kiểm tra | Trạng thái | Chi tiết |
+| :--- | :---: | :--- |
+| **Bảo mật & Tránh rò rỉ dữ liệu** | ${icon(leakStatus)} | ${leakMsg.replace(/\n/g, '<br>')} |
+| **Chuẩn tiêu đề (Conventional Commits)** | ${icon(titleStatus)} | ${titleMsg} |
+| **Mô tả Pull Request** | ${icon(bodyStatus)} | ${bodyMsg} |
+| **Định dạng mã nguồn Rust (\`cargo fmt\`)** | ${icon(fmtStatus)} | ${fmtMsg} |
+
+---
+*Ghi chú: Nếu có cảnh báo ⚠️ hoặc lỗi ❌, bạn chỉ cần sửa ở branch của mình và \`git push\` lại, bot sẽ tự động cập nhật!*`;
+
+            // Find existing bot comment to update instead of spamming new comments
+            const botTag = '### 🤖 ctdozlite PR Check Bot';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existingComment = comments.find(c => c.body && c.body.includes(botTag));
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody
+              });
+            }
