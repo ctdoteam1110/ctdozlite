@@ -574,12 +574,33 @@ impl ZaloGuiApp {
             if env("QTZALO_DEMO_DRAWER").as_deref() == Some("open") {
                 app.info_drawer_open = true;
             }
+            // `QTZALO_DEMO_SETTINGS=<tab>` opens Settings on that tab (`data`/`sync` shows the
+            // storage section); `QTZALO_DEMO_CONFIRM_CLEAR=1` also opens the clear-cache dialog.
+            if let Some(tab) = env("QTZALO_DEMO_SETTINGS") {
+                app.settings_modal_open = true;
+                app.settings_tab = match tab.to_ascii_lowercase().as_str() {
+                    "privacy" => SettingsTab::Privacy,
+                    "sync" | "data" | "storage" => SettingsTab::Sync,
+                    "appearance" => SettingsTab::Appearance,
+                    "notifications" => SettingsTab::Notifications,
+                    "messages" => SettingsTab::Messages,
+                    "utilities" => SettingsTab::Utilities,
+                    _ => SettingsTab::General,
+                };
+                app.confirm_clear_cache = env("QTZALO_DEMO_CONFIRM_CLEAR").as_deref() == Some("1");
+            }
             // Deliberately NOT spawning the session worker: WORKER_TX stays unset, so every
             // `WORKER_TX.get()` send is a no-op and no network request can leave the process.
             drop(session);
             let _ = initial_threads;
             return app;
         }
+
+        // Sweep clipboard-paste temp images left over from earlier runs (never in demo mode,
+        // which returned above and must not touch real data).
+        std::thread::spawn(|| {
+            crate::paths::cleanup_old_clipboard_images(std::time::Duration::from_secs(24 * 3600));
+        });
 
         let is_logged_in = session.login.is_some();
         let (user_name, user_uin, user_avatar) = session
