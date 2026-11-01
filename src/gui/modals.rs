@@ -12,6 +12,7 @@ impl ZaloGuiApp {
 
         let mut close_menu = false;
         let mut do_logout = false;
+        let mut do_wipe = false;
         let area_resp = egui::Area::new(Id::new("left_rail_profile_popover"))
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(68.0, 44.0))
@@ -130,6 +131,31 @@ impl ZaloGuiApp {
                             .add_sized(
                                 [200.0, 30.0],
                                 egui::Button::new(
+                                    RichText::new("Xoá dữ liệu tin nhắn cục bộ")
+                                        .size(12.0)
+                                        .color(pal.text_secondary),
+                                )
+                                .fill(pal.bg_input)
+                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .rounding(Rounding::same(7.0)),
+                            )
+                            .on_hover_text(
+                                "Xoá zalo_history.db và threads_cache.json. Phiên đăng nhập giữ nguyên.",
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            do_wipe = true;
+                            close_menu = true;
+                        }
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        if ui
+                            .add_sized(
+                                [200.0, 30.0],
+                                egui::Button::new(
                                     RichText::new("Đăng xuất tài khoản")
                                         .size(12.5)
                                         .color(pal.danger)
@@ -189,12 +215,16 @@ impl ZaloGuiApp {
             self.login_status_msg.clear();
             self.qr_status = "Đang xin mã QR mới…".into();
             self.status_msg = "Đã đăng xuất".into();
-            let _ = std::fs::remove_file("session.json");
-            let _ = std::fs::remove_file("threads_cache.json");
+            // `WorkerCmd::Logout` owns the file side: it removes `session.json` and
+            // `threads_cache.json` but keeps `zalo_history.db` (#21).
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::Logout);
                 let _ = tx.send(WorkerCmd::RequestQr);
             }
+        }
+        if do_wipe {
+            // Destructive and irreversible, so it asks first.
+            self.wipe_confirm_open = true;
         }
         if close_menu {
             self.profile_menu_open = false;
@@ -2190,6 +2220,77 @@ impl ZaloGuiApp {
             }
         } else if self.active_call.is_some() {
             self.active_call = Some(call);
+        }
+    }
+
+    pub(super) fn render_wipe_confirm(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        if !self.wipe_confirm_open {
+            return;
+        }
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Xoá dữ liệu tin nhắn cục bộ")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .fixed_size(Vec2::new(380.0, 150.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Xoá zalo_history.db và threads_cache.json trên máy này. \
+                         Không thể hoàn tác, và tin nhắn cũ chỉ tải lại được từ đám mây Zalo.",
+                    )
+                    .size(12.5)
+                    .color(pal.text_secondary),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Phiên đăng nhập trong session.json giữ nguyên.")
+                        .size(12.0)
+                        .color(pal.text_muted),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(
+                            [140.0, 30.0],
+                            egui::Button::new(
+                                RichText::new("Xoá dữ liệu").size(12.5).color(pal.danger).strong(),
+                            )
+                            .fill(pal.danger.linear_multiply(0.12))
+                            .rounding(Rounding::same(7.0)),
+                        )
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                    if ui
+                        .add_sized(
+                            [100.0, 30.0],
+                            egui::Button::new(
+                                RichText::new("Huỷ").size(12.5).color(pal.text_secondary),
+                            )
+                            .fill(pal.bg_input)
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .rounding(Rounding::same(7.0)),
+                        )
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            self.wipe_confirm_open = false;
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::WipeLocalData);
+            }
+        } else if cancel || !open {
+            self.wipe_confirm_open = false;
         }
     }
 

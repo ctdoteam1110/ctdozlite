@@ -67,9 +67,9 @@ impl FilterTab {
 
     fn label(self) -> &'static str {
         match self {
-            Self::All => "Tat ca",
-            Self::Direct => "Ca nhan",
-            Self::Group => "Nhom",
+            Self::All => "Tất cả",
+            Self::Direct => "Cá nhân",
+            Self::Group => "Nhóm",
         }
     }
 }
@@ -96,6 +96,9 @@ struct PromptState {
 enum ConfirmKind {
     Logout,
     DeleteMessage,
+    /// Drop local message history (`zalo_history.db` + `threads_cache.json`) while
+    /// keeping the session (#21).
+    WipeLocalData,
 }
 
 struct ConfirmAction {
@@ -203,7 +206,7 @@ impl<'a> TuiApp<'a> {
             selected_thread: 0,
             input_text: String::new(),
             focus: Focus::Threads,
-            status: "San sang".into(),
+            status: "Sẵn sàng".into(),
             should_quit: false,
             store,
             poll_state: chat::PollState::default(),
@@ -348,7 +351,7 @@ impl<'a> TuiApp<'a> {
     fn cycle_filter(&mut self) {
         self.filter = self.filter.next();
         self.rebuild_filter();
-        self.status = format!("Loc: {}", self.filter.label());
+        self.status = format!("Lọc: {}", self.filter.label());
     }
 
     fn cycle_focus(&mut self) {
@@ -376,7 +379,7 @@ impl<'a> TuiApp<'a> {
     fn escape(&mut self) {
         if self.reply_target.is_some() {
             self.reply_target = None;
-            self.status = "Da huy tra loi".into();
+            self.status = "Đã huỷ trả lời".into();
             return;
         }
         self.focus = match self.focus {
@@ -516,7 +519,7 @@ impl<'a> TuiApp<'a> {
     }
 
     fn spawn_refresh(&mut self) {
-        self.status = "Dang lam moi...".into();
+        self.status = "Đang làm mới...".into();
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
@@ -536,7 +539,17 @@ impl<'a> TuiApp<'a> {
                 }
                 Err(e) => {
                     logger::log_error("tui::refresh::get_friends", &e.to_string());
-                    let _ = tx.send(BgEvent::ActionFailed(format!("Loi lam moi: {e}")));
+                    if crate::session::SessionStatus::from_error(&e)
+                        == crate::session::SessionStatus::Expired
+                    {
+                        // Credentials are still on disk: re-login replaces them (#21).
+                        let _ = tx.send(BgEvent::ActionFailed(
+                            "Phiên đã hết hạn (máy chủ từ chối zpw_sek). Bấm 'x' để đăng xuất rồi đăng nhập lại."
+                                .into(),
+                        ));
+                    } else {
+                        let _ = tx.send(BgEvent::ActionFailed(format!("Lỗi làm mới: {e}")));
+                    }
                 }
             }
         });
@@ -547,11 +560,11 @@ impl<'a> TuiApp<'a> {
             return;
         };
         if !t.is_group {
-            self.status = "Chi ap dung cho nhom chat".into();
+            self.status = "Chỉ áp dụng cho nhóm chat".into();
             return;
         }
         let group_id = t.id.clone();
-        self.status = "Dang tai lich su nhom...".into();
+        self.status = "Đang tải lịch sử nhóm...".into();
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
         let gid = group_id.clone();
@@ -565,7 +578,7 @@ impl<'a> TuiApp<'a> {
                 }
                 Err(e) => {
                     logger::log_error("tui::get_group_history", &e.to_string());
-                    let _ = tx.send(BgEvent::ActionFailed(format!("Loi tai lich su nhom: {e}")));
+                    let _ = tx.send(BgEvent::ActionFailed(format!("Lỗi tải lịch sử nhóm: {e}")));
                 }
             }
         });
@@ -587,7 +600,7 @@ impl<'a> TuiApp<'a> {
                 }
                 Err(e) => {
                     logger::log_error("tui::fetch_sticker_store_packs", &e.to_string());
-                    let _ = tx.send(BgEvent::ActionFailed(format!("Loi tai kho nhan dan: {e}")));
+                    let _ = tx.send(BgEvent::ActionFailed(format!("Lỗi tải kho nhãn dán: {e}")));
                 }
             }
         });
@@ -627,7 +640,7 @@ impl<'a> TuiApp<'a> {
                     }
                     Err(e) => {
                         logger::log_error("tui::fetch_sticker_pack_items", &e.to_string());
-                        let _ = tx.send(BgEvent::ActionFailed(format!("Loi tai bo nhan dan: {e}")));
+                        let _ = tx.send(BgEvent::ActionFailed(format!("Lỗi tải bộ nhãn dán: {e}")));
                     }
                 }
             });
@@ -670,7 +683,7 @@ impl<'a> TuiApp<'a> {
         let ts = unix_now_ms();
         let msg = ChatMessage {
             id: format!("local_{ts}"),
-            sender: "Toi".into(),
+            sender: "Tôi".into(),
             text: String::new(),
             time: now.clone(),
             is_outgoing: true,
@@ -682,7 +695,7 @@ impl<'a> TuiApp<'a> {
         };
         if let Some(t) = self.threads.get_mut(self.selected_thread) {
             t.messages.push(msg);
-            t.preview = "[Nhan dan]".into();
+            t.preview = "[Nhãn dán]".into();
             t.time = now;
         }
         self.selected_msg = None;
@@ -708,16 +721,16 @@ impl<'a> TuiApp<'a> {
                 }
                 Err(e) => {
                     logger::log_error("tui::send_sticker", &e.to_string());
-                    let _ = tx.send(BgEvent::ActionFailed(format!("Loi gui nhan dan: {e}")));
+                    let _ = tx.send(BgEvent::ActionFailed(format!("Lỗi gửi nhãn dán: {e}")));
                 }
             }
         });
-        self.status = "Da gui nhan dan".into();
+        self.status = "Đã gửi nhãn dán".into();
     }
 
     fn send_attachment(&mut self, path: PathBuf) {
         if !path.is_file() {
-            self.status = format!("Khong tim thay tep: {}", path.display());
+            self.status = format!("Không tìm thấy tệp: {}", path.display());
             return;
         }
         let Some(t) = self.threads.get(self.selected_thread) else {
@@ -727,7 +740,7 @@ impl<'a> TuiApp<'a> {
         let is_group = t.is_group;
         let caption = self.input_text.trim().to_string();
         self.input_text.clear();
-        self.status = format!("Dang gui tep {}...", path.display());
+        self.status = format!("Đang gửi tệp {}...", path.display());
 
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
@@ -741,7 +754,7 @@ impl<'a> TuiApp<'a> {
                 }
                 Err(e) => {
                     logger::log_error("tui::send_attachment", &e.to_string());
-                    let _ = tx.send(BgEvent::ActionFailed(format!("Loi gui tep: {e}")));
+                    let _ = tx.send(BgEvent::ActionFailed(format!("Lỗi gửi tệp: {e}")));
                 }
             }
         });
@@ -752,7 +765,7 @@ impl<'a> TuiApp<'a> {
             PromptKind::Attachment => {
                 let trimmed = text.trim().to_string();
                 if trimmed.is_empty() {
-                    self.status = "Chua nhap duong dan tep".into();
+                    self.status = "Chưa nhập đường dẫn tệp".into();
                     return;
                 }
                 self.send_attachment(PathBuf::from(trimmed));
@@ -766,7 +779,7 @@ impl<'a> TuiApp<'a> {
             return;
         }
         let Some(t) = self.threads.get(self.selected_thread) else {
-            self.status = "Chua chon hoi thoai".into();
+            self.status = "Chưa chọn hội thoại".into();
             return;
         };
         let to_id = t.id.clone();
@@ -778,7 +791,7 @@ impl<'a> TuiApp<'a> {
         let ts = unix_now_ms();
         let msg = ChatMessage {
             id: format!("local_{ts}"),
-            sender: "Toi".into(),
+            sender: "Tôi".into(),
             text: text.clone(),
             time: now.clone(),
             is_outgoing: true,
@@ -829,7 +842,7 @@ impl<'a> TuiApp<'a> {
                 }
             }
         });
-        self.status = "Dang gui tin nhan...".into();
+        self.status = "Đang gửi tin nhắn...".into();
     }
 
     fn react_quick(&mut self, key: char) {
@@ -875,11 +888,11 @@ impl<'a> TuiApp<'a> {
                 }
                 Err(e) => {
                     logger::log_error("tui::send_reaction", &e.to_string());
-                    let _ = tx.send(BgEvent::ActionFailed(format!("Loi tha cam xuc: {e}")));
+                    let _ = tx.send(BgEvent::ActionFailed(format!("Lỗi thả cảm xúc: {e}")));
                 }
             }
         });
-        self.status = format!("Da tha cam xuc {emoji}");
+        self.status = format!("Đã thả cảm xúc {emoji}");
     }
 
     fn quote_selected(&mut self) {
@@ -894,7 +907,7 @@ impl<'a> TuiApp<'a> {
         };
         self.reply_target = Some(m.clone());
         self.focus = Focus::Input;
-        self.status = "Dang tra loi tin nhan (Ctrl+X de huy)".into();
+        self.status = "Đang trả lời tin nhắn (Ctrl+X để huỷ)".into();
     }
 
     fn confirm_delete_selected(&mut self) {
@@ -908,12 +921,12 @@ impl<'a> TuiApp<'a> {
             return;
         };
         if m.id.is_empty() || m.id.starts_with("local_") {
-            self.status = "Tin nhan chua dong bo, chua the xoa tren server".into();
+            self.status = "Tin nhắn chưa đồng bộ, chưa thể xoá trên server".into();
             return;
         }
         let preview = m.text.chars().take(60).collect::<String>();
         self.confirm = Some(ConfirmAction {
-            question: "Xoa tin nhan nay (chi phia ban)?".into(),
+            question: "Xoá tin nhắn này (chỉ phía bạn)?".into(),
             detail: preview,
             kind: ConfirmKind::DeleteMessage,
             thread_id: t.id.clone(),
@@ -933,9 +946,9 @@ impl<'a> TuiApp<'a> {
         match url {
             Some(u) if !u.is_empty() => {
                 open_external_url(&u);
-                self.status = format!("Mo lien ket: {u}");
+                self.status = format!("Mở liên kết: {u}");
             }
-            _ => self.status = "Tin nhan khong co lien ket".into(),
+            _ => self.status = "Tin nhắn không có liên kết".into(),
         }
     }
 
@@ -951,7 +964,16 @@ impl<'a> TuiApp<'a> {
                 self.unread.clear();
                 self.selected_thread = 0;
                 self.selected_msg = None;
-                self.status = "Da dang xuat. Bam 'q' de thoat.".into();
+                self.status = "Đã đăng xuất. Bấm 'q' để thoát.".into();
+            }
+            ConfirmKind::WipeLocalData => {
+                // History only: the session and the thread list stay usable (#21).
+                let _ = std::fs::remove_file("zalo_history.db");
+                let _ = std::fs::remove_file("threads_cache.json");
+                for t in self.threads.iter_mut() {
+                    t.messages.clear();
+                }
+                self.status = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên).".into();
             }
             ConfirmKind::DeleteMessage => {
                 let thread_id = action.thread_id;
@@ -972,11 +994,11 @@ impl<'a> TuiApp<'a> {
                         }
                         Err(e) => {
                             logger::log_error("tui::delete_message_for_me", &e.to_string());
-                            let _ = tx.send(BgEvent::ActionFailed(format!("Loi xoa tin nhan: {e}")));
+                            let _ = tx.send(BgEvent::ActionFailed(format!("Lỗi xoá tin nhắn: {e}")));
                         }
                     }
                 });
-                self.status = "Dang xoa tin nhan...".into();
+                self.status = "Đang xoá tin nhắn...".into();
             }
         }
     }
@@ -995,7 +1017,7 @@ impl<'a> TuiApp<'a> {
                 KeyCode::Char('x') => {
                     if self.reply_target.is_some() {
                         self.reply_target = None;
-                        self.status = "Da huy tra loi".into();
+                        self.status = "Đã huỷ trả lời".into();
                     }
                     return;
                 }
@@ -1006,7 +1028,7 @@ impl<'a> TuiApp<'a> {
         if let Some(action) = self.confirm.take() {
             match code {
                 KeyCode::Char('y') | KeyCode::Enter => self.run_confirm(action),
-                KeyCode::Char('n') | KeyCode::Esc => self.status = "Da huy thao tac".into(),
+                KeyCode::Char('n') | KeyCode::Esc => self.status = "Đã huỷ thao tác".into(),
                 _ => self.confirm = Some(action),
             }
             return;
@@ -1015,7 +1037,7 @@ impl<'a> TuiApp<'a> {
         if let Some(mut prompt) = self.prompt.take() {
             match code {
                 KeyCode::Esc => {
-                    self.status = "Da huy nhap".into();
+                    self.status = "Đã huỷ nhập".into();
                 }
                 KeyCode::Enter => {
                     let text = prompt.text.clone();
@@ -1116,7 +1138,7 @@ impl<'a> TuiApp<'a> {
             }
             KeyCode::Char('/') if self.focus != Focus::Input => {
                 self.search_mode = true;
-                self.status = "Tim kiem: go tu khoa, Enter de xong, Esc de xoa".into();
+                self.status = "Tìm kiếm: gõ từ khoá, Enter để xong, Esc để xoá".into();
                 return;
             }
             KeyCode::Char('f') if self.focus != Focus::Input => {
@@ -1125,7 +1147,7 @@ impl<'a> TuiApp<'a> {
             }
             KeyCode::Char('u') if self.focus != Focus::Input => {
                 self.unread.clear();
-                self.status = "Da xoa thong bao chua doc".into();
+                self.status = "Đã xoá thông báo chưa đọc".into();
                 return;
             }
             KeyCode::Char('r') if self.focus != Focus::Input => {
@@ -1141,14 +1163,25 @@ impl<'a> TuiApp<'a> {
                     self.overlay = Overlay::Log;
                     self.log_scroll = 0;
                 } else {
-                    self.status = "Nhat ky chi co trong che do --dev".into();
+                    self.status = "Nhật ký chỉ có trong chế độ --dev".into();
                 }
+                return;
+            }
+            KeyCode::Char('w') if self.focus != Focus::Input => {
+                self.confirm = Some(ConfirmAction {
+                    question:
+                        "Xoá lịch sử tin nhắn cục bộ (zalo_history.db, threads_cache.json)?".into(),
+                    detail: "Session đăng nhập giữ nguyên. Thao tác này không thể hoàn tác.".into(),
+                    kind: ConfirmKind::WipeLocalData,
+                    thread_id: String::new(),
+                    msg_id: String::new(),
+                });
                 return;
             }
             KeyCode::Char('x') if self.focus != Focus::Input => {
                 self.confirm = Some(ConfirmAction {
-                    question: "Dang xuat va xoa session.json, threads_cache.json?".into(),
-                    detail: "Thao tac nay khong the hoan tac.".into(),
+                    question: "Đăng xuất và xoá session.json, threads_cache.json?".into(),
+                    detail: "Thao tác này không thể hoàn tác.".into(),
                     kind: ConfirmKind::Logout,
                     thread_id: String::new(),
                     msg_id: String::new(),
@@ -1314,7 +1347,7 @@ impl<'a> TuiApp<'a> {
 
     fn apply_refresh(&mut self, list: Vec<Thread>) {
         if list.is_empty() {
-            self.status = "Khong lay duoc danh sach hoi thoai".into();
+            self.status = "Không lấy được danh sách hội thoại".into();
             return;
         }
         for ft in list {
@@ -1335,7 +1368,7 @@ impl<'a> TuiApp<'a> {
                 BgEvent::PollDone { threads, state } => {
                     self.poll_inflight = false;
                     let changed = self.apply_polled(threads, state);
-                    self.status = format!("Cap nhat {}", crate::ui::clock());
+                    self.status = format!("Cập nhật {}", crate::ui::clock());
                     if changed {
                         chat::save_threads_cache(&self.threads);
                         self.persist_async();
@@ -1343,12 +1376,12 @@ impl<'a> TuiApp<'a> {
                 }
                 BgEvent::PollFailed(err) => {
                     self.poll_inflight = false;
-                    self.status = format!("Loi cap nhat: {err}");
+                    self.status = format!("Lỗi cập nhật: {err}");
                 }
                 BgEvent::ThreadsRefreshed(list) => {
                     let n = list.len();
                     self.apply_refresh(list);
-                    self.status = format!("Da lam moi ({n} hoi thoai)");
+                    self.status = format!("Đã làm mới ({n} hội thoại)");
                 }
                 BgEvent::HistoryLoaded { thread_id, resp } => {
                     let mut count = 0usize;
@@ -1361,9 +1394,9 @@ impl<'a> TuiApp<'a> {
                         chat::save_threads_cache(&self.threads);
                         self.selected_msg = None;
                         self.follow_tail = true;
-                        self.status = format!("Da tai lich su nhom ({count} tin)");
+                        self.status = format!("Đã tải lịch sử nhóm ({count} tin)");
                     } else {
-                        self.status = "Khong co tin nhan moi tu nhom".into();
+                        self.status = "Không có tin nhắn mới từ nhóm".into();
                     }
                 }
                 BgEvent::MessageSent { thread_id, text } => {
@@ -1371,7 +1404,7 @@ impl<'a> TuiApp<'a> {
                         t.preview = text;
                     }
                     self.bump_thread(&thread_id);
-                    self.status = "Da gui tin nhan".into();
+                    self.status = "Đã gửi tin nhắn".into();
                 }
                 BgEvent::AttachmentSent { thread_id, msg } => {
                     let mut appended = false;
@@ -1381,7 +1414,7 @@ impl<'a> TuiApp<'a> {
                             appended = true;
                         }
                         t.preview = if msg.text.is_empty() {
-                            "[Tep dinh kem]".into()
+                            "[Tệp đính kèm]".into()
                         } else {
                             msg.text.clone()
                         };
@@ -1392,12 +1425,12 @@ impl<'a> TuiApp<'a> {
                         self.persist_thread_by_id(&thread_id);
                         chat::save_threads_cache(&self.threads);
                         self.follow_tail = true;
-                        self.status = "Da gui tep dinh kem".into();
+                        self.status = "Đã gửi tệp đính kèm".into();
                     }
                 }
                 BgEvent::StickerSent { thread_id } => {
                     self.bump_thread(&thread_id);
-                    self.status = "Da gui nhan dan".into();
+                    self.status = "Đã gửi nhãn dán".into();
                 }
                 BgEvent::ReactionDone {
                     thread_id,
@@ -1415,7 +1448,7 @@ impl<'a> TuiApp<'a> {
                             m.reactions.push(code.to_string());
                         }
                     }
-                    self.status = "Da tha cam xuc".into();
+                    self.status = "Đã thả cảm xúc".into();
                 }
                 BgEvent::DeleteDone { thread_id, msg_id } => {
                     if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
@@ -1424,7 +1457,7 @@ impl<'a> TuiApp<'a> {
                     self.selected_msg = None;
                     self.persist_thread_by_id(&thread_id);
                     chat::save_threads_cache(&self.threads);
-                    self.status = "Da xoa tin nhan".into();
+                    self.status = "Đã xoá tin nhắn".into();
                 }
                 BgEvent::StickerPacks(packs) => {
                     self.sticker.loading = false;
@@ -1433,7 +1466,7 @@ impl<'a> TuiApp<'a> {
                     self.sticker.pack_idx = 0;
                     self.sticker.item_idx = 0;
                     self.sticker.stage = 0;
-                    self.status = format!("Kho nhan dan: {} bo", self.sticker.packs.len());
+                    self.status = format!("Kho nhãn dán: {} bộ", self.sticker.packs.len());
                 }
                 BgEvent::StickerItems(items) => {
                     self.sticker.loading = false;
@@ -1442,13 +1475,13 @@ impl<'a> TuiApp<'a> {
                     self.sticker.item_idx = 0;
                     self.sticker.stage = 1;
                     self.status = if n == 0 {
-                        "Bo nhan dan trong".into()
+                        "Bộ nhãn dán trống".into()
                     } else {
-                        format!("Bo nhan dan: {n} sticker")
+                        format!("Bộ nhãn dán: {n} sticker")
                     };
                 }
                 BgEvent::SendFailed(err) => {
-                    self.status = format!("Gui tin nhan that bai: {err}");
+                    self.status = format!("Gửi tin nhắn thất bại: {err}");
                 }
                 BgEvent::ActionFailed(err) => {
                     self.status = err;
@@ -1529,7 +1562,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
                 format!("{} (UIN: {})", l.display_name, l.uin)
             }
         })
-        .unwrap_or_else(|| "Chua dang nhap".into());
+        .unwrap_or_else(|| "Chưa đăng nhập".into());
 
     let mode_span = if logger::is_dev_mode() {
         Span::styled(
@@ -1554,14 +1587,14 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("| Tai khoan: "),
+        Span::raw("| Tài khoản: "),
         Span::styled(
             user_name,
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" | Chua doc: "),
+        Span::raw(" | Chưa đọc: "),
         Span::styled(
             total_unread.to_string(),
             Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
@@ -1573,7 +1606,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
     ];
     if app.poll_inflight {
         header_spans.push(Span::styled(
-            " [dang cap nhat] ",
+            " [đang cập nhật] ",
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -1619,7 +1652,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
                 Style::default().fg(Color::White)
             };
             let preview_text = if t.preview.is_empty() {
-                "- chua co tin nhan -".to_string()
+                "- chưa có tin nhắn -".to_string()
             } else {
                 let p = t.preview.chars().take(22).collect::<String>();
                 format!("{p}...")
@@ -1650,10 +1683,10 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         .collect();
 
     let threads_title = if app.search_mode {
-        format!(" Tim: {}_ ", app.search)
+        format!(" Tìm: {}_ ", app.search)
     } else if !app.search.is_empty() {
         format!(
-            " Hoi thoai {}/{} [{}] tim '{}' ",
+            " Hội thoại {}/{} [{}] tìm '{}' ",
             app.filtered.len(),
             app.threads.len(),
             app.filter.label(),
@@ -1661,7 +1694,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         )
     } else {
         format!(
-            " Hoi thoai {}/{} [{}] ",
+            " Hội thoại {}/{} [{}] ",
             app.filtered.len(),
             app.threads.len(),
             app.filter.label()
@@ -1706,13 +1739,13 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
     let (name, id, is_group, msg_count) = match app.threads.get(app.selected_thread) {
         Some(t) => (t.name.clone(), t.id.clone(), t.is_group, t.messages.len()),
         None => (
-            "Chua chon hoi thoai".to_string(),
+            "Chưa chọn hội thoại".to_string(),
             String::new(),
             false,
             0,
         ),
     };
-    let kind = if is_group { "Nhom" } else { "Ca nhan" };
+    let kind = if is_group { "Nhóm" } else { "Cá nhân" };
     let chat_header = Paragraph::new(Line::from(vec![
         Span::styled(
             format!(" {name} "),
@@ -1725,9 +1758,9 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         Span::styled(id, Style::default().fg(Color::DarkGray)),
         Span::raw(format!(" | {msg_count} tin | ")),
         if app.follow_tail {
-            Span::styled("theo doi cuoi", Style::default().fg(Color::Green))
+            Span::styled("theo dõi cuối", Style::default().fg(Color::Green))
         } else {
-            Span::styled("dang xem lich su", Style::default().fg(Color::Yellow))
+            Span::styled("đang xem lịch sử", Style::default().fg(Color::Yellow))
         },
     ]))
     .block(
@@ -1749,7 +1782,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         Some(t) => build_chat_lines(t, inner_w, app.selected_msg, highlight),
         None => (
             vec![Line::from(Span::styled(
-                "  Chon mot hoi thoai de bat dau.",
+                "  Chọn một hội thoại để bắt đầu.",
                 Style::default().fg(Color::DarkGray),
             ))],
             Vec::new(),
@@ -1786,7 +1819,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
     let chat_body = Paragraph::new(lines)
         .block(
             Block::default()
-                .title(format!(" Noi dung tin nhan [{pct}] "))
+                .title(format!(" Nội dung tin nhắn [{pct}] "))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Plain)
                 .border_style(chat_border_style),
@@ -1803,7 +1836,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         let reply = Paragraph::new(quote)
             .block(
                 Block::default()
-                    .title(" Dang tra loi [Ctrl+X huy] ")
+                    .title(" Đang trả lời [Ctrl+X huỷ] ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Plain)
                     .border_style(Style::default().fg(Color::Magenta)),
@@ -1813,9 +1846,9 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
     }
 
     let input_title = if app.focus == Focus::Input {
-        " Soan tin nhan: [DANG GO] (Enter: Gui | Esc: Lui | Ctrl+X: Huy tra loi) "
+        " Soạn tin nhắn: [ĐANG GÕ] (Enter: Gửi | Esc: Lùi | Ctrl+X: Huỷ trả lời) "
     } else {
-        " Soan tin nhan: [Tab de nhap] "
+        " Soạn tin nhắn: [Tab để nhập] "
     };
     let input_border_style = if app.focus == Focus::Input {
         Style::default()
@@ -1837,20 +1870,20 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
     // 3. Footer
     let (hint1, hint2) = match app.focus {
         Focus::Threads => (
-            "[Up/Down j/k] chon | [PgUp/PgDn] nhay 10 | [Enter] xem tin | [Tab] doi vung | [/] tim | [f] loc",
-            "[r] lam moi | [h] lich su nhom | [u] xoa chua doc | [F2] nhan dan | [F3] tep | [x] dang xuat | [F1] tro giup | [q] thoat",
+            "[Up/Down j/k] chọn | [PgUp/PgDn] nhảy 10 | [Enter] xem tin | [Tab] đổi vùng | [/] tìm | [f] lọc",
+            "[r] làm mới | [h] lịch sử nhóm | [u] xoá chưa đọc | [F2] nhãn dán | [F3] tệp | [x] đăng xuất | [F1] trợ giúp | [q] thoát",
         ),
         Focus::Messages => (
-            "[Up/Down j/k] chon tin | [PgUp/PgDn] cuon | [Home/End] dau/cuoi | [Enter] soan | [Tab] doi vung",
-            "[1-6] cam xuc | [y] tra loi | [d] xoa | [o] mo link | [F2] nhan dan | [F3] tep | [F1] tro giup | [q] thoat",
+            "[Up/Down j/k] chọn tin | [PgUp/PgDn] cuộn | [Home/End] đầu/cuối | [Enter] soạn | [Tab] đổi vùng",
+            "[1-6] cảm xúc | [y] trả lời | [d] xoá | [o] mở link | [F2] nhãn dán | [F3] tệp | [F1] trợ giúp | [q] thoát",
         ),
         Focus::Input => (
-            "[Enter] gui | [Ctrl+U] xoa het | [Ctrl+X] huy tra loi | [Esc] lui | [Tab] doi vung",
-            "[F2] nhan dan | [F3] tep dinh kem | [F1] tro giup | [Ctrl+C] thoat",
+            "[Enter] gửi | [Ctrl+U] xoá hết | [Ctrl+X] huỷ trả lời | [Esc] lùi | [Tab] đổi vùng",
+            "[F2] nhãn dán | [F3] tệp đính kèm | [F1] trợ giúp | [Ctrl+C] thoát",
         ),
     };
     let footer_text = if app.search_mode {
-        format!("Tim kiem: {}_   (Enter: xong | Esc: xoa)", app.search)
+        format!("Tìm kiếm: {}_   (Enter: xong | Esc: xoá)", app.search)
     } else {
         String::new()
     };
@@ -1868,7 +1901,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Plain)
-            .title(" Phim tat "),
+            .title(" Phím tắt "),
     )
     .alignment(Alignment::Center);
     f.render_widget(footer, chunks[2]);
@@ -1901,11 +1934,11 @@ fn build_chat_lines(
     if thread.messages.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            format!("  Hoi thoai '{}' da san sang.", thread.name),
+            format!("  Hội thoại '{}' đã sẵn sàng.", thread.name),
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::from(Span::styled(
-            "  Bam Tab de soan tin nhan, Enter de gui.",
+            "  Bấm Tab để soạn tin nhắn, Enter để gửi.",
             Style::default().fg(Color::Cyan),
         )));
         return (lines, ranges);
@@ -1932,11 +1965,11 @@ fn build_chat_lines(
         let sel = highlight && selected == Some(idx);
 
         let sender_name = if m.is_outgoing {
-            "Toi".to_string()
+            "Tôi".to_string()
         } else if !m.sender.trim().is_empty() {
             m.sender.clone()
         } else if thread.is_group {
-            "Thanh vien".to_string()
+            "Thành viên".to_string()
         } else {
             thread.name.clone()
         };
@@ -1986,7 +2019,7 @@ fn build_chat_lines(
         }
 
         let mut body = if m.sticker_id.unwrap_or(0) > 0 {
-            format!("[Nhan dan #{}]", m.sticker_id.unwrap_or(0))
+            format!("[Nhãn dán #{}]", m.sticker_id.unwrap_or(0))
         } else {
             m.text.clone()
         };
@@ -2004,7 +2037,7 @@ fn build_chat_lines(
             body.push_str(&icons.join(" "));
         }
         if body.trim().is_empty() {
-            body = "(khong co noi dung)".to_string();
+            body = "(không có nội dung)".to_string();
         }
 
         let avail = width.saturating_sub(prefix_len).max(10);
@@ -2120,9 +2153,9 @@ fn day_label(day: i64) -> String {
     let today = (crate::login::unix_now() + 7 * 3600).div_euclid(86_400);
     let (y, m, d) = civil_from_days(day);
     if day == today {
-        format!("Hom nay {d:02}/{m:02}/{y}")
+        format!("Hôm nay {d:02}/{m:02}/{y}")
     } else if day == today - 1 {
-        format!("Hom qua {d:02}/{m:02}/{y}")
+        format!("Hôm qua {d:02}/{m:02}/{y}")
     } else {
         format!("{d:02}/{m:02}/{y}")
     }
@@ -2170,61 +2203,62 @@ fn render_help(f: &mut Frame, area: Rect) {
 
     let mut content: Vec<Line<'static>> = Vec::new();
     content.push(Line::from(Span::styled(
-        "=== PHIM TAT ZALO TUI ===",
+        "=== PHÍM TẮT ZALO TUI ===",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )));
     content.push(Line::raw(""));
-    content.push(help_line("Tab / BackTab", "Chuyen vung: Danh sach -> Tin nhan -> Soan tin"));
-    content.push(help_line("F1 / ?", "Mo tro giup nay"));
-    content.push(help_line("q / Ctrl+C", "Thoat (q chi khi khong go tin)"));
+    content.push(help_line("Tab / BackTab", "Chuyển vùng: Danh sách -> Tin nhắn -> Soạn tin"));
+    content.push(help_line("F1 / ?", "Mở trợ giúp này"));
+    content.push(help_line("q / Ctrl+C", "Thoát (q chỉ khi không gõ tin)"));
     content.push(Line::raw(""));
     content.push(Line::from(Span::styled(
-        "-- Danh sach hoi thoai --",
+        "-- Danh sách hội thoại --",
         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
     )));
-    content.push(help_line("Up/Down j/k", "Chon hoi thoai (cuon chuot cung duoc)"));
-    content.push(help_line("PgUp/PgDn", "Nhay 10 hoi thoai"));
-    content.push(help_line("Home / End", "Hoi thoai dau / cuoi"));
-    content.push(help_line("/", "Tim theo ten, ID, noi dung, tin nhan"));
-    content.push(help_line("f", "Loc: Tat ca -> Ca nhan -> Nhom"));
-    content.push(help_line("u", "Xoa tat ca thong bao chua doc"));
-    content.push(help_line("r", "Lam moi danh sach tu server (nen)"));
-    content.push(help_line("h", "Tai lich su nhom (50 tin)"));
-    content.push(help_line("x", "Dang xuat (co xac nhan)"));
+    content.push(help_line("Up/Down j/k", "Chọn hội thoại (cuộn chuột cũng được)"));
+    content.push(help_line("PgUp/PgDn", "Nhảy 10 hội thoại"));
+    content.push(help_line("Home / End", "Hội thoại đầu / cuối"));
+    content.push(help_line("/", "Tìm theo tên, ID, nội dung, tin nhắn"));
+    content.push(help_line("f", "Lọc: Tất cả -> Cá nhân -> Nhóm"));
+    content.push(help_line("u", "Xoá tất cả thông báo chưa đọc"));
+    content.push(help_line("r", "Làm mới danh sách từ server (nên)"));
+    content.push(help_line("h", "Tải lịch sử nhóm (50 tin)"));
+    content.push(help_line("x", "Đăng xuất (có xác nhận)"));
+    content.push(help_line("w", "Xoá lịch sử tin nhắn cục bộ (có xác nhận)"));
     content.push(Line::raw(""));
     content.push(Line::from(Span::styled(
-        "-- Tin nhan --",
+        "-- Tin nhắn --",
         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
     )));
-    content.push(help_line("Up/Down j/k", "Chon tin nhan"));
-    content.push(help_line("PgUp/PgDn", "Cuon nhanh"));
-    content.push(help_line("Home / End", "Dau / cuoi hoi thoai"));
-    content.push(help_line("1 .. 6", "Tha cam xuc nhanh (Thich, Yeu, Haha, Wow, Buon, Phan no)"));
-    content.push(help_line("y", "Tra loi tin dang chon"));
-    content.push(help_line("d", "Xoa tin nhan (chi phia ban)"));
-    content.push(help_line("o", "Mo lien ket cua tin nhan"));
+    content.push(help_line("Up/Down j/k", "Chọn tin nhắn"));
+    content.push(help_line("PgUp/PgDn", "Cuộn nhanh"));
+    content.push(help_line("Home / End", "Đầu / cuối hội thoại"));
+    content.push(help_line("1 .. 6", "Thả cảm xúc nhanh (Thích, Yêu, Haha, Wow, Buồn, Phẫn nộ)"));
+    content.push(help_line("y", "Trả lời tin đang chọn"));
+    content.push(help_line("d", "Xoá tin nhắn (chỉ phía bạn)"));
+    content.push(help_line("o", "Mở liên kết của tin nhắn"));
     content.push(Line::raw(""));
     content.push(Line::from(Span::styled(
-        "-- Soan tin / dinh kem --",
+        "-- Soạn tin / đính kèm --",
         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
     )));
-    content.push(help_line("Enter", "Gui tin nhan"));
-    content.push(help_line("Ctrl+U", "Xoa toan bo o soan"));
-    content.push(help_line("Ctrl+X", "Huy tra loi"));
-    content.push(help_line("Esc", "Lui ve vung truoc"));
-    content.push(help_line("F2", "Kho nhan dan: Enter chon bo, Enter lan 2 de gui"));
-    content.push(help_line("F3", "Gui tep dinh kem bang duong dan"));
-    content.push(help_line("l", "Dev log inspector (chi che do --dev)"));
+    content.push(help_line("Enter", "Gửi tin nhắn"));
+    content.push(help_line("Ctrl+U", "Xoá toàn bộ ô soạn"));
+    content.push(help_line("Ctrl+X", "Huỷ trả lời"));
+    content.push(help_line("Esc", "Lùi về vùng trước"));
+    content.push(help_line("F2", "Kho nhãn dán: Enter chọn bộ, Enter lần 2 để gửi"));
+    content.push(help_line("F3", "Gửi tệp đính kèm bằng đường dẫn"));
+    content.push(help_line("l", "Dev log inspector (chỉ chế độ --dev)"));
     content.push(Line::raw(""));
     content.push(Line::from(Span::styled(
-        "Esc hoac F1 de dong tro giup.",
+        "Esc hoặc F1 để đóng trợ giúp.",
         Style::default().fg(Color::DarkGray),
     )));
 
     let block = Block::default()
-        .title(" Tro giup (Esc/F1 de dong) ")
+        .title(" Trợ giúp (Esc/F1 để đóng) ")
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Cyan));
@@ -2243,15 +2277,15 @@ fn render_sticker_overlay(f: &mut Frame, area: Rect, app: &TuiApp<'_>) {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(modal_area);
 
-    let loading = if app.sticker.loading { " (dang tai...)" } else { "" };
+    let loading = if app.sticker.loading { " (đang tải...)" } else { "" };
     let packs_title = if app.sticker.stage == 0 {
         format!(
-            " Kho nhan dan ({} bo){loading} [DANG CHON] — Enter de mo bo ",
+            " Kho nhãn dán ({} bộ){loading} [ĐANG CHỌN] — Enter để mở bộ ",
             app.sticker.packs.len()
         )
     } else {
         format!(
-            " Kho nhan dan ({} bo){loading} — Left/Right doi cot ",
+            " Kho nhãn dán ({} bộ){loading} — Left/Right đổi cột ",
             app.sticker.packs.len()
         )
     };
@@ -2300,18 +2334,18 @@ fn render_sticker_overlay(f: &mut Frame, area: Rect, app: &TuiApp<'_>) {
 
     let items_title = if app.sticker.items.is_empty() {
         format!(
-            " Bo '{}' — chon mot bo ben tren roi Enter ",
+            " Bộ '{}' — chọn một bộ bên trên rồi Enter ",
             app.sticker.loaded_name
         )
     } else if app.sticker.stage == 1 {
         format!(
-            " Bo '{}' ({} sticker) [DANG CHON] — Enter de gui ",
+            " Bộ '{}' ({} sticker) [ĐANG CHỌN] — Enter để gửi ",
             app.sticker.loaded_name,
             app.sticker.items.len()
         )
     } else {
         format!(
-            " Bo '{}' ({} sticker) ",
+            " Bộ '{}' ({} sticker) ",
             app.sticker.loaded_name,
             app.sticker.items.len()
         )
@@ -2385,13 +2419,13 @@ fn render_confirm(f: &mut Frame, area: Rect, action: &ConfirmAction) {
         )),
         Line::raw(""),
         Line::from(Span::styled(
-            "  [y/Enter] Xac nhan    [n/Esc] Huy",
+            "  [y/Enter] Xác nhận    [n/Esc] Huỷ",
             Style::default().fg(Color::Cyan),
         )),
     ];
     let paragraph = Paragraph::new(content).block(
         Block::default()
-            .title(" Xac nhan ")
+            .title(" Xác nhận ")
             .borders(Borders::ALL)
             .border_type(BorderType::Plain)
             .border_style(Style::default().fg(Color::Yellow)),
@@ -2404,7 +2438,7 @@ fn render_prompt(f: &mut Frame, area: Rect, prompt: &PromptState) {
     f.render_widget(Clear, modal_area);
 
     let title = match prompt.kind {
-        PromptKind::Attachment => " Gui tep dinh kem: nhap duong dan tep ",
+        PromptKind::Attachment => " Gửi tệp đính kèm: nhập đường dẫn tệp ",
     };
     let content = vec![
         Line::raw(""),
@@ -2416,7 +2450,7 @@ fn render_prompt(f: &mut Frame, area: Rect, prompt: &PromptState) {
         )),
         Line::raw(""),
         Line::from(Span::styled(
-            "  [Enter] Gui    [Esc] Huy",
+            "  [Enter] Gửi    [Esc] Huỷ",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -2440,7 +2474,7 @@ fn render_log_modal(f: &mut Frame, area: Rect, scroll: usize) {
     let mut content = Vec::new();
 
     content.push(Line::from(vec![Span::styled(
-        "=== KET QUA QUET LOG & CHAN DOAN GIAO THUC ===",
+        "=== KẾT QUẢ QUÉT LOG & CHẨN ĐOÁN GIAO THỨC ===",
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
@@ -2462,11 +2496,11 @@ fn render_log_modal(f: &mut Frame, area: Rect, scroll: usize) {
             ),
         ]));
         content.push(Line::from(vec![
-            Span::raw("  Chi tiet: "),
+            Span::raw("  Chỉ tiết: "),
             Span::styled(finding.detail.clone(), Style::default().fg(Color::White)),
         ]));
         content.push(Line::from(vec![
-            Span::raw("  Goi y: "),
+            Span::raw("  Gợi ý: "),
             Span::styled(finding.suggestion.clone(), Style::default().fg(Color::Cyan)),
         ]));
         content.push(Line::raw(""));
@@ -2474,7 +2508,7 @@ fn render_log_modal(f: &mut Frame, area: Rect, scroll: usize) {
 
     content.push(Line::from(vec![Span::styled(
         format!(
-            "=== LUU LUONG MANG THOI GIAN THUC ({} requests) ===",
+            "=== LƯU LƯỢNG MẠNG THỜI GIAN THỰC ({} requests) ===",
             entries.len()
         ),
         Style::default()
@@ -2512,14 +2546,14 @@ fn render_log_modal(f: &mut Frame, area: Rect, scroll: usize) {
         }
         if let Some(err) = &e.error_msg {
             content.push(Line::from(vec![Span::styled(
-                format!("  + Loi: {err}"),
+                format!("  + Lỗi: {err}"),
                 Style::default().fg(Color::Red),
             )]));
         }
     }
 
     let block = Block::default()
-        .title(" Dev Inspector & Protocol Scanner (Esc/q de dong, Up/Down de cuon) ")
+        .title(" Dev Inspector & Protocol Scanner (Esc/q để đóng, Up/Down để cuộn) ")
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Yellow));
@@ -2598,7 +2632,7 @@ mod tests {
                 },
                 ChatMessage {
                     id: "m2".into(),
-                    sender: "Toi".into(),
+                    sender: "Tôi".into(),
                     text: "chao ban".into(),
                     time: "12:01".into(),
                     is_outgoing: true,
@@ -2646,5 +2680,71 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| ui_draw(f, &mut app)).unwrap();
         assert!(app.msg_ranges.len() >= 2);
+    }
+
+    /// The "clear local data" confirmation must reach the terminal with its Vietnamese
+    /// text intact — it is the only guard in front of an irreversible delete (#21).
+    #[test]
+    fn wipe_confirmation_renders_its_vietnamese_text() {
+        let mut session = crate::session::Session::new(false, false, false).unwrap();
+        let (tx, rx) = channel();
+        let mut app = TuiApp {
+            session: &mut session,
+            threads: Vec::new(),
+            list_state: ListState::default(),
+            selected_thread: 0,
+            input_text: String::new(),
+            focus: Focus::Threads,
+            status: "test".into(),
+            should_quit: false,
+            store: None,
+            poll_state: chat::PollState::default(),
+            filtered: Vec::new(),
+            filter: FilterTab::All,
+            search: String::new(),
+            search_mode: false,
+            unread: HashMap::new(),
+            selected_msg: None,
+            msg_scroll: 0,
+            follow_tail: true,
+            msg_ranges: Vec::new(),
+            chat_view_h: 10,
+            threads_width: 0,
+            reply_target: None,
+            overlay: Overlay::None,
+            log_scroll: 0,
+            sticker: StickerState::default(),
+            prompt: None,
+            confirm: Some(ConfirmAction {
+                question: "Xoá lịch sử tin nhắn cục bộ (zalo_history.db, threads_cache.json)?"
+                    .into(),
+                detail: "Session đăng nhập giữ nguyên. Thao tác này không thể hoàn tác.".into(),
+                kind: ConfirmKind::WipeLocalData,
+                thread_id: String::new(),
+                msg_id: String::new(),
+            }),
+            poll_inflight: false,
+            bg_rx: rx,
+            bg_tx: tx,
+        };
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui_draw(f, &mut app)).unwrap();
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            screen.contains("Xác nhận"),
+            "confirmation title missing from the frame"
+        );
+        assert!(
+            screen.contains("Xoá lịch sử tin nhắn cục bộ"),
+            "confirmation question missing from the frame"
+        );
     }
 }
