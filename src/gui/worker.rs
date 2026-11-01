@@ -117,6 +117,9 @@ pub enum WorkerCmd {
     },
     PersistThreads(Vec<Thread>),
     Logout,
+    /// Delete local message data (`zalo_history.db` + `threads_cache.json`) without
+    /// touching credentials. Separate from [`WorkerCmd::Logout`] by design (#21).
+    WipeLocalData,
 }
 
 pub(super) static WORKER_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<WorkerCmd>> =
@@ -137,13 +140,6 @@ pub(super) fn resp_error_code(resp: &serde_json::Value) -> Option<i64> {
     resp.get("error_code")
         .and_then(serde_json::Value::as_i64)
         .filter(|c| *c != 0)
-}
-
-pub(super) fn is_session_expired_error(err_str: &str) -> bool {
-    err_str.contains("server error 600")
-        || err_str.contains("zpw_sek")
-        || err_str.contains("server error -102")
-        || err_str.contains("chưa đăng nhập")
 }
 
 /// Immediately decode any disk-cached sticker thumbnails (`stickers_cache/stk_{cid}_{sid}.png`)
@@ -416,9 +412,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             if let Some(task) = current_qr_task.take() {
                                 task.abort();
                             }
+                            // Credentials and the account-scoped thread cache only:
+                            // message history is removed by `WipeLocalData` (#21).
                             let _ = std::fs::remove_file("session.json");
                             let _ = std::fs::remove_file("threads_cache.json");
-                            let _ = std::fs::remove_file("zalo_history.db");
                             {
                                 let mut s = session.lock().await;
                                 s.logout();
@@ -428,6 +425,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                 *ps = crate::chat::PollState::default();
                             }
                             let _ = gui_tx.send(GuiEvent::LoggedOut);
+                            egui_ctx.request_repaint();
+                        }
+                        WorkerCmd::WipeLocalData => {
+                            let _ = std::fs::remove_file("zalo_history.db");
+                            let _ = std::fs::remove_file("threads_cache.json");
+                            let _ = gui_tx.send(GuiEvent::LocalDataWiped);
                             egui_ctx.request_repaint();
                         }
                         WorkerCmd::RequestQr => {
@@ -614,21 +617,40 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             tokio::spawn(async move {
                                 let mut s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
-                                    if !s.validate_session().await {
-                                        let _ = std::fs::remove_file("session.json");
-                                        {
-                                            let mut sl = session_clone.lock().await;
-                                            sl.logout();
+                                    match s.session_status().await {
+                                        crate::session::SessionStatus::Valid => {}
+                                        crate::session::SessionStatus::Expired => {
+                                            // Keep `session.json`: the old credentials stay
+                                            // readable until a new login replaces the file (#21).
+                                            {
+                                                let mut sl = session_clone.lock().await;
+                                                sl.mark_expired();
+                                                let _ = sl.save_to_file("session.json");
+                                                sl.logout();
+                                            }
+                                            let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
+                                                "Phiên đăng nhập (zpw_sek) đã hết hạn trên máy chủ Zalo"
+                                                    .into(),
+                                            ));
+                                            ctx_clone.request_repaint();
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                let _ = tx.send(WorkerCmd::RequestQr);
+                                            }
+                                            return;
                                         }
-                                        let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
-                                            "Phiên đăng nhập (zpw_sek) đã hết hạn trên máy chủ Zalo"
-                                                .into(),
-                                        ));
-                                        ctx_clone.request_repaint();
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::RequestQr);
+                                        crate::session::SessionStatus::Unreachable => {
+                                            // Offline: keep the session, say so, and let the
+                                            // next poll retry.
+                                            crate::logger::log_error(
+                                                "gui::refresh_threads",
+                                                "không kết nối được máy chủ Zalo",
+                                            );
+                                            let _ = gui_tx_clone.send(GuiEvent::SessionUnreachable(
+                                                "Không kết nối được máy chủ Zalo".into(),
+                                            ));
+                                            ctx_clone.request_repaint();
+                                            return;
                                         }
-                                        return;
                                     }
                                     if let Some((uid, name)) = s.sync_profile_me().await {
                                         {
@@ -697,7 +719,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         })
                                         .collect();
 
-                                    let mut poll_err: Option<String> = None;
+                                    let mut poll_err: Option<anyhow::Error> = None;
                                     for _ in 0..3 {
                                         let poll_res = {
                                             let mut ps = poll_clone.lock().await;
@@ -725,38 +747,55 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                 }
                                             }
                                             Err(e) => {
-                                                poll_err = Some(e.to_string());
+                                                poll_err = Some(e);
                                                 break;
                                             }
                                         }
                                     }
 
-                                    if let Some(err_s) = poll_err {
-                                        if is_session_expired_error(&err_s) {
-                                            let _ = std::fs::remove_file("session.json");
+                                    match poll_err {
+                                        Some(e) => {
+                                            if crate::session::SessionStatus::from_error(&e)
+                                                == crate::session::SessionStatus::Expired
                                             {
-                                                let mut sl = session_clone.lock().await;
-                                                sl.logout();
-                                            }
-                                            let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
-                                                "Phiên đăng nhập (zpw_sek) đã hết hạn".into(),
-                                            ));
-                                            ctx_clone.request_repaint();
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::RequestQr);
+                                                {
+                                                    let mut sl = session_clone.lock().await;
+                                                    sl.mark_expired();
+                                                    let _ = sl.save_to_file("session.json");
+                                                    sl.logout();
+                                                }
+                                                let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
+                                                    "Phiên đăng nhập (zpw_sek) đã hết hạn".into(),
+                                                ));
+                                                ctx_clone.request_repaint();
+                                                if let Some(tx) = WORKER_TX.get() {
+                                                    let _ = tx.send(WorkerCmd::RequestQr);
+                                                }
+                                            } else {
+                                                // The session is untouched: report and retry on
+                                                // the next poll instead of logging the user out.
+                                                crate::logger::log_error(
+                                                    "gui::poll_messages",
+                                                    &e.to_string(),
+                                                );
+                                                let _ = gui_tx_clone.send(
+                                                    GuiEvent::SessionUnreachable(e.to_string()),
+                                                );
+                                                ctx_clone.request_repaint();
                                             }
                                         }
-                                    } else {
-                                        temp_threads.retain(|t| !t.messages.is_empty());
-                                        if !temp_threads.is_empty() {
-                                            crate::chat::resolve_thread_names(
-                                                &s,
-                                                &mut temp_threads,
-                                            )
-                                            .await;
-                                            let _ = gui_tx_clone
-                                                .send(GuiEvent::ThreadsUpdated(temp_threads));
-                                            ctx_clone.request_repaint();
+                                        None => {
+                                            temp_threads.retain(|t| !t.messages.is_empty());
+                                            if !temp_threads.is_empty() {
+                                                crate::chat::resolve_thread_names(
+                                                    &s,
+                                                    &mut temp_threads,
+                                                )
+                                                .await;
+                                                let _ = gui_tx_clone
+                                                    .send(GuiEvent::ThreadsUpdated(temp_threads));
+                                                ctx_clone.request_repaint();
+                                            }
                                         }
                                     }
                                 }
@@ -946,10 +985,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             text,
                                             error: err_s.clone(),
                                         });
-                                        if is_session_expired_error(&err_s) {
-                                            let _ = std::fs::remove_file("session.json");
+                                        if crate::session::SessionStatus::from_error(&e)
+                                            == crate::session::SessionStatus::Expired
+                                        {
                                             {
                                                 let mut sl = session_clone.lock().await;
+                                                sl.mark_expired();
+                                                let _ = sl.save_to_file("session.json");
                                                 sl.logout();
                                             }
                                             let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
@@ -1256,10 +1298,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             text: String::new(),
                                             error: err_s.clone(),
                                         });
-                                        if is_session_expired_error(&err_s) {
-                                            let _ = std::fs::remove_file("session.json");
+                                        if crate::session::SessionStatus::from_error(&e)
+                                            == crate::session::SessionStatus::Expired
+                                        {
                                             {
                                                 let mut sl = session_clone.lock().await;
+                                                sl.mark_expired();
+                                                let _ = sl.save_to_file("session.json");
                                                 sl.logout();
                                             }
                                             let _ = gui_tx_clone.send(GuiEvent::SessionExpired(

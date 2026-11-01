@@ -529,7 +529,7 @@ pub async fn send_message(s: &Session, to_id: &str, text: &str) -> Result<Value>
                 .get("error_message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            anyhow::bail!("server error {code}: {msg}");
+            return Err(crate::session::SessionError::new(code, msg).into());
         }
     }
     Ok(resp)
@@ -566,7 +566,7 @@ pub async fn send_group_message(s: &Session, grid: &str, text: &str) -> Result<V
                 .get("error_message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            anyhow::bail!("server error {code}: {msg}");
+            return Err(crate::session::SessionError::new(code, msg).into());
         }
     }
     Ok(resp)
@@ -772,7 +772,7 @@ pub async fn send_attachment(
                     .get("error_message")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                anyhow::bail!("server error {code}: {msg}");
+                return Err(crate::session::SessionError::new(code, msg).into());
             }
         }
 
@@ -942,7 +942,7 @@ pub async fn send_attachment(
                 .get("error_message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            anyhow::bail!("server error {code}: {msg}");
+            return Err(crate::session::SessionError::new(code, msg).into());
         }
     }
 
@@ -1394,7 +1394,7 @@ pub async fn send_sticker(
                     .get("error_message")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                anyhow::bail!("server error {code}: {msg}");
+                return Err(crate::session::SessionError::new(code, msg).into());
             }
         }
         return Ok(resp);
@@ -1429,7 +1429,7 @@ pub async fn send_sticker(
                 .get("error_message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            anyhow::bail!("server error {code}: {msg}");
+            return Err(crate::session::SessionError::new(code, msg).into());
         }
     }
     Ok(resp)
@@ -2951,7 +2951,7 @@ pub async fn get_chat_from_polling(s: &Session, state: &mut PollState) -> Result
                         .get("error_message")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown");
-                    anyhow::bail!("server error {code}: {msg}");
+                    return Err(crate::session::SessionError::new(code, msg).into());
                 }
             }
             state.update_from_response(&dec);

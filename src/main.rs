@@ -141,26 +141,47 @@ async fn main() -> Result<()> {
     // Otherwise, run in TUI mode:
     println!("🖥️ Khởi chạy chế độ dòng lệnh TUI…");
 
-    // Validate session on server to avoid getting stuck in an expired session
-    let session_restored = if session_restored {
-        if s.validate_session().await {
-            true
-        } else {
-            println!("⚠️ Phiên đăng nhập trong session.json đã hết hạn. Đang chuyển sang đăng nhập mới…");
-            let _ = std::fs::remove_file("session.json");
-            let _ = std::fs::remove_file("threads_cache.json");
-            s.logout();
-            false
+    // Validate the stored session, but never destroy it for anything but a server
+    // verdict: only `600` / `-102` mean the credentials are gone (#21).
+    let mut session_restored = session_restored;
+    let mut server_ok = false;
+    if session_restored && s.is_expired_marked() {
+        // A previous run already read `600` / `-102`; the file still holds the old
+        // credentials until a new login replaces them.
+        println!(
+            "⚠️ Phiên trong session.json đã bị máy chủ từ chối ở lần chạy trước. Cần đăng nhập lại."
+        );
+        session_restored = false;
+    } else if session_restored {
+        match s.session_status().await {
+            session::SessionStatus::Valid => server_ok = true,
+            session::SessionStatus::Expired => {
+                println!("⚠️ Phiên đăng nhập đã hết hạn (máy chủ từ chối zpw_sek). Cần đăng nhập lại.");
+                // Keep every credential and only record the verdict; the file is not
+                // replaced until a fresh login succeeds.
+                s.mark_expired();
+                if let Err(e) = s.save_to_file("session.json") {
+                    eprintln!("! Không ghi được dấu hết hạn vào session.json: {e}");
+                }
+                session_restored = false;
+            }
+            session::SessionStatus::Unreachable => {
+                // Offline: keep the session and start with cached threads and local
+                // history. `r` retries inside the TUI; no QR, no logout.
+                println!(
+                    "⚠️ Không kết nối được máy chủ Zalo — giữ nguyên phiên, chạy tiếp với dữ liệu cục bộ. Bấm 'r' để thử lại."
+                );
+            }
         }
-    } else {
-        false
-    };
+    }
 
     // Login via QR or credentials if not already restored
+    let mut logged_in_now = false;
     if force_qr || !session_restored {
         if force_qr {
             println!("… Đang tạo mã QR");
             let _ = qr::login_via_qr(&mut s, "vi").await?;
+            logged_in_now = true;
         } else {
             let arg_val = |name: &str| -> Option<String> {
                 args.iter()
@@ -190,14 +211,24 @@ async fn main() -> Result<()> {
                 } else {
                     login::login_by_password(&mut s, phone.trim(), &password, iso.trim()).await?
                 };
+                logged_in_now = true;
             }
         }
+    }
+
+    if logged_in_now {
+        // First moment the previous `session.json` may be replaced (#21). `qr::login_via_qr`
+        // already saved once; the password path never persisted before this.
+        if let Err(e) = s.save_to_file("session.json") {
+            eprintln!("! Không lưu được session.json: {e}");
+        }
+        server_ok = true;
     }
 
     // Fetch initial threads and hydrate with local SQLite history
     let mut initial_threads = chat::load_threads_cache();
     store::load_history_into_threads("zalo_history.db", &mut initial_threads, 200);
-    if s.login.is_some() {
+    if s.login.is_some() && server_ok {
         match chat::get_friends(&s).await {
             Ok(list) => {
                 for ft in list {

@@ -310,6 +310,9 @@ pub fn apply_login_config(s: &mut Session, cfg: &Value) {
     // Domain overrides: `zpw_chts_new` and `zpw_ctrs_new` are long-polling hosts,
     // while `zpw_service_map_v3` holds the REST API domains.
     s.apply_server_info(cfg);
+    // A real login response means the session is fresh: drop the "refused" marker so it
+    // cannot leak into the new `session.json` (#21).
+    s.clear_expired();
     if let Some(v) = cfg.get("zpw_chts_new").and_then(as_str) {
         if !v.is_empty() {
             s.domains.lp_chat = normalize_host(&v);
@@ -363,6 +366,26 @@ mod tests {
         let login = s.login.as_ref().unwrap();
         assert_eq!(login.zpw_sek, "sek_abc_123");
         assert_eq!(login.uin, "12345");
+    }
+
+    #[test]
+    fn apply_login_config_clears_the_expired_marker() {
+        let mut s = Session::new(false, false, false).unwrap();
+        s.mark_expired();
+        assert!(s.is_expired_marked());
+
+        apply_login_config(
+            &mut s,
+            &serde_json::json!({
+                "dkey": "12345",
+                "zpw_enk": "dGVzdF9lbmtfMzJfYnl0ZXNfbG9uZ19hZXNfa2V5IQ==",
+                "zpw_sek": "sek_after_relogin",
+            }),
+        );
+
+        // Keeping the marker would pin the next start to the login screen (#21).
+        assert!(!s.is_expired_marked());
+        assert_eq!(s.zpw_sek.as_deref(), Some("sek_after_relogin"));
     }
 
     #[test]

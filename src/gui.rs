@@ -121,6 +121,10 @@ pub enum GuiEvent {
         error: String,
     },
     SessionExpired(String),
+    /// The server could not be reached: the session is intact, show it and retry (#21).
+    SessionUnreachable(String),
+    /// `zalo_history.db` + `threads_cache.json` were removed on request (#21).
+    LocalDataWiped,
     CallStateChanged(String),
     IncomingCall {
         call_id: i64,
@@ -318,6 +322,8 @@ pub struct ZaloGuiApp {
 
     info_drawer_open: bool,
     profile_menu_open: bool,
+    /// "Xoá dữ liệu tin nhắn cục bộ" is pending confirmation (#21).
+    wipe_confirm_open: bool,
     toast_notice: Option<(String, std::time::Instant)>,
     phone_modal_open: bool,
     phone_modal_input: String,
@@ -414,7 +420,9 @@ impl ZaloGuiApp {
 
         let (tx, rx) = channel();
 
-        let is_logged_in = session.login.is_some();
+        // A session the server already refused is not "logged in": jump straight to the
+        // login prompt instead of re-testing it (#21).
+        let is_logged_in = session.login.is_some() && !session.is_expired_marked();
         let (user_name, user_uin, user_avatar) = session
             .login
             .as_ref()
@@ -496,6 +504,7 @@ impl ZaloGuiApp {
             status_msg: "Trực tuyến · Sẵn sàng".into(),
             info_drawer_open: true,
             profile_menu_open: false,
+            wipe_confirm_open: false,
             toast_notice: None,
             phone_modal_open: false,
             phone_modal_input: String::new(),
@@ -709,6 +718,16 @@ impl ZaloGuiApp {
                         "{reason} — Quét mã QR bên dưới để khôi phục phiên trực tuyến."
                     );
                     self.status_msg = format!("{reason} (Lịch sử tin nhắn vẫn được bảo toàn)");
+                }
+                GuiEvent::SessionUnreachable(reason) => {
+                    // Only the network failed: stay logged in, keep the thread list, and
+                    // let the next poll retry (#21).
+                    self.status_msg = format!("⚠️ {reason} — đang thử lại…");
+                }
+                GuiEvent::LocalDataWiped => {
+                    self.threads.clear();
+                    self.selected_thread_index = 0;
+                    self.status_msg = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên)".into();
                 }
                 GuiEvent::LoggedOut => {
                     self.is_logged_in = false;
