@@ -14,7 +14,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use aes::Aes128;
@@ -1874,7 +1873,7 @@ impl CallBridge {
     /// Spawn the 100% Pure-Rust VoIP Call Engine (no external `ZaloCall.exe` process).
     pub fn spawn(
         session: Arc<Mutex<Session>>,
-        gui_tx: Sender<GuiEvent>,
+        gui_tx: crate::gui::GuiTx,
         egui_ctx: eframe::egui::Context,
     ) -> Self {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<CallEngineCmd>();
