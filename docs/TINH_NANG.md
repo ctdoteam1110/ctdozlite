@@ -98,7 +98,7 @@ Cột **Issue** trỏ tới nơi đang theo dõi. Nếu issue đã đóng, tính
 | Giao diện terminal (TUI) | 🟡 | Danh sách bạn bè có thể trống nếu dính lỗi domain | [#22](https://github.com/ctdoteam1110/ctdozlite/issues/22) |
 | Chủ đề sáng / tối | ✅ | | |
 | Thông báo tin nhắn mới | 🟡 | Đếm số chưa đọc trên tiêu đề cửa sổ, nhấp nháy taskbar và âm thanh; chưa có toast của hệ điều hành | |
-| Hiển thị tiếng Việt và tiếng Trung | 🟡 | Phụ thuộc font hệ thống; xem [Xử lý sự cố](KHAC_PHUC_SU_CO.md) | [#6](https://github.com/ctdoteam1110/ctdozlite/issues/6) |
+| Hiển thị tiếng Việt và tiếng Trung | 🟡 | Phụ thuộc font hệ thống — máy thiếu font CJK sẽ hiện ô vuông. Xem [Xử lý sự cố](KHAC_PHUC_SU_CO.md) | [#6](https://github.com/ctdoteam1110/ctdozlite/issues/6), [#5](https://github.com/ctdoteam1110/ctdozlite/issues/5) |
 | Tự động cập nhật | ⛔ | Phải tải bản mới thủ công từ Releases | [#12](https://github.com/ctdoteam1110/ctdozlite/issues/12) |
 | Plugin / Theme của bên thứ ba | ⛔ | Chưa có API mở rộng | [#7](https://github.com/ctdoteam1110/ctdozlite/issues/7) |
 | iOS / Android | 🚫 | Chỉ có desktop | |
