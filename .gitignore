@@ -27,6 +27,7 @@ call_trace.log
 
 # Generated graph/tooling output
 graphify-out/
+/book/
 
 # Local agent tooling & skill kit (machine-specific, symlinked paths)
 .claude/

@@ -369,7 +369,9 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
             Session::plain_params(&body)
         }
     };
-    let hosts = [&s.domains.profile, &s.domains.friend];
+    // `friend` is the canonical host for `social/friend/getfriends`; `profile` is
+    // only a fallback for very old sessions where `friend` was never populated.
+    let hosts = [&s.domains.friend, &s.domains.profile];
     let mut resp_opt = None;
     let mut last_err = None;
     for host in hosts {
@@ -388,13 +390,20 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
                 break;
             }
             Err(e) => {
+                crate::logger::log_error(
+                    "chat::get_friends",
+                    &format!("host {} failed: {e}", host),
+                );
                 last_err = Some(e);
             }
         }
     }
     let resp = match resp_opt {
         Some(r) => r,
-        None => return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("get_friends failed"))),
+        None => {
+            let err = last_err.unwrap_or_else(|| anyhow::anyhow!("get_friends failed"));
+            return Err(err.context("không tải được danh sách bạn bè"));
+        }
     };
     let data_root = resp.get("data").unwrap_or(&resp);
     let mut threads: Vec<Thread> = match data_root {
