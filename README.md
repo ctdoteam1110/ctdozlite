@@ -23,6 +23,7 @@ QTzalo là bản fork của dự án mã nguồn mở [ctdozlite](https://github
 - **Nhắn tin thời gian thực** qua WebSocket (`zpw_ws`), dự phòng bằng HTTP polling: chat 1-1, nhóm, Cloud của tôi, trả lời trích dẫn, thả cảm xúc, ghim, thu hồi, xoá phía tôi.
 - **Gửi/nhận** văn bản, hình ảnh (dán trực tiếp từ clipboard), tệp đính kèm, nhãn dán, xem trước liên kết.
 - **Gợi ý nhãn dán** theo từ khoá tiếng Việt khi đang gõ.
+- **Tải tệp/ảnh/video** từ tin nhắn về "Thư mục lưu file" (chỉ `https`, làm sạch tên file, không ghi đè, Mark-of-the-Web trên Windows, không tự mở file thực thi).
 - **Lưu trữ cục bộ**: lịch sử tin nhắn trong SQLite, danh sách hội thoại được cache để mở app nhanh.
 - **Gọi thoại và gọi video 1-1** (cần `ffmpeg` trong `PATH` cho video).
 - **Hai chế độ giao diện**: GUI desktop (mặc định) và TUI cho terminal.
@@ -55,7 +56,7 @@ Hướng dẫn chi tiết, kể cả cách xử lý cảnh báo Windows SmartScr
 | Linux | `$XDG_DATA_HOME/qtzalo` (mặc định `~/.local/share/qtzalo`) |
 | macOS | `~/Library/Application Support/QTzalo` |
 
-Bên trong gồm `session.json` (phiên đăng nhập — **không chia sẻ file này**), `zalo_history.db` (lịch sử tin nhắn), `threads_cache.json`, `app_settings.json`, `stickers_cache/` và `logs/` (chỉ có khi bật chế độ `--dev`).
+Bên trong gồm `session.json` (phiên đăng nhập — **không chia sẻ file này**), `zalo_history.db` (lịch sử tin nhắn), `threads_cache.json`, `app_settings.json`, `stickers_cache/` (cache ảnh — xem dung lượng và xoá được trong *Cài đặt → Dữ liệu & làm mới*) và `logs/` (chỉ có khi bật chế độ `--dev`).
 
 - Trên Linux/macOS, thư mục có quyền `0700` và file phiên có quyền `0600`.
 - Có thể đổi vị trí bằng biến môi trường `QTZALO_DATA_DIR`.

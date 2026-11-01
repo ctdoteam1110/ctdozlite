@@ -16,21 +16,14 @@ Kiểm tra file bằng `SHA256SUMS.txt`. Bộ cài Windows chưa ký số: nếu
 
 ### Điểm mới
 
-![Giao diện QTzalo](https://raw.githubusercontent.com/quangthoai1985/QTzalo/v{{VERSION}}/docs/assets/qtzalo-ui.png)
+![Tải tệp trong QTzalo](https://raw.githubusercontent.com/quangthoai1985/QTzalo/v{{VERSION}}/docs/assets/qtzalo-download.png)
 
-- **Giao diện mới 3 cột:** tông sáng xanh nhạt, có giao diện tối. Thanh điều hướng thu gọn được thành dải icon, danh sách hội thoại thu gọn thành cột avatar.
-- **Hiển thị đúng chữ Việt và chữ Hán** trên Windows, Linux (kể cả Fedora) và macOS (#5, #6).
-- **Giờ tin nhắn theo múi giờ của máy**, không còn lệch 7 tiếng (#4).
-- **Không mất đăng nhập khi rớt mạng** (#21). Đăng xuất không xoá lịch sử tin nhắn.
-- **Danh sách bạn bè không còn lỗi 404** (#22).
-- **Gọi được mọi liên hệ 1-1:** đã gỡ khoá thử nghiệm còn sót.
-- **Bảo mật:**
-  - Phiên đăng nhập và lịch sử lưu trong thư mục riêng của người dùng, chỉ chủ tài khoản đọc được.
-  - Log chẩn đoán tắt mặc định.
-  - Link trong tin nhắn đến không còn làm lộ IP.
-  - Sinh số ngẫu nhiên bằng nguồn của hệ điều hành.
-  - Cookie WebSocket chỉ gửi qua `wss://` tới Zalo.
-  - Vá lỗ hổng tokio.
+- **Tải tệp, video và ảnh gốc về máy** vào "Thư mục lưu file" (Cài đặt): nút tải trên từng thẻ tệp/video/ảnh và trong trình xem ảnh, có tiến trình phần trăm, nút **Mở** / **Mở thư mục** khi xong và **Thử lại** khi lỗi.
+- **An toàn khi tải:** chỉ qua `https`, làm sạch tên file, không ghi đè file có sẵn, gắn Mark-of-the-Web trên Windows, không tự mở file thực thi (`.exe`, `.bat`, `.ps1`, `.lnk`…).
+- **Quản lý cache ảnh** trong *Cài đặt → Dữ liệu & làm mới*: xem dung lượng, xoá cache ảnh (không đụng tới đăng nhập, lịch sử và cài đặt), mở thư mục dữ liệu.
+- **Số thành viên nhóm** hiện ở header chat khi máy chủ Zalo cung cấp.
+- Chọn "Thư mục lưu file" bằng hộp chọn thư mục của hệ điều hành; ảnh dán từ clipboard không còn rơi vào thư mục đang chạy app.
+- Nâng `ratatui`/`crossterm`, loại bỏ cảnh báo `lru` unsound.
 
 Xem đầy đủ: [CHANGELOG.md](https://github.com/quangthoai1985/QTzalo/blob/v{{VERSION}}/CHANGELOG.md).
 

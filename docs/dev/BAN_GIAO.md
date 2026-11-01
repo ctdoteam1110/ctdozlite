@@ -1,26 +1,21 @@
-# Bàn giao dự án QTzalo — từ v0.1.0 sang v0.1.1
+# Bàn giao dự án QTzalo — từ v0.1.1 sang bản tiếp theo
 
 > Tài liệu này dành cho phiên làm việc (người hoặc AI) tiếp theo. Đọc hết trước khi sửa code.
-> Cập nhật lần cuối: 2026-11-01, sau khi phát hành v0.1.0.
+> Cập nhật lần cuối: 2026-11-01, khi phát hành v0.1.1. (Bản bàn giao v0.1.0 → v0.1.1 xem lịch sử git của file này, commit `b0d328b`.)
 
 ## 1. Trạng thái hiện tại
 
 - **Repo:** `quangthoai1985/QTzalo`, bản fork của `ctdoteam1110/ctdozlite` (tách từ commit `73849bd` = tag upstream `v0.0.2`).
-- **`main` = `47c16f9`.** Đã phát hành [QTzalo v0.1.0](https://github.com/quangthoai1985/QTzalo/releases/tag/v0.1.0) do CI build. Release gồm:
-  - bộ cài và bản portable Windows
-  - `.deb` và `.tar.gz` cho Linux
-  - `.dmg` cho macOS
-  - `SHA256SUMS.txt`
-- **GitHub Actions đã bật.** Workflow duy nhất: `.github/workflows/ci-release.yml`. Cả 6 lần chạy đều xanh.
-- **Kiểm chứng cục bộ của v0.1.0:**
-  - `cargo test --locked`: 123 test pass, 1 bỏ qua.
-  - `cargo check --target x86_64-pc-windows-gnu`: sạch.
-  - `cargo audit`: 0 lỗ hổng, 5 cảnh báo đã biết (xem §8).
-- **Nhật ký thay đổi và trạng thái từng lỗi:**
-  - `CHANGELOG.md`
-  - `docs/SECURITY_AUDIT.md` (bảng S1–S14, B1–B9 kèm commit sửa)
-  - `docs/CAI_DAT.md`
-  - `README.md`
+- **`main` = commit phát hành 0.1.1** (fast-forward từ nhánh `claude/release-0.1.1`). Release [QTzalo v0.1.1](https://github.com/quangthoai1985/QTzalo/releases/tag/v0.1.1) do CI build (bộ cài + portable Windows, `.deb`, `.tar.gz`, `.dmg`, `SHA256SUMS.txt`). v0.1.0 vẫn còn trên trang Releases.
+- **Đã làm trong 0.1.1** (chi tiết: `CHANGELOG.md`):
+  - Tải tệp/video/ảnh về "Thư mục lưu file" — `src/download.rs` (chính sách + I/O), `WorkerCmd::DownloadAttachment`, `GuiEvent::Download{Progress,Finished,Failed}`, `DownloadState` và `downloads`/`download_toast` trong `ZaloGuiApp`; nút trên thẻ (`src/gui/messages.rs`, `BubbleAction::{Download,OpenDownloaded,RevealDownloaded}`), trình xem ảnh và toast (`src/gui/modals.rs`).
+  - Quản lý cache ảnh trong *Cài đặt → Dữ liệu & làm mới* (`WorkerCmd::{ComputeCacheSize,ClearImageCache}`), dọn `clipboard_*.png` > 24 h khi khởi động (`paths::cleanup_old_clipboard_images`).
+  - Ảnh dán clipboard ghi vào `paths::cache_dir()`; chọn thư mục lưu file bằng hộp chọn thư mục (`pick_native_folder_dialog`).
+  - Số thành viên nhóm thật từ `totalMember` của `getmg-v2` (cache trong tiến trình `chat::group_member_count`, **không** lưu vào `Thread`/`threads_cache.json`).
+  - ratatui 0.30 / crossterm 0.29 (bỏ `lru` unsound và `paste`) + vài bản patch.
+- **Kiểm chứng cục bộ của 0.1.1:** `cargo test --locked` 147 pass / 1 bỏ qua; `scripts/check-windows.sh` sạch; `cargo +1.88 check --locked --all-targets` sạch; `cargo audit` 0 lỗ hổng, 2 cảnh báo hết bảo trì; ảnh giao diện `--demo` (sáng/tối, Cài đặt) đã xem — `docs/assets/qtzalo-download.png`.
+- **CHƯA kiểm chứng:** chưa chạy trên Windows thật (MotW, `explorer /select`, hộp chọn thư mục PowerShell), chưa thử với tài khoản Zalo thật (tải file thật từ CDN Zalo, xoá cache thật, `totalMember` có thật trong payload hay không).
+- **Nhật ký thay đổi và trạng thái từng lỗi:** `CHANGELOG.md`, `docs/SECURITY_AUDIT.md` (S1–S16, B1–B9), `docs/CAI_DAT.md`, `README.md`.
 
 ## 2. Quyết định đã được người dùng chốt
 
@@ -30,7 +25,7 @@
 | Nhánh & phát hành | **Được merge vào `main` và phát hành Release từ `main`** bằng fast-forward, không viết lại lịch sử. Người dùng đã đồng ý lại cho v0.1.1. |
 | Thư mục dữ liệu | `%APPDATA%\QTzalo` / `~/.local/share/qtzalo` / `~/Library/Application Support/QTzalo` (`src/paths.rs`). Biến `QTZALO_DATA_DIR` ghi đè. |
 | Giao diện | 3 cột tông sáng theo ảnh mẫu của người dùng; cột trái và cột hội thoại thu gọn được còn icon/avatar; vẫn có giao diện tối. |
-| Phạm vi v0.1.1 | Làm các chức năng còn thiếu ở §5 rồi **phát hành v0.1.1 luôn**. |
+| Phạm vi v0.1.1 | Đã làm và phát hành (P0 đủ, P1: số thành viên + dependency; chỉ báo đang nhập chưa làm vì thiếu bằng chứng giao thức). |
 | Khi nào hỏi người dùng | Chỉ dừng lại hỏi khi cần một quyết định thật sự (ví dụ: đổi tên binary, xoá dữ liệu người dùng, thay đổi hành vi bảo mật lớn). |
 
 ## 3. Bản đồ mã nguồn
@@ -39,6 +34,7 @@
 |---|---|---|
 | Khởi động, CLI | `src/main.rs` | `--gui` (mặc định), `--tui`, `--qr`, `--dev`, `--demo`, `--logout`, `--pass-stdin` |
 | Đường dẫn dữ liệu | `src/paths.rs` | `data_dir()`, `session_file()`, `history_db()`, `cache_dir()`, `logs_dir()`, `settings_file()`, `write_private()` (ghi nguyên tử, 0600), `migrate_legacy_files()` |
+| Tải tệp | `src/download.rs` | `download_url_allowed`, `sanitize_filename`, `pick_unique_path`, `download_to_dir` (stream → `.part` → hard link không ghi đè), `write_mark_of_the_web`, `open_downloaded` (không mở file thực thi), `dir_size`, `clear_dir_contents` |
 | Định dạng giờ | `src/timefmt.rs` | `hm_from_ms`, `local_day_index`, `local_weekday`… dùng `chrono::Local` |
 | Phiên & HTTP | `src/session.rs` | `SessionStatus {Valid, Expired, Unreachable}`, `check_session()`, domain đã kiểm chứng thắng `zpw_service_map_v3`, chỉ gửi cookie tới host https của Zalo |
 | Đăng nhập | `src/login.rs`, `src/qr.rs`, `src/param_cipher.rs`, `src/crypto.rs` | ParamCipher v2, sinh số ngẫu nhiên bằng `getrandom` |
@@ -73,60 +69,27 @@ cargo audit                                # đã cài sẵn trong môi trườn
 
   Các biến `QTZALO_DEMO_*` trong `src/gui/demo.rs` / `src/gui.rs` chỉnh kích thước, theme, trạng thái thu gọn và hội thoại được chọn. Xem ảnh bằng công cụ đọc ảnh trước khi kết luận giao diện đã đúng.
 
-## 5. Phạm vi v0.1.1
+## 5. Gợi ý phạm vi bản tiếp theo (chưa được người dùng chốt)
 
-### P0 — bắt buộc
+1. **Xin người dùng thử 0.1.1 trên Windows + tài khoản thật** và ghi lại: tải tệp/ảnh/video từ CDN Zalo (có cần cookie không? có `Content-Length` không?), MotW (`Get-Content file -Stream Zone.Identifier`), nút Mở/Mở thư mục, xoá cache, số thành viên nhóm. Sửa theo phản hồi trước khi thêm tính năng.
+2. **Chỉ báo "đang nhập" thật:** cần bắt một frame điều khiển thật (cmd 601/602 trong `src/socket.rs:47` hoặc mục `lp_control` của long-poll) lúc đối phương gõ, cả 1-1 và nhóm, ghi vào `re-notes/`. Có bằng chứng thì chỉ cần 1 biến thể `GuiEvent` + hết hạn 5 s (`typing_indicators` trong `src/gui/workspace.rs` đã có).
+3. **Lưu số thành viên vào `Thread`** (`member_count: Option<u32>` + `#[serde(default)]`): cần sửa struct literal ở `src/gui/demo.rs`, `src/gui/modals.rs`, `src/gui/worker.rs`, `src/bin/test_fetch.rs`. Nên xác nhận `totalMember` có trong payload thật trước.
+4. **Tải về:** nút huỷ khi đang tải; macOS gắn `com.apple.quarantine`; giới hạn số lượt tải song song; ảnh gốc khi tin nhắn chỉ có thumbnail (hiện tải `link_url`, thiếu thì tải thumbnail).
+5. **Đồng bộ lịch sử có giới hạn (#19)** — xem thiết kế cũ: mở rộng `WorkerCmd::LoadGroupHistory`/`getoldv2` với tiến trình và nút huỷ.
+6. Không làm khi chưa có quyết định của người dùng: lọc gói UDP theo relay (S6, cần cuộc gọi thật), ký số bộ cài, đổi tên binary.
 
-1. **Tải tệp/media về "Thư mục lưu file"**
-   - **Hiện trạng:** `AppSettings.download_dir` (mặc định `%USERPROFILE%\Downloads\Zalo Received Files`) chỉ được lưu và mở bằng nút "Mở thư mục" (`src/gui.rs:262`, `src/gui/modals.rs:1370-1376`). Bấm vào tệp, video hay ảnh gốc chỉ gọi `open_external_url` mở trình duyệt (`src/gui/messages.rs:281`, các chỗ gọi ở `:1158 :1243 :1274 :1298 :1312`).
-   - **Cần làm:**
-     - Nút **"Tải về"** trên thẻ tệp, thẻ video và thẻ ảnh (`src/gui/messages.rs`, khoảng `:1342-1420`), và trong thanh công cụ trình xem ảnh (`src/gui/modals.rs`, khoảng `:2549-2627`).
-     - Khi tải xong, toast có nút **"Mở"** và **"Mở thư mục"**.
-     - Có trạng thái đang tải (phần trăm nếu biết `Content-Length`) và báo lỗi rõ ràng.
-   - **Worker:** thêm `WorkerCmd::DownloadAttachment { url, suggested_name, thread_id }` cùng các `GuiEvent::DownloadProgress / DownloadFinished { path } / DownloadFailed`. Tải theo luồng (stream) xuống đĩa, không giữ cả file trong RAM.
-   - **Yêu cầu bảo mật (bắt buộc):**
-     - Chỉ tải qua `https://`; `http://` chỉ cho host CDN Zalo (`*.zdn.vn`, `*.zalo.me`, `*.zaloapp.com`) như chính sách ảnh hiện có trong `worker.rs`.
-     - **Làm sạch tên file:** bỏ `/ \ : * ? " < > |`, ký tự điều khiển, dấu chấm và khoảng trắng ở cuối; đổi tên dành riêng của Windows (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`); giới hạn độ dài khoảng 150 ký tự; tên rỗng thì đặt `tep_<thời gian>`.
-     - **Không ghi đè file có sẵn:** thêm hậu tố `" (1)"`, `" (2)"`…
-     - Ghi vào `*.part` rồi đổi tên. Thư mục đích phải là đường dẫn tuyệt đối; tạo thư mục nếu chưa có.
-     - Trên Windows, ghi ADS `:Zone.Identifier` với `ZoneId=3` (Mark-of-the-Web) để SmartScreen/Office cảnh báo đúng.
-     - **Không tự mở file thực thi.** Với `.exe .msi .bat .cmd .com .scr .ps1 .vbs .js .jse .wsf .hta .lnk .reg .jar .cpl .dll`, nút "Mở" chỉ mở thư mục (hoặc hỏi xác nhận rõ ràng).
-     - Tên file và URL lấy từ tin nhắn của người khác là **dữ liệu không tin cậy**.
-   - **Unit test:** làm sạch tên file, đặt tên tránh trùng, chính sách URL. Logic thuần nên tách khỏi I/O.
-2. **Sửa ảnh dán từ clipboard ghi ra thư mục hiện hành:** `src/gui/messages.rs:443-448` vẫn dùng `"stickers_cache/clipboard_{ms}.png"` tương đối. Chuyển sang `crate::paths::cache_dir().join(...)`, và xoá các `clipboard_*.png` cũ hơn 24 giờ khi khởi động.
-3. **Quản lý cache ảnh trong Cài đặt** (tab "Dữ liệu" hoặc tab phù hợp trong `src/gui/modals.rs`):
-   - Hiển thị dung lượng `paths::cache_dir()`; tính ở worker hoặc thread phụ để không chặn khung hình.
-   - Nút **"Xoá cache ảnh"**: chỉ xoá nội dung `stickers_cache/`, **không động** tới `session.json`, `zalo_history.db`, `app_settings.json`. Có hộp xác nhận. Xoá xong thì dọn texture trong RAM để ảnh tự tải lại.
-   - Hiển thị đường dẫn thư mục dữ liệu, kèm nút "Mở thư mục dữ liệu".
+## 6. Quy trình phát hành (đã chạy thành công cho v0.1.0 và v0.1.1)
 
-### P1 — nên làm nếu khả thi (mỗi mục phải có cách kiểm chứng; không bịa dữ liệu giao thức)
-
-4. **Số thành viên nhóm thật** ở header chat: hiện chỉ có ở demo, chế độ thật hiện "Nhóm". `chat::get_groups` đã gọi `/api/group/getmg-v2` (`src/chat.rs` khoảng `:2728-2760`). Kiểm tra payload có `totalMember` / `memVerList` (xem `re-notes/02_chat_data.md`), thêm trường `member_count: Option<u32>` vào `Thread` nếu dữ liệu có thật. Không có thì giữ "Nhóm".
-5. **Chỉ báo "đang nhập" thật:** GUI đã có `typing_indicators` (`src/gui/workspace.rs` khoảng `:1207`, `:1569`) nhưng worker chưa phát sự kiện. Chỉ làm nếu tìm thấy bằng chứng sự kiện typing trong luồng WebSocket/long-poll (`src/socket.rs`, `re-notes/`). Nếu không chắc thì ghi vào tồn đọng.
-6. **Dependency:** thử nâng `ratatui` (0.29 kéo `lru 0.12.5` bị đánh dấu unsound) nếu API tương thích và TUI vẫn build/chạy. Cập nhật các dependency patch khác khi `cargo audit` sạch và MSRV ≤ 1.88.
-
-### P2 — chỉ làm khi P0/P1 xong và còn thời gian
-
-7. **Đồng bộ lịch sử có giới hạn (#19):** nút "Tải thêm tin nhắn cũ" đã có (`WorkerCmd::LoadGroupHistory`). Có thể mở rộng phân trang `getoldv2` với tiến trình và nút huỷ, nhưng phải thiết kế trước. Nếu không làm, giữ nguyên trong tồn đọng.
-
-### Không làm trong v0.1.1
-
-- Lọc gói UDP theo relay (S6): cần thử với cuộc gọi thật.
-- Ký số bộ cài.
-- Đổi tên binary.
-
-## 6. Quy trình phát hành (đã chạy thành công cho v0.1.0)
-
-1. Sửa `Cargo.toml` thành `version = "0.1.1"`, chạy `cargo build` để `Cargo.lock` cập nhật dòng `ctdozlite`.
-2. `CHANGELOG.md`: thêm mục `## [0.1.1] - <ngày>` (Thêm mới / Sửa lỗi / Bảo mật) và link `[0.1.1]` ở cuối file. Cập nhật `docs/SECURITY_AUDIT.md` nếu có thay đổi bảo mật.
-3. `.github/release-notes.md`: cập nhật mục "Điểm mới" cho 0.1.1. Template có sẵn `{{VERSION}}` / `{{COMMIT}}`.
+1. Sửa `Cargo.toml` thành `version = "<phiên bản mới>"`, chạy `cargo build` để `Cargo.lock` cập nhật dòng `ctdozlite`.
+2. `CHANGELOG.md`: thêm mục `## [x.y.z] - <ngày>` (Thêm mới / Sửa lỗi / Bảo mật) và link ở cuối file. Cập nhật `docs/SECURITY_AUDIT.md` nếu có thay đổi bảo mật.
+3. `.github/release-notes.md`: cập nhật mục "Điểm mới" cho phiên bản mới. Template có sẵn `{{VERSION}}` / `{{COMMIT}}`.
 4. Commit theo Conventional Commits, kết thúc bằng hai dòng attribution mà hệ thống cung cấp cho phiên. Push nhánh làm việc; CI chạy cả bản Windows trên mọi push vào `claude/**`.
 5. Khi CI xanh: fast-forward `main` (`git push origin HEAD:main`; trước đó kiểm tra `git merge-base --is-ancestor origin/main HEAD`).
 6. Kích hoạt phát hành bằng GitHub MCP:
    - `actions_run_trigger` với `method=run_workflow`, `workflow_id=ci-release.yml`, `ref=main`, `inputs={"release": true}`.
    - Job `release` tự tạo tag `v<version>` tại commit đã build và chỉ chạy khi `test` + `windows` xanh.
    - Release đã tồn tại thì job dừng có chủ ý, nên mỗi lần phát hành phải tăng phiên bản.
-7. Kiểm tra bằng `get_release_by_tag v0.1.1` rằng release có đủ file:
+7. Kiểm tra bằng `get_release_by_tag v<phiên bản>` rằng release có đủ file:
    - `QTzalo-0.1.1-setup-windows-x86_64.exe`
    - `QTzalo-0.1.1-portable-windows-x86_64.exe`
    - `qtzalo_0.1.1_amd64.deb`
@@ -146,13 +109,18 @@ cargo audit                                # đã cài sẵn trong môi trườn
 - **Không dùng `gh` CLI cho việc khác ngoài tìm kiếm.** Mọi thao tác GitHub (Actions, Release, PR) dùng GitHub MCP. CI chạy được `gh` trên runner, điều này không bị ảnh hưởng.
 - **Không thể ngủ chờ (sleep/poll).** Để chờ CI, dùng `send_later` hẹn tự kiểm tra lại sau khoảng 10–12 phút. Run Windows mất khoảng 9–10 phút.
 - **Không ghi model identifier** vào commit, PR hay mã nguồn.
+- **(0.1.1) Worktree của agent được tạo từ `73849bd` (commit upstream cũ), không phải `main`.** Cách nhắn agent `git merge --ff-only <commit nền>` vẫn hiệu quả; ghi luôn lệnh này vào đầu prompt giao việc.
+- **(0.1.1) Dùng chung `CARGO_TARGET_DIR` giữa các worktree tiết kiệm đĩa nhưng có thể khiến binary là bản build của agent khác** (cùng metadata package). Agent phải `touch` file của mình trước khi build để chụp ảnh và copy binary ngay sau khi build. Đặt tên file chụp/script riêng cho từng agent (scratchpad dùng chung).
+- **(0.1.1) Mẫu chia việc hiệu quả:** coordinator tự viết toàn bộ backend + biến thể enum + xử lý sự kiện trong `gui.rs`, agent chỉ làm UI theo vùng file (messages/modals-viewer vs modals-settings vs chat/deps). Chỉ có 1 xung đột nhỏ ở khối biến demo trong `src/gui.rs`.
 
 ## 8. Tồn đọng đã biết
 
+- **Chưa thử trên Windows thật và tài khoản Zalo thật** cho các tính năng 0.1.1 (và các sửa lỗi lõi #21/#22 của 0.1.0).
+- **Chỉ báo đang nhập** chỉ có ở demo (thiếu bằng chứng giao thức, xem §5.2).
+- **Số thành viên nhóm** dựa trên `totalMember` suy ra từ entity `Group` của web bundle cũ (đã xoá ở `54314e0`); chưa thấy trong payload thật. Thiếu thì header vẫn hiện "Nhóm".
 - **S6:** media cuộc gọi chưa lọc nguồn gói UDP; client khai `srtpMode: 0`.
 - **#19:** chưa đồng bộ toàn bộ lịch sử.
-- **Cảnh báo `cargo audit`:** `lru 0.12.5` unsound (qua ratatui 0.29); `audiopus_sys`, `paste`, `ttf-parser` hết bảo trì.
-- **Chế độ thật:** header nhóm hiện "Nhóm" thay vì số thành viên; chỉ báo đang nhập chỉ có ở demo.
-- **Emoji màu:** egui không vẽ được emoji màu (đã thêm font Segoe UI Emoji làm dự phòng nét đơn trên Windows, chưa thử trên máy thật).
+- **Cảnh báo `cargo audit`:** `audiopus_sys`, `ttf-parser` hết bảo trì (không có lỗ hổng).
+- **Tải về:** chưa có nút huỷ; macOS chưa gắn quarantine; dark theme nút đỏ (`pal.danger`) chữ trắng tương phản hơi thấp.
+- **Emoji màu:** egui không vẽ được emoji màu.
 - **Bộ cài chưa ký số**, nên SmartScreen cảnh báo.
-- **Chưa thử với tài khoản Zalo thật** sau khi sửa các lỗi lõi #21/#22. Nên nhờ người dùng thử và báo lại.

@@ -4,6 +4,39 @@ Mọi thay đổi đáng chú ý của QTzalo được ghi tại đây. Định 
 
 QTzalo là bản fork của [ctdozlite](https://github.com/ctdoteam1110/ctdozlite), tách ra từ commit `73849bd` (tag `v0.0.2` của upstream).
 
+## [0.1.1] - 2026-11-01
+
+### Thêm mới
+
+- **Tải tệp, video và ảnh gốc về "Thư mục lưu file"**
+  - Nút tải về trên thẻ tệp, thẻ video, ảnh trong khung chat (và trong menu chuột phải), cùng nút "Tải về" trên thanh công cụ trình xem ảnh.
+  - Hiển thị tiến trình (phần trăm khi máy chủ báo dung lượng), trạng thái "Đã tải" với nút **Mở** / **Mở thư mục**, báo lỗi rõ ràng và nút **Thử lại**.
+  - Tải xong hiện thông báo có nút **Mở** và **Mở thư mục**.
+  - Tải theo luồng thẳng xuống đĩa, không giữ cả file trong RAM.
+- **Quản lý cache ảnh** trong *Cài đặt → Dữ liệu & làm mới → Lưu trữ trên máy*: xem đường dẫn thư mục dữ liệu (nút "Mở thư mục dữ liệu"), dung lượng cache ảnh (tính ở luồng nền), nút **Xoá cache ảnh** có hộp xác nhận. Chỉ xoá `stickers_cache/`; phiên đăng nhập, lịch sử tin nhắn và cài đặt không bị đụng tới. Ảnh tự tải lại sau khi xoá.
+- **Số thành viên nhóm thật** ở header khung chat ("N thành viên"), lấy từ trường `totalMember` của danh sách nhóm nếu máy chủ trả về; nếu không có vẫn hiện "Nhóm".
+
+### Sửa lỗi
+
+- Ảnh dán từ clipboard không còn bị ghi vào thư mục đang đứng khi chạy app; nay nằm trong cache của thư mục dữ liệu và được dọn sau 24 giờ.
+- Nút **Thay đổi** thư mục lưu file dùng hộp chọn thư mục của hệ điều hành (trước đây phải chọn một file rồi lấy thư mục cha, không chọn được thư mục rỗng).
+- Bố cục cửa sổ Cài đặt bị dàn ngang và tràn màn hình; nút "Làm mới hội thoại" mất chữ ở giao diện sáng.
+
+### Bảo mật
+
+- Tính năng tải về coi URL và tên file trong tin nhắn là dữ liệu không tin cậy (S15 trong `docs/SECURITY_AUDIT.md`):
+  - chỉ tải qua `https://` (`http://` chỉ cho CDN Zalo), kiểm tra lại sau chuyển hướng;
+  - làm sạch tên file (ký tự cấm, ký tự điều khiển và ký tự đảo chiều U+202E, tên thiết bị Windows như `CON`/`COM1`, độ dài ≤ 150 ký tự);
+  - không bao giờ ghi đè file có sẵn (`tên (1).ext`), ghi vào `*.part` rồi mới đổi tên;
+  - trên Windows gắn Mark-of-the-Web (`Zone.Identifier`, `ZoneId=3`) để SmartScreen/Office cảnh báo đúng;
+  - không tự mở file thực thi/script (`.exe .msi .bat .cmd .ps1 .js .lnk .jar .reg .iso`…): nút **Mở** chỉ mở thư mục chứa file.
+- Dependency: nâng `ratatui` 0.30 và `crossterm` 0.29, loại bỏ `lru 0.12.5` (unsound, RUSTSEC-2026-0002 / RUSTSEC-2026-0253) và `paste` (hết bảo trì). Cập nhật patch: `log`, `memmap2`, `rustix`, `smallvec`, `unicode-width`, `webbrowser`, `webpki-roots`, `zune-core`. `cargo audit`: 0 lỗ hổng, còn 2 cảnh báo hết bảo trì (`audiopus_sys`, `ttf-parser`).
+
+### Phát triển
+
+- Module mới `src/download.rs` (chính sách tải tách khỏi I/O, có unit test và test end-to-end với server cục bộ).
+- Biến môi trường cho chế độ `--demo`: `QTZALO_DEMO_DOWNLOADS=1`, `QTZALO_DEMO_SETTINGS=<tab>`, `QTZALO_DEMO_CONFIRM_CLEAR=1`.
+
 ## [0.1.0] - 2026-11-01
 
 Phiên bản đầu tiên của QTzalo.
@@ -115,4 +148,5 @@ Phiên bản đầu tiên của QTzalo.
 - Thêm `docs/CAI_DAT.md` (hướng dẫn cài đặt, xử lý SmartScreen), `docs/SECURITY_AUDIT.md` (kết quả rà soát), `SECURITY.md`.
 - Bổ sung `docs/KHAC_PHUC_SU_CO.md`: font, phiên đăng nhập, giờ hiển thị.
 
+[0.1.1]: https://github.com/quangthoai1985/QTzalo/releases/tag/v0.1.1
 [0.1.0]: https://github.com/quangthoai1985/QTzalo/releases/tag/v0.1.0
