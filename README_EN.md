@@ -26,7 +26,7 @@ Prebuilt installers and portable binaries are available on [GitHub Releases](htt
 
 | OS | Package | Instructions |
 | :--- | :--- | :--- |
-| **Windows** | `.exe` Installer / Portable `.zip` | Run installer or extract and run `zalo-rust.exe` |
+| **Windows** | `.exe` Installer / Portable `.zip` | Run installer or extract and run `ctdozlite.exe` |
 | **macOS** | Universal `.dmg` (Apple Silicon & Intel) | Open `.dmg`, drag `ctdozlite.app` to `/Applications` |
 | **Linux** | `.deb` / `.rpm` / `.AppImage` / `.tar.gz` | Install via package manager or run directly with `chmod +x` |
 
@@ -34,13 +34,13 @@ Prebuilt installers and portable binaries are available on [GitHub Releases](htt
 
 | Option | Description | Example |
 | :--- | :--- | :--- |
-| `--data-dir <PATH>` | Set custom directory for session, database, cache, and logs | `zalo-rust --data-dir ./my-data --gui` |
-| `--print-data-dir` | Print resolved data directory and exit | `zalo-rust --print-data-dir` |
-| `--gui` | Launch graphical user interface (default) | `zalo-rust --gui` |
-| `--tui` | Launch terminal user interface | `zalo-rust --tui` |
-| `--qr` | Request login QR code immediately | `zalo-rust --tui --qr` |
-| `--logout` | Clear saved session and exit | `zalo-rust --logout` |
-| `--version` / `-V` | Print version and exit without initializing storage | `zalo-rust --version` |
+| `--data-dir <PATH>` | Set custom directory for session, database, cache, and logs | `ctdozlite --data-dir ./my-data --gui` |
+| `--print-data-dir` | Print resolved data directory and exit | `ctdozlite --print-data-dir` |
+| `--gui` | Launch graphical user interface (default) | `ctdozlite --gui` |
+| `--tui` | Launch terminal user interface | `ctdozlite --tui` |
+| `--qr` | Request login QR code immediately | `ctdozlite --tui --qr` |
+| `--logout` | Clear saved session and exit | `ctdozlite --logout` |
+| `--version` / `-V` | Print version and exit without initializing storage | `ctdozlite --version` |
 
 ---
 
@@ -61,7 +61,7 @@ cd ctdozlite
 cargo build --release
 
 # Run GUI
-./target/release/zalo-rust --gui
+./target/release/ctdozlite --gui
 ```
 
 ---
@@ -81,6 +81,31 @@ Core contributors with representative code commits in the repository:
 > *Note: The complete hall of fame honoring all contributors (bug reports, feature requests, pull requests) is published at [Contributors Wall](https://ctdozlite.ctdo.net/contributors.html).*
 
 ---
+
+
+---
+
+## 🙏 Acknowledgements
+
+`ctdozlite` expresses its deepest gratitude to **VNG Corporation** and the **Zalo** development team, who built an excellent messaging platform serving tens of millions of users in Vietnam.
+
+### Purpose of this project
+
+- This project exists for **one purpose only**: learning and systems-engineering research, specifically understanding how a modern messaging application operates at the network-protocol, encryption, and native desktop architecture layers.
+- All source code is **written from scratch in Rust**, based on observing public data flows between Zalo Web/PC and its servers. This project does **not** decompile, extract, or repackage any proprietary Zalo asset (no bundled original icons, stickers, audio, images, or Zalo JS/WASM code).
+- We **do not own** and **do not claim ownership** of the `Zalo` trademark, logo, or any VNG intellectual property. The name `Zalo` is used descriptively only, to state **which service's protocol this software is compatible with**, so users understand the product's nature.
+- The project is **entirely non-commercial**: 100% open source, no fees, no advertising, no data sales, no monetization of any kind.
+
+### Data privacy
+
+- All messages and user data are stored **locally on your machine** (`zalo_history.db`, `session.json`, `threads_cache.json`).
+- The application **sends no data** to the maintainer's servers or any third party. The only network connection is to the official Zalo system, identical to a browser opening `chat.zalo.me`.
+
+### Takedown policy
+
+If VNG Corporation or an authorized Zalo representative has any request regarding this project (including but not limited to takedown, renaming, or content adjustment), please contact us via **GitHub Issues** or the maintainer's email. We commit to **responding within 72 hours** and **complying with any legitimate request**.
+
+> **In short:** We are deeply grateful to VNG and the Zalo team for building a great product. This project is only a learning effort by a small group of developers who love Rust and want to understand modern messaging systems more deeply. If anything is incorrect, we are ready to listen and change.
 
 ## 📜 License
 

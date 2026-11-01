@@ -126,7 +126,7 @@ cd ctdozlite
 $env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"
 cargo build --release
 ```
-Binary đầu ra: `target\release\zalo-rust.exe`
+Binary đầu ra: `target\release\ctdozlite.exe`
 
 ### 3. Linux (Debian / Ubuntu / Fedora / Arch)
 Cài đặt các gói thư viện hệ thống cho âm thanh (`ALSA`) và cửa sổ (`X11` / `Wayland` / `GTK3`):
@@ -157,7 +157,7 @@ git clone https://github.com/ctdoteam1110/ctdozlite.git
 cd ctdozlite
 CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo build --release
 ```
-Binary đầu ra: `target/release/zalo-rust`
+Binary đầu ra: `target/release/ctdozlite`
 
 ### 4. macOS (Apple Silicon ARM64 & Intel x86_64)
 ```bash
@@ -167,7 +167,7 @@ git clone https://github.com/ctdoteam1110/ctdozlite.git
 cd ctdozlite
 cargo build --release
 ```
-Binary đầu ra: `target/release/zalo-rust` *(Tự động liên kết tĩnh `libopus.a` qua `.cargo/config.toml` + `packaging/macos/toolchain-*.cmake`, không cần cài `opus` rời qua Homebrew)*.
+Binary đầu ra: `target/release/ctdozlite` *(Tự động liên kết tĩnh `libopus.a` qua `.cargo/config.toml` + `packaging/macos/toolchain-*.cmake`, không cần cài `opus` rời qua Homebrew)*.
 
 ---
 
@@ -175,26 +175,26 @@ Binary đầu ra: `target/release/zalo-rust` *(Tự động liên kết tĩnh `l
 
 ### Chạy giao diện đồ họa (GUI - mặc định)
 ```bash
-./target/release/zalo-rust --gui
+./target/release/ctdozlite --gui
 ```
 - Quét mã QR bằng ứng dụng Zalo trên điện thoại và xác nhận đăng nhập.
 - Khi gõ các từ/cụm từ cảm xúc trong ô chat (`xin chào`, `cảm ơn`, `khóc`, `nhớ`, `cố lên`, `mệt quá`, `đi chơi`...), thanh gợi ý nhãn dán sẽ tự động hiển thị phía trên ô nhập. Có thể bấm chuột hoặc dùng phím `↑` `←` `→` `Enter` để chọn và gửi nhanh, hoặc nhấn `Esc` để đóng.
 
 ### Chạy giao diện dòng lệnh (TUI)
 ```bash
-./target/release/zalo-rust --tui --qr
+./target/release/ctdozlite --tui --qr
 ```
 - Điều hướng bằng `↑`/`↓` (hoặc `j`/`k`), nhấn `Enter` để gửi tin nhắn, `Tab` để đổi vùng chọn, `r` để làm mới danh sách và `q` để thoát.
 
 ### Chế độ chẩn đoán giao thức (Dev Inspector)
 ```bash
-./target/release/zalo-rust --gui --dev
+./target/release/ctdozlite --gui --dev
 ```
 - Hiển thị thêm bảng kiểm tra request/response, thời gian phản hồi, payload đã giải mã và trạng thái khóa phiên.
 
 ### Đăng xuất và xóa phiên
 ```bash
-./target/release/zalo-rust --logout
+./target/release/ctdozlite --logout
 ```
 
 ---
@@ -336,6 +336,31 @@ Dự án ghi nhận các thành viên có đóng góp mã nguồn tiêu biểu t
 
 </details>
 
+
+
+---
+
+## 🙏 Lời cảm ơn & Ghi công (Acknowledgements)
+
+`ctdozlite` xin bày tỏ lòng biết ơn sâu sắc tới **VNG Corporation** và đội ngũ phát triển **Zalo** — những người đã xây dựng nên một nền tảng nhắn tin tuyệt vời, phục vụ hàng chục triệu người dùng Việt Nam.
+
+### Về mục đích dự án
+
+- Dự án này được sinh ra với **duy nhất một mục đích**: học hỏi và nghiên cứu kỹ thuật hệ thống (systems engineering research) — cụ thể là tìm hiểu cách một ứng dụng nhắn tin hiện đại vận hành ở tầng giao thức mạng, mã hóa, và kiến trúc desktop native.
+- Toàn bộ mã nguồn được viết lại **từ đầu bằng Rust**, dựa trên quan sát luồng dữ liệu công khai giữa Zalo Web/PC và máy chủ. Dự án **không** decompile, **không** trích xuất, **không** đóng gói lại bất kỳ tài nguyên độc quyền nào của Zalo (không nhúng icon gốc, sticker gốc, âm thanh, hình ảnh hay mã nguồn JS/WASM của Zalo).
+- Chúng tôi **không sở hữu** và **không tuyên bố sở hữu** thương hiệu `Zalo`, logo Zalo, hay bất kỳ tài sản trí tuệ nào của VNG. Tên `Zalo` chỉ được sử dụng với ý nghĩa mô tả (descriptive use) để chỉ rõ phần mềm này **tương thích giao thức với dịch vụ nào**, giúp người dùng hiểu rõ bản chất sản phẩm.
+- Dự án **hoàn toàn phi thương mại**: 100% mã nguồn mở, không thu phí, không quảng cáo, không bán dữ liệu, không có bất kỳ hình thức kiếm tiền nào.
+
+### Về quyền riêng tư dữ liệu
+
+- Mọi tin nhắn và dữ liệu người dùng đều được lưu **cục bộ trên máy của bạn** (`zalo_history.db`, `session.json`, `threads_cache.json`).
+- Ứng dụng **không gửi** bất kỳ dữ liệu nào tới máy chủ của tác giả dự án hay bất kỳ bên thứ ba nào. Kết nối mạng duy nhất là tới hệ thống chính thức của Zalo — giống hệt trình duyệt khi bạn mở `chat.zalo.me`.
+
+### Về khả năng gỡ bỏ
+
+Nếu VNG Corporation hoặc đại diện hợp pháp của Zalo có bất kỳ yêu cầu nào liên quan đến dự án này (bao gồm nhưng không giới hạn: yêu cầu gỡ bỏ, đổi tên, hoặc điều chỉnh nội dung), vui lòng liên hệ trực tiếp qua **GitHub Issues** hoặc email của maintainer. Chúng tôi cam kết **phản hồi trong vòng 72 giờ** và **tuân thủ mọi yêu cầu chính đáng**.
+
+> **Tóm lại:** Chúng tôi vô cùng biết ơn VNG và đội ngũ Zalo đã tạo ra một sản phẩm tuyệt vời. Dự án này chỉ là nỗ lực học tập của một nhóm nhỏ các lập trình viên yêu thích Rust và muốn hiểu sâu hơn về hệ thống nhắn tin hiện đại. Nếu có bất kỳ điều gì chưa đúng, chúng tôi sẵn sàng lắng nghe và sửa đổi.
 
 ## Giấy phép
 

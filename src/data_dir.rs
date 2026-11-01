@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn resolves_bundle_cli_and_explicit_paths() {
         let cwd = Path::new("/work");
-        let exe = Path::new("/Applications/Zalo.app/Contents/MacOS/zalo-rust");
+        let exe = Path::new("/Applications/Zalo.app/Contents/MacOS/ctdozlite");
         assert_eq!(
             resolve(&[], cwd, exe, Some(Path::new("/Users/fixture")), true).unwrap(),
             (
@@ -174,7 +174,7 @@ mod tests {
             )
         );
         assert_eq!(
-            resolve(&[], cwd, Path::new("/bin/zalo-rust"), None, true).unwrap(),
+            resolve(&[], cwd, Path::new("/bin/ctdozlite"), None, true).unwrap(),
             (cwd.to_path_buf(), false)
         );
         assert_eq!(
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn explicit_path_overrides_bundle_and_relative_home_is_rejected() {
         let cwd = Path::new("/work");
-        let exe = Path::new("/Applications/Fixture.app/Contents/MacOS/zalo-rust");
+        let exe = Path::new("/Applications/Fixture.app/Contents/MacOS/ctdozlite");
         assert_eq!(
             resolve(&["--data-dir=/fixture-data".into()], cwd, exe, None, true).unwrap(),
             (PathBuf::from("/fixture-data"), true)
@@ -241,7 +241,7 @@ mod tests {
             resolve(
                 &[],
                 cwd,
-                Path::new("/Fixture.app/Contents/MacOS-extra/zalo-rust"),
+                Path::new("/Fixture.app/Contents/MacOS-extra/ctdozlite"),
                 None,
                 true
             )
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn spaced_storage_option_rejects_flags_but_explicit_dash_paths_are_valid() {
         let cwd = Path::new("/work");
-        let exe = Path::new("/bin/zalo-rust");
+        let exe = Path::new("/bin/ctdozlite");
         for flag in ["-d", "-v", "-V", "--logout"] {
             assert!(
                 resolve(&["--data-dir".into(), flag.into()], cwd, exe, None, true).is_err(),

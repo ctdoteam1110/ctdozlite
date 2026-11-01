@@ -26,7 +26,7 @@
 
 | 操作系统 | 安装包类型 | 安装说明 |
 | :--- | :--- | :--- |
-| **Windows** | `.exe` 安装程序 / 便携版 `.zip` | 运行安装程序或解压后直接执行 `zalo-rust.exe` |
+| **Windows** | `.exe` 安装程序 / 便携版 `.zip` | 运行安装程序或解压后直接执行 `ctdozlite.exe` |
 | **macOS** | Universal `.dmg` (支持 M 系列及 Intel) | 打开 `.dmg` 文件，将 `ctdozlite.app` 拖入 `/Applications` |
 | **Linux** | `.deb` / `.rpm` / `.AppImage` / `.tar.gz` | 通过包管理器安装，或赋予 `chmod +x` 权限后直接运行 |
 
@@ -34,13 +34,13 @@
 
 | 参数 | 功能说明 | 使用示例 |
 | :--- | :--- | :--- |
-| `--data-dir <PATH>` | 指定会话、数据库、缓存与日志存储的绝对或相对目录 | `zalo-rust --data-dir ./my-data --gui` |
-| `--print-data-dir` | 输出当前解析生效的数据目录路径并退出 | `zalo-rust --print-data-dir` |
-| `--gui` | 以图形界面 GUI 模式启动（默认） | `zalo-rust --gui` |
-| `--tui` | 以终端控制台 TUI 模式启动 | `zalo-rust --tui` |
-| `--qr` | 启动 TUI 模式时立即请求并渲染登录二维码 | `zalo-rust --tui --qr` |
-| `--logout` | 清除本地保存的登录凭据并退出 | `zalo-rust --logout` |
-| `--version` / `-V` | 查看版本信息并直接退出（不创建数据文件夹） | `zalo-rust --version` |
+| `--data-dir <PATH>` | 指定会话、数据库、缓存与日志存储的绝对或相对目录 | `ctdozlite --data-dir ./my-data --gui` |
+| `--print-data-dir` | 输出当前解析生效的数据目录路径并退出 | `ctdozlite --print-data-dir` |
+| `--gui` | 以图形界面 GUI 模式启动（默认） | `ctdozlite --gui` |
+| `--tui` | 以终端控制台 TUI 模式启动 | `ctdozlite --tui` |
+| `--qr` | 启动 TUI 模式时立即请求并渲染登录二维码 | `ctdozlite --tui --qr` |
+| `--logout` | 清除本地保存的登录凭据并退出 | `ctdozlite --logout` |
+| `--version` / `-V` | 查看版本信息并直接退出（不创建数据文件夹） | `ctdozlite --version` |
 
 ---
 
@@ -61,7 +61,7 @@ cd ctdozlite
 cargo build --release
 
 # 运行客户端
-./target/release/zalo-rust --gui
+./target/release/ctdozlite --gui
 ```
 
 ---
@@ -81,6 +81,31 @@ cargo build --release
 > *注: 涵盖所有报告缺陷、提出建议和提交 PR 的完整贡献者荣誉墙请查阅 [在线贡献者名录](https://ctdozlite.ctdo.net/contributors.html)。*
 
 ---
+
+
+---
+
+## 🙏 致谢
+
+`ctdozlite` 由衷感谢 **VNG Corporation** 及 **Zalo** 开发团队，他们打造了这一服务越南数千万用户的优秀即时通讯平台。
+
+### 关于本项目的目的
+
+- 本项目存在的 **唯一目的** 是学习与系统级工程研究，即理解现代即时通讯应用在网络协议、加密以及原生桌面架构层面是如何运作的。
+- 所有源代码均基于对 Zalo Web/PC 与服务器之间公开数据流的观察，**使用 Rust 从零编写**。本项目 **不会** 反编译、提取或重新打包任何 Zalo 专有资源（不内置原始图标、贴纸、音频、图像或 Zalo 的 JS/WASM 代码）。
+- 我们 **不拥有** 也 **不主张拥有** `Zalo` 商标、Logo 或任何 VNG 知识产权。`Zalo` 名称仅作描述性使用，用于说明本软件 **与哪个服务的协议相兼容**，以便用户理解产品性质。
+- 本项目 **完全非商业**：100% 开源、不收费、无广告、不出售数据、无任何形式的盈利。
+
+### 关于数据隐私
+
+- 所有消息和用户数据均 **保存在您本机**（`zalo_history.db`、`session.json`、`threads_cache.json`）。
+- 本应用 **不会** 向项目维护者的服务器或任何第三方发送任何数据。唯一的网络连接指向 Zalo 官方系统，与您在浏览器中打开 `chat.zalo.me` 完全一致。
+
+### 关于下架政策
+
+若 VNG Corporation 或 Zalo 的合法代表对本项目提出任何要求（包括但不限于下架、更名或调整内容），请通过 **GitHub Issues** 或维护者邮箱与我们联系。我们承诺 **在 72 小时内回复** 并 **遵守一切合理要求**。
+
+> **总之：** 我们非常感谢 VNG 与 Zalo 团队打造了如此优秀的产品。本项目只是一小群热爱 Rust、希望更深入理解现代即时通讯系统的开发者的学习尝试。
 
 ## 📜 开源许可证
 

@@ -26,7 +26,7 @@ ElectronやChromiumを使用せず、Rust（`eframe`/`egui` + `ratatui`）を用
 
 | OS | パッケージ形式 | インストール手順 |
 | :--- | :--- | :--- |
-| **Windows** | `.exe` インストーラー / ポータブル `.zip` | インストーラーを実行するか、展開して `zalo-rust.exe` を起動 |
+| **Windows** | `.exe` インストーラー / ポータブル `.zip` | インストーラーを実行するか、展開して `ctdozlite.exe` を起動 |
 | **macOS** | Universal `.dmg`（Apple SiliconおよびIntel） | `.dmg` を開き、`ctdozlite.app` を `/Applications` へドラッグ |
 | **Linux** | `.deb` / `.rpm` / `.AppImage` / `.tar.gz` | パッケージマネージャーで導入するか、`chmod +x` を付与して直接実行 |
 
@@ -34,13 +34,13 @@ ElectronやChromiumを使用せず、Rust（`eframe`/`egui` + `ratatui`）を用
 
 | オプション | 説明 | 実行例 |
 | :--- | :--- | :--- |
-| `--data-dir <PATH>` | セッション、データベース、キャッシュ、ログの保存先を指定 | `zalo-rust --data-dir ./my-data --gui` |
-| `--print-data-dir` | 解決されたデータディレクトリのパスを表示して終了 | `zalo-rust --print-data-dir` |
-| `--gui` | グラフィカルUI（GUI）モードで起動（デフォルト） | `zalo-rust --gui` |
-| `--tui` | ターミナルUI（TUI）モードで起動 | `zalo-rust --tui` |
-| `--qr` | TUI起動時に直ちにログインQRコードを生成 | `zalo-rust --tui --qr` |
-| `--logout` | 保存されたセッションを破棄して終了 | `zalo-rust --logout` |
-| `--version` / `-V` | ストレージの準備を行わずにバージョンを表示して終了 | `zalo-rust --version` |
+| `--data-dir <PATH>` | セッション、データベース、キャッシュ、ログの保存先を指定 | `ctdozlite --data-dir ./my-data --gui` |
+| `--print-data-dir` | 解決されたデータディレクトリのパスを表示して終了 | `ctdozlite --print-data-dir` |
+| `--gui` | グラフィカルUI（GUI）モードで起動（デフォルト） | `ctdozlite --gui` |
+| `--tui` | ターミナルUI（TUI）モードで起動 | `ctdozlite --tui` |
+| `--qr` | TUI起動時に直ちにログインQRコードを生成 | `ctdozlite --tui --qr` |
+| `--logout` | 保存されたセッションを破棄して終了 | `ctdozlite --logout` |
+| `--version` / `-V` | ストレージの準備を行わずにバージョンを表示して終了 | `ctdozlite --version` |
 
 ---
 
@@ -61,7 +61,7 @@ cd ctdozlite
 cargo build --release
 
 # GUI起動
-./target/release/zalo-rust --gui
+./target/release/ctdozlite --gui
 ```
 
 ---
@@ -81,6 +81,31 @@ cargo build --release
 > *注: バグ報告、機能提案、プルリクエストを含むすべての貢献者の名簿は[貢献者一覧ウォール](https://ctdozlite.ctdo.net/contributors.html)で公開されています。*
 
 ---
+
+
+---
+
+## 🙏 謝辞
+
+`ctdozlite` は、ベトナムで数千万人に利用されている優れたメッセージングプラットフォームを構築した **VNG Corporation** および **Zalo** 開発チームに深く感謝いたします。
+
+### 本プロジェクトの目的
+
+- 本プロジェクトは **ただ一つの目的** のために存在します。それは学習とシステムエンジニアリング研究であり、現代のメッセージングアプリがネットワークプロトコル、暗号化、ネイティブデスクトップアーキテクチャの各層でどのように動作するかを理解することです。
+- すべてのソースコードは、Zalo Web/PC とサーバー間の公開データフローを観察して **Rust でゼロから記述** されています。本プロジェクトは Zalo の独自資産（オリジナルのアイコン、スタンプ、音声、画像、JS/WASM コード）を **逆コンパイル、抽出、再配布することはありません**。
+- 当方は `Zalo` の商標、ロゴ、その他 VNG の知的財産を **所有しておらず、所有権を主張しません**。`Zalo` という名称は、本ソフトウェアが **どのサービスのプロトコルと互換性があるか** を示すための記述的用途にのみ使用されています。
+- 本プロジェクトは **完全に非営利** です。100% オープンソース、料金なし、広告なし、データ販売なし。
+
+### データプライバシー
+
+- すべてのメッセージとユーザーデータは **お使いのマシンにローカル保存** されます（`zalo_history.db`、`session.json`、`threads_cache.json`）。
+- 本アプリケーションは、管理者のサーバーや第三者に **いかなるデータも送信しません**。唯一のネットワーク接続は、ブラウザで `chat.zalo.me` を開く場合と同一の、公式 Zalo システムへの接続です。
+
+### 削除要請ポリシー
+
+VNG Corporation または Zalo の権限ある代理人が本プロジェクトに関して何らかの要請（削除、名称変更、内容修正など）を行う場合は、**GitHub Issues** または管理者のメールアドレスまでご連絡ください。当方は **72時間以内に回答** し、**あらゆる正当な要請に従う** ことを約束します。
+
+> **要約:** VNG と Zalo チームが素晴らしい製品を生み出したことに深く感謝します。本プロジェクトは、Rust を愛し現代のメッセージングシステムをより深く理解したい小規模な開発者グループによる学習の取り組みに過ぎません。
 
 ## 📜 ライセンス
 

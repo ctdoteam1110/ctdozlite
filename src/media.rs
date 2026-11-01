@@ -344,6 +344,53 @@ fn clear_rtcp_inbox() {
     }
 }
 
+/// Cross-leg audio conference bridge for multi-member group calls (up to 4 slots).
+/// Decoded PCM from slot `s` is pushed into every other slot's queue and mixed into
+/// each slot's outbound Opus stream so all group call participants hear one another.
+static PEER_AUDIO_BRIDGE: [Mutex<VecDeque<f32>>; 4] = [
+    Mutex::new(VecDeque::new()),
+    Mutex::new(VecDeque::new()),
+    Mutex::new(VecDeque::new()),
+    Mutex::new(VecDeque::new()),
+];
+const PEER_BRIDGE_MAX_SAMPLES: usize = FRAME_SAMPLES * 8;
+
+fn push_peer_bridge_audio(from_slot: u16, pcm: &[f32]) {
+    let idx = from_slot as usize;
+    if idx >= PEER_AUDIO_BRIDGE.len() {
+        return;
+    }
+    for (other, q_mtx) in PEER_AUDIO_BRIDGE.iter().enumerate() {
+        if other == idx {
+            continue;
+        }
+        if let Ok(mut q) = q_mtx.lock() {
+            let q_len = q.len();
+            if q_len + pcm.len() > PEER_BRIDGE_MAX_SAMPLES {
+                let drop_n = ((q_len + pcm.len()) - PEER_BRIDGE_MAX_SAMPLES).min(q_len);
+                q.drain(..drop_n);
+            }
+            q.extend(pcm.iter().copied());
+        }
+    }
+}
+
+fn mix_peer_bridge_audio(for_slot: u16, frame: &mut [f32]) {
+    let idx = for_slot as usize;
+    if idx >= PEER_AUDIO_BRIDGE.len() {
+        return;
+    }
+    if let Ok(mut q) = PEER_AUDIO_BRIDGE[idx].lock() {
+        if q.len() >= frame.len() {
+            for s in frame.iter_mut() {
+                if let Some(p) = q.pop_front() {
+                    *s = (*s + p).clamp(-1.0, 1.0);
+                }
+            }
+        }
+    }
+}
+
 /// True if a raw relay-framed datagram is RTCP (PT 200..=207) containing a PLI or FIR.
 #[cfg(test)]
 fn wire_requests_keyframe(wire: &[u8]) -> bool {
@@ -1428,6 +1475,7 @@ fn run_media_loop(
             if mic_muted.load(Ordering::Relaxed) {
                 frame.fill(0.0);
             }
+            mix_peer_bridge_audio(slot_idx, &mut frame);
             let mut out = vec![0u8; 4000];
             match encoder.encode_float(&frame, &mut out) {
                 Ok(n) => {
@@ -1701,6 +1749,7 @@ fn run_media_loop(
                     if let Some(payload) = extract_rtp_opus_payload(inner_rtp) {
                         let mut pcm = vec![0f32; FRAME_SAMPLES];
                         if decoder.decode_float(payload, &mut pcm, false).is_ok() {
+                            push_peer_bridge_audio(slot_idx, &pcm);
                             if let Ok(mut b) = output_buf.lock() {
                                 b.extend_from_slice(&pcm);
                             }

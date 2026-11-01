@@ -26,7 +26,7 @@ Electron이나 Chromium 없이 Rust(`eframe`/`egui` + `ratatui`)로 제작되어
 
 | 운영체제 | 패키지 형태 | 설치 방법 |
 | :--- | :--- | :--- |
-| **Windows** | `.exe` 설치 프로그램 / 포터블 `.zip` | 설치 파일 실행 또는 압축 해제 후 `zalo-rust.exe` 실행 |
+| **Windows** | `.exe` 설치 프로그램 / 포터블 `.zip` | 설치 파일 실행 또는 압축 해제 후 `ctdozlite.exe` 실행 |
 | **macOS** | Universal `.dmg` (Apple Silicon & Intel) | `.dmg` 마운트 후 `ctdozlite.app`을 `/Applications`로 드래그 |
 | **Linux** | `.deb` / `.rpm` / `.AppImage` / `.tar.gz` | 패키지 매니저로 설치하거나 `chmod +x` 실행 권한 부여 후 직접 실행 |
 
@@ -34,13 +34,13 @@ Electron이나 Chromium 없이 Rust(`eframe`/`egui` + `ratatui`)로 제작되어
 
 | 옵션 | 설명 | 실행 예시 |
 | :--- | :--- | :--- |
-| `--data-dir <PATH>` | 세션, 데이터베이스, 캐시, 로그 저장 경로 직접 지정 | `zalo-rust --data-dir ./my-data --gui` |
-| `--print-data-dir` | 사용 중인 데이터 디렉터리 경로 출력 후 즉시 종료 | `zalo-rust --print-data-dir` |
-| `--gui` | 그래픽 사용자 인터페이스(GUI) 모드로 실행 (기본값) | `zalo-rust --gui` |
-| `--tui` | 터미널 콘솔(TUI) 모드로 실행 | `zalo-rust --tui` |
-| `--qr` | TUI 모드 시작 즉시 로그인 QR 코드 생성 요청 | `zalo-rust --tui --qr` |
-| `--logout` | 저장된 세션 로그아웃 및 삭제 후 종료 | `zalo-rust --logout` |
-| `--version` / `-V` | 버전 정보 출력 후 즉시 종료 (데이터 폴더 미생성) | `zalo-rust --version` |
+| `--data-dir <PATH>` | 세션, 데이터베이스, 캐시, 로그 저장 경로 직접 지정 | `ctdozlite --data-dir ./my-data --gui` |
+| `--print-data-dir` | 사용 중인 데이터 디렉터리 경로 출력 후 즉시 종료 | `ctdozlite --print-data-dir` |
+| `--gui` | 그래픽 사용자 인터페이스(GUI) 모드로 실행 (기본값) | `ctdozlite --gui` |
+| `--tui` | 터미널 콘솔(TUI) 모드로 실행 | `ctdozlite --tui` |
+| `--qr` | TUI 모드 시작 즉시 로그인 QR 코드 생성 요청 | `ctdozlite --tui --qr` |
+| `--logout` | 저장된 세션 로그아웃 및 삭제 후 종료 | `ctdozlite --logout` |
+| `--version` / `-V` | 버전 정보 출력 후 즉시 종료 (데이터 폴더 미생성) | `ctdozlite --version` |
 
 ---
 
@@ -61,7 +61,7 @@ cd ctdozlite
 cargo build --release
 
 # GUI 실행
-./target/release/zalo-rust --gui
+./target/release/ctdozlite --gui
 ```
 
 ---
@@ -81,6 +81,31 @@ cargo build --release
 > *참고: 버그 제보, 기능 제안, PR을 포함한 모든 기여자의 전체 명단은 [기여자 명예의 전당](https://ctdozlite.ctdo.net/contributors.html)에서 확인하실 수 있습니다.*
 
 ---
+
+
+---
+
+## 🙏 감사의 말
+
+`ctdozlite`는 베트남 수천만 사용자에게 서비스를 제공하는 뛰어난 메신저 플랫폼을 만든 **VNG Corporation**과 **Zalo** 개발팀에게 깊은 감사를 표합니다.
+
+### 프로젝트 목적
+
+- 본 프로젝트는 **단 하나의 목적**을 위해 존재합니다: 학습 및 시스템 엔지니어링 연구, 즉 현대 메신저 애플리케이션이 네트워크 프로토콜, 암호화, 네이티브 데스크톱 아키텍처 계층에서 어떻게 동작하는지 이해하는 것입니다.
+- 모든 소스 코드는 Zalo Web/PC와 서버 간의 공개 데이터 흐름을 관찰하여 **Rust로 처음부터 작성**되었습니다. 본 프로젝트는 Zalo의 독점 자산(원본 아이콘, 스티커, 오디오, 이미지, JS/WASM 코드)을 **디컴파일하거나 추출하거나 재배포하지 않습니다**.
+- 당사는 `Zalo` 상표, 로고 또는 VNG의 지식재산권을 **소유하지 않으며 소유권을 주장하지 않습니다**. `Zalo`라는 이름은 본 소프트웨어가 **어떤 서비스의 프로토콜과 호환되는지**를 설명하기 위한 서술적 용도로만 사용됩니다.
+- 본 프로젝트는 **완전히 비상업적**입니다: 100% 오픈 소스, 요금 없음, 광고 없음, 데이터 판매 없음.
+
+### 데이터 프라이버시
+
+- 모든 메시지와 사용자 데이터는 **사용자 컴퓨터에 로컬로** 저장됩니다 (`zalo_history.db`, `session.json`, `threads_cache.json`).
+- 애플리케이션은 관리자 서버나 제3자에게 **어떤 데이터도 전송하지 않습니다**. 유일한 네트워크 연결은 브라우저로 `chat.zalo.me`에 접속할 때와 동일하게 공식 Zalo 시스템으로 향합니다.
+
+### 삭제 요청 정책
+
+VNG Corporation 또는 Zalo의 권한 있는 대리인이 본 프로젝트와 관련하여 어떠한 요청(삭제, 이름 변경, 내용 조정 등)을 하시려면 **GitHub Issues** 또는 관리자 이메일로 연락해 주시기 바랍니다. 당사는 **72시간 이내에 답변**하고 **모든 정당한 요청을 준수**할 것을 약속합니다.
+
+> **요약:** VNG와 Zalo 팀이 훌륭한 제품을 만들어 주신 것에 깊이 감사드립니다. 본 프로젝트는 Rust를 사랑하고 현대 메신저 시스템을 더 깊이 이해하고자 하는 소규모 개발자 그룹의 학습 노력일 뿐입니다.
 
 ## 📜 라이선스
 

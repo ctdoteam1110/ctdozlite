@@ -72,14 +72,13 @@ jobs:
         run: cargo test --locked
       - name: Build release binary (static libopus & sqlite3)
         run: |
-          cargo build --release --locked --bin zalo-rust
-          strip target/release/zalo-rust
-          chmod +x packaging/linux/ctdozlite packaging/linux/install.sh packaging/linux/uninstall.sh
+          cargo build --release --locked --bin ctdozlite
+          strip target/release/ctdozlite
+          chmod +x packaging/linux/install.sh packaging/linux/uninstall.sh
       - name: Package .deb (Debian / Ubuntu 22.04+ / Linux Mint / Kali / Pop!_OS / Zorin)
         run: |
           mkdir -p dist pkg_deb/DEBIAN pkg_deb/usr/bin pkg_deb/usr/share/applications pkg_deb/usr/share/icons/hicolor/256x256/apps
-          cp target/release/zalo-rust pkg_deb/usr/bin/zalo-rust
-          cp packaging/linux/ctdozlite pkg_deb/usr/bin/ctdozlite
+          cp target/release/ctdozlite pkg_deb/usr/bin/ctdozlite
           cp packaging/linux/ctdozlite.desktop pkg_deb/usr/share/applications/ctdozlite.desktop
           cp src/assets/app_icon.png pkg_deb/usr/share/icons/hicolor/256x256/apps/ctdozlite.png
           cat > pkg_deb/DEBIAN/control << EOF
@@ -115,13 +114,11 @@ jobs:
           mkdir -p %{buildroot}/usr/bin
           mkdir -p %{buildroot}/usr/share/applications
           mkdir -p %{buildroot}/usr/share/icons/hicolor/256x256/apps
-          install -m 755 %{_topdir}/../target/release/zalo-rust %{buildroot}/usr/bin/zalo-rust
-          install -m 755 %{_topdir}/../packaging/linux/ctdozlite %{buildroot}/usr/bin/ctdozlite
+          install -m 755 %{_topdir}/../target/release/ctdozlite %{buildroot}/usr/bin/ctdozlite
           install -m 644 %{_topdir}/../packaging/linux/ctdozlite.desktop %{buildroot}/usr/share/applications/ctdozlite.desktop
           install -m 644 %{_topdir}/../src/assets/app_icon.png %{buildroot}/usr/share/icons/hicolor/256x256/apps/ctdozlite.png
 
           %files
-          /usr/bin/zalo-rust
           /usr/bin/ctdozlite
           /usr/share/applications/ctdozlite.desktop
           /usr/share/icons/hicolor/256x256/apps/ctdozlite.png
@@ -132,8 +129,7 @@ jobs:
       - name: Package .AppImage (Universal single-file executable for all Linux distros)
         run: |
           mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
-          cp target/release/zalo-rust AppDir/usr/bin/zalo-rust
-          cp packaging/linux/ctdozlite AppDir/usr/bin/ctdozlite
+          cp target/release/ctdozlite AppDir/usr/bin/ctdozlite
           cp packaging/linux/ctdozlite.desktop AppDir/ctdozlite.desktop
           cp packaging/linux/ctdozlite.desktop AppDir/usr/share/applications/ctdozlite.desktop
           cp src/assets/app_icon.png AppDir/ctdozlite.png
@@ -144,9 +140,9 @@ jobs:
           HERE="$(dirname "$(readlink -f "${0}")")"
           export PATH="${HERE}/usr/bin:${PATH}"
           if [ $# -eq 0 ]; then
-              exec "${HERE}/usr/bin/zalo-rust" --gui
+              exec "${HERE}/usr/bin/ctdozlite" --gui
           else
-              exec "${HERE}/usr/bin/zalo-rust" "$@"
+              exec "${HERE}/usr/bin/ctdozlite" "$@"
           fi
           EOF
           chmod +x AppDir/AppRun
@@ -158,14 +154,13 @@ jobs:
         run: |
           STAGE="ctdozlite-${VERSION}-linux-x86_64"
           mkdir -p "$STAGE"
-          cp target/release/zalo-rust "$STAGE/zalo-rust"
-          cp packaging/linux/ctdozlite "$STAGE/ctdozlite"
+          cp target/release/ctdozlite "$STAGE/ctdozlite"
           cp packaging/linux/install.sh "$STAGE/install.sh"
           cp packaging/linux/uninstall.sh "$STAGE/uninstall.sh"
           cp packaging/linux/ctdozlite.desktop "$STAGE/ctdozlite.desktop"
           cp src/assets/app_icon.png "$STAGE/ctdozlite.png"
           cp README.md LICENSE-MIT LICENSE-APACHE "$STAGE/"
-          chmod +x "$STAGE/zalo-rust" "$STAGE/ctdozlite" "$STAGE/install.sh" "$STAGE/uninstall.sh"
+          chmod +x "$STAGE/ctdozlite" "$STAGE/install.sh" "$STAGE/uninstall.sh"
           tar -czf "dist/${STAGE}.tar.gz" "$STAGE"
       - uses: actions/upload-artifact@v4
         with:
@@ -198,12 +193,11 @@ jobs:
           key: bullseye-glibc231
       - name: Build legacy release binary & .deb + .tar.gz
         run: |
-          cargo build --release --locked --bin zalo-rust
-          strip target/release/zalo-rust
-          chmod +x packaging/linux/ctdozlite packaging/linux/install.sh packaging/linux/uninstall.sh
+          cargo build --release --locked --bin ctdozlite
+          strip target/release/ctdozlite
+          chmod +x packaging/linux/install.sh packaging/linux/uninstall.sh
           mkdir -p dist pkg_deb/DEBIAN pkg_deb/usr/bin pkg_deb/usr/share/applications pkg_deb/usr/share/icons/hicolor/256x256/apps
-          cp target/release/zalo-rust pkg_deb/usr/bin/zalo-rust
-          cp packaging/linux/ctdozlite pkg_deb/usr/bin/ctdozlite
+          cp target/release/ctdozlite pkg_deb/usr/bin/ctdozlite
           cp packaging/linux/ctdozlite.desktop pkg_deb/usr/share/applications/ctdozlite.desktop
           cp src/assets/app_icon.png pkg_deb/usr/share/icons/hicolor/256x256/apps/ctdozlite.png
           cat > pkg_deb/DEBIAN/control << EOF
@@ -221,14 +215,13 @@ jobs:
 
           STAGE="ctdozlite-${VERSION}-linux-x86_64-legacy-glibc2.31"
           mkdir -p "$STAGE"
-          cp target/release/zalo-rust "$STAGE/zalo-rust"
-          cp packaging/linux/ctdozlite "$STAGE/ctdozlite"
+          cp target/release/ctdozlite "$STAGE/ctdozlite"
           cp packaging/linux/install.sh "$STAGE/install.sh"
           cp packaging/linux/uninstall.sh "$STAGE/uninstall.sh"
           cp packaging/linux/ctdozlite.desktop "$STAGE/ctdozlite.desktop"
           cp src/assets/app_icon.png "$STAGE/ctdozlite.png"
           cp README.md LICENSE-MIT LICENSE-APACHE "$STAGE/"
-          chmod +x "$STAGE/zalo-rust" "$STAGE/ctdozlite" "$STAGE/install.sh" "$STAGE/uninstall.sh"
+          chmod +x "$STAGE/ctdozlite" "$STAGE/install.sh" "$STAGE/uninstall.sh"
           tar -czf "dist/${STAGE}.tar.gz" "$STAGE"
       - uses: actions/upload-artifact@v4
         with:
@@ -250,9 +243,9 @@ jobs:
       - name: Build release binary & installer
         shell: pwsh
         run: |
-          cargo build --release --locked --bin zalo-rust
+          cargo build --release --locked --bin ctdozlite
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target\release\zalo-rust.exe "dist\ctdozlite-$($env:VERSION)-portable-windows-x86_64.exe"
+          Copy-Item target\release\ctdozlite.exe "dist\ctdozlite-$($env:VERSION)-portable-windows-x86_64.exe"
           iscc "/DMyAppVersion=$($env:VERSION)" packaging\windows\installer.iss
           Move-Item dist\ctdozlite-setup-windows-x86_64.exe "dist\ctdozlite-$($env:VERSION)-setup-windows-x86_64.exe" -Force
       - uses: actions/upload-artifact@v4
@@ -292,24 +285,24 @@ jobs:
 
           echo "=== [1/4] Building Apple Silicon (aarch64-apple-darwin) ==="
           CMAKE_TOOLCHAIN_FILE="$PWD/packaging/macos/toolchain-arm64.cmake" \
-            cargo build --release --locked --target aarch64-apple-darwin --bin zalo-rust
+            cargo build --release --locked --target aarch64-apple-darwin --bin ctdozlite
 
           echo "=== [2/4] Building Mac Intel (x86_64-apple-darwin) ==="
           CMAKE_TOOLCHAIN_FILE="$PWD/packaging/macos/toolchain-x86_64.cmake" \
-            cargo build --release --locked --target x86_64-apple-darwin --bin zalo-rust
+            cargo build --release --locked --target x86_64-apple-darwin --bin ctdozlite
 
           echo "=== [3/4] Creating Universal Binary (arm64 + x86_64) via lipo ==="
           mkdir -p target/universal-apple-darwin/release
           lipo -create \
-            target/aarch64-apple-darwin/release/zalo-rust \
-            target/x86_64-apple-darwin/release/zalo-rust \
-            -output target/universal-apple-darwin/release/zalo-rust
-          lipo -info target/universal-apple-darwin/release/zalo-rust
+            target/aarch64-apple-darwin/release/ctdozlite \
+            target/x86_64-apple-darwin/release/ctdozlite \
+            -output target/universal-apple-darwin/release/ctdozlite
+          lipo -info target/universal-apple-darwin/release/ctdozlite
 
           echo "=== Verifying zero Homebrew dynamic library dependencies ==="
-          otool -L target/aarch64-apple-darwin/release/zalo-rust
-          otool -L target/x86_64-apple-darwin/release/zalo-rust
-          if otool -L target/universal-apple-darwin/release/zalo-rust | grep -E '/opt/homebrew|/usr/local'; then
+          otool -L target/aarch64-apple-darwin/release/ctdozlite
+          otool -L target/x86_64-apple-darwin/release/ctdozlite
+          if otool -L target/universal-apple-darwin/release/ctdozlite | grep -E '/opt/homebrew|/usr/local'; then
             echo "ERROR: Binary still links against Homebrew dylib!"
             exit 1
           fi
@@ -333,8 +326,8 @@ jobs:
             stage_dir="$(mktemp -d)"
             mkdir -p "$stage_dir/ctdozlite.app/Contents/MacOS"
             mkdir -p "$stage_dir/ctdozlite.app/Contents/Resources"
-            cp "$bin_path" "$stage_dir/ctdozlite.app/Contents/MacOS/zalo-rust"
-            chmod +x "$stage_dir/ctdozlite.app/Contents/MacOS/zalo-rust"
+            cp "$bin_path" "$stage_dir/ctdozlite.app/Contents/MacOS/ctdozlite"
+            chmod +x "$stage_dir/ctdozlite.app/Contents/MacOS/ctdozlite"
             cp packaging/macos/Info.plist "$stage_dir/ctdozlite.app/Contents/Info.plist"
             plutil -replace CFBundleShortVersionString -string "$VER" "$stage_dir/ctdozlite.app/Contents/Info.plist"
             printf 'APPL????' > "$stage_dir/ctdozlite.app/Contents/PkgInfo"
@@ -357,9 +350,9 @@ jobs:
           }
 
           echo "=== [4/4] Packaging .dmg installers (Apple Silicon, Intel, Universal) ==="
-          package_dmg "target/aarch64-apple-darwin/release/zalo-rust" "dist/ctdozlite-${VER}-macos-arm64.dmg" "ctdozlite (Apple Silicon)"
-          package_dmg "target/x86_64-apple-darwin/release/zalo-rust" "dist/ctdozlite-${VER}-macos-x86_64.dmg" "ctdozlite (Intel)"
-          package_dmg "target/universal-apple-darwin/release/zalo-rust" "dist/ctdozlite-${VER}-macos.dmg" "ctdozlite"
+          package_dmg "target/aarch64-apple-darwin/release/ctdozlite" "dist/ctdozlite-${VER}-macos-arm64.dmg" "ctdozlite (Apple Silicon)"
+          package_dmg "target/x86_64-apple-darwin/release/ctdozlite" "dist/ctdozlite-${VER}-macos-x86_64.dmg" "ctdozlite (Intel)"
+          package_dmg "target/universal-apple-darwin/release/ctdozlite" "dist/ctdozlite-${VER}-macos.dmg" "ctdozlite"
           ls -lh dist/*.dmg
       - uses: actions/upload-artifact@v4
         with:

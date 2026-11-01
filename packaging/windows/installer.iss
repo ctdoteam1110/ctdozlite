@@ -7,7 +7,7 @@
 #endif
 #define MyAppPublisher "ctdoteam1110"
 #define MyAppURL "https://github.com/ctdoteam1110/ctdozlite"
-#define MyAppExeName "zalo-rust.exe"
+#define MyAppExeName "ctdozlite.exe"
 
 [Setup]
 AppId={{8F4E2D1A-9C3B-4E7F-A6D5-1B2C3D4E5F60}

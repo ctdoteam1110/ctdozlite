@@ -697,7 +697,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                 if !ft.name.is_empty() {
                                                     ex.name = ft.name;
                                                 }
-                                                if ft.avatar.is_some() {
+                                                if crate::chat::should_replace_avatar(
+                                                    ex.avatar.as_deref(),
+                                                    ft.avatar.as_deref(),
+                                                ) {
                                                     ex.avatar = ft.avatar;
                                                 }
                                                 ex.is_group = ex.is_group || ft.is_group;
@@ -712,7 +715,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                 if !gt.name.is_empty() {
                                                     ex.name = gt.name;
                                                 }
-                                                if gt.avatar.is_some() {
+                                                if crate::chat::should_replace_avatar(
+                                                    ex.avatar.as_deref(),
+                                                    gt.avatar.as_deref(),
+                                                ) {
                                                     ex.avatar = gt.avatar;
                                                 }
                                                 ex.is_group = true;
@@ -996,7 +1002,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             cursor_id = nc;
                                         }
                                     }
-                                    if is_group && !is_send2me {
+                                    if is_group
+                                        && !is_send2me
+                                        && (crate::chat::is_generic_thread_name(&t.name)
+                                            || t.avatar.as_deref().unwrap_or("").is_empty())
+                                    {
                                         crate::chat::resolve_thread_names(
                                             &s,
                                             std::slice::from_mut(&mut t),

@@ -750,9 +750,9 @@ impl ZaloGuiApp {
                         if new_incoming_alert && self.settings.enable_notifications {
                             let total_unread: usize = self.unread_counts.values().sum();
                             let title = if total_unread > 0 {
-                                format!("({total_unread}) Zalo")
+                                format!("({total_unread}) ctdozlite")
                             } else {
-                                "Zalo".to_string()
+                                "ctdozlite".to_string()
                             };
                             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
                             if !is_focused {
@@ -1473,7 +1473,7 @@ impl ZaloGuiApp {
 
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new("Zalo")
+                        RichText::new("ctdozlite")
                             .color(pal.text_primary)
                             .size(13.5)
                             .strong(),

@@ -7,7 +7,7 @@ description = "Lightweight, high-performance native Zalo PC client written in Ru
 homepage = "https://ctdozlite.ctdo.net/"
 repository = "https://github.com/ctdoteam1110/ctdozlite"
 license = "MIT OR Apache-2.0"
-default-run = "zalo-rust"
+default-run = "ctdozlite"
 
 [dependencies]
 aes = "0.8"
@@ -41,7 +41,7 @@ name = "zalo_rust"
 path = "src/lib.rs"
 
 [[bin]]
-name = "zalo-rust"
+name = "ctdozlite"
 path = "src/main.rs"
 
 [[bin]]
@@ -74,7 +74,7 @@ recommends = "ffmpeg, zenity, xclip, wl-clipboard, fonts-noto-core"
 section = "net"
 priority = "optional"
 assets = [
-    ["target/release/zalo-rust", "usr/bin/", "755"],
+    ["target/release/ctdozlite", "usr/bin/", "755"],
     ["packaging/linux/ctdozlite", "usr/bin/", "755"],
     ["packaging/linux/ctdozlite.desktop", "usr/share/applications/", "644"],
     ["src/assets/app_icon.png", "usr/share/icons/hicolor/256x256/apps/ctdozlite.png", "644"],

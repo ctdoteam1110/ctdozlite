@@ -86,7 +86,7 @@ fn embed_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
         res_path
     };
 
-    println!("cargo:rustc-link-arg-bin=zalo-rust={}", link_path.display());
+    println!("cargo:rustc-link-arg-bin=ctdozlite={}", link_path.display());
     Ok(())
 }
 

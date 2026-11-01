@@ -248,7 +248,9 @@ fn paint_single_circle_avatar(
             && !u.ends_with("/default")
             && (u.starts_with("http://") || u.starts_with("https://"))
     }) {
-        let key = format!("ava_{}", crate::crypto::md5_hex(url));
+        let file_or_base = crate::chat::avatar_file_key(Some(url))
+            .unwrap_or_else(|| url.split('?').next().unwrap_or(url).to_string());
+        let key = format!("ava_{}", crate::crypto::md5_hex(&file_or_base));
         if let Some(tex) = textures.get(&key) {
             let rect = Rect::from_center_size(center, Vec2::splat(radius * 2.0));
             painter.image(

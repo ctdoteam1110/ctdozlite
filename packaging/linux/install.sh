@@ -18,7 +18,6 @@ fi
 
 mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
 
-install -m 755 "$SCRIPT_DIR/zalo-rust" "$BIN_DIR/zalo-rust"
 install -m 755 "$SCRIPT_DIR/ctdozlite" "$BIN_DIR/ctdozlite"
 install -m 644 "$SCRIPT_DIR/ctdozlite.desktop" "$APP_DIR/ctdozlite.desktop"
 install -m 644 "$SCRIPT_DIR/ctdozlite.png" "$ICON_DIR/ctdozlite.png"

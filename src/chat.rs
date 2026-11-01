@@ -113,17 +113,98 @@ pub fn avatar_url_time(avatar: Option<&str>) -> i64 {
     let Some(url) = avatar else {
         return 0;
     };
-    let Some(query) = url.split('?').nth(1) else {
-        return 0;
-    };
-    for pair in query.split('&') {
-        if let Some(val) = pair.strip_prefix("time=") {
-            if let Ok(ts) = val.parse::<i64>() {
-                return ts;
+    let mut max_ts = 0i64;
+    for seg in url.split(';') {
+        let Some(query) = seg.split('?').nth(1) else {
+            continue;
+        };
+        for pair in query.split('&') {
+            if let Some(val) = pair.strip_prefix("time=") {
+                let digits: String = val.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(ts) = digits.parse::<i64>() {
+                    if ts > max_ts {
+                        max_ts = ts;
+                    }
+                }
             }
         }
     }
-    0
+    max_ts
+}
+
+/// Count how many real `http(s)://` image URLs (excluding `/default`) an avatar string contains.
+pub fn avatar_http_url_count(avatar: Option<&str>) -> usize {
+    let Some(raw) = avatar.map(str::trim).filter(|s| !s.is_empty()) else {
+        return 0;
+    };
+    if let Some(rest) = raw.strip_prefix("multi:") {
+        rest.split(';')
+            .filter_map(|seg| seg.split_once('|').map(|(_, u)| u.trim()))
+            .filter(|u| {
+                (u.starts_with("http://") || u.starts_with("https://")) && !u.ends_with("/default")
+            })
+            .count()
+    } else if (raw.starts_with("http://") || raw.starts_with("https://"))
+        && !raw.ends_with("/default")
+    {
+        1
+    } else {
+        0
+    }
+}
+
+/// Normalize an avatar string by extracting stable image filenames (`avatar_file_key`) so `s120`
+/// vs `s160` CDN subdomains and rotating `?key=...&time=...` tokens compare equal.
+fn normalize_avatar_signature(avatar: &str) -> String {
+    let raw = avatar.trim();
+    if let Some(rest) = raw.strip_prefix("multi:") {
+        let mut out = String::from("multi:");
+        for (idx, seg) in rest.split(';').enumerate() {
+            if idx > 0 {
+                out.push(';');
+            }
+            if let Some((name, url)) = seg.split_once('|') {
+                let u_trim = url.trim();
+                let file_key = avatar_file_key(Some(u_trim))
+                    .unwrap_or_else(|| u_trim.split('?').next().unwrap_or("").to_string());
+                out.push_str(name.trim());
+                out.push('|');
+                out.push_str(&file_key);
+            } else {
+                out.push_str(seg.trim());
+            }
+        }
+        out
+    } else {
+        avatar_file_key(Some(raw))
+            .unwrap_or_else(|| raw.split('?').next().unwrap_or(raw).to_string())
+    }
+}
+
+/// Decide whether `incoming` should replace `current` avatar without downgrading a rich
+/// `multi:` composite avatar (with member photo URLs) or flipping between `s120` and `s160` URLs.
+pub fn should_replace_avatar(current: Option<&str>, incoming: Option<&str>) -> bool {
+    let Some(inc) = incoming.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Some(cur) = current.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    let cur_urls = avatar_http_url_count(Some(cur));
+    let inc_urls = avatar_http_url_count(Some(inc));
+    if inc_urls < cur_urls {
+        return false;
+    }
+    if inc_urls > cur_urls {
+        return true;
+    }
+    if cur.starts_with("multi:") && inc.starts_with("multi:") && cur_urls > 0 {
+        return false;
+    }
+    if normalize_avatar_signature(cur) == normalize_avatar_signature(inc) {
+        return false;
+    }
+    avatar_url_time(Some(inc)) > avatar_url_time(Some(cur))
 }
 
 /// Return `true` if two `Thread` entries represent the same underlying contact or group,
@@ -165,11 +246,7 @@ pub fn merge_thread_into(
     {
         target.name = incoming.name;
     }
-    if incoming.avatar.is_some()
-        && (target.avatar.is_none()
-            || incoming_id_is_authoritative
-            || avatar_url_time(incoming.avatar.as_deref()) >= avatar_url_time(target.avatar.as_deref()))
-    {
+    if should_replace_avatar(target.avatar.as_deref(), incoming.avatar.as_deref()) {
         target.avatar = incoming.avatar;
     }
     target.is_group = target.is_group || incoming.is_group;
@@ -2796,6 +2873,21 @@ fn format_multi_group_avatar(
     if slots.is_empty() {
         return None;
     }
+    // If the group name is a comma-separated list of member names (e.g. "Đỗ Thành, Đtc, Hoang"),
+    // order the slots to match `fallback_names` so API-resolved and name-derived slots never swap positions.
+    if fallback_names.len() >= 2 {
+        slots.sort_by_key(|slot| {
+            let s_name = slot.split('|').next().unwrap_or("").trim();
+            let s_fold = strip_vn_for_sticker_kw(s_name);
+            fallback_names
+                .iter()
+                .position(|cand| {
+                    let c_fold = strip_vn_for_sticker_kw(cand);
+                    !c_fold.is_empty() && (c_fold == s_fold || s_fold.contains(&c_fold) || c_fold.contains(&s_fold))
+                })
+                .unwrap_or(99)
+        });
+    }
     let tot = total_members.max(slots.len());
     Some(format!("multi:{tot};{}", slots.join(";")))
 }
@@ -2888,26 +2980,46 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
     Ok(groups)
 }
 
-/// `POST /api/social/friend/getminiprofiles` (cmd 12134) — get basic profiles (name, avatar) for user IDs.
+/// `POST /api/social/group/members` (cmd 12030) — fetch member display names and avatars for user IDs.
+///
+/// Zalo's `/api/social/friend/getminiprofiles` returns `error_code = 114` for raw UID lists,
+/// whereas `/api/social/group/members` with `friend_pversion_map: ["<uid>_0", ...]` returns
+/// `data.profiles.<uid>.{displayName, zaloName, avatar}` with `error_code = 0`.
 pub async fn get_mini_profiles(s: &Session, user_ids: &[String]) -> Result<serde_json::Map<String, Value>> {
     if s.login.is_none() || user_ids.is_empty() {
         return Ok(serde_json::Map::new());
     }
-    let body = obj(&[
-        ("friend_ids", json!(user_ids)),
-        ("imei", json!(s.imei)),
-    ]);
+    let versioned_ids: Vec<String> = user_ids
+        .iter()
+        .map(|uid| {
+            let clean = uid.trim();
+            if clean.contains('_') {
+                clean.to_string()
+            } else {
+                format!("{clean}_0")
+            }
+        })
+        .collect();
+    let body = obj(&[("friend_pversion_map", json!(versioned_ids))]);
     let params = s.encoded_params(&body)?;
-    let url = format!("{}/api/social/friend/getminiprofiles?{}", s.domains.profile, s.common_params());
+    let url = format!("{}/api/social/group/members?{}", s.domains.profile, s.common_params());
     let form = format!("params={params}");
     let resp = s.post_form(&url, form).await?;
-    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-
-    if let Some(data) = resp.get("data").and_then(Value::as_object) {
-        Ok(data.clone())
-    } else {
-        Ok(serde_json::Map::new())
+    let mut resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(d_str) = resp.get("data").and_then(Value::as_str) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(d_str.trim()) {
+            resp["data"] = parsed;
+        }
     }
+    if let Some(profiles) = resp
+        .pointer("/data/profiles")
+        .or_else(|| resp.pointer("/data/data/profiles"))
+        .or_else(|| resp.get("data"))
+        .and_then(Value::as_object)
+    {
+        return Ok(profiles.clone());
+    }
+    Ok(serde_json::Map::new())
 }
 
 /// Automatically resolve real display names and avatars for 1-1 and group threads that only have placeholder names.
@@ -3016,14 +3128,15 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
                             .trim_start_matches('g')
                             .trim_start_matches('G');
                         if let Some(info) = info_map.get(&t.id).or_else(|| info_map.get(clean_id)) {
-                            if t.avatar.as_deref().unwrap_or("").is_empty()
-                                || t.avatar.as_deref().unwrap_or("").starts_with("multi:")
-                            {
+                            let cur = t.avatar.as_deref().unwrap_or("");
+                            if cur.is_empty() || cur.starts_with("multi:") {
                                 let (mids, tot) = extract_group_member_ids(info);
                                 if let Some(multi_s) =
                                     format_multi_group_avatar(&t.name, &mids, tot, &all_profiles)
                                 {
-                                    t.avatar = Some(multi_s);
+                                    if should_replace_avatar(t.avatar.as_deref(), Some(&multi_s)) {
+                                        t.avatar = Some(multi_s);
+                                    }
                                 }
                             }
                         }
@@ -3051,7 +3164,7 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
             continue;
         }
         let cur_ava = t.avatar.as_deref().unwrap_or("");
-        if cur_ava.starts_with("http://") || cur_ava.starts_with("https://") {
+        if avatar_http_url_count(Some(cur_ava)) > 0 {
             continue;
         }
         let parts: Vec<&str> = t
@@ -3063,22 +3176,19 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
         if parts.len() >= 2 {
             let mut slots: Vec<String> = Vec::new();
             for p in parts.iter().take(4) {
-                let p_low = p.to_lowercase();
-                let p_tokens: Vec<&str> = p_low.split_whitespace().collect();
+                let p_fold = strip_vn_for_sticker_kw(p);
                 let matched_url = known_contacts
                     .iter()
                     .find(|(cname, _)| {
-                        let c_low = cname.to_lowercase();
-                        c_low == p_low
-                            || (!p_tokens.is_empty()
-                                && p_tokens.iter().all(|tok| c_low.contains(tok)))
+                        let c_fold = strip_vn_for_sticker_kw(cname);
+                        !p_fold.is_empty() && c_fold == p_fold
                     })
                     .map(|(_, url)| url.as_str())
                     .unwrap_or("");
                 slots.push(format!("{}|{}", p.replace(';', " ").replace('|', " "), matched_url));
             }
             let new_multi = format!("multi:{};{}", parts.len(), slots.join(";"));
-            if cur_ava.is_empty() || (!cur_ava.contains("http") && new_multi.contains("http")) {
+            if should_replace_avatar(t.avatar.as_deref(), Some(&new_multi)) {
                 t.avatar = Some(new_multi);
             }
         }
