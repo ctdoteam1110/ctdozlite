@@ -73,6 +73,16 @@ pub enum WorkerCmd {
     SyncHistory {
         threads: Vec<(String, String, bool)>,
     },
+    /// Select a path into a durable draft; the user still explicitly presses Send.
+    PickComposerAttachment { account: String, thread: String, images_only: bool },
+    /// One payload-free wake drains the bounded latest draft mailbox.
+    FlushComposer,
+    /// Read the account-owned draft and uncertain sends outside the UI.
+    LoadComposer { account: String, thread: String, revision: u64 },
+    /// Stage the exact draft and request identities before any network operation.
+    SendDurableComposer { account: String, thread: String, is_group: bool, draft: crate::composer_store::Draft, revision: u64 },
+    /// Explicitly move only unresolved outbox content into a draft, never resend automatically.
+    RecoverComposer { account: String, id: String, revision: u64 },
     SendMessage {
         to_id: String,
         text: String,
@@ -601,6 +611,45 @@ async fn prefetch_missing_sticker_thumbnails(
     futures_util::future::join_all(futs).await;
 }
 
+async fn commit_authenticated_session(
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>, candidate: Session,
+) -> anyhow::Result<()> {
+    crate::runtime_scope::spawn_transition_blocking(move || {
+        let mut shared = session.blocking_lock();
+        let account = candidate.login.as_ref().map(|login| login.uin.as_str()).unwrap_or("");
+        let generation = crate::runtime_scope::execution_scope().map(|scope| scope.generation)
+            .unwrap_or_else(|| crate::runtime_scope::registry().generation());
+        crate::runtime_scope::transition_if_current_fallible(generation, account, || {
+            super::durable_composer::flush_pending_sync(std::path::Path::new("."))
+        })?;
+        *shared = candidate;
+        let _ = shared.save_to_file("session.json");
+        Ok::<_, anyhow::Error>(())
+    }).await???;
+    Ok(())
+}
+
+// Lifecycle admission has already invalidated normal account work. This intentional flush
+// saves immutable owner-bound drafts under the same transition barrier, without network work.
+fn transition_with_composer(
+    generation: u64, account: &str, previous: &str, sender: &GuiTx, cleanup: impl FnOnce(),
+) -> anyhow::Result<crate::runtime_scope::SessionScope> {
+    match crate::runtime_scope::transition_if_current_fallible(generation, account, || {
+        super::durable_composer::flush_pending_sync(std::path::Path::new("."))?;
+        cleanup();
+        Ok(())
+    }) {
+        Ok(scope) => Ok(scope),
+        Err(error) => {
+            // Failed persistence must not strand an authenticated screen on an obsolete epoch.
+            if let Ok(scope) = crate::runtime_scope::transition_if_current(generation, previous, || {}) {
+                let _ = sender.send(GuiEvent::Scoped { scope, event: Box::new(GuiEvent::LifecycleFlushFailed(format!("Nháp chưa lưu; thao tác đã dừng: {error}"))) });
+            }
+            Err(error)
+        }
+    }
+}
+
 pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: egui::Context) {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, WorkerCmd)>();
     let _ = crate::runtime_scope::transition(session.login.as_ref().map(|login| login.uin.as_str()).unwrap_or(""));
@@ -1120,7 +1169,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             }
                         }
                         WorkerCmd::Shutdown => {
-                            let barrier = tokio::task::spawn_blocking(move || crate::runtime_scope::transition_if_current(generation, "", || {}));
+                            let previous = session.lock().await.login.as_ref().map(|login| login.uin.clone()).unwrap_or_default();
+                            let flush_sender = gui_tx.clone();
+                            let barrier = tokio::task::spawn_blocking(move || transition_with_composer(generation, "", &previous, &flush_sender, || {}));
                             let result = async {
                                 let shutdown_scope = barrier.await.map_err(|_| "Dừng ghi dữ liệu bị gián đoạn".to_owned())?
                                     .map_err(|_| "Phiên làm việc đã thay đổi".to_owned())?;
@@ -1207,8 +1258,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         WorkerCmd::Logout => {
                             crate::history_sync::CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
                             if let Some(task) = current_qr_task.take() { task.abort(); }
+                            let previous = session.lock().await.login.as_ref().map(|login| login.uin.clone()).unwrap_or_default();
+                            let flush_sender = gui_tx.clone();
                             let Ok(Ok(logout_scope)) = tokio::task::spawn_blocking(move || {
-                                crate::runtime_scope::transition_if_current(generation, "", || {
+                                transition_with_composer(generation, "", &previous, &flush_sender, || {
                                     let _ = std::fs::remove_file("session.json");
                                 })
                             }).await else { continue; };
@@ -1225,8 +1278,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let captured = session.lock().await.clone();
                             if captured.login.as_ref().map(|login| login.uin.as_str()) != Some(account.as_str()) { continue; }
                             let transition_account = account.clone();
+                            let flush_sender = gui_tx.clone();
                             let Ok(Ok(wipe_scope)) = tokio::task::spawn_blocking(move || {
-                                crate::runtime_scope::transition_if_current(generation, &transition_account, || {})
+                                transition_with_composer(generation, &transition_account, &transition_account, &flush_sender, || {})
                             }).await else { continue; };
                             let session = session.clone();
                             let sender = gui_tx.clone();
@@ -1319,7 +1373,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::RequestQr => {
-                            let Ok(Ok(attempt_scope)) = tokio::task::spawn_blocking(move || crate::runtime_scope::transition_if_current(generation, "", || {})).await else { continue; };
+                            let previous = session.lock().await.login.as_ref().map(|login| login.uin.clone()).unwrap_or_default();
+                            let flush_sender = gui_tx.clone();
+                            let Ok(Ok(attempt_scope)) = tokio::task::spawn_blocking(move || transition_with_composer(generation, "", &previous, &flush_sender, || {})).await else { continue; };
                             let _ = gui_tx.send(GuiEvent::Scoped {
                                 scope: attempt_scope.clone(), event: Box::new(GuiEvent::LoggedOut),
                             });
@@ -1426,13 +1482,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                             }
                                                         }
                                                         let _ = s.sync_profile_me().await;
-                                                        {
-                                                            let mut shared = session_clone.lock().await;
-                                                            let account = s.login.as_ref().map(|login| login.uin.as_str()).unwrap_or("");
-                                                            if crate::runtime_scope::transition(account).is_err() { return; }
-                                                            *shared = s.clone();
-                                                            let _ = s.save_to_file("session.json");
-                                                        }
+                                                        if commit_authenticated_session(session_clone.clone(), s.clone()).await.is_err() { return; }
 
                                                         let snapshot = s.clone();
                                                         drop(s);
@@ -1546,17 +1596,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         }
                                     }
                                     if let Some((uid, name)) = s.sync_profile_me().await {
-                                        {
-                                            let mut sl = session_clone.lock().await;
-                                            if crate::runtime_scope::transition(&uid).is_err() { return; }
-                                            if let Some(ref mut li) = sl.login {
-                                                li.uin = uid.clone();
-                                                if !name.is_empty() {
-                                                    li.display_name = name.clone();
-                                                }
-                                            }
-                                            let _ = sl.save_to_file("session.json");
+                                        let mut candidate = s.clone();
+                                        if let Some(ref mut li) = candidate.login {
+                                            li.uin = uid.clone();
+                                            if !name.is_empty() { li.display_name = name.clone(); }
                                         }
+                                        if commit_authenticated_session(session_clone.clone(), candidate).await.is_err() { return; }
                                         let u_ava = s
                                             .login
                                             .as_ref()
@@ -2026,6 +2071,34 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     )));
                                     ctx_clone.request_repaint();
                                 }
+                            });
+                        }
+                        WorkerCmd::PickComposerAttachment { account, thread, images_only } => {
+                            let sender = gui_tx.clone();
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
+                                if let Ok(Ok(Some(path))) = crate::runtime_scope::spawn_blocking(move || pick_native_file_dialog(images_only)).await {
+                                    super::durable_composer::pick(std::path::PathBuf::from("."), account, thread, path, sender).await;
+                                }
+                            });
+                        }
+                        WorkerCmd::FlushComposer => {
+                            let sender = gui_tx.clone();
+                            let wake = super::durable_composer::WakeLease::new();
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move { let _wake = wake; super::durable_composer::flush(std::path::PathBuf::from("."), sender).await; });
+                        }
+                        WorkerCmd::LoadComposer { account, thread, revision } => {
+                            let sender = gui_tx.clone();
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move { super::durable_composer::load(std::path::PathBuf::from("."), account, thread, revision, sender).await; });
+                        }
+                        WorkerCmd::RecoverComposer { account, id, revision } => {
+                            let sender = gui_tx.clone();
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move { super::durable_composer::recover(std::path::PathBuf::from("."), account, id, revision, sender).await; });
+                        }
+                        WorkerCmd::SendDurableComposer { account, thread, is_group, draft, revision } => {
+                            let sender = gui_tx.clone(); let session = session.clone();
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
+                                let captured = session.lock().await.clone();
+                                super::durable_composer::deliver(std::path::PathBuf::from("."), captured, sender, super::durable_composer::Request { account, thread, group: is_group, draft, revision }).await;
                             });
                         }
                         WorkerCmd::SendMessage {
@@ -2791,27 +2864,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 ctx_clone.request_repaint();
 
                                 let s = session_clone.lock().await.clone();
-                                match crate::chat::send_attachment(
-                                    &s, &to_id, is_group, &path, &caption,
-                                )
-                                .await
-                                {
-                                    Ok((_resp, cm)) => {
-                                        let _ = gui_tx_clone.send(GuiEvent::AttachmentSent {
-                                            thread_id: to_id,
-                                            msg: cm,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        let err_s = e.to_string();
-                                        crate::logger::log_error("gui::send_attachment", &err_s);
-                                        let _ = gui_tx_clone.send(GuiEvent::SendFailed {
-                                            thread_id: to_id,
-                                            text: caption,
-                                            error: format!("Lỗi gửi '{fname}': {err_s}"),
-                                        });
-                                    }
-                                }
+                                let account = s.login.as_ref().map(|login| login.uin.clone()).unwrap_or_default();
+                                let draft = crate::composer_store::Draft { text: caption, attachments: vec![path], ..Default::default() };
+                                super::durable_composer::deliver(std::path::PathBuf::from("."), s, gui_tx_clone, super::durable_composer::Request { account, thread: to_id, group: is_group, draft, revision: 0 }).await;
                                 ctx_clone.request_repaint();
                             });
                         }
@@ -3019,7 +3074,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::LoginPassword { phone, pass } => {
-                            let Ok(Ok(attempt_scope)) = tokio::task::spawn_blocking(move || crate::runtime_scope::transition_if_current(generation, "", || {})).await else { continue; };
+                            let previous = session.lock().await.login.as_ref().map(|login| login.uin.clone()).unwrap_or_default();
+                            let flush_sender = gui_tx.clone();
+                            let Ok(Ok(attempt_scope)) = tokio::task::spawn_blocking(move || transition_with_composer(generation, "", &previous, &flush_sender, || {})).await else { continue; };
                             let _ = gui_tx.send(GuiEvent::Scoped {
                                 scope: attempt_scope.clone(), event: Box::new(GuiEvent::AuthenticationStarted),
                             });
@@ -3041,13 +3098,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             if let Some(cfg) = info.get("data") {
                                                 crate::login::apply_login_config(&mut s, cfg);
                                                 s.apply_server_info(cfg);
-                                                {
-                                                    let mut shared = session_clone.lock().await;
-                                                    let account = s.login.as_ref().map(|login| login.uin.as_str()).unwrap_or("");
-                                                    if crate::runtime_scope::transition(account).is_err() { return; }
-                                                    *shared = s.clone();
-                                                    let _ = s.save_to_file("session.json");
-                                                }
+                                                if commit_authenticated_session(session_clone.clone(), s.clone()).await.is_err() { return; }
 
                                                 let uin = s
                                                     .login
@@ -3979,7 +4030,7 @@ mod original_reaction_import_consumer_tests {
 }
 
 /// Construct the same confirmed local row the GUI inserts, retaining the exact selected identities.
-fn composed_sent_message(text: &str, mentions: &[crate::composer_mentions::OutgoingMention], quoted: Option<&ChatMessage>, client_id: u64, server_id: String) -> ChatMessage {
+pub(super) fn composed_sent_message(text: &str, mentions: &[crate::composer_mentions::OutgoingMention], quoted: Option<&ChatMessage>, client_id: u64, server_id: String) -> ChatMessage {
     ChatMessage {
         id: if server_id.is_empty() { format!("out_{client_id}") } else { server_id },
         client_message_id: client_id.to_string(), text: text.into(), sender: "Tôi".into(),

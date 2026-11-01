@@ -9,6 +9,8 @@ pub mod endpoints;
 pub mod feed;
 pub mod gui;
 pub mod history_sync;
+/// Bounded keyed coalescing for background persistence producers.
+pub mod latest_snapshot;
 pub mod logger;
 pub mod login;
 pub mod media;

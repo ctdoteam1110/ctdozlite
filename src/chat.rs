@@ -1412,20 +1412,31 @@ fn pick_str(v: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
-/// Allocate a millisecond-shaped request ID once per send, including simultaneous sends.
+static LAST_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reserve a checked contiguous request-ID range shared by legacy and durable sends in this process.
+///
+/// # Errors
+/// Returns an error for an invalid batch size or exhausted client-ID space.
+pub(crate) fn reserve_client_message_ids(minimum: u64, count: usize) -> Result<u64> {
+    let now = u64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis())?;
+    reserve_client_ids_at(&LAST_CLIENT_ID, minimum, count, now)
+}
+fn reserve_client_ids_at(last: &std::sync::atomic::AtomicU64, minimum: u64, count: usize, now: u64) -> Result<u64> {
+    use std::sync::atomic::Ordering;
+    anyhow::ensure!((1..=33).contains(&count), "Invalid request ID batch size");
+    let mut previous = last.load(Ordering::Relaxed);
+    loop {
+        let first = previous.checked_add(1).ok_or_else(|| anyhow::anyhow!("Client ID space exhausted"))?.max(minimum).max(now);
+        let end = first.checked_add(count as u64 - 1).ok_or_else(|| anyhow::anyhow!("Client ID space exhausted"))?;
+        match last.compare_exchange_weak(previous, end, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(first), Err(current) => previous = current,
+        }
+    }
+}
+/// Allocate a millisecond-shaped request ID once per legacy send, including simultaneous sends.
 pub(crate) fn next_client_message_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LAST_ID: AtomicU64 = AtomicU64::new(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0);
-    let previous = LAST_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
-            Some(now.max(last.saturating_add(1)))
-        })
-        .unwrap_or_else(|last| last);
-    now.max(previous.saturating_add(1))
+    reserve_client_message_ids(1, 1).expect("Client ID space exhausted")
 }
 
 /// Send a 1-1 text message: `POST {domains.chat}/api/message/sms?{common}`
@@ -1574,10 +1585,22 @@ pub async fn send_attachment(
     file_path: &std::path::Path,
     caption: &str,
 ) -> Result<(Value, ChatMessage)> {
+    send_attachment_with_client_id(s, to_id, is_group, file_path, caption, next_client_message_id()).await
+}
+
+/// Preserve the persisted outbox request ID through attachment upload and send fallbacks.
+///
+/// # Errors
+/// Returns upload, protocol, decoding, or filesystem errors from the standard attachment path.
+pub(crate) async fn send_attachment_with_client_id(
+    s: &Session, to_id: &str, is_group: bool, file_path: &std::path::Path,
+    caption: &str, client_id: u64,
+) -> Result<(Value, ChatMessage)> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let file_bytes = std::fs::read(file_path)?;
+    let owned_path = file_path.to_path_buf();
+    let file_bytes = crate::runtime_scope::spawn_blocking(move || std::fs::read(owned_path)).await???;
     if file_bytes.is_empty() {
         anyhow::bail!("Tập tin rỗng (0 byte)");
     }
@@ -1611,7 +1634,6 @@ pub async fn send_attachment(
     } else {
         to_id
     };
-    let client_id = next_client_message_id();
     let total_size = file_bytes.len() as u64;
     let chunk_size: usize = 1_048_576; // 1 MiB chunks
     let total_chunks = file_bytes.len().div_ceil(chunk_size).max(1);
@@ -6449,6 +6471,21 @@ mod message_state_defaults_tests {
 #[cfg(test)]
 mod send_identity_tests {
     use super::*;
+
+    #[test]
+    fn reserved_and_legacy_ids_interleave_without_same_clock_or_rollback_collisions() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let allocator = AtomicU64::new(0);
+        let plain = reserve_client_ids_at(&allocator, 1, 1, 1000).unwrap();
+        let staged = reserve_client_ids_at(&allocator, 1, 3, 1000).unwrap();
+        let sticker = reserve_client_ids_at(&allocator, 1, 1, 1000).unwrap();
+        let rollback_floor = reserve_client_ids_at(&allocator, 1, 1, 10).unwrap();
+        assert_eq!([plain, staged, staged + 1, staged + 2, sticker, rollback_floor], [1000,1001,1002,1003,1004,1005]);
+        assert!(reserve_client_ids_at(&allocator, u64::MAX, 2, 1000).is_err());
+        assert_eq!(allocator.load(Ordering::Relaxed), 1005);
+        assert!(reserve_client_ids_at(&allocator, 1, 34, 1000).is_err());
+        assert_eq!(reserve_client_ids_at(&allocator, 5000, 2, 1000).unwrap(), 5000);
+    }
 
     #[test]
     fn request_ids_are_unique_when_sends_share_a_clock_tick() {

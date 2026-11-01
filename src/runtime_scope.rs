@@ -97,6 +97,8 @@ pub fn registry() -> &'static ScopeRegistry {
 tokio::task_local! { static EXECUTION: Arc<Mutex<SessionScope>>; }
 thread_local! {
     static BLOCKING_SCOPE: std::cell::RefCell<Option<SessionScope>> = const { std::cell::RefCell::new(None) };
+    static TRANSITION_TICKET: std::cell::RefCell<Option<Arc<Mutex<SessionScope>>>> = const { std::cell::RefCell::new(None) };
+    static LIFECYCLE_CLEANUP: Cell<bool> = const { Cell::new(false) };
     static MUTATION_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 /// Scope attached explicitly to the current async task or blocking closure.
@@ -135,9 +137,11 @@ pub fn mutation() -> Result<MutationGuard, StaleScope> {
                 .unwrap_or_else(|e| e.into_inner()),
         )
     };
-    if let Some(scope) = execution_scope() {
-        if !registry().accepts(&scope) || scope.account.is_empty() {
-            return Err(StaleScope);
+    if !LIFECYCLE_CLEANUP.with(Cell::get) {
+        if let Some(scope) = execution_scope() {
+            if !registry().accepts(&scope) || scope.account.is_empty() {
+                return Err(StaleScope);
+            }
         }
     }
     MUTATION_DEPTH.with(|depth| depth.set(depth.get() + 1));
@@ -151,7 +155,7 @@ pub fn transition(account: &str) -> Result<SessionScope, StaleScope> {
     transition_after_cleanup(account, || {})
 }
 /// Drain started writes, perform synchronous cleanup, then publish the next incarnation.
-/// The cleanup must use raw synchronous operations, never acquire another mutation guard or await.
+/// Cleanup stays synchronous; nested store guards reuse this authorized barrier. Never await.
 ///
 /// # Errors
 /// Rejects an obsolete caller before cleanup or publication.
@@ -181,13 +185,41 @@ fn transition_checked(
     account: &str,
     cleanup: impl FnOnce(),
 ) -> Result<SessionScope, StaleScope> {
+    transition_checked_fallible(expected, account, || {
+        cleanup();
+        Ok(())
+    })
+    .map_err(|_| StaleScope)
+}
+/// Flush intentional lifecycle-owned state before publishing an auth transition.
+/// Failed persistence leaves the incarnation unpublished so shutdown can report failure and retry.
+///
+/// # Errors
+/// Returns a stale-intent or persistence error; never publishes a transition after cleanup failure.
+pub(crate) fn transition_if_current_fallible(
+    generation: u64,
+    account: &str,
+    cleanup: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<SessionScope> {
+    transition_checked_fallible(Some(generation), account, cleanup)
+}
+fn transition_checked_fallible(
+    expected: Option<u64>,
+    account: &str,
+    cleanup: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<SessionScope> {
     let _barrier = registry()
         .mutation
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // Mark this authorized synchronous barrier as reentrant for nested store saves.
+    MUTATION_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let _barrier = MutationGuard {
+        _guard: Some(_barrier),
+    };
     let observed = registry().generation();
     if expected.is_some_and(|generation| generation != observed) {
-        return Err(StaleScope);
+        return Err(StaleScope.into());
     }
     let pending = std::mem::take(
         &mut *registry()
@@ -198,7 +230,18 @@ fn transition_checked(
     for (_, settle) in pending {
         settle();
     }
-    cleanup();
+    // Only this synchronous, intent-checked callback may flush immutable owner-bound data
+    // while the initiating auth attempt has an empty/invalidated account ticket.
+    struct CleanupPermit(bool);
+    impl Drop for CleanupPermit {
+        fn drop(&mut self) {
+            LIFECYCLE_CLEANUP.with(|flag| flag.set(self.0));
+        }
+    }
+    {
+        let _permit = CleanupPermit(LIFECYCLE_CLEANUP.with(|flag| flag.replace(true)));
+        cleanup()?;
+    }
     let generation = observed.checked_add(1).ok_or(StaleScope)?;
     // UI invalidation is lock-free and can occur during cleanup. Publication must not
     // adopt that newer intent merely because the old worker already owned the disk barrier.
@@ -213,6 +256,16 @@ fn transition_checked(
     *registry().state.lock().unwrap_or_else(|e| e.into_inner()) = scope.clone();
     let _ = EXECUTION
         .try_with(|ticket| *ticket.lock().unwrap_or_else(|e| e.into_inner()) = scope.clone());
+    BLOCKING_SCOPE.with(|current| {
+        if current.borrow().is_some() {
+            *current.borrow_mut() = Some(scope.clone());
+        }
+    });
+    TRANSITION_TICKET.with(|current| {
+        if let Some(ticket) = current.borrow().as_ref() {
+            *ticket.lock().unwrap_or_else(|e| e.into_inner()) = scope.clone();
+        }
+    });
     registry().changed.notify_waiters();
     Ok(scope)
 }
@@ -327,15 +380,35 @@ pub(crate) fn spawn_scoped(
 pub fn spawn_blocking<T: Send + 'static>(
     operation: impl FnOnce() -> T + Send + 'static,
 ) -> tokio::task::JoinHandle<Result<T, StaleScope>> {
+    spawn_blocking_mode(operation, false)
+}
+/// Run an authorized authentication commit off-thread while updating only its initiating task ticket.
+/// Ordinary blocking descendants still capture immutable snapshots and never adopt future accounts.
+pub(crate) fn spawn_transition_blocking<T: Send + 'static>(
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> tokio::task::JoinHandle<Result<T, StaleScope>> {
+    spawn_blocking_mode(operation, true)
+}
+fn spawn_blocking_mode<T: Send + 'static>(
+    operation: impl FnOnce() -> T + Send + 'static,
+    transition: bool,
+) -> tokio::task::JoinHandle<Result<T, StaleScope>> {
+    let parent = if transition {
+        EXECUTION.try_with(Clone::clone).ok()
+    } else {
+        None
+    };
     let scope = execution_scope();
     let active = scope.as_ref().map(|_| ActiveTask::enter());
     tokio::task::spawn_blocking(move || {
         let _active = active;
         BLOCKING_SCOPE.with(|slot| *slot.borrow_mut() = scope);
+        TRANSITION_TICKET.with(|slot| *slot.borrow_mut() = parent);
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
                 BLOCKING_SCOPE.with(|slot| *slot.borrow_mut() = None);
+                TRANSITION_TICKET.with(|slot| *slot.borrow_mut() = None);
             }
         }
         let _reset = Reset;
@@ -754,5 +827,116 @@ pub(crate) mod tests {
         assert!(result.is_some());
         let _ = release_tx.send(());
         assert!(child.await.is_err());
+    }
+    #[tokio::test]
+    async fn fallible_lifecycle_flush_does_not_publish_or_override_newer_intent() {
+        let _serial = TEST_LOCK.lock().await;
+        let initial = transition("account-a").unwrap();
+        let intent = registry()
+            .invalidate_if_current(initial.generation)
+            .unwrap();
+        let result =
+            transition_if_current_fallible(intent, "", || anyhow::bail!("Synthetic disk failure"));
+        assert!(result.is_err());
+        assert_eq!(
+            registry().generation(),
+            intent,
+            "Failed flush must not publish logout/close"
+        );
+        let resumed = transition_if_current(intent, "account-a", || {}).unwrap();
+        assert_eq!(resumed.account, "account-a");
+        let newer = registry()
+            .invalidate_if_current(resumed.generation)
+            .unwrap();
+        let mut wrote = false;
+        assert!(transition_if_current_fallible(resumed.generation, "", || {
+            wrote = true;
+            Ok(())
+        })
+        .is_err());
+        assert!(!wrote);
+        assert_eq!(registry().generation(), newer);
+        let during = registry().generation();
+        assert!(transition_if_current_fallible(during, "", || {
+            registry().invalidate_now();
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(
+            registry().generation(),
+            during + 1,
+            "Cleanup cannot adopt a later intent"
+        );
+    }
+    #[tokio::test]
+    async fn authorized_blocking_auth_transition_updates_only_parent_not_siblings() {
+        let _serial = TEST_LOCK.lock().await;
+        let scope = transition("account-a").unwrap();
+        let old = scope.clone();
+        let continued = run(scope, async move {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocking = spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                assert_eq!(execution_scope().unwrap(), old);
+                mutation().is_err()
+            });
+            started_rx.await.unwrap();
+            let sibling_effect = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let effect = sibling_effect.clone();
+            let sibling = spawn(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                effect.store(true, Ordering::SeqCst);
+            });
+            let commit = spawn_transition_blocking(|| transition("account-a"))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(execution_scope().unwrap(), commit);
+            assert!(
+                check().is_ok(),
+                "Authorized parent must continue after its auth commit"
+            );
+            release_tx.send(()).unwrap();
+            assert!(
+                blocking.await.unwrap().unwrap(),
+                "Unrelated blocking descendant must retain its old ticket"
+            );
+            sibling.await.unwrap();
+            assert!(!sibling_effect.load(Ordering::SeqCst));
+            commit
+        })
+        .await;
+        assert!(continued.is_some());
+    }
+    #[tokio::test]
+    async fn intentional_flush_permit_is_limited_to_checked_sync_cleanup_even_on_error() {
+        let _serial = TEST_LOCK.lock().await;
+        let scope = transition("").unwrap();
+        run(scope.clone(), async move {
+            let generation = scope.generation;
+            spawn_transition_blocking(move || {
+                assert!(
+                    mutation().is_err(),
+                    "An empty auth attempt cannot perform ordinary writes"
+                );
+                let failed = transition_if_current_fallible(generation, "account-a", || {
+                    let _authorized = mutation()?;
+                    anyhow::bail!("Synthetic flush failure")
+                });
+                assert!(failed.is_err());
+                assert!(
+                    mutation().is_err(),
+                    "Cleanup permission must not escape the failed callback"
+                );
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        })
+        .await
+        .unwrap();
     }
 }

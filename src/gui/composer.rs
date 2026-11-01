@@ -37,37 +37,23 @@ pub(super) fn member_picker(
 /// # Errors
 /// Returns an error for unsupported direct mentions or invalid selected spans.
 pub(super) fn send_command(
-    thread_id: String,
-    text: String,
+    account: String,
+    thread: String,
     is_group: bool,
-    quoted: Option<ChatMessage>,
-    mentions: Vec<crate::composer_mentions::OutgoingMention>,
+    draft: crate::composer_store::Draft,
+    revision: u64,
 ) -> anyhow::Result<WorkerCmd> {
-    crate::composer_mentions::validate_mentions(&text, &mentions)?;
+    crate::composer_mentions::validate_mentions(&draft.text, &draft.mentions)?;
     anyhow::ensure!(
-        is_group || mentions.is_empty(),
+        is_group || draft.mentions.is_empty(),
         "Nhắc tên chỉ được xác minh cho nhóm"
     );
-    Ok(if !mentions.is_empty() {
-        WorkerCmd::SendWithMentions {
-            to_id: thread_id,
-            text,
-            mentions,
-            quoted,
-        }
-    } else if let Some(quoted) = quoted {
-        WorkerCmd::SendQuote {
-            to_id: thread_id,
-            text,
-            quoted,
-            is_group,
-        }
-    } else {
-        WorkerCmd::SendMessage {
-            to_id: thread_id,
-            text,
-            is_group,
-        }
+    Ok(WorkerCmd::SendDurableComposer {
+        account,
+        thread,
+        is_group,
+        draft,
+        revision,
     })
 }
 
@@ -139,17 +125,33 @@ mod composer_tests {
             text: "Raw :+1:".into(),
             ..Default::default()
         };
-        let command =
-            send_command("group-1".into(), text.clone(), true, Some(quoted), mentions).unwrap();
-        let WorkerCmd::SendWithMentions {
-            to_id,
-            text: sent,
-            mentions,
-            quoted,
+        let command = send_command(
+            "account-1".into(),
+            "group-1".into(),
+            true,
+            crate::composer_store::Draft {
+                text: text.clone(),
+                reply: Some(quoted),
+                mentions,
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+        let WorkerCmd::SendDurableComposer {
+            thread: to_id,
+            draft,
+            ..
         } = command
         else {
             panic!("Mention selections must reach the dedicated worker request")
         };
+        let crate::composer_store::Draft {
+            text: sent,
+            mentions,
+            reply: quoted,
+            ..
+        } = draft;
         assert_eq!(to_id, "group-1");
         assert_eq!(sent, "😀 @An ");
         assert_eq!(sent, text);

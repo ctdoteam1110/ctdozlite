@@ -29,6 +29,7 @@ mod native_photo_viewer;
 mod messages;
 mod emoji_text;
 mod composer;
+mod durable_composer;
 mod modals;
 mod stickers;
 mod theme;
@@ -58,7 +59,7 @@ fn reset_epoch_loading(
 }
 
 fn is_epoch_transition(event: &GuiEvent) -> bool {
-    matches!(event, GuiEvent::AuthenticationStarted | GuiEvent::LoginSuccess { .. } | GuiEvent::LoggedOut | GuiEvent::LocalDataWiped | GuiEvent::HistoryClearFailed(_))
+    matches!(event, GuiEvent::AuthenticationStarted | GuiEvent::LifecycleFlushFailed(_) | GuiEvent::LoginSuccess { .. } | GuiEvent::LoggedOut | GuiEvent::LocalDataWiped | GuiEvent::HistoryClearFailed(_))
 }
 fn epoch_event_allowed(ui_generation: u64, generation: u64, event: &GuiEvent) -> bool {
     is_epoch_transition(event) || ui_generation == generation || matches!(event, GuiEvent::CallStateChanged(state) if state == "free")
@@ -110,6 +111,8 @@ pub enum GuiEvent {
     AuthenticationStarted,
     /// Shutdown barrier result; the GUI closes only after a successful acknowledgement.
     ShutdownFinished(Result<(), String>),
+    /// Intentional lifecycle flush failed; acknowledge the resumed authenticated incarnation.
+    LifecycleFlushFailed(String),
     /// Scoped worker output, checked again when dequeued by the UI.
     Scoped { scope: crate::runtime_scope::SessionScope, event: Box<GuiEvent> },
     /// Terminal response for a Settings authorization action.
@@ -198,6 +201,18 @@ pub enum GuiEvent {
     },
     /// Terminal result of a bounded background native emoji render.
     InlineEmojiReady { cluster: String, sprite_id: Option<u16>, image: Option<egui::ColorImage> },
+    /// A selected attachment was saved into its exact account/thread draft off the UI thread.
+    ComposerAttachmentPicked { account: String, thread: String, path: std::path::PathBuf },
+    /// A durable stage completed; clear only the matching unchanged visible draft.
+    ComposerStaged { account: String, thread: String, draft: crate::composer_store::Draft },
+    /// Staging failed before transport; leave the user's original editable draft intact.
+    ComposerStageFailed { account: String, thread: String, error: String },
+    /// Worker-only draft read, applied only if the visible revision has not changed.
+    ComposerLoaded { account: String, thread: String, revision: u64, result: Result<(crate::composer_store::Draft, Vec<crate::composer_store::OutboxEntry>), String> },
+    /// Explicit recovery moved unresolved content into an editable durable draft, never sent it.
+    ComposerRecovered { account: String, revision: u64, result: Result<(String, crate::composer_store::Draft), String> },
+    /// Pending failures and attachment remainders for explicit user recovery.
+    ComposerOutbox { account: String, entries: Vec<crate::composer_store::OutboxEntry> },
     /// Confirmed composer text with the exact request ID and selected mention metadata.
     ComposerMessageSent { account: String, thread_id: String, msg: ChatMessage },
     /// An in-memory composer failure preserves explicit selections and the original reply.
@@ -641,6 +656,7 @@ pub struct ZaloGuiApp {
     search_query: String,
     input_message: String,
     composer_mentions: crate::composer_mentions::ComposerMentions,
+    durable_composer: durable_composer::State,
     status_msg: String,
 
     // Reply / forward state
@@ -860,6 +876,7 @@ impl ZaloGuiApp {
             search_query: String::new(),
             input_message: String::new(),
             composer_mentions: Default::default(),
+            durable_composer: Default::default(),
             replying_to: None,
             forward_msg: None,
             forward_filter: String::new(),
@@ -1067,6 +1084,7 @@ impl ZaloGuiApp {
         self.live_read_ledger = Default::default();
         self.visible_read_pending = false;
         self.read_last_attempt_ms = 0;
+        self.durable_composer.reset_loads();
         self.native_photo_pending = false;
         self.original_reaction_import_pending = false;
         reset_epoch_loading(
@@ -1158,6 +1176,10 @@ impl ZaloGuiApp {
                     self.login_in_progress = true;
                     // Keep the in-memory composer untouched; durable draft policy is independent.
                     self.login_status_msg.clear();
+                }
+                GuiEvent::LifecycleFlushFailed(error) => {
+                    self.shutdown_pending = false;
+                    self.show_toast(error);
                 }
                 GuiEvent::ShutdownFinished(result) => {
                     self.shutdown_pending = false;
@@ -1328,6 +1350,7 @@ impl ZaloGuiApp {
                     self.user_name = name;
                     if self.user_uin != uin {
                         self.composer_mentions = Default::default();
+                        self.durable_composer = Default::default();
                         self.input_message.clear();
                         self.replying_to = None;
                         self.threads.clear();
@@ -1543,6 +1566,7 @@ impl ZaloGuiApp {
                 GuiEvent::LocalDataWiped => {
                     self.threads.clear();
                     self.composer_mentions = Default::default();
+                    self.durable_composer = Default::default();
                     self.input_message.clear();
                     self.replying_to = None;
                     self.publish_known_threads();
@@ -1564,6 +1588,7 @@ impl ZaloGuiApp {
                     self.user_uin.clear();
                     self.threads.clear();
                     self.composer_mentions = Default::default();
+                        self.durable_composer = Default::default();
                     self.input_message.clear();
                     self.replying_to = None;
                     self.selected_thread_index = 0;
@@ -1571,6 +1596,70 @@ impl ZaloGuiApp {
                     self.qr_status = "Đang xin mã QR mới…".into();
                     self.status_msg = "Đã đăng xuất".into();
                     self.publish_known_threads();
+                }
+                GuiEvent::ComposerAttachmentPicked { account, thread, path } => {
+                    if self.is_logged_in && self.user_uin == account { self.durable_composer.add_path(&thread, path); }
+                }
+                GuiEvent::ComposerStaged { account, thread, draft } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        self.durable_composer.staged(&thread);
+                        let visible = self.threads.get(self.selected_thread_index).is_some_and(|current| current.id == thread);
+                        if self.durable_composer.attachments_match(&thread, &draft.attachments)
+                            && !(visible && self.pending_clipboard_image.is_some())
+                            && self.composer_mentions.acknowledge_staged(&thread, &draft, &mut self.input_message, &mut self.replying_to) {
+                            self.durable_composer.acknowledge_attachments(&thread, &draft.attachments);
+                            if self.threads.get(self.selected_thread_index).is_some_and(|current| current.id == thread) { self.pending_clipboard_image = None; }
+                        }
+                    }
+                }
+                GuiEvent::ComposerStageFailed { account, thread, error } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        self.durable_composer.staging.remove(&thread);
+                        self.durable_composer.invalidate_snapshot();
+                        self.show_toast(format!("Chưa gửi; nháp được giữ: {error}"));
+                    }
+                }
+                GuiEvent::ComposerLoaded { account, thread, revision, result } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        match result {
+                            Ok((draft, entries)) => {
+                                self.durable_composer.recovery = entries;
+                                if self.durable_composer.accept_load(&account, &thread, revision)
+                                    && self.input_message.is_empty() && self.replying_to.is_none()
+                                    && self.durable_composer.attachments.is_empty() {
+                                    self.composer_mentions.restore_failed(&thread, draft.text, &draft.mentions, draft.reply,
+                                        &mut self.input_message, &mut self.replying_to);
+                                    self.durable_composer.attachments = draft.attachments;
+                                    self.durable_composer.invalidate_snapshot();
+                                }
+                            }
+                            Err(error) => self.show_toast(format!("Đọc nháp thất bại: {error}")),
+                        }
+                    }
+                }
+                GuiEvent::ComposerRecovered { account, revision, result } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        match result {
+                            Ok((thread, draft)) => {
+                                if self.durable_composer.accept_load(&account, &thread, revision)
+                                    && self.input_message.is_empty() && self.replying_to.is_none()
+                                    && self.durable_composer.attachments.is_empty() {
+                                    self.composer_mentions.restore_failed(&thread, draft.text, &draft.mentions, draft.reply,
+                                        &mut self.input_message, &mut self.replying_to);
+                                    self.durable_composer.attachments = draft.attachments;
+                                    self.durable_composer.invalidate_snapshot();
+                                    self.durable_composer.recovery.retain(|entry| entry.thread_id != thread);
+                                } else {
+                                    self.durable_composer.reload_later(&thread);
+                                    self.show_toast("Phần khôi phục đã lưu thành nháp; ô soạn hiện tại được giữ nguyên");
+                                }
+                            }
+                            Err(error) => self.show_toast(format!("Khôi phục nháp thất bại: {error}")),
+                        }
+                    }
+                }
+                GuiEvent::ComposerOutbox { account, entries } => {
+                    if self.is_logged_in && self.user_uin == account { self.durable_composer.recovery = entries; }
                 }
                 GuiEvent::ComposerMessageSent { account, thread_id, msg } => {
                     if self.is_logged_in && self.user_uin == account {

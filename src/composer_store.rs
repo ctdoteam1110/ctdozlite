@@ -35,6 +35,31 @@ fn read_data(path: &Path, account: &str) -> Result<ComposerData> {
     {
         validate_draft(draft)?;
     }
+    let mut allocated = std::collections::BTreeSet::new();
+    let mut maximum = 0;
+    for (key, entry) in &data.outbox {
+        ensure!(
+            key == &entry.id && !entry.thread_id.is_empty(),
+            "Invalid outbox identity"
+        );
+        ensure!(
+            entry.attachment_client_ids.len() == entry.draft.attachments.len(),
+            "Invalid attachment identity mapping"
+        );
+        for id in std::iter::once(&entry.id).chain(&entry.attachment_client_ids) {
+            ensure!(
+                !id.is_empty() && id.bytes().all(|ch| ch.is_ascii_digit()),
+                "Invalid request client ID"
+            );
+            let numeric = id.parse::<u64>()?;
+            ensure!(
+                numeric > 0 && allocated.insert(numeric),
+                "Reused request client ID"
+            );
+            maximum = maximum.max(numeric);
+        }
+    }
+    ensure!(data.next_id >= maximum, "Client ID allocator regressed");
     Ok(data)
 }
 fn validate_draft(draft: &Draft) -> Result<()> {
@@ -42,12 +67,16 @@ fn validate_draft(draft: &Draft) -> Result<()> {
         draft.text.len() <= 128 * 1024 && draft.attachments.len() <= 32,
         "Composer draft limit exceeded"
     );
+    crate::composer_mentions::validate_mentions(&draft.text, &draft.mentions)?;
     Ok(())
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 /// Exact draft payload owned by one conversation.
 pub struct Draft {
     pub text: String,
+    /// Explicit selected identities, validated against the unchanged raw text on every read.
+    #[serde(default)]
+    pub mentions: Vec<crate::composer_mentions::OutgoingMention>,
     pub reply: Option<crate::chat::ChatMessage>,
     #[serde(default)]
     pub attachments: Vec<PathBuf>,
@@ -109,6 +138,7 @@ impl ComposerStore {
                 ..Default::default()
             }
         };
+        let _scope_guard = crate::runtime_scope::mutation()?;
         std::fs::create_dir_all(&dir)?;
         #[cfg(unix)]
         {
@@ -179,6 +209,7 @@ impl ComposerStore {
     /// # Errors
     /// Returns an error for invalid identity, limits, or failed persistence.
     pub fn set_draft(&mut self, thread: &str, draft: Draft) -> Result<()> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         ensure!(!thread.is_empty(), "Conversation identity required");
         validate_draft(&draft)?;
         let _guard = composer_mutations()
@@ -206,6 +237,7 @@ impl ComposerStore {
     /// # Errors
     /// Returns an error for limits, exhausted IDs, or failed persistence.
     pub fn stage(&mut self, thread: &str, draft: Draft) -> Result<String> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         validate_draft(&draft)?;
         let _guard = composer_mutations()
             .lock()
@@ -218,11 +250,6 @@ impl ComposerStore {
             draft.attachments.len() <= 32,
             "Attachment batch limit reached"
         );
-        let now = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_millis(),
-        )?;
         let persisted_max = self
             .data
             .outbox
@@ -231,10 +258,10 @@ impl ComposerStore {
             .max()
             .unwrap_or(0);
         let previous = self.data.next_id.max(persisted_max);
-        let next = previous
+        let minimum = previous
             .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("Client ID space exhausted"))?
-            .max(now);
+            .ok_or_else(|| anyhow::anyhow!("Client ID space exhausted"))?;
+        let next = crate::chat::reserve_client_message_ids(minimum, draft.attachments.len() + 1)?;
         let before = self.data.clone();
         let attachment_client_ids = (0..draft.attachments.len())
             .map(|index| {
@@ -269,6 +296,7 @@ impl ComposerStore {
     /// # Errors
     /// Returns an error when persistence fails.
     pub fn complete(&mut self, id: &str, state: crate::message_model::DeliveryState) -> Result<()> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         let _guard = composer_mutations()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -295,6 +323,7 @@ impl ComposerStore {
     /// # Errors
     /// Returns an error when persistence fails.
     pub fn recover_interrupted(&mut self) -> Result<usize> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         let _guard = composer_mutations()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -321,6 +350,7 @@ impl ComposerStore {
     /// # Errors
     /// Returns an error for ambiguous paths, missing entries, or failed persistence.
     pub fn complete_attachment(&mut self, id: &str, path: &Path) -> Result<()> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         let _guard = composer_mutations()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -362,6 +392,7 @@ impl ComposerStore {
     /// # Errors
     /// Returns an error for a missing entry/identity or failed persistence.
     pub fn complete_attachment_id(&mut self, id: &str, client_id: &str) -> Result<()> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         let _guard = composer_mutations()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -441,7 +472,55 @@ impl ComposerStore {
     pub fn entry(&self, id: &str) -> Result<Option<OutboxEntry>> {
         Ok(self.snapshot()?.outbox.get(id).cloned())
     }
+    /// Move only unresolved content to an editable draft after explicit user recovery.
+    /// Acknowledged text is never included again, and an existing edited draft is never overwritten.
+    ///
+    /// # Errors
+    /// Returns an error for a missing entry, nonempty current draft, or failed atomic persistence.
+    pub fn recover_to_draft(&mut self, id: &str) -> Result<(String, Draft)> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
+        let _guard = composer_mutations()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _transaction = self.serial_transaction()?;
+        self.reload()?;
+        let before = self.data.clone();
+        let entry = self
+            .data
+            .outbox
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Outbox entry not found"))?;
+        ensure!(
+            entry.state != crate::message_model::DeliveryState::Pending,
+            "Send still in progress"
+        );
+        let thread = entry.thread_id.clone();
+        ensure!(
+            !self
+                .data
+                .drafts
+                .get(&thread)
+                .is_some_and(|d| !d.text.is_empty()
+                    || d.reply.is_some()
+                    || !d.attachments.is_empty()),
+            "Edited draft already exists"
+        );
+        let mut draft = entry.draft.clone();
+        if terminal_delivery(entry.state) {
+            draft.text.clear();
+            draft.mentions.clear();
+            draft.reply = None;
+        }
+        self.data.outbox.remove(id);
+        self.data.drafts.insert(thread.clone(), draft.clone());
+        if let Err(error) = self.save() {
+            self.data = before;
+            return Err(error);
+        }
+        Ok((thread, draft))
+    }
     fn save(&self) -> Result<()> {
+        let _scope_guard = crate::runtime_scope::mutation()?;
         let bytes = serde_json::to_vec(&self.data)?;
         ensure!(
             bytes.len() as u64 <= MAX_FILE_BYTES,
@@ -900,5 +979,79 @@ mod validation_tests {
             .is_err());
         assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
         std::fs::remove_dir_all(p).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod identity_validation_tests {
+    use super::*;
+    #[test]
+    fn corrupt_outbox_identity_mapping_is_rejected_without_writes() {
+        let root = std::env::temp_dir().join(format!("composer-corrupt-{}", std::process::id()));
+        let mut store = ComposerStore::open(&root, "A").unwrap();
+        let id = store
+            .stage(
+                "thread-A",
+                Draft {
+                    text: "raw".into(),
+                    attachments: vec!["a.png".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let valid: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&store.path).unwrap()).unwrap();
+        for case in 0..7 {
+            let mut data = valid.clone();
+            match case {
+                0 => data["outbox"][&id]["id"] = serde_json::json!("999"),
+                1 => data["outbox"][&id]["thread_id"] = serde_json::json!(""),
+                2 => data["outbox"][&id]["attachment_client_ids"] = serde_json::json!([]),
+                3 => data["outbox"][&id]["attachment_client_ids"] = serde_json::json!([id]),
+                4 => data["next_id"] = serde_json::json!(1),
+                5 => data["outbox"][&id]["attachment_client_ids"] = serde_json::json!(["0"]),
+                _ => {
+                    data["outbox"][&id]["attachment_client_ids"] =
+                        serde_json::json!(["not-decimal"])
+                }
+            }
+            let bytes = serde_json::to_vec(&data).unwrap();
+            std::fs::write(&store.path, &bytes).unwrap();
+            assert!(
+                ComposerStore::open(&root, "A").is_err(),
+                "Corrupt case {case}"
+            );
+            assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn durable_mentions_reject_corrupt_utf16_identity_and_keep_raw_reply() {
+        let root = std::env::temp_dir().join(format!("composer-mentions-{}", std::process::id()));
+        let mut store = ComposerStore::open(&root, "A").unwrap();
+        let mut draft = Draft {
+            text: "😀 @An ".into(),
+            mentions: vec![crate::composer_mentions::OutgoingMention {
+                uid: "22".into(),
+                pos: 3,
+                len: 3,
+                kind: 0,
+            }],
+            reply: Some(crate::chat::ChatMessage {
+                text: "Raw :+1:".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        store.set_draft("thread-A", draft.clone()).unwrap();
+        draft.mentions[0].pos = 1;
+        assert!(store.set_draft("thread-A", draft).is_err());
+        let saved = ComposerStore::open(&root, "A")
+            .unwrap()
+            .draft("thread-A")
+            .unwrap();
+        assert_eq!(saved.mentions[0].pos, 3);
+        assert_eq!(saved.reply.unwrap().text, "Raw :+1:");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1827,6 +1827,10 @@ impl ZaloGuiApp {
 
         if let Some(thread_id) = self.threads.get(self.selected_thread_index).map(|thread| thread.id.clone()) {
             self.composer_mentions.switch_thread(&thread_id, &mut self.input_message, &mut self.replying_to);
+            if self.durable_composer.switching(&self.user_uin, &thread_id) {
+                if let Some((path, _, _, _)) = self.pending_clipboard_image.take() { self.durable_composer.attachments.push(path); }
+            }
+            self.durable_composer.activate(&self.user_uin, &thread_id);
         }
 
         // Extract lightweight metadata for Header, Right Info Drawer, and Central Chat Stream
@@ -3884,6 +3888,33 @@ impl ZaloGuiApp {
                         .inner_margin(Margin::symmetric(14.0, 10.0))
                         .stroke(Stroke::new(1.0_f32, pal.border))
                         .show(ui, |ui| {
+                            let mut remove_attachment = None;
+                            for (index, path) in self.durable_composer.attachments.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("Tệp trong nháp: {}", path.display()));
+                                    if ui.small_button("Bỏ tệp").clicked() { remove_attachment = Some(index); }
+                                });
+                            }
+                            if let Some(index) = remove_attachment { self.durable_composer.attachments.remove(index); }
+                            if !self.durable_composer.attachments.is_empty() {
+                                ui.label("Văn bản/nhắc tên/trả lời được gửi trước tệp; phần đã xác nhận sẽ không gửi lại.");
+                            }
+                            let recoveries: Vec<_> = self.durable_composer.recovery.iter()
+                                .filter(|entry| entry.thread_id == thread_id).cloned().collect();
+                            for entry in recoveries {
+                                let state = match entry.state {
+                                    crate::message_model::DeliveryState::Pending => "đang xử lý",
+                                    crate::message_model::DeliveryState::Failed => "gửi lỗi",
+                                    crate::message_model::DeliveryState::DeliveryUnknown => "chưa rõ kết quả",
+                                    _ => "văn bản đã xác nhận, còn tệp chưa xác nhận",
+                                };
+                                ui.label(format!("Lượt {}: {state}. Kiểm tra lịch sử trước khi khôi phục; không tự gửi lại.", entry.id));
+                                if ui.button("Mở phần chưa xác nhận để sửa").clicked() {
+                                    if self.input_message.is_empty() && self.replying_to.is_none() && self.durable_composer.attachments.is_empty() {
+                                        if let Some(tx) = WORKER_TX.get() { let _ = tx.send(WorkerCmd::RecoverComposer { account: self.user_uin.clone(), id: entry.id, revision: self.durable_composer.revision() }); }
+                                    } else { self.show_toast("Giữ nguyên nháp đang sửa; hãy gửi hoặc xóa nháp trước khi khôi phục"); }
+                                }
+                            }
                             // Handle drag-and-drop files onto the chat window
                             let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| {
                                 i.raw
@@ -3892,17 +3923,7 @@ impl ZaloGuiApp {
                                     .filter_map(|df| df.path.clone())
                                     .collect()
                             });
-                            for dpath in dropped {
-                                if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                        to_id: thread_id.clone(),
-                                        is_group,
-                                        images_only: false,
-                                        caption: String::new(),
-                                        preset_path: Some(dpath),
-                                    });
-                                }
-                            }
+                            self.durable_composer.attachments.extend(dropped);
 
                             egui::Frame::none()
                                 .fill(pal.bg_input)
@@ -3970,16 +3991,8 @@ impl ZaloGuiApp {
                                             .on_hover_text("Gửi hình ảnh")
                                             .clicked()
                                         {
-                                            let cap = self.input_message.trim().to_string();
-                                            self.input_message.clear();
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                                    to_id: thread_id.clone(),
-                                                    is_group,
-                                                    images_only: true,
-                                                    caption: cap,
-                                                    preset_path: None,
-                                                });
+                                                let _ = tx.send(WorkerCmd::PickComposerAttachment { account: self.user_uin.clone(), thread: thread_id.clone(), images_only: true });
                                             }
                                         }
 
@@ -4010,16 +4023,8 @@ impl ZaloGuiApp {
                                             .on_hover_text("Đính kèm File / Video")
                                             .clicked()
                                         {
-                                            let cap = self.input_message.trim().to_string();
-                                            self.input_message.clear();
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                                    to_id: thread_id.clone(),
-                                                    is_group,
-                                                    images_only: false,
-                                                    caption: cap,
-                                                    preset_path: None,
-                                                });
+                                                let _ = tx.send(WorkerCmd::PickComposerAttachment { account: self.user_uin.clone(), thread: thread_id.clone(), images_only: false });
                                             }
                                         }
 
@@ -4186,8 +4191,8 @@ impl ZaloGuiApp {
                                         }
 
                                         // Responsive Padded Send Button (shows icon-only on very tight widths)
-                                        let can_send = !self.input_message.trim().is_empty()
-                                            || self.pending_clipboard_image.is_some();
+                                        let can_send = (!self.durable_composer.attachments.is_empty() || !self.input_message.trim().is_empty()
+                                            || self.pending_clipboard_image.is_some()) && !self.durable_composer.staging.contains(&thread_id);
                                         let (send_rect, send_resp) = ui.allocate_exact_size(
                                             Vec2::new(send_btn_w, 34.0),
                                             Sense::click(),
@@ -4259,40 +4264,18 @@ impl ZaloGuiApp {
                                                     is_group,
                                                 });
                                             }
-                                        } else if (send_clicked || enter_pressed)
-                                            && self.pending_clipboard_image.is_some()
-                                        {
-                                            if let Some((clip_path, _, _, _)) =
-                                                self.pending_clipboard_image.take()
-                                            {
-                                                let cap =
-                                                    self.input_message.trim().to_string();
-                                                self.input_message.clear();
-                                                self.dismissed_sticker_suggest_for.clear();
-                                                self.composer_sticker_selected = None;
-                                                response.request_focus();
-                                                if let Some(tx) = WORKER_TX.get() {
-                                                    let _ = tx.send(
-                                                        WorkerCmd::PickAndSendAttachment {
-                                                            to_id: thread_id.clone(),
-                                                            is_group,
-                                                            images_only: true,
-                                                            caption: cap,
-                                                            preset_path: Some(clip_path),
-                                                        },
-                                                    );
-                                                }
-                                            }
                                         } else if (send_clicked || enter_pressed) && can_send {
+                                            if let Some((path, _, _, _)) = self.pending_clipboard_image.take() { self.durable_composer.attachments.push(path); }
                                             let mentions = self.composer_mentions.outgoing(&self.input_message);
-                                            let text = if mentions.is_empty() { self.input_message.trim().to_string() } else { self.input_message.clone() };
+                                            let text = self.input_message.clone();
                                             let quoted = self.replying_to.clone();
-                                            match super::composer::send_command(thread_id.clone(), text, is_group, quoted, mentions) {
+                                            let draft = crate::composer_store::Draft { text, mentions, reply: quoted, attachments: self.durable_composer.attachments.clone() };
+                                            if let Err(error) = self.durable_composer.observe(&self.user_uin, &thread_id, draft.clone()) { self.show_toast(error); }
+                                            let command = super::composer::send_command(self.user_uin.clone(), thread_id.clone(), is_group, draft, self.durable_composer.revision());
+                                            match command {
                                                 Ok(command) => {
                                                     if WORKER_TX.get().is_some_and(|tx| tx.send(command).is_ok()) {
-                                                        self.input_message.clear();
-                                                        self.composer_mentions.clear();
-                                                        self.replying_to = None;
+                                                        self.durable_composer.staging.insert(thread_id.clone());
                                                         self.dismissed_sticker_suggest_for.clear();
                                                         self.composer_sticker_selected = None;
                                                         response.request_focus();
@@ -4308,6 +4291,15 @@ impl ZaloGuiApp {
                                     });
                                 });
                         });
+
+                    let mut paths = self.durable_composer.attachments.clone();
+                    if let Some((path, _, _, _)) = &self.pending_clipboard_image { paths.push(path.clone()); }
+                    let draft = crate::composer_store::Draft {
+                        text: self.input_message.clone(), reply: self.replying_to.clone(),
+                        mentions: self.composer_mentions.outgoing(&self.input_message),
+                        attachments: paths,
+                    };
+                    if let Err(error) = self.durable_composer.observe(&self.user_uin, &thread_id, draft) { self.show_toast(error); }
 
                     // 4b. Floating Contextual Sticker Suggestion Popover (`egui::Area`, rendered AFTER composer bar)
                     if !contextual_stickers.is_empty() && !self.sticker_picker_open {

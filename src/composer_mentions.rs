@@ -293,6 +293,41 @@ impl ComposerMentions {
         true
     }
 
+    /// Clear only the unchanged draft acknowledged by the worker, including an inactive thread.
+    pub(crate) fn acknowledge_staged(
+        &mut self,
+        thread: &str,
+        sent: &crate::composer_store::Draft,
+        text: &mut String,
+        reply: &mut Option<ChatMessage>,
+    ) -> bool {
+        let same_reply = |reply: &Option<ChatMessage>| {
+            serde_json::to_value(reply).ok() == serde_json::to_value(&sent.reply).ok()
+        };
+        if self.thread_id == thread {
+            if *text == sent.text && same_reply(reply) && self.outgoing(text) == sent.mentions {
+                text.clear();
+                *reply = None;
+                self.clear();
+                return true;
+            }
+        } else if let Some(draft) = self.drafts.get(thread) {
+            let mut snapshot = Self {
+                snapshot: draft.text.clone(),
+                mentions: draft.mentions.clone(),
+                ..Default::default()
+            };
+            if draft.text == sent.text
+                && same_reply(&draft.reply)
+                && snapshot.outgoing(&draft.text) == sent.mentions
+            {
+                self.drafts.remove(thread);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Clear identities after the GUI consumes the draft text for a send.
     pub(crate) fn clear(&mut self) {
         self.mentions.clear();
@@ -433,5 +468,27 @@ mod composer_tests {
         // Either deletion produces the same raw string. No UID can be inferred from that string.
         text.drain(..4);
         assert!(model.outgoing(&text).is_empty());
+    }
+    #[test]
+    fn composer_stage_ack_clears_only_unchanged_draft_even_after_thread_switch() {
+        let mut model = ComposerMentions::default();
+        let mut text = "😀 @".into();
+        let mut reply = None;
+        model.switch_thread("A", &mut text, &mut reply);
+        model.select_member(&mut text, &member("22"), 3..3).unwrap();
+        let draft = crate::composer_store::Draft {
+            text: text.clone(),
+            mentions: model.outgoing(&text),
+            ..Default::default()
+        };
+        model.switch_thread("B", &mut text, &mut reply);
+        text = "new edits".into();
+        assert!(model.acknowledge_staged("A", &draft, &mut text, &mut reply));
+        assert_eq!(text, "new edits");
+        model.switch_thread("A", &mut text, &mut reply);
+        assert!(text.is_empty());
+        text = "changed after enqueue".into();
+        assert!(!model.acknowledge_staged("A", &draft, &mut text, &mut reply));
+        assert_eq!(text, "changed after enqueue");
     }
 }
