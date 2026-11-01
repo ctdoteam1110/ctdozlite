@@ -6,6 +6,8 @@ Thư mục này chứa tài liệu chi tiết về cách sử dụng, cấu trú
 
 | Tài liệu | Nội dung |
 |---|---|
+| [0. Tính năng & giới hạn](TINH_NANG.md) | Cái gì đang chạy, cái gì chạy một phần, cái gì chưa có — kèm issue theo dõi. |
+| [0b. Đã biết](DA_BIET.md) | **Sinh tự động** từ GitHub Issues. Đừng sửa tay. |
 | [1. Cài đặt](CAI_DAT.md) | Tải và cài đặt trên Linux, Windows, macOS; kiểm tra SHA-256 và gỡ cài đặt. |
 | [2. Hướng dẫn sử dụng](HUONG_DAN_SU_DUNG.md) | Các tham số CLI, thao tác trên GUI (`egui`), phím tắt TUI (`ratatui`) và công cụ kiểm thử. |
 | [3. Kiến trúc hệ thống](KIEN_TRUC_HE_THONG.md) | Mô hình phân tách UI thread / Tokio worker, đồng bộ WebSocket + HTTP polling và lưu trữ SQLite. |
@@ -44,3 +46,17 @@ cargo build --release
 # Bật thêm bảng kiểm tra mạng (Dev Inspector)
 ./target/release/zalo-rust --gui --dev
 ```
+
+## Xây dựng trang tài liệu
+
+Tài liệu trong thư mục này cũng được dựng thành một site tĩnh bằng [mdBook](https://rust-lang.github.io/mdBook/). Danh mục trang nằm ở `docs/SUMMARY.md` — file nào không có trong đó sẽ không được dựng.
+
+```bash
+cargo install mdbook --locked     # chỉ cần một lần
+./scripts/build-docs.sh           # sinh trang "Đã biết" + dựng site
+# Kết quả: book/index.html
+```
+
+- `scripts/gen-known-issues.sh` sinh `docs/DA_BIET.md` từ GitHub Issues (`gh`/`curl` + `jq`). Không có mạng thì giữ nguyên file cũ.
+- `book/` là output, đã nằm trong `.gitignore`.
+- Việc đưa site lên `ctdozlite.ctdo.net/docs/` đang chờ quyền truy cập Hostinger — xem [#20](https://github.com/ctdoteam1110/ctdozlite/issues/20).

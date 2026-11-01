@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="vi" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chính sách quyền riêng tư - ctdozlite</title>
+<meta name="description" content="Chính sách bảo vệ quyền riêng tư và minh bạch dữ liệu của ứng dụng ctdozlite. 100% dữ liệu lưu trữ cục bộ trên máy của bạn.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://ctdozlite.ctdo.net/privacy.html">
+<link rel="icon" href="assets/app_icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --radius-card: 12px;
+    --radius-btn: 8px;
+    --radius-chip: 999px;
+    --max: 860px;
+    --sans: 'Geist', ui-sans-serif, system-ui, sans-serif;
+    --mono: 'JetBrains Mono', ui-monospace, monospace;
+    --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  html[data-theme="dark"] {
+    --bg: #282c34;
+    --surface: #2c313a;
+    --surface-2: #353b45;
+    --text: #e5e5e6;
+    --text-2: #abb2bf;
+    --border: #181a1f;
+    --accent: #61afef;
+    --accent-contrast: #21252b;
+    --accent-soft: rgba(97, 175, 239, 0.15);
+    --highlight: #56b6c2;
+  }
+
+  html[data-theme="light"] {
+    --bg: #fafafa;
+    --surface: #ffffff;
+    --surface-2: #f0f0f1;
+    --text: #202227;
+    --text-2: #383a42;
+    --border: #e5e5e6;
+    --accent: #4078f2;
+    --accent-contrast: #ffffff;
+    --accent-soft: rgba(64, 120, 242, 0.12);
+    --highlight: #0184bc;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text-2);
+    font-family: var(--sans);
+    font-size: 15.5px;
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+    transition: background-color 0.28s var(--ease), color 0.28s var(--ease);
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code {
+    font-family: var(--mono);
+    font-size: 13px;
+    background: var(--surface-2);
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+
+  .wrap { max-width: var(--max); margin: 0 auto; padding: 0 24px; }
+
+  header.nav {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 85%, transparent);
+    backdrop-filter: blur(14px);
+  }
+
+  .nav-in {
+    height: 70px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .logo { display: flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none; }
+  .logo img { width: 24px; height: 24px; border-radius: 6px; }
+  .logo span { font-family: var(--mono); font-size: 14px; font-weight: 600; }
+
+  .nav-right { display: flex; align-items: center; gap: 12px; }
+
+  .theme-toggle {
+    display: inline-flex;
+    align-items: center;
+    height: 34px;
+    padding: 0 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-chip);
+    background: var(--surface);
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-2);
+  }
+
+  .theme-toggle b {
+    display: inline-flex;
+    align-items: center;
+    height: 26px;
+    padding: 0 9px;
+    border-radius: var(--radius-chip);
+    font-weight: 500;
+  }
+
+  html[data-theme="dark"] .theme-toggle .t-dark,
+  html[data-theme="light"] .theme-toggle .t-light {
+    background: var(--accent);
+    color: #ffffff;
+  }
+
+  main { padding: 60px 0 90px; }
+
+  .meta-tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 12px;
+  }
+
+  h1 {
+    font-size: clamp(30px, 4vw, 44px);
+    color: var(--text);
+    letter-spacing: -0.03em;
+    line-height: 1.15;
+    margin-bottom: 12px;
+    font-weight: 700;
+  }
+
+  .updated {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-2);
+    margin-bottom: 40px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .card-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    padding: 24px 28px;
+    margin-bottom: 32px;
+  }
+
+  h2 {
+    font-size: 20px;
+    color: var(--text);
+    letter-spacing: -0.02em;
+    margin: 32px 0 12px;
+    font-weight: 600;
+  }
+
+  p { margin-bottom: 16px; }
+
+  ul {
+    margin-bottom: 20px;
+    padding-left: 20px;
+  }
+
+  li { margin-bottom: 8px; }
+
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 36px 0;
+    font-size: 13px;
+    font-family: var(--mono);
+    color: var(--text-2);
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-in">
+    <a href="index.html" class="logo">
+      <img src="assets/app_icon.png" alt="ctdozlite">
+      <span>ctdozlite</span>
+    </a>
+    <div class="nav-right">
+      <button class="theme-toggle" id="themeToggle" type="button" aria-label="Chuyển giao diện sáng tối">
+        <b class="t-light">Sáng</b><b class="t-dark">Tối</b>
+      </button>
+      <a href="index.html" style="font-size: 13px; margin-left: 6px;">Trang chủ</a>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <div class="meta-tag">Chính sách minh bạch dữ liệu</div>
+    <h1>Chính sách quyền riêng tư</h1>
+    <div class="updated">Cập nhật lần cuối: 31/10/2026</div>
+
+    <div class="card-box">
+      <p style="margin-bottom: 0; color: var(--text); font-weight: 500;">
+        Cam kết cốt lõi: <strong>ctdozlite không sở hữu máy chủ trung gian, không thu thập dữ liệu phân tích hành vi (zero telemetry), và không lưu bất kỳ thông tin nào của bạn lên đám mây của bên thứ ba.</strong>
+      </p>
+    </div>
+
+    <h2>1. Nguyên lý vận hành & Dữ liệu lưu trữ</h2>
+    <p>
+      ctdozlite là một client mã nguồn mở chạy hoàn toàn cục bộ trên máy tính của bạn. Mọi trao đổi mạng diễn ra trực tiếp giữa máy tính của bạn và các máy chủ chính thức của hệ thống Zalo (thông qua giao thức HTTPS và ZRTP UDP).
+    </p>
+    <p>Các dữ liệu được tạo và lưu trữ trên ổ đĩa của bạn bao gồm:</p>
+    <ul>
+      <li><code>session.json</code>: Chứa mã phiên (tokens), cookie xác thực và khóa mã hóa tạm thời do server trả về sau khi bạn quét QR hoặc đăng nhập. Tệp này nằm trực tiếp trong thư mục làm việc của bạn.</li>
+      <li><code>threads_cache.json</code>: Bản chụp bộ nhớ đệm danh sách hội thoại gần nhất nhằm tăng tốc độ tải cửa sổ khi khởi động lại.</li>
+      <li><code>zalo_history.db</code>: Cơ sở dữ liệu SQLite cục bộ lưu trữ các tin nhắn đã nhận và gửi. Bạn nắm quyền kiểm soát tuyệt đối tệp này.</li>
+      <li><code>call_trace.log</code>: Tệp nhật ký tín hiệu cuộc gọi chỉ được tạo khi bật chế độ chẩn đoán (dev mode) và lưu cục bộ trên máy.</li>
+    </ul>
+
+    <h2>2. Không thu thập Telemetry hay Dữ liệu quảng cáo</h2>
+    <p>
+      Khác với các ứng dụng đóng gói bằng Chromium thương mại, ctdozlite:
+    </p>
+    <ul>
+      <li>Không tích hợp Google Analytics, Crashlytics, Mixpanel hay bất kỳ SDK theo dõi hành vi nào.</li>
+      <li>Không có tiến trình báo cáo lỗi (crash-reporter) ngầm tự động gửi thông tin phần cứng về máy chủ của tác giả.</li>
+      <li>Không cài cắm quảng cáo hoặc thu thập danh bạ để phục vụ mục đích thương mại.</li>
+    </ul>
+
+    <h2>3. Quyền hạn thiết bị (Permissions)</h2>
+    <p>
+      Ứng dụng chỉ yêu cầu quyền truy cập phần cứng khi cần thiết để thực hiện các chức năng bạn chỉ định:
+    </p>
+    <ul>
+      <li><strong>Microphone & Loa:</strong> Chỉ được kích hoạt qua thư viện âm thanh <code>cpal</code> khi bạn tham gia cuộc gọi thoại hoặc gọi video.</li>
+      <li><strong>Camera (Webcam):</strong> Chỉ mở khi bạn bật tính năng video call và có thể tắt bất cứ lúc nào.</li>
+      <li><strong>Kết nối mạng (Network):</strong> Chỉ kết nối tới các domain chính thức của Zalo được trả về từ lời gọi <code>getserverinfo</code>.</li>
+    </ul>
+
+    <h2>4. Trách nhiệm người dùng</h2>
+    <p>
+      Vì <code>session.json</code> và <code>zalo_history.db</code> lưu trữ trực tiếp trên máy của bạn ở định dạng không khóa mật khẩu phần cứng, bạn có trách nhiệm:
+    </p>
+    <ul>
+      <li>Bảo vệ an toàn thư mục làm việc, không chia sẻ file <code>session.json</code> cho người khác vì tệp này tương đương với phiên đăng nhập của bạn.</li>
+      <li>Xóa các tệp phiên bằng lệnh <code>cargo run -- --logout</code> khi không còn sử dụng trên thiết bị công cộng.</li>
+    </ul>
+
+    <h2>5. Mã nguồn mở & Xác minh độc lập</h2>
+    <p>
+      Toàn bộ mã nguồn của ctdozlite được công khai tại <a href="https://github.com/ctdoteam1110/ctdozlite" target="_blank" rel="noreferrer">GitHub Repository</a>. Bạn hoặc bất kỳ chuyên gia bảo mật nào đều có thể tự kiểm tra, đối chiếu mã nguồn và tự biên dịch để đảm bảo không có mã độc ẩn.
+    </p>
+
+    <div style="margin-top: 48px; padding-top: 24px; border-top: 1px solid var(--border);">
+      <p style="font-size: 13.5px;">Mọi thắc mắc liên quan đến tính minh bạch hoặc bảo mật, vui lòng mở issue trên repository GitHub chính thức của dự án.</p>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap" style="width: 100%; display: flex; justify-content: space-between; flex-wrap: wrap;">
+    <div>CTDOTEAM · ctdozlite</div>
+    <div style="display: flex; gap: 18px;">
+      <a href="index.html" style="color: var(--text-2);">Trang chủ</a>
+      <a href="disclaimer.html" style="color: var(--text-2);">Miễn trừ trách nhiệm</a>
+      <a href="https://github.com/ctdoteam1110/ctdozlite" target="_blank" rel="noreferrer" style="color: var(--text-2);">GitHub</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  const root = document.documentElement;
+  const toggle = document.getElementById('themeToggle');
+  const stored = localStorage.getItem('ctdozlite-theme');
+  const initial = stored || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  root.setAttribute('data-theme', initial);
+
+  toggle.addEventListener('click', () => {
+    const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    localStorage.setItem('ctdozlite-theme', next);
+  });
+</script>
+
+</body>
+</html>
