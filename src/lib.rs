@@ -22,3 +22,5 @@ pub mod voip_log;
 
 /// Writable storage selection and private atomic session writes.
 pub mod data_dir;
+/// Independent resource and transaction primitives.
+pub mod media_resources;
