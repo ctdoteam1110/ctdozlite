@@ -34,6 +34,10 @@ pub struct MessageStore {
 }
 
 impl MessageStore {
+    /// Messages per thread loaded at startup / on refresh. The list only needs the newest one
+    /// for ordering and preview; opening a thread reads deeper (`LoadGroupHistory`).
+    pub const PRELOAD_MSGS: usize = 20;
+
     /// Open SQLite database at `path` and initialize table schemas and indices if absent.
     pub fn open(path: &str) -> Result<Self> {
         let conn = if path == ":memory:" {
@@ -62,6 +66,16 @@ impl MessageStore {
                 last_ts INTEGER
             );",
         )?;
+        // Migration 1: one-time cleanup of placeholder rows. This DELETE used to run (a full
+        // table scan) on every hydrate; new rows are filtered in `persist_threads` instead.
+        if conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? < 1 {
+            conn.execute_batch(
+                "BEGIN;
+                 DELETE FROM messages WHERE text = 'sendBubbleMessage';
+                 PRAGMA user_version = 1;
+                 COMMIT;",
+            )?;
+        }
 
         Ok(Self { conn })
     }
@@ -128,14 +142,19 @@ impl MessageStore {
         Ok(())
     }
 
-    /// Retrieve up to `limit` messages for a thread ordered by timestamp ascending.
+    /// Retrieve the newest `limit` messages for a thread, ordered by timestamp ascending.
     pub fn messages_for(&self, thread_id: &str, limit: usize) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
+            // Newest `limit` rows, returned oldest-first. `ORDER BY ts ASC LIMIT` handed back the
+            // *oldest* rows, so a thread longer than the limit reopened on stale messages.
             "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
-             FROM messages
-             WHERE thread_id = ?1
-             ORDER BY ts ASC
-             LIMIT ?2",
+             FROM (
+                 SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
+                 FROM messages
+                 WHERE thread_id = ?1
+                 ORDER BY ts DESC
+                 LIMIT ?2
+             ) ORDER BY ts ASC",
         )?;
 
         let rows = stmt.query_map(params![thread_id, limit as i64], |row| {
@@ -186,10 +205,6 @@ impl MessageStore {
     /// Hydrate `threads` with persisted threads and message history from SQLite.
     /// Returns the total number of messages loaded into `threads`.
     pub fn hydrate_threads(&self, threads: &mut Vec<Thread>, limit_per_thread: usize) -> Result<usize> {
-        let _ = self.conn.execute(
-            "DELETE FROM messages WHERE text = 'sendBubbleMessage'",
-            [],
-        );
         crate::chat::deduplicate_threads(threads, None);
 
         let stored_threads = self.all_threads().unwrap_or_default();
@@ -241,27 +256,21 @@ impl MessageStore {
             }
         }
 
-        let mut msg_owner: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        if let Ok(mut stmt) = self.conn.prepare("SELECT msg_id, thread_id FROM messages") {
-            if let Ok(rows) = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            }) {
-                for r in rows.flatten() {
-                    msg_owner.insert(r.0, r.1);
-                }
-            }
-        }
+        // Primary-key lookups for the messages actually in memory. This used to load every
+        // (msg_id, thread_id) row in the database into a HashMap on each call. One transaction
+        // around them: in autocommit every SELECT takes and drops the file lock, ~50 µs on
+        // Windows, which made 62k lookups cost 3 s.
+        let tx = self.conn.unchecked_transaction()?;
+        let mut owner_of = self.conn.prepare("SELECT thread_id FROM messages WHERE msg_id = ?1")?;
 
         let mut loaded_count = 0;
         for t in threads.iter_mut() {
             let before = t.messages.len();
+            let tid = t.id.clone();
             t.messages.retain(|m| {
-                if let Some(owner_tid) = msg_owner.get(&m.id) {
-                    owner_tid == &t.id
-                } else {
-                    true
-                }
+                owner_of
+                    .query_row(params![m.id], |r| r.get::<_, String>(0))
+                    .map_or(true, |owner| owner == tid)
             });
             if t.messages.len() != before && t.messages.is_empty() {
                 t.preview.clear();
@@ -426,6 +435,8 @@ impl MessageStore {
                 }
             }
         }
+        drop(owner_of);
+        tx.commit()?;
         crate::chat::deduplicate_threads(threads, None);
         Ok(loaded_count)
     }
@@ -502,6 +513,16 @@ impl From<&ChatMessage> for StoredMessage {
 
 /// Persist threads and their messages to SQLite store, returning the count of newly inserted messages.
 pub fn persist_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
+    // One transaction for the whole snapshot: in autocommit every row was its own fsync.
+    store.conn.execute_batch("BEGIN")?;
+    let res = persist_threads_inner(store, threads);
+    store
+        .conn
+        .execute_batch(if res.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+    res
+}
+
+fn persist_threads_inner(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
     let mut new_count = 0;
     for t in threads {
         let last_ts = t.messages.iter().map(|m| m.ts).max().unwrap_or(0);
@@ -513,7 +534,7 @@ pub fn persist_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<u
         };
         store.upsert_thread(&st)?;
 
-        for m in &t.messages {
+        for m in t.messages.iter().filter(|m| m.text != "sendBubbleMessage") {
             let mut sm = StoredMessage::from(m);
             sm.thread_id = t.id.clone();
             if sm.msg_id.is_empty() {
@@ -647,6 +668,10 @@ mod tests {
         assert_eq!(msgs[1].msg_id, "m1");
         assert_eq!(msgs[2].ts, 300);
         assert_eq!(msgs[2].msg_id, "m3");
+
+        // A limit keeps the *newest* rows, still returned oldest-first.
+        let newest = store.messages_for(thread_id, 2).unwrap();
+        assert_eq!(newest.iter().map(|m| m.ts).collect::<Vec<_>>(), vec![200, 300]);
     }
 
     #[test]

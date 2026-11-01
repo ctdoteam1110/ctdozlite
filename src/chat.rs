@@ -174,21 +174,43 @@ pub fn merge_thread_into(
     }
     target.is_group = target.is_group || incoming.is_group;
 
+    // Same two rules as before (equal ids, or same text + direction at the same clock time /
+    // within 5 s — how a local `out_*` echo meets its server copy), looked up through two
+    // indexes instead of scanning every message per incoming one: syncing 1 000 messages into
+    // a 1 000-message thread was a million comparisons.
+    use std::collections::HashMap;
+    let mut by_id: HashMap<String, usize> = HashMap::new();
+    let mut by_text: HashMap<(String, bool), Vec<usize>> = HashMap::new();
+    for (i, m) in target.messages.iter().enumerate() {
+        if !m.id.is_empty() {
+            by_id.entry(m.id.clone()).or_insert(i);
+        }
+        by_text.entry((m.text.clone(), m.is_outgoing)).or_default().push(i);
+    }
+
     for msg in incoming.messages {
         if msg.text == "sendBubbleMessage" {
             continue;
         }
-        if let Some(existing_msg) = target.messages.iter_mut().find(|m| {
-            (!m.id.is_empty() && !msg.id.is_empty() && m.id == msg.id)
-                || (m.text == msg.text
-                    && m.is_outgoing == msg.is_outgoing
-                    && (m.time == msg.time
-                        || (m.ts != 0 && msg.ts != 0 && (m.ts - msg.ts).abs() < 5000)))
-        }) {
+        let text_key = (msg.text.clone(), msg.is_outgoing);
+        let found = by_id
+            .get(&msg.id)
+            .filter(|_| !msg.id.is_empty())
+            .copied()
+            .or_else(|| {
+                by_text.get(&text_key)?.iter().copied().find(|&i| {
+                    let m = &target.messages[i];
+                    m.time == msg.time || (m.ts != 0 && msg.ts != 0 && (m.ts - msg.ts).abs() < 5000)
+                })
+            });
+        if let Some(idx) = found {
+            let existing_msg = &mut target.messages[idx];
+            let old_text_key = (existing_msg.text.clone(), existing_msg.is_outgoing);
             if existing_msg.id.starts_with("out_")
                 && !msg.id.is_empty()
                 && !msg.id.starts_with("out_")
             {
+                by_id.insert(msg.id.clone(), idx);
                 existing_msg.id = msg.id;
             }
             if msg.ts > 0 && existing_msg.ts != msg.ts {
@@ -226,7 +248,19 @@ pub fn merge_thread_into(
             }
             existing_msg.is_pinned = existing_msg.is_pinned || msg.is_pinned;
             existing_msg.is_starred = existing_msg.is_starred || msg.is_starred;
+            if existing_msg.text != old_text_key.0 {
+                let new_key = (existing_msg.text.clone(), existing_msg.is_outgoing);
+                if let Some(v) = by_text.get_mut(&old_text_key) {
+                    v.retain(|&i| i != idx);
+                }
+                by_text.entry(new_key).or_default().push(idx);
+            }
         } else {
+            let idx = target.messages.len();
+            if !msg.id.is_empty() {
+                by_id.entry(msg.id.clone()).or_insert(idx);
+            }
+            by_text.entry(text_key).or_default().push(idx);
             target.messages.push(msg);
         }
     }
@@ -338,9 +372,24 @@ pub fn load_threads_cache() -> Vec<Thread> {
     Vec::new()
 }
 
-/// Persist conversations and message history locally so they survive app restarts.
+/// Snapshot of the thread list for an instant first paint. Only the newest
+/// `PRELOAD_MSGS` messages per thread are kept: full history lives in `zalo_history.db`, and
+/// rewriting every message as pretty JSON on each change cost more than the SQLite write.
 pub fn save_threads_cache(threads: &[Thread]) {
-    if let Ok(text) = serde_json::to_string_pretty(threads) {
+    let keep = crate::store::MessageStore::PRELOAD_MSGS;
+    let slim: Vec<Thread> = threads
+        .iter()
+        .map(|t| Thread {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            preview: t.preview.clone(),
+            time: t.time.clone(),
+            avatar: t.avatar.clone(),
+            is_group: t.is_group,
+            messages: t.messages[t.messages.len().saturating_sub(keep)..].to_vec(),
+        })
+        .collect();
+    if let Ok(text) = serde_json::to_string(&slim) {
         let _ = std::fs::write("threads_cache.json", text);
     }
 }
@@ -438,7 +487,11 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
     }
 
     // Hydrate with locally persisted history from SQLite (`zalo_history.db`)
-    crate::store::load_history_into_threads("zalo_history.db", &mut threads, 200);
+    crate::store::load_history_into_threads(
+        "zalo_history.db",
+        &mut threads,
+        crate::store::MessageStore::PRELOAD_MSGS,
+    );
 
     // Merge user groups (`getlg/v4` + `getmg-v2`) into threads list, upgrading any placeholder group names
     if let Ok(mut groups) = get_groups(s).await {
@@ -4047,6 +4100,18 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
         .trim_start_matches('G')
         .to_string();
 
+    // Index existing messages once (ids, and text+ts) instead of scanning per incoming message.
+    let mut by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut by_text_ts: std::collections::HashMap<(String, i64), usize> = std::collections::HashMap::new();
+    for (i, m) in thread.messages.iter().enumerate() {
+        if !m.id.is_empty() {
+            by_id.entry(m.id.clone()).or_insert(i);
+        }
+        if m.ts != 0 {
+            by_text_ts.entry((m.text.clone(), m.ts)).or_insert(i);
+        }
+    }
+
     for it in raw_msgs {
         if !clean_thread_id.is_empty() {
             if let Some(id_to) = pick_str(it, &["idTo", "toId", "grid", "groupId"]) {
@@ -4060,10 +4125,12 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
             }
         }
         if let Some(m) = parse_chat_message(it) {
-            if let Some(existing) = thread.messages.iter_mut().find(|existing| {
-                (!existing.id.is_empty() && !m.id.is_empty() && existing.id == m.id)
-                    || (existing.text == m.text && existing.ts != 0 && existing.ts == m.ts)
-            }) {
+            let hit = by_id
+                .get(&m.id)
+                .filter(|_| !m.id.is_empty())
+                .or_else(|| by_text_ts.get(&(m.text.clone(), m.ts)).filter(|_| m.ts != 0))
+                .copied();
+            if let Some(existing) = hit.map(|i| &mut thread.messages[i]) {
                 if existing.link_url.is_none() && m.link_url.is_some() {
                     existing.link_url = m.link_url;
                     existing.link_title = m.link_title;
@@ -4075,6 +4142,13 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
                     }
                 }
             } else {
+                let idx = thread.messages.len();
+                if !m.id.is_empty() {
+                    by_id.entry(m.id.clone()).or_insert(idx);
+                }
+                if m.ts != 0 {
+                    by_text_ts.entry((m.text.clone(), m.ts)).or_insert(idx);
+                }
                 thread.messages.push(m);
             }
         }
@@ -4537,6 +4611,39 @@ mod tests {
             is_group: false,
             messages: Vec::new(),
         }
+    }
+
+    #[test]
+    fn merge_thread_into_keeps_match_rules() {
+        let m = |id: &str, text: &str, ts: i64, out: bool| ChatMessage {
+            id: id.into(),
+            text: text.into(),
+            ts,
+            time: format!("{}", ts / 60_000),
+            is_outgoing: out,
+            ..Default::default()
+        };
+        let mut target = Thread {
+            id: "t".into(),
+            name: "A".into(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            is_group: false,
+            messages: vec![m("1", "chào", 1_000_000, false), m("out_9", "ok", 2_000_000, true)],
+        };
+        let incoming = Thread {
+            messages: vec![
+                m("1", "chào", 1_000_000, false),       // same id -> no duplicate
+                m("77", "ok", 2_002_000, true),          // echo of out_9 within 5 s -> takes real id
+                m("78", "ok", 9_000_000_000, true),      // same text, other day -> new message
+                m("79", "mới", 3_000_000, false),        // new
+            ],
+            ..target.clone()
+        };
+        merge_thread_into(&mut target, incoming, false);
+        let ids: Vec<&str> = target.messages.iter().map(|x| x.id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "77", "79", "78"]);
     }
 
     #[test]

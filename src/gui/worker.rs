@@ -583,7 +583,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                         crate::store::load_history_into_threads(
                                                             "zalo_history.db",
                                                             &mut list,
-                                                            200,
+                                                            crate::store::MessageStore::PRELOAD_MSGS,
                                                         );
                                                         {
                                                             let mut ps = poll_clone.lock().await;
@@ -724,7 +724,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                     crate::store::load_history_into_threads(
                                         "zalo_history.db",
                                         &mut list,
-                                        200,
+                                        crate::store::MessageStore::PRELOAD_MSGS,
                                     );
                                     let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
                                         format!("⏳ Đang tải tin nhắn cho {} hội thoại…", list.len()),
