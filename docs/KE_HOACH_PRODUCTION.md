@@ -1,4 +1,6 @@
-# KẾ HOẠCH HOÀN THIỆN PRODUCTION — `ctdozlite` (`zalo-rust`)
+# KẾ HOẠCH HOÀN THIỆN PRODUCTION — QTzalo (`zalo-rust`)
+
+> Tài liệu kế thừa từ dự án gốc `ctdozlite`, giữ lại để tham khảo lộ trình.
 
 Tài liệu này tổng hợp lộ trình đưa `zalo-rust` từ bản Prototype lên bản **Production Desktop Client** ổn định để sử dụng hàng ngày thay thế Zalo PC chính thức.
 

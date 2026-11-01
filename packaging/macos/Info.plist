@@ -5,30 +5,29 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>vi</string>
     <key>CFBundleDisplayName</key>
-    <string>ctdozlite</string>
+    <string>QTzalo</string>
     <key>CFBundleExecutable</key>
     <string>zalo-rust</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.ctdoteam1110.ctdozlite</string>
+    <string>io.github.quangthoai1985.qtzalo</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>ctdozlite</string>
+    <string>QTzalo</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <!-- Version sentinels: CI replaces both with the version from Cargo.toml (plutil -replace). -->
     <key>CFBundleShortVersionString</key>
-    <string>0.0.1</string>
+    <string>0.0.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>0.0.0</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>ctdozlite cần quyền truy cập Microphone để thực hiện cuộc gọi thoại và video Zalo.</string>
+    <string>QTzalo cần quyền truy cập Microphone để thực hiện cuộc gọi thoại và video Zalo.</string>
     <key>NSCameraUsageDescription</key>
-    <string>ctdozlite cần quyền truy cập Camera để thực hiện cuộc gọi video Zalo.</string>
+    <string>QTzalo cần quyền truy cập Camera để thực hiện cuộc gọi video Zalo.</string>
 </dict>
 </plist>

@@ -1,6 +1,9 @@
-# Rust build artifacts
+# Rust build artifacts and packaging output
 target/
 dist/
+/book/
+pkg_deb/
+release_assets/
 
 # Active session credentials and tokens (CRITICAL: NEVER COMMIT)
 session.json
@@ -24,6 +27,8 @@ qr.png
 Zalo_app_icon_redesign_*.jpg
 call_relay.json
 call_trace.log
+voip.log*
+logs/
 
 # Generated graph/tooling output
 graphify-out/
@@ -43,3 +48,6 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local agent tooling
+.claude/worktrees/

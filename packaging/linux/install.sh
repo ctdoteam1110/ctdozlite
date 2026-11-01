@@ -1,31 +1,34 @@
 #!/usr/bin/env bash
+# Install QTzalo from the portable .tar.gz.
+#   ./install.sh          -> /usr/local (uses sudo when available), otherwise ~/.local
+#   ./install.sh --user   -> always ~/.local (no root needed)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODE="${1:-}"
 
-if [ "$(id -u)" -eq 0 ]; then
-    BIN_DIR="/usr/local/bin"
-    APP_DIR="/usr/local/share/applications"
-    ICON_DIR="/usr/local/share/icons/hicolor/256x256/apps"
-elif command -v sudo >/dev/null 2>&1; then
-    echo "Cài đặt ctdozlite vào /usr/local/bin (yêu cầu quyền sudo)..."
+if [ "$MODE" != "--user" ] && [ "$(id -u)" -eq 0 ]; then
+    PREFIX="/usr/local"
+elif [ "$MODE" != "--user" ] && command -v sudo >/dev/null 2>&1; then
+    echo "Cài đặt QTzalo vào /usr/local (yêu cầu quyền sudo). Dùng --user để chỉ cài cho tài khoản hiện tại."
     exec sudo bash "$0" "$@"
 else
-    BIN_DIR="$HOME/.local/bin"
-    APP_DIR="$HOME/.local/share/applications"
-    ICON_DIR="$HOME/.local/share/icons/hicolor/256x256/apps"
+    PREFIX="$HOME/.local"
 fi
 
-mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
+BIN_DIR="$PREFIX/bin"
+APP_DIR="$PREFIX/share/applications"
+ICON_DIR="$PREFIX/share/icons/hicolor/256x256/apps"
 
-install -m 755 "$SCRIPT_DIR/zalo-rust" "$BIN_DIR/zalo-rust"
-install -m 755 "$SCRIPT_DIR/ctdozlite" "$BIN_DIR/ctdozlite"
-install -m 644 "$SCRIPT_DIR/ctdozlite.desktop" "$APP_DIR/ctdozlite.desktop"
-install -m 644 "$SCRIPT_DIR/ctdozlite.png" "$ICON_DIR/ctdozlite.png"
+mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
+install -m 755 "$SCRIPT_DIR/qtzalo" "$BIN_DIR/qtzalo"
+install -m 644 "$SCRIPT_DIR/qtzalo.desktop" "$APP_DIR/qtzalo.desktop"
+install -m 644 "$SCRIPT_DIR/qtzalo.png" "$ICON_DIR/qtzalo.png"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
 fi
 
-echo "Đã cài đặt thành công ctdozlite v0.0.1 tại $BIN_DIR/ctdozlite"
-echo "Chạy ứng dụng bằng lệnh: ctdozlite (hoặc mở từ menu ứng dụng)."
+echo "Đã cài đặt QTzalo tại $BIN_DIR/qtzalo"
+echo "Chạy bằng lệnh: qtzalo (hoặc mở QTzalo từ menu ứng dụng)."
+echo "Dữ liệu người dùng: \${XDG_DATA_HOME:-~/.local/share}/qtzalo"

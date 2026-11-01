@@ -1,6 +1,6 @@
-# Kiến trúc hệ thống ctdozlite
+# Kiến trúc hệ thống QTzalo
 
-Tài liệu mô tả cách phân tách luồng xử lý, tổ chức module giao diện và cơ chế lưu trữ cục bộ của `ctdozlite`.
+Tài liệu mô tả cách phân tách luồng xử lý, tổ chức module giao diện và cơ chế lưu trữ cục bộ của QTzalo (kế thừa từ `ctdozlite`).
 
 ---
 
