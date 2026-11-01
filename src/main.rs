@@ -7,6 +7,7 @@
 mod audio;
 mod call;
 mod chat;
+mod clock;
 mod crypto;
 mod endpoints;
 mod gui;

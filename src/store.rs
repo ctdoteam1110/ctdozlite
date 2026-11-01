@@ -274,8 +274,7 @@ impl MessageStore {
             let saved_msgs = self.messages_for(&t.id, limit_per_thread)?;
             for sm in saved_msgs {
                 let time = if sm.ts > 0 {
-                    let s = sm.ts / 1000;
-                    format!("{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60)
+                    crate::clock::message_time(sm.ts)
                 } else {
                     crate::ui::clock()
                 };
@@ -538,6 +537,45 @@ pub fn load_history_into_threads(path: &str, threads: &mut Vec<Thread>, limit_pe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_time_when_hydrating_seconds_and_milliseconds() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        store
+            .upsert_thread(&StoredThread {
+                thread_id: "thread-1".into(),
+                name: "Example".into(),
+                is_group: false,
+                last_ts: 1793467800000,
+            })
+            .unwrap();
+        for (id, ts) in [("msg-0001", 1793467800), ("msg-0002", 1793467800000)] {
+            store
+                .upsert_message(&StoredMessage {
+                    msg_id: id.into(),
+                    thread_id: "thread-1".into(),
+                    sender_id: "user-1".into(),
+                    sender_name: "Example".into(),
+                    text: "hello".into(),
+                    msg_type: "chat.text".into(),
+                    ts,
+                    is_outgoing: false,
+                    raw_json: String::new(),
+                })
+                .unwrap();
+        }
+        let mut threads = Vec::new();
+        assert_eq!(store.hydrate_threads(&mut threads, 10).unwrap(), 2);
+        let expected = crate::clock::message_time(1793467800000);
+        assert_eq!(threads[0].time, expected);
+        for message in &threads[0].messages {
+            assert_eq!(message.time, expected);
+        }
+        assert_eq!(
+            store.messages_for("thread-1", 10).unwrap()[0].ts,
+            1793467800
+        );
+    }
 
     #[test]
     fn test_insert_twice_returns_false() {
