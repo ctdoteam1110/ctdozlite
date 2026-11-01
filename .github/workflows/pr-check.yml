@@ -1,12 +1,14 @@
-name: PR Quality & Security Guard (Free Bot)
+name: PR Quality & Security Guard
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened]
 
 permissions:
   pull-requests: write
   contents: read
+  issues: write
+
 
 jobs:
   pr-check:
