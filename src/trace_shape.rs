@@ -46,10 +46,17 @@ const VALUE_KEYS: &[&str] = &[
     "format",
     "is_full_transfer",
     "user_action",
+    "pc",
+    "error",
+    "isFiltered",
+    "isFilteredByPhase",
+    "isFilteredByTimeJoin",
+    "isOld",
+    "isRootDel",
 ];
 
 /// Keys holding Unix timestamps; an array of objects shows them as `min..max`.
-const TIME_KEYS: &[&str] = &["ts", "sendDttm", "serverTime", "createdTime"];
+const TIME_KEYS: &[&str] = &["ts", "sendDttm", "serverTime", "createdTime", "tsJoinGroup"];
 
 /// Keys whose arrays hold action ids worth seeing (`queueStatus[q].ids`, `preIds`).
 const ID_LIST_KEYS: &[&str] = &["ids", "preIds"];
