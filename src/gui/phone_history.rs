@@ -1155,6 +1155,13 @@ fn convert_objects(
     })
 }
 
+/// Output route and run identity captured when the coordinator admits a transfer.
+pub(super) struct TransferOutput {
+    tx: super::GuiTx,
+    ctx: eframe::egui::Context,
+    generation: u64,
+}
+
 /// Execute one explicit transfer and emit a terminal status on every normal error path.
 /// Dropping the task disposes active rounds and terminates its native codec child.
 pub(super) async fn run(
@@ -1163,10 +1170,13 @@ pub(super) async fn run(
     commands: UnboundedSender<WsCommand>,
     mut events: UnboundedReceiver<WsEvent>,
     mut wakeups: UnboundedReceiver<()>,
-    tx: super::GuiTx,
-    ctx: eframe::egui::Context,
-    generation: u64,
+    output: TransferOutput,
 ) {
+    let TransferOutput {
+        tx,
+        ctx,
+        generation,
+    } = output;
     let account = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
     let result = run_inner(
         live,
@@ -2177,17 +2187,16 @@ impl PhoneCoordinator {
 
     /// Route only transfer controls and lifecycle events to the active run.
     pub(super) fn forward(&self, event: &WsEvent) {
-        if matches!(
+        if (matches!(
             event.cmd,
             crate::socket::CMD_SYNC_V2_REQUEST
                 | crate::socket::CMD_SYNC_V2_WAKEUP
                 | crate::socket::CMD_TRANSPORT_STATUS
-        ) || event.is_voip_ish()
+        ) || event.is_voip_ish())
+            && self.task.as_ref().is_some_and(|task| !task.is_finished())
         {
-            if self.task.as_ref().is_some_and(|task| !task.is_finished()) {
-                if let Some(events) = &self.events {
-                    let _ = events.send(event.clone());
-                }
+            if let Some(events) = &self.events {
+                let _ = events.send(event.clone());
             }
         }
     }
@@ -2250,9 +2259,11 @@ impl PhoneCoordinator {
                         commands.clone(),
                         events_rx,
                         wake_rx,
-                        tx.clone(),
-                        ctx.clone(),
-                        generation,
+                        TransferOutput {
+                            tx: tx.clone(),
+                            ctx: ctx.clone(),
+                            generation,
+                        },
                     ),
                 ));
             }
