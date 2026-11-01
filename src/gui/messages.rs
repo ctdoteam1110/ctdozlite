@@ -1648,6 +1648,7 @@ pub(super) fn render_chat_bubble(
                 let rounding = Rounding::same(8.0);
 
                 let mut card_action = None;
+                let mut quote_action = None;
                 let fr = egui::Frame::none()
                     .fill(fill)
                     .stroke(stroke)
@@ -1657,7 +1658,7 @@ pub(super) fn render_chat_bubble(
                         ui.set_min_width(content_width);
                         ui.set_max_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            render_quote_block(ui, msg, pal, true, content_width);
+                            quote_action = render_quote_block(ui, msg, pal, true, content_width);
                             if let Some(card) = &call_card_opt {
                                 card_action =
                                     render_call_card_widget(ui, card, pal, content_width);
@@ -1697,7 +1698,7 @@ pub(super) fn render_chat_bubble(
                 if fr.response.double_clicked() {
                     return Some(BubbleAction::Reply);
                 }
-                card_action.or_else(|| {
+                quote_action.or(card_action).or_else(|| {
                     bubble_context_menu(
                         ui,
                         &fr.response,
@@ -1772,6 +1773,7 @@ pub(super) fn render_chat_bubble(
             ui.vertical(|ui| {
                 ui.set_max_width(total_bubble_w);
                 let mut card_action = None;
+                let mut quote_action = None;
                 let fr = egui::Frame::none()
                     .fill(fill)
                     .stroke(stroke)
@@ -1790,7 +1792,7 @@ pub(super) fn render_chat_bubble(
                                 );
                                 ui.add_space(2.0);
                             }
-                            render_quote_block(ui, msg, pal, false, content_width);
+                            quote_action = render_quote_block(ui, msg, pal, false, content_width);
                             if let Some(card) = &call_card_opt {
                                 card_action =
                                     render_call_card_widget(ui, card, pal, content_width);
@@ -1825,7 +1827,7 @@ pub(super) fn render_chat_bubble(
                 if fr.response.double_clicked() {
                     return Some(BubbleAction::Reply);
                 }
-                card_action.or_else(|| {
+                quote_action.or(card_action).or_else(|| {
                     bubble_context_menu(
                         ui,
                         &fr.response,
@@ -1846,6 +1848,7 @@ pub(super) fn render_chat_bubble(
 #[derive(Clone, PartialEq)]
 pub(super) enum BubbleAction {
     Reply,
+    JumpToQuoted(String),
     Forward,
     React(&'static str),
     TogglePin,
@@ -2004,10 +2007,8 @@ pub(super) fn render_quote_block(
     pal: &ThemePalette,
     outgoing: bool,
     max_w: f32,
-) {
-    let Some(qt) = msg.reply_to_text.as_ref() else {
-        return;
-    };
+) -> Option<BubbleAction> {
+    let qt = msg.reply_to_text.as_ref()?;
     let (text_col, meta_col) = if outgoing {
         (pal.bubble_out_text, pal.bubble_out_meta)
     } else {
@@ -2026,7 +2027,7 @@ pub(super) fn render_quote_block(
         text_col.linear_multiply(0.06)
     };
     let inner_col_w = (max_w - 28.0).max(72.0);
-    egui::Frame::none()
+    let frame = egui::Frame::none()
         .fill(bg_col)
         .rounding(Rounding::same(7.0))
         .inner_margin(Margin::symmetric(8.0, 5.0))
@@ -2054,8 +2055,20 @@ pub(super) fn render_quote_block(
                 });
             });
         });
+    let reference = crate::message_navigation::message_reply_reference(msg);
+    let response = ui.interact(
+        frame.response.rect,
+        frame.response.id.with("quote_jump"),
+        Sense::click(),
+    );
+    let clicked = response
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Đi tới tin nhắn gốc đã tải")
+        .clicked();
     ui.add_space(5.0);
+    clicked.then(|| BubbleAction::JumpToQuoted(reference.unwrap_or_default()))
 }
+
 
 pub(super) fn render_reactions(
     ui: &mut egui::Ui,
@@ -2128,4 +2141,145 @@ pub(super) fn render_reactions(
                 });
         }
     });
+}
+
+#[cfg(test)]
+mod quote_navigation_tests {
+    use super::*;
+
+    #[test]
+    fn quote_navigation_bubble_propagates_action_for_both_directions() {
+        for is_outgoing in [false, true] {
+            let ctx = egui::Context::default();
+            let msg = ChatMessage {
+                id: "reply-1".into(),
+                text: "Reply body".into(),
+                sender: "Sender".into(),
+                reply_to_id: Some("original-1".into()),
+                reply_to_text: Some("Original text".into()),
+                is_outgoing,
+                ..Default::default()
+            };
+            let mut position = egui::pos2(30.0, 30.0);
+            let mut action = None;
+            for frame in 0..4 {
+                let mut events = vec![egui::Event::PointerMoved(position)];
+                if frame >= 2 {
+                    events.push(egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame == 2,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(600.0, 400.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            action = render_chat_bubble(
+                                ui,
+                                &msg,
+                                false,
+                                false,
+                                false,
+                                false,
+                                "Thread",
+                                None,
+                                &ThemePalette::light(),
+                                &HashMap::new(),
+                                &mut HashSet::new(),
+                                &HashMap::new(),
+                                0,
+                            );
+                        });
+                    },
+                );
+                if frame == 0 {
+                    position = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.job.text == "Original text" => {
+                                Some(text.pos + Vec2::new(4.0, 4.0))
+                            }
+                            _ => None,
+                        })
+                        .expect("Quote must be rendered in the bubble");
+                }
+            }
+            assert!(
+                matches!(action, Some(BubbleAction::JumpToQuoted(reference)) if reference == "original-1")
+            );
+        }
+    }
+
+    #[test]
+    fn quote_navigation_emits_exact_reference_when_clicked() {
+        let ctx = egui::Context::default();
+        let msg = ChatMessage {
+            reply_to_id: Some("00123".into()),
+            reply_to_text: Some("Original text".into()),
+            ..Default::default()
+        };
+        let mut action = None;
+        for pressed in [None, Some(true), Some(false)] {
+            let mut events = vec![egui::Event::PointerMoved(egui::pos2(30.0, 30.0))];
+            if let Some(pressed) = pressed {
+                events.push(egui::Event::PointerButton {
+                    pos: egui::pos2(30.0, 30.0),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        action = render_quote_block(ui, &msg, &ThemePalette::light(), false, 300.0);
+                    });
+                },
+            );
+        }
+        assert!(
+            matches!(action, Some(BubbleAction::JumpToQuoted(reference)) if reference == "00123")
+        );
+    }
+
+    #[test]
+    fn quote_navigation_advertises_click_when_reference_exists() {
+        let ctx = egui::Context::default();
+        let msg = ChatMessage {
+            reply_to_id: Some("original-1".into()),
+            reply_to_text: Some("Original text".into()),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let output = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::PointerMoved(egui::pos2(30.0, 30.0))],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        render_quote_block(ui, &msg, &ThemePalette::light(), false, 300.0);
+                    });
+                },
+            );
+            if output.platform_output.cursor_icon == egui::CursorIcon::PointingHand {
+                return;
+            }
+        }
+        panic!("Quote with an exact reference must advertise a clickable target");
+    }
 }

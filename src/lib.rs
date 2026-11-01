@@ -11,6 +11,8 @@ pub mod logger;
 pub mod login;
 pub mod media;
 pub mod message_model;
+/// Exact quoted-message references in loaded conversations.
+pub mod message_navigation;
 pub mod param_cipher;
 pub mod qr;
 pub mod reactions;
@@ -32,3 +34,6 @@ pub mod updater;
 pub mod scheduler;
 /// Local HTTP REST API, MCP JSON-RPC 2.0 server, and auto-reply rules (#35).
 pub mod api_mcp;
+
+/// Native notification authorization without delivery.
+pub mod native_notifications;
