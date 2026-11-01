@@ -15,6 +15,7 @@
   - ratatui 0.30 / crossterm 0.29 (bỏ `lru` unsound và `paste`) + vài bản patch.
 - **Kiểm chứng cục bộ của 0.1.1:** `cargo test --locked` 147 pass / 1 bỏ qua; `scripts/check-windows.sh` sạch; `cargo +1.88 check --locked --all-targets` sạch; `cargo audit` 0 lỗ hổng, 2 cảnh báo hết bảo trì; ảnh giao diện `--demo` (sáng/tối, Cài đặt) đã xem — `docs/assets/qtzalo-download.png`.
 - **CHƯA kiểm chứng:** chưa chạy trên Windows thật (MotW, `explorer /select`, hộp chọn thư mục PowerShell), chưa thử với tài khoản Zalo thật (tải file thật từ CDN Zalo, xoá cache thật, `totalMember` có thật trong payload hay không).
+- **Sau phát hành 0.1.1:** đã nghiên cứu cơ chế đồng bộ của Zalo PC (`re-notes/09_dong_bo_tin_nhan.md`) và lập kế hoạch tiếp theo (`docs/dev/KE_HOACH_TIEP_THEO.md`). Chưa có thay đổi mã nguồn nào sau `d8ba11c`.
 - **Nhật ký thay đổi và trạng thái từng lỗi:** `CHANGELOG.md`, `docs/SECURITY_AUDIT.md` (S1–S16, B1–B9), `docs/CAI_DAT.md`, `README.md`.
 
 ## 2. Quyết định đã được người dùng chốt
@@ -69,14 +70,13 @@ cargo audit                                # đã cài sẵn trong môi trườn
 
   Các biến `QTZALO_DEMO_*` trong `src/gui/demo.rs` / `src/gui.rs` chỉnh kích thước, theme, trạng thái thu gọn và hội thoại được chọn. Xem ảnh bằng công cụ đọc ảnh trước khi kết luận giao diện đã đúng.
 
-## 5. Gợi ý phạm vi bản tiếp theo (chưa được người dùng chốt)
+## 5. Việc tiếp theo — xem `docs/dev/KE_HOACH_TIEP_THEO.md`
 
-1. **Xin người dùng thử 0.1.1 trên Windows + tài khoản thật** và ghi lại: tải tệp/ảnh/video từ CDN Zalo (có cần cookie không? có `Content-Length` không?), MotW (`Get-Content file -Stream Zone.Identifier`), nút Mở/Mở thư mục, xoá cache, số thành viên nhóm. Sửa theo phản hồi trước khi thêm tính năng.
-2. **Chỉ báo "đang nhập" thật:** cần bắt một frame điều khiển thật (cmd 601/602 trong `src/socket.rs:47` hoặc mục `lp_control` của long-poll) lúc đối phương gõ, cả 1-1 và nhóm, ghi vào `re-notes/`. Có bằng chứng thì chỉ cần 1 biến thể `GuiEvent` + hết hạn 5 s (`typing_indicators` trong `src/gui/workspace.rs` đã có).
-3. **Lưu số thành viên vào `Thread`** (`member_count: Option<u32>` + `#[serde(default)]`): cần sửa struct literal ở `src/gui/demo.rs`, `src/gui/modals.rs`, `src/gui/worker.rs`, `src/bin/test_fetch.rs`. Nên xác nhận `totalMember` có trong payload thật trước.
-4. **Tải về:** nút huỷ khi đang tải; macOS gắn `com.apple.quarantine`; giới hạn số lượt tải song song; ảnh gốc khi tin nhắn chỉ có thumbnail (hiện tải `link_url`, thiếu thì tải thumbnail).
-5. **Đồng bộ lịch sử có giới hạn (#19)** — xem thiết kế cũ: mở rộng `WorkerCmd::LoadGroupHistory`/`getoldv2` với tiến trình và nút huỷ.
-6. Không làm khi chưa có quyết định của người dùng: lọc gói UDP theo relay (S6, cần cuộc gọi thật), ký số bộ cài, đổi tên binary.
+Người dùng đã chọn hướng (2026-11-01): **v0.1.2 = tự bắt kịp tin nhắn khi mở app** (lưu con trỏ hàng đợi, kéo bù tới khi hết, báo khoảng thiếu, nối liền lịch sử nhóm/Cloud, nhận diện tin E2EE), sau đó **nghiên cứu "Đồng bộ từ điện thoại" theo hướng Sync V1**. Phiên tiếp theo chạy **trên PC Windows** của người dùng, có tài khoản Zalo thật.
+
+- Kế hoạch chi tiết, tiêu chí nghiệm thu, các bước nghiên cứu Sync V1 và cách dựng môi trường PC: `docs/dev/KE_HOACH_TIEP_THEO.md`.
+- Prompt dán vào phiên mới: `docs/dev/PROMPT_BAN_GIAO.md`.
+- Cơ sở nghiên cứu: `re-notes/09_dong_bo_tin_nhan.md` (bundle Zalo PC trong lịch sử git + tài liệu phân tích Zalo PC 26.10.20 do người dùng cung cấp, tài liệu này không có trong repo).
 
 ## 6. Quy trình phát hành (đã chạy thành công cho v0.1.0 và v0.1.1)
 
@@ -116,7 +116,8 @@ cargo audit                                # đã cài sẵn trong môi trườn
 ## 8. Tồn đọng đã biết
 
 - **Chưa thử trên Windows thật và tài khoản Zalo thật** cho các tính năng 0.1.1 (và các sửa lỗi lõi #21/#22 của 0.1.0).
-- **Chỉ báo đang nhập** chỉ có ở demo (thiếu bằng chứng giao thức, xem §5.2).
+- **Chỉ báo đang nhập** chỉ có ở demo (thiếu bằng chứng giao thức).
+- **Không tự bắt kịp tin offline:** con trỏ hàng đợi không được lưu, chỉ kéo 3 đợt; tin E2EE (queue 513/713) không đọc được. Kế hoạch sửa ở `KE_HOACH_TIEP_THEO.md` Phần A.
 - **Số thành viên nhóm** dựa trên `totalMember` suy ra từ entity `Group` của web bundle cũ (đã xoá ở `54314e0`); chưa thấy trong payload thật. Thiếu thì header vẫn hiện "Nhóm".
 - **S6:** media cuộc gọi chưa lọc nguồn gói UDP; client khai `srtpMode: 0`.
 - **#19:** chưa đồng bộ toàn bộ lịch sử.
