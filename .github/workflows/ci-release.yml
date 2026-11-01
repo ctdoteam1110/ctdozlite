@@ -218,8 +218,16 @@ jobs:
           path: dist/*.exe
 
   macos-dmg:
-    name: macOS (Apple Silicon + .dmg)
-    runs-on: macos-latest
+    name: macOS (${{ matrix.arch }} + .dmg)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -236,10 +244,10 @@ jobs:
           cp target/release/zalo-rust dist/dmg/ctdozlite.app/Contents/MacOS/zalo-rust
           cp packaging/macos/Info.plist dist/dmg/ctdozlite.app/Contents/Info.plist
           ln -s /Applications dist/dmg/Applications
-          hdiutil create -volname "ctdozlite" -srcfolder dist/dmg -ov -format UDZO dist/ctdozlite-0.0.1-macos.dmg
+          hdiutil create -volname "ctdozlite" -srcfolder dist/dmg -ov -format UDZO dist/ctdozlite-0.0.1-macos-${{ matrix.arch }}.dmg
       - uses: actions/upload-artifact@v4
         with:
-          name: ctdozlite-macos-dmg
+          name: ctdozlite-macos-dmg-${{ matrix.arch }}
           path: dist/*.dmg
 
   release:
@@ -295,4 +303,5 @@ jobs:
             - Bản chạy ngay (Portable): `ctdozlite-0.0.1-portable-windows-x86_64.exe`
 
             #### 🍎 Bản cài đặt cho macOS
-            - `ctdozlite-0.0.1-macos.dmg`
+            - Apple Silicon (M1/M2/M3/M4): `ctdozlite-0.0.1-macos-arm64.dmg`
+            - Intel: `ctdozlite-0.0.1-macos-x86_64.dmg`

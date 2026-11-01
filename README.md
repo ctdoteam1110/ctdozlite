@@ -118,7 +118,7 @@ Toàn bộ gói cài đặt dựng sẵn cho từng hệ điều hành và các 
 
 ### 2. Cài đặt trên Windows & macOS
 - **Windows (x64):** Chạy bộ cài `ctdozlite-0.0.1-setup-windows-x86_64.exe` hoặc bản chạy ngay `ctdozlite-0.0.1-portable-windows-x86_64.exe`.
-- **macOS:** Mở `ctdozlite-0.0.1-macos.dmg` và kéo `ctdozlite.app` vào `/Applications`.
+- **macOS:** Mở `ctdozlite-0.0.1-macos-arm64.dmg` (Apple Silicon) hoặc `ctdozlite-0.0.1-macos-x86_64.dmg` (Intel) và kéo `ctdozlite.app` vào `/Applications`.
 
 > [!IMPORTANT]
 > **Phiên bản iOS — Dùng 1 tài khoản Zalo song song trên 2 máy (Sắp ra mắt):**
@@ -229,7 +229,7 @@ Workflow GitHub Actions tại [`.github/workflows/ci-release.yml`](.github/workf
   - `ctdozlite-0.0.1-x86_64.AppImage` (Gói thực thi độc lập chạy trên mọi bản Linux)
   - `ctdozlite-0.0.1-linux-x86_64.tar.gz` & `ctdozlite-0.0.1-linux-x86_64-legacy-glibc2.31.tar.gz` (kèm script `install.sh` / `uninstall.sh`)
 - **Windows:** `ctdozlite-0.0.1-portable-windows-x86_64.exe` và `ctdozlite-0.0.1-setup-windows-x86_64.exe` ([`packaging/windows/installer.iss`](packaging/windows/installer.iss))
-- **macOS:** `ctdozlite-0.0.1-macos.dmg` đóng gói `ctdozlite.app` ([`packaging/macos/Info.plist`](packaging/macos/Info.plist))
+- **macOS:** `ctdozlite-0.0.1-macos-arm64.dmg` / `ctdozlite-0.0.1-macos-x86_64.dmg` đóng gói `ctdozlite.app` ([`packaging/macos/Info.plist`](packaging/macos/Info.plist))
 
 ---
 
