@@ -141,6 +141,22 @@ Khi đối phương gõ: socket nhận `602_0`, và `lp_control` trả `actions:
 - Lượt 5 (mở lại ngay): mọi queue kéo bằng `{first: true, lastId: <đã lưu>, preIds: [...]}`. `510_1` trả **0 tin**, `more = 0`, `evict = 0`, không có `resetLastActionId`. `603_1` không còn trả lại 2 control `transfer_after_login`. Long-poll bắt đầu từ `lastActionId` đã lưu và cũng không bị reset.
 - → `lastId` đã lưu có đúng nghĩa "chỉ lấy phần sau mốc này". Còn phải kiểm tra trường hợp có tin mới trong lúc tắt (nghiệm thu A7).
 
+## Nghiệm thu A7 — có tin mới trong lúc tắt, gồm cả tin nhóm (02/11 00:06)
+
+Từ 23:57 đến 00:06 QTzalo tắt hẳn. Người dùng nhận/gửi tin 1-1 và **nhắn trong 1–2 nhóm (có ảnh, video)** từ điện thoại. Mở lại bằng bản `c543f72`.
+
+### 12. Tin 1-1: đạt [O]
+
+- `510_1` kéo bằng `lastId` đã lưu, trả **đúng 3 tin mới** (`webchat` ×3; `ts` trong khoảng 00:03–00:05 giờ máy chủ), `more = 0`, `evict = 0`. Long-poll trả cùng 3 tin đó.
+- DB: hội thoại 1-1 từ 27 lên 29 tin, "Cloud của tôi" từ 50 lên 51 tin (tin gửi vào Cloud về cùng hàng đợi `510_1`). Không trùng tin.
+
+### 13. Tin nhóm: không về [O]
+
+- `511_1` trả 0 tin; long-poll `groupMsgs` rỗng; `getrecentv2` cho 60 nhóm vẫn 0 tin, với phân bố cờ y như lượt 3 (42 nhóm `isFiltered=0`, 18 nhóm `isFiltered=1`, trong đó 8 nhóm `hasMore=1`).
+- Lần này long-poll trả `queueStatus["7"].evict = 1` (các lượt trước đều 0). Queue `7` không có trong `evict_broadcast_queues.lp_msg` và chưa rõ ý nghĩa **[U]**, nên QTzalo không hiện banner thiếu tin cho nó.
+- **[I]** Máy chủ không giao tin nhóm cho phiên QTzalo trên thiết bị này. Giả thiết mạnh nhất: các nhóm này dùng mã hoá đầu cuối (SenderKey); phiên QTzalo được xếp vào nhóm web (queue E2EE `515/517`) nhưng chưa đăng ký thiết bị E2EE, nên tin bị lọc (`isFiltered`). Cần kiểm chứng: so với Zalo Web trên trình duyệt, xem nhóm có hiện "tin nhắn được mã hoá đầu cuối" trên điện thoại không, và thử khi QTzalo đang mở (tin đẩy trực tiếp `521`).
+- Hệ quả: không thể sửa trong v0.1.2. Hai hướng là hỗ trợ E2EE (Signal, đăng ký thiết bị) hoặc đồng bộ từ điện thoại (Phần B). Snapshot Sync V1 được xuất từ DB của điện thoại, nên có thể chứa tin nhóm.
+
 ## Kết luận theo giả thiết
 
 | Giả thiết (nguồn) | Kết luận |
@@ -151,8 +167,8 @@ Khi đối phương gõ: socket nhận `602_0`, và `lp_control` trả `actions:
 | Nhóm đủ lịch sử nhờ `getrecentv2` (09 §1 B) | **Bác bỏ** với thiết bị mới: 0 tin, có cờ lọc |
 | Có `resetLastActionId` / `evict = true` | Chưa gặp (ba lượt đều `evict = 0`, không có `resetLastActionId`); trường `evict` có thật trong `queueStatus` |
 | Hàng đợi 1-1 giữ tin trong lúc app tắt; `lastId: 1` lấy lại được (10 phút) | **Xác nhận**. Kéo về không xoá khỏi hàng đợi: mỗi lần mở app tải lại toàn bộ từ lúc đăng nhập |
-| Tin nhóm về qua hàng đợi offline `511_x` | Chưa rõ: không có tin nhóm nào trong thời gian đo; kiểm tra lại ở nghiệm thu A7 |
+| Tin nhóm về qua hàng đợi offline `511_x` | **Bác bỏ** trên thiết bị này (A7): người dùng nhắn trong nhóm, nhưng `511_1`, long-poll và `getrecentv2` đều không có tin. [I] Bị lọc vì mã hoá đầu cuối |
 | Lịch sử nhóm từ `getrecentv2` nối được khoảng thiếu (A4) | **Bác bỏ** trên thiết bị này: 0 tin ở cả 60 nhóm, có cờ `isFiltered` |
 | Tin E2EE đến qua `513/713` | **Bác bỏ** queue: phiên này dùng `515/517`. Có tin E2EE thật hay không: chưa rõ |
 | PC nhận `temp_key` sau đăng nhập QR (Phần B) | **Xác nhận**: `transfer_after_login` / `transfer_sync2` trong `603_1` |
-| Kéo với `lastId` đã lưu chỉ trả phần mới (A1) | **Xác nhận** khi không có tin mới (lượt 5); trường hợp có tin mới chờ A7 |
+| Kéo với `lastId` đã lưu chỉ trả phần mới (A1) | **Xác nhận**: không có tin mới → 0 tin (lượt 5); có 3 tin mới → đúng 3 tin (A7) |
