@@ -12,7 +12,7 @@
 
 ## ⚡ 核心亮点
 
-- **极致 Rust 性能:** 毫秒级极速冷启动，极低内存开销（~20-50MB RAM），待机 CPU 占用近乎为零。
+- **极致 Rust 性能:** 约0.18秒毫秒级极速冷启动 (<200ms)，待机 Working Set 内存仅约 149.5 MB（相比官方 Electron 版 1.8~1.9 GB 节省超 92% 内存），单一原生进程，待机 CPU 占用近乎为零。
 - **全平台支持:** 原生支持 Windows 10/11 (MSVC 与 GNU)、macOS (Apple Silicon arm64 与 Intel x86_64 通用二进制) 以及 Linux (Debian, Ubuntu, Fedora Wayland/X11)。
 - **双模式切换:** 全功能图形界面 GUI (Atom One Dark 经典深色主题) 以及终端控制台模式 TUI (`ratatui`)。
 - **VoIP 音视频通话:** 纯 Rust 原生实现的 VoIP 通话引擎，支持 Annex-B H.264 视频解码、RTP/RTCP 协议及 Opus 音频重采样。

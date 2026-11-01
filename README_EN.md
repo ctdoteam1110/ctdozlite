@@ -12,7 +12,7 @@ A pure Rust Zalo Desktop client (`eframe`/`egui` + `ratatui`) communicating dire
 
 ## ⚡ Highlights
 
-- **Pure Rust Performance:** Startup in milliseconds, minimal RAM footprint (~20-50MB), near-zero idle CPU usage.
+- **Pure Rust Performance:** Cold startup in ~0.18s (<200ms), idle Working Set RAM ~149.5 MB (vs ~1.8-1.9 GB on official Electron client), 1 single native process, near-zero idle CPU.
 - **Cross-Platform:** Native builds for Windows 10/11 (MSVC & GNU), macOS (Apple Silicon arm64 & Intel x86_64), and Linux (Debian, Ubuntu, Fedora Wayland/X11).
 - **Dual Mode:** Full-featured GUI (Atom One Dark theme) and terminal-based TUI (`ratatui`).
 - **VoIP Audio & Video Calls:** 100% Rust VoIP engine supporting Annex-B H.264 video decoding, RTP/RTCP protocols, and Opus audio resampling.

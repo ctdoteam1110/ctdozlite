@@ -12,7 +12,7 @@ ElectronやChromiumを使用せず、Rust（`eframe`/`egui` + `ratatui`）を用
 
 ## ⚡ 主な特徴
 
-- **純Rustによる圧倒的な性能:** ミリ秒単位での高速起動、極めて軽量なメモリ消費（RAM ~20〜50MB）、アイドル時のCPU使用率はほぼ0%。
+- **純Rustによる圧倒的な性能:** 約0.18秒の超高速コールドスタート (<200ms)、待機時RAM約149.5 MB（公式Electron版の1.8〜1.9 GBに比べ92%以上削減）、単一ネイティブプロセス、アイドル時CPU使用率ほぼ0%。
 - **クロスプラットフォーム対応:** Windows 10/11（MSVCおよびGNU）、macOS（Apple Silicon arm64およびIntel x86_64ユニバーサル）、Linux（Debian、Ubuntu、Fedora Wayland/X11）ネイティブ対応。
 - **デュアルモード搭載:** フル機能GUI（Atom One Darkテーマ）およびターミナルベースTUI（`ratatui`）。
 - **VoIP音声・ビデオ通話:** Annex-B H.264デコード、RTP/RTCPプロトコル、Opusオーディオリサンプリングをサポートする純Rust製VoIPエンジン。

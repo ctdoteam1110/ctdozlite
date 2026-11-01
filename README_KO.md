@@ -12,7 +12,7 @@ Electron이나 Chromium 없이 Rust(`eframe`/`egui` + `ratatui`)로 제작되어
 
 ## ⚡ 주요 특징
 
-- **초고속 Rust 성능:** 수 밀리초 단위의 빠른 실행 속도, 초경량 메모리 사용량 (~20-50MB RAM), 유휴 상태 CPU 사용률 0%에 근접.
+- **초고속 Rust 성능:** ~0.18초 초고속 콜드 스타트 (<200ms), 대기 상태 RAM 약 149.5 MB (공식 Electron 앱 1.8~1.9 GB 대비 92% 이상 절감), 1개 단일 네이티브 프로세스, 유휴 CPU 0%에 근접.
 - **완벽한 크로스 플랫폼 지원:** Windows 10/11 (MSVC & GNU), macOS (Apple Silicon arm64 & Intel x86_64 Universal), Linux (Debian, Ubuntu, Fedora Wayland/X11).
 - **듀얼 모드 지원:** 풀 피처 GUI (Atom One Dark 테마) 및 터미널 기반 TUI (`ratatui`).
 - **VoIP 음성 및 영상 통화:** 순수 Rust로 구현된 VoIP 엔진 (Annex-B H.264 디코딩, RTP/RTCP 프로토콜, Opus 오디오 리샘플링 지원).
