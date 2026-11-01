@@ -3161,6 +3161,7 @@ impl ZaloGuiApp {
             });
 
         self.render_profile_popover(ctx, pal);
+        self.render_wipe_confirm(ctx, pal);
         self.render_toast_overlay(ctx, pal);
         self.render_forward_dialog(ctx, pal);
         self.render_call_overlay(ctx, pal);

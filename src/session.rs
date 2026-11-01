@@ -237,6 +237,12 @@ pub struct SavedSession {
     pub zpw_sek: Option<String>,
     pub login: Option<LoginInfo>,
     pub domains: Domains,
+    /// Epoch seconds at which the server last refused these credentials (#21).
+    ///
+    /// Written **without touching the rest of the file**, so the old session survives
+    /// until a fresh login replaces it. Absent in files from older builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expired_at: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -257,6 +263,100 @@ pub struct Session {
     pub dump: bool,
     /// Skip URL redaction in dumps (needed to reproduce signature failures).
     pub dump_raw: bool,
+    /// `Some(epoch)` once the server has refused these credentials (#21): the marker
+    /// persists in `session.json` so the next start asks for a login instead of
+    /// re-testing a dead session.
+    pub expired_at: Option<i64>,
+}
+
+/// `error_code` values Zalo answers when the stored credentials are no longer usable.
+pub const AUTH_ERROR_CODES: &[i64] = &[600, -102];
+
+/// A non-zero `error_code` from Zalo, carrying the number instead of burying it in a
+/// formatted message.
+///
+/// [`Session::send`] bails with this so callers can tell "the session is gone" (#21)
+/// from "the network is down" without matching substrings.
+#[derive(Debug)]
+pub struct SessionError {
+    pub code: i64,
+    pub message: String,
+    pub url: String,
+}
+
+impl SessionError {
+    pub fn new(code: i64, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            url: String::new(),
+        }
+    }
+
+    /// Attach the endpoint that answered, when the caller knows it.
+    pub fn at(mut self, url: impl Into<String>) -> Self {
+        self.url = url.into();
+        self
+    }
+
+    /// The server rejected the credentials, not the request.
+    pub fn is_auth(&self) -> bool {
+        AUTH_ERROR_CODES.contains(&self.code)
+    }
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.url.is_empty() {
+            write!(f, "server error {}: {}", self.code, self.message)
+        } else {
+            write!(
+                f,
+                "server error {}: {} (from {})",
+                self.code, self.message, self.url
+            )
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
+
+/// What the server — or the network — last said about the stored session (#21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatus {
+    Valid,
+    /// The server refused the credentials: re-login required.
+    Expired,
+    /// No verdict: transport, HTTP, unreadable body, or an unrelated `error_code`.
+    /// Never destroy `session.json` for this.
+    Unreachable,
+}
+
+impl SessionStatus {
+    /// Only [`AUTH_ERROR_CODES`] mean the session is gone; `0` is success and anything
+    /// else leaves the status undetermined.
+    pub fn from_error_code(code: i64) -> Self {
+        if code == 0 {
+            Self::Valid
+        } else if AUTH_ERROR_CODES.contains(&code) {
+            Self::Expired
+        } else {
+            Self::Unreachable
+        }
+    }
+
+    /// Classify a failed request. Only a [`SessionError`] knows its code; every other
+    /// error (timeout, DNS, `HTTP 500`, parse) is [`SessionStatus::Unreachable`].
+    pub fn from_error(err: &anyhow::Error) -> Self {
+        match err.downcast_ref::<SessionError>() {
+            Some(e) => Self::from_error_code(e.code),
+            None => Self::Unreachable,
+        }
+    }
+
+    pub fn is_valid(self) -> bool {
+        matches!(self, Self::Valid)
+    }
 }
 
 impl Session {
@@ -294,6 +394,7 @@ impl Session {
             verbose,
             dump,
             dump_raw,
+            expired_at: None,
         })
     }
 
@@ -335,10 +436,33 @@ impl Session {
         }
     }
 
-    /// Check whether the current session is valid on the server.
-    pub async fn validate_session(&self) -> bool {
+    /// The stored session is already known to be refused by the server (#21).
+    pub fn is_expired_marked(&self) -> bool {
+        self.expired_at.is_some()
+    }
+
+    /// Record that the server refused these credentials. The file is rewritten with the
+    /// marker but **keeps every credential**, so it can still be read if the verdict was
+    /// wrong — and it is only replaced once a fresh login succeeds.
+    pub fn mark_expired(&mut self) {
+        self.expired_at = Some(crate::login::unix_now());
+    }
+
+    /// A fresh login succeeded: the marker must not leak into the new session.
+    pub fn clear_expired(&mut self) {
+        self.expired_at = None;
+    }
+
+    /// Ask the server whether the stored session still works.
+    ///
+    /// Only `error_code` `600` / `-102` mean the session is gone. Transport failures,
+    /// HTTP errors, unreadable bodies and unrelated codes are
+    /// [`SessionStatus::Unreachable`] — the caller must not touch `session.json` for
+    /// those (#21). A session with no credentials has nothing to validate and reports
+    /// [`SessionStatus::Expired`].
+    pub async fn session_status(&self) -> SessionStatus {
         if self.login.is_none() || self.zpw_sek.is_none() {
-            return false;
+            return SessionStatus::Expired;
         }
         let body = serde_json::json!({
             "avatar_size": 160,
@@ -356,12 +480,16 @@ impl Session {
                 self.common_params()
             ),
         };
-        match self.get(&url).await {
-            Ok(resp) => {
-                let code = resp.get("error_code").and_then(serde_json::Value::as_i64).unwrap_or(-1);
-                code == 0
-            }
-            Err(_) => false,
+        let resp = match self.get(&url).await {
+            Ok(r) => r,
+            Err(e) => return SessionStatus::from_error(&e),
+        };
+        // `me-v2` answers param-encrypted requests with a base64 body, so decode before
+        // reading the code — otherwise a live session looks like a malformed response.
+        let dec = self.maybe_decrypt(resp, self.session_key_bytes()).await;
+        match dec.get("error_code").and_then(serde_json::Value::as_i64) {
+            Some(code) => SessionStatus::from_error_code(code),
+            None => SessionStatus::Unreachable,
         }
     }
 
@@ -460,6 +588,7 @@ impl Session {
             zpw_sek: self.zpw_sek.clone(),
             login: self.login.clone(),
             domains: self.domains.clone(),
+            expired_at: self.expired_at,
         };
         let text = serde_json::to_string_pretty(&saved)?;
         std::fs::write(path, text)?;
@@ -501,6 +630,7 @@ impl Session {
             self.domains.ws = default_ws();
         }
         self.session_key = saved.session_key;
+        self.expired_at = saved.expired_at;
         let sek = saved
             .zpw_sek
             .filter(|s| !s.is_empty())
@@ -813,7 +943,7 @@ impl Session {
                 Some(&text),
                 Some(&format!("server error {code}: {msg}")),
             );
-            bail!("server error {code}: {msg} (from {url})");
+            return Err(SessionError::new(code, msg).at(url).into());
         }
         Ok(v)
     }
@@ -1049,14 +1179,10 @@ mod tests {
         assert_eq!(s.domains.lp_chat, "https://p7-msg-chat.zaloapp.com");
         assert_eq!(s.domains.lp_control, "https://p7-ctl-chat.zaloapp.com");
         assert_eq!(s.domains.ws, vec!["wss://ws7-msg.chat.zalo.me"]);
-        // Verified endpoint survives the stale server value, unverified one is taken.
         assert_eq!(s.domains.friend, "https://tt-friend-wpa.chat.zalo.me");
         assert_eq!(s.domains.cloud_msg, "https://tt-group-cm.example.test");
     }
 
-    /// `session.json` written by an older build holds the stale hosts the server used to
-    /// hand out (#22). Loading it must restore **every** verified endpoint and leave the
-    /// server-owned ones (`lp_*`, `ws`, `cloud_msg`) alone.
     #[test]
     fn loading_a_legacy_session_heals_every_verified_domain() {
         let fixture = serde_json::json!({
@@ -1115,5 +1241,44 @@ mod tests {
         assert_eq!(s.domains.cloud_msg, "https://tt-group-cm.api.zaloapp.com");
         assert_eq!(s.domains.ws, vec!["wss://ws9-msg.chat.zalo.me"]);
         assert_eq!(s.zpw_sek.as_deref(), Some("fixture-sek"));
+    }
+
+    #[test]
+    fn status_maps_error_codes_and_only_auth_codes_expire() {
+        assert_eq!(SessionStatus::from_error_code(0), SessionStatus::Valid);
+        assert_eq!(SessionStatus::from_error_code(600), SessionStatus::Expired);
+        assert_eq!(SessionStatus::from_error_code(-102), SessionStatus::Expired);
+        for code in [111, 114, 18022, -1, 500, 401] {
+            assert_eq!(
+                SessionStatus::from_error_code(code),
+                SessionStatus::Unreachable,
+                "error_code {code} must not be treated as an expired session"
+            );
+        }
+    }
+
+    #[test]
+    fn status_classifies_typed_server_errors_and_bare_failures() {
+        let auth: anyhow::Error = SessionError::new(600, "zpw_sek bị thiếu hoặc không đúng").into();
+        assert_eq!(SessionStatus::from_error(&auth), SessionStatus::Expired);
+
+        let unrelated: anyhow::Error = SessionError::new(111, "invalid param").into();
+        assert_eq!(
+            SessionStatus::from_error(&unrelated),
+            SessionStatus::Unreachable
+        );
+
+        for msg in [
+            "HTTP 404 Not Found from https://tt-friend-wpa.chat.zalo.me/api/x",
+            "error sending request for url (https://wpa.chat.zalo.me/...): connection refused",
+            "error decoding response body",
+        ] {
+            let e = anyhow::anyhow!("{msg}");
+            assert_eq!(
+                SessionStatus::from_error(&e),
+                SessionStatus::Unreachable,
+                "{msg} must not expire the session"
+            );
+        }
     }
 }
