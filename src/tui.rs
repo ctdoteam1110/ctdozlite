@@ -2614,6 +2614,8 @@ mod tests {
         let mut session = crate::session::Session::new(false, false, false).unwrap();
         let (tx, rx) = channel();
         let thread = Thread {
+            presentation: Default::default(),
+            unread: Default::default(),
             id: "u1".into(),
             name: "Test".into(),
             preview: "xin chao".into(),

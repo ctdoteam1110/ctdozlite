@@ -591,7 +591,7 @@ impl Session {
             expired_at: self.expired_at,
         };
         let text = serde_json::to_string_pretty(&saved)?;
-        std::fs::write(path, text)?;
+        crate::data_dir::write_private_atomic(std::path::Path::new(path), text.as_bytes())?;
         Ok(())
     }
 
@@ -1056,6 +1056,36 @@ fn random_imei() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_atomic_save_preserves_saved_format_and_restores_fixture() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-session-test-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("session.json");
+        let mut source = Session::new(false, false, false).unwrap();
+        source.computer_name = "fixture-device".into();
+        source.secret_key = Some(vec![7; 32]);
+        source.session_key = Some("fixture-session-key".into());
+        source.zpw_sek = Some("fixture-auth-token".into());
+        source.save_to_file(path.to_str().unwrap()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let saved: SavedSession = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved.computer_name, "fixture-device");
+        assert_eq!(saved.session_key.as_deref(), Some("fixture-session-key"));
+        let mut restored = Session::new(false, false, false).unwrap();
+        restored.load_from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(restored.computer_name, source.computer_name);
+        assert_eq!(restored.secret_key, source.secret_key);
+        assert_eq!(restored.session_key, source.session_key);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn session_new_initializes_zpw_sek_and_headers() {
