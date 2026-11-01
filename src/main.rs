@@ -8,6 +8,7 @@ mod audio;
 mod call;
 mod chat;
 mod crypto;
+mod data_dir;
 mod endpoints;
 mod gui;
 mod logger;
@@ -29,7 +30,16 @@ pub const POLL_SECS: u64 = 4;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    ensure_writable_working_dir();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("ctdozlite v{} (zalo-rust)", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let data_path = data_dir::initialize(&args)?;
+    if args.iter().any(|a| a == "--print-data-dir") {
+        println!("{}", data_path.display());
+        return Ok(());
+    }
     std::panic::set_hook(Box::new(|info| {
         use std::io::Write;
         let ts = std::time::SystemTime::now()
@@ -46,11 +56,6 @@ async fn main() -> Result<()> {
             let _ = f.write_all(msg.as_bytes());
         }
     }));
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("ctdozlite v{} (zalo-rust)", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
     let dev_mode = args.iter().any(|a| a == "--dev" || a == "-v" || a == "--verbose");
     let dump = args.iter().any(|a| a == "-d" || a == "--dump");
     let dump_raw = args.iter().any(|a| a == "--dump-raw");
@@ -280,64 +285,4 @@ async fn main() -> Result<()> {
     tui::run_tui(tui_app).await?;
 
     Ok(())
-}
-
-/// When launched from a macOS `.app` bundle (`/Applications/ctdozlite.app` or mounted `.dmg`),
-/// or from a read-only system directory (`/`, `/usr/bin`, `C:\Program Files`), switch the
-/// process working directory to the user's application data folder so `session.json`,
-/// `zalo_history.db`, `threads_cache.json`, `stickers_cache/`, and `crash.log` can be written.
-fn ensure_writable_working_dir() {
-    let inside_macos_app = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(|s| s.contains(".app/Contents/MacOS")))
-        .unwrap_or(false);
-    let cwd_is_root = std::env::current_dir()
-        .ok()
-        .map(|p| p.as_os_str() == "/" || p.as_os_str() == "\\")
-        .unwrap_or(true);
-    let probe_path = ".ctdozlite_write_probe";
-    let cwd_writable = if inside_macos_app || cwd_is_root {
-        false
-    } else if std::path::Path::new("session.json").exists()
-        || std::path::Path::new("zalo_history.db").exists()
-        || std::path::Path::new("Cargo.toml").exists()
-    {
-        true
-    } else if std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(probe_path)
-        .is_ok()
-    {
-        let _ = std::fs::remove_file(probe_path);
-        true
-    } else {
-        false
-    };
-
-    if !cwd_writable {
-        let data_dir = if cfg!(target_os = "macos") {
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .map(|h| h.join("Library/Application Support/ctdozlite"))
-        } else if cfg!(target_os = "windows") {
-            std::env::var_os("LOCALAPPDATA")
-                .or_else(|| std::env::var_os("APPDATA"))
-                .map(std::path::PathBuf::from)
-                .map(|p| p.join("ctdozlite"))
-        } else {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .map(std::path::PathBuf::from)
-                        .map(|h| h.join(".local/share"))
-                })
-                .map(|p| p.join("ctdozlite"))
-        };
-        if let Some(dir) = data_dir {
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::env::set_current_dir(&dir);
-        }
-    }
 }

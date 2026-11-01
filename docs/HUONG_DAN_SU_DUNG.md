@@ -8,6 +8,8 @@ Tài liệu tóm tắt các tùy chọn dòng lệnh, thao tác trên giao diệ
 
 | Tham số | Ý nghĩa | Ví dụ |
 |---|---|---|
+| `--data-dir <PATH>` | Chọn thư mục lưu phiên, cache, log và cơ sở dữ liệu; đường dẫn tương đối tính từ thư mục khởi chạy. | `zalo-rust --data-dir ./local-data --gui` |
+| `--print-data-dir` | Chuẩn bị và in thư mục dữ liệu rồi thoát, không mở giao diện hay kết nối mạng. | `zalo-rust --print-data-dir` |
 | `--gui` | Chạy chế độ giao diện đồ họa (mặc định nếu không truyền tham số). | `zalo-rust --gui` |
 | `--tui` | Chạy chế độ giao diện dòng lệnh trong terminal. | `zalo-rust --tui` |
 | `--qr` | Yêu cầu tạo mã QR đăng nhập ngay khi khởi động TUI. | `zalo-rust --tui --qr` |
@@ -18,6 +20,10 @@ Tài liệu tóm tắt các tùy chọn dòng lệnh, thao tác trên giao diệ
 | `--dump` | Lưu các gói phản hồi JSON ra thư mục `dump/` để phục vụ phân tích. | `zalo-rust --dump` |
 
 ---
+
+Trên macOS, bản `.app` mặc định lưu dữ liệu trong `~/Library/Application Support/ctdozlite`, kể cả khi khởi chạy với thư mục làm việc `/`. Bản CLI ngoài bundle giữ thư mục làm việc hiện tại để tiếp tục dùng dữ liệu cũ. `--data-dir` ghi đè cả hai lựa chọn; thư mục chỉ định và thư mục mặc định của bundle có quyền `0700` trên Unix. Nếu thư mục không ghi được, chương trình báo lỗi trước khi mở dữ liệu.
+
+`--version` không chuẩn bị thư mục dữ liệu. Chương trình không tự di chuyển, sao chép hay xóa dữ liệu cũ khi thay đổi thư mục; có thể dùng `--data-dir` để chọn lại thư mục đã có dữ liệu.
 
 ## 2. Giao diện đồ họa (GUI)
 
