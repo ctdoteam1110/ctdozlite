@@ -179,12 +179,9 @@ async fn main() -> Result<()> {
             ..Default::default()
         };
 
-        let mut initial_threads = chat::load_threads_cache();
-        store::load_history_into_threads(
-            "zalo_history.db",
-            &mut initial_threads,
-            store::MessageStore::PRELOAD_MSGS,
-        );
+        // GUI history is loaded by the worker after the account is known. Never
+        // hydrate the unowned legacy cache into a newly selected account.
+        let initial_threads = Vec::new();
 
         let app_session = s;
         let res = eframe::run_native(

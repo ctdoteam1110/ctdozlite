@@ -174,7 +174,14 @@ pub enum WorkerCmd {
         user_id: String,
         user_name: String,
     },
-    PersistThreads(Vec<Thread>),
+    /// Persist only the account that supplied this UI snapshot.
+    PersistThreads { account: String, threads: Vec<Thread> },
+    /// Load one bounded local-history page without requesting network history.
+    LoadHistoryPage { account: String, thread_id: String, before: Option<crate::store_v2::HistoryCursor> },
+    /// Resolve an offscreen exact quote against durable account history.
+    NavigateHistory { account: String, thread_id: String, reference: String },
+    /// Search durable history outside the loaded viewport.
+    SearchHistory { account: String, thread_id: String, query: String },
     CheckForUpdates {
         silent: bool,
     },
@@ -185,9 +192,8 @@ pub enum WorkerCmd {
         expected_sha256: Option<String>,
     },
     Logout,
-    /// Delete local message data (`zalo_history.db` + `threads_cache.json`) without
-    /// touching credentials. Separate from [`WorkerCmd::Logout`] by design (#21).
-    WipeLocalData,
+    /// Clear only the current account-owned history without touching legacy data or credentials. Separate from [`WorkerCmd::Logout`] by design (#21).
+    WipeLocalData { account: String },
     PinThread {
         thread_id: String,
         is_group: bool,
@@ -430,7 +436,7 @@ impl WorkerSender {
     }
     #[allow(clippy::result_large_err)]
     pub(super) fn send(&self, command: WorkerCmd) -> Result<(), tokio::sync::mpsc::error::SendError<(u64, WorkerCmd)>> {
-        let lifecycle = matches!(command, WorkerCmd::Shutdown | WorkerCmd::Logout | WorkerCmd::WipeLocalData | WorkerCmd::RequestQr | WorkerCmd::LoginPassword { .. });
+        let lifecycle = matches!(command, WorkerCmd::Shutdown | WorkerCmd::Logout | WorkerCmd::WipeLocalData { .. } | WorkerCmd::RequestQr | WorkerCmd::LoginPassword { .. });
         let generation = if lifecycle {
             // A late expired-session response must not invalidate a newer login.
             if let Some(scope) = crate::runtime_scope::execution_scope() {
@@ -592,6 +598,16 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     let s = session.lock().await.clone();
                     let scope = crate::runtime_scope::registry().current();
                     crate::runtime_scope::run(scope, async { let _ = crate::login::get_server_info(&s).await; }).await;
+                }
+                {
+                    let captured = session.lock().await.clone();
+                    let account = captured.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
+                    if !account.is_empty() {
+                        match account_history(session.clone(), captured, account.clone(), history::Request::Load(Vec::new())).await {
+                            Ok(history::Reply::Threads(threads)) => { let _ = gui_tx.send(GuiEvent::AccountThreadsUpdated { account, threads, live: false }); }
+                            _ => { let _ = gui_tx.send(GuiEvent::StatusUpdate("Chưa khôi phục được lịch sử tài khoản".into())); }
+                        }
+                    }
                 }
                 // Message poll timer. It used to live in the GUI's update(), which forced a full
                 // repaint every 1.2 s just to fire it. The PollMessages handler skips while a
@@ -807,9 +823,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                         &mut ws_threads,
                                                     )
                                                     .await;
-                                                    let _ = gui_tx_ws.send(
-                                                        GuiEvent::LiveThreadsUpdated(ws_threads),
-                                                    );
+                                                    publish_account_threads(s_ws.clone(), s_snap.clone(), gui_tx_ws.clone(), ws_threads, true).await;
                                                     ctx_ws.request_repaint();
                                                 }
                                             }
@@ -888,7 +902,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                 let mut current_qr_task: Option<tokio::task::JoinHandle<()>> = None;
 
                 while let Some((generation, cmd)) = cmd_rx.recv().await {
-                    let lifecycle = matches!(cmd, WorkerCmd::Shutdown | WorkerCmd::Logout | WorkerCmd::WipeLocalData | WorkerCmd::RequestQr | WorkerCmd::LoginPassword { .. });
+                    let lifecycle = matches!(cmd, WorkerCmd::Shutdown | WorkerCmd::Logout | WorkerCmd::WipeLocalData { .. } | WorkerCmd::RequestQr | WorkerCmd::LoginPassword { .. });
                     let application = matches!(cmd, WorkerCmd::ReadNotificationAuthorization { .. } | WorkerCmd::RequestNotificationAuthorization { .. } | WorkerCmd::CheckForUpdates { .. } | WorkerCmd::DownloadAndApplyUpdate { .. });
                     let command_scope = crate::runtime_scope::registry().current();
                     if !application && generation != command_scope.generation { continue; }
@@ -916,12 +930,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         WorkerCmd::ImportHistory { account, path } => {
                             let tx = gui_tx.clone();
                             let ctx = egui_ctx.clone();
-                            let current = session.lock().await.login.as_ref().map(|info| info.uin.clone()).unwrap_or_default();
+                            let captured = session.lock().await.clone();
+                            let session = session.clone();
                             crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
-                                let result = if current != account || account.is_empty() {
-                                    Err("Account mismatch".to_owned())
-                                } else {
-                                    import_history_async(path, "zalo_history.db".to_owned()).await
+                                let result = match account_history(session, captured, account.clone(), history::Request::Import(path)).await {
+                                    Ok(history::Reply::Imported(report, threads)) => Ok((report, threads)),
+                                    _ => Err("Chưa nhập được lịch sử theo tài khoản".into()),
                                 };
                                 let _ = tx.send(GuiEvent::HistoryImported { account, result });
                                 ctx.request_repaint();
@@ -1018,17 +1032,52 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 });
                             });
                         }
-                        WorkerCmd::PersistThreads(threads_snapshot) => {
+                        WorkerCmd::PersistThreads { account, threads } => {
+                            let captured = session.lock().await.clone();
+                            let session = session.clone();
+                            let sender = gui_tx.clone();
                             crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
-                            let _ = crate::runtime_scope::spawn_blocking(move || {
-                                if let Ok(mut store) =
-                                    crate::store::MessageStore::open("zalo_history.db")
-                                {
-                                    let _ =
-                                        crate::store::persist_threads(&mut store, &threads_snapshot);
-                                }
-                                crate::chat::save_threads_cache(&threads_snapshot);
-                            }).await;
+                                let result = account_history(session, captured, account, history::Request::Persist(threads)).await;
+                                if result.is_err() { let _ = sender.send(GuiEvent::StatusUpdate("Chưa lưu được lịch sử theo tài khoản".into())); }
+                            });
+                        }
+                        WorkerCmd::LoadHistoryPage { account, thread_id, before } => {
+                            let captured = session.lock().await.clone();
+                            let session = session.clone();
+                            let sender = gui_tx.clone();
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
+                                let result = account_history(session, captured, account.clone(), history::Request::Page { thread: thread_id.clone(), before }).await;
+                                let result = match result {
+                                    Ok(history::Reply::Page { messages, has_more }) => Ok((messages, has_more)),
+                                    _ => Err("Chưa tải được trang lịch sử".into()),
+                                };
+                                let _ = sender.send(GuiEvent::HistoryPageLoaded { account, thread_id, result });
+                            });
+                        }
+                        WorkerCmd::NavigateHistory { account, thread_id, reference } => {
+                            let captured = session.lock().await.clone();
+                            let session = session.clone();
+                            let sender = gui_tx.clone();
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
+                                let result = account_history(session, captured, account.clone(), history::Request::Navigate { thread: thread_id.clone(), reference: reference.clone() }).await;
+                                let result = match result {
+                                    Ok(history::Reply::Navigation(page)) => Ok(page),
+                                    _ => Err("Chưa tra được tin nhắn gốc".into()),
+                                };
+                                let _ = sender.send(GuiEvent::HistoryNavigationLoaded { account, thread_id, reference, result });
+                            });
+                        }
+                        WorkerCmd::SearchHistory { account, thread_id, query } => {
+                            let captured = session.lock().await.clone();
+                            let session = session.clone();
+                            let sender = gui_tx.clone();
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
+                                let result = account_history(session, captured, account.clone(), history::Request::Search { thread: thread_id.clone(), query: query.clone() }).await;
+                                let result = match result {
+                                    Ok(history::Reply::Page { messages, .. }) => Ok(messages),
+                                    _ => Err("Chưa tìm được lịch sử".into()),
+                                };
+                                let _ = sender.send(GuiEvent::HistorySearchLoaded { account, thread_id, query, result });
                             });
                         }
                         WorkerCmd::Logout => {
@@ -1037,7 +1086,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let Ok(Ok(logout_scope)) = tokio::task::spawn_blocking(move || {
                                 crate::runtime_scope::transition_if_current(generation, "", || {
                                     let _ = std::fs::remove_file("session.json");
-                                    let _ = std::fs::remove_file("threads_cache.json");
                                 })
                             }).await else { continue; };
                             session.lock().await.logout();
@@ -1049,17 +1097,20 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             // QR begins only after logout cleanup; it carries a fresh validated intent.
                             if let Some(tx) = WORKER_TX.get() { let _ = tx.send_lifecycle_from(logout_scope.generation, WorkerCmd::RequestQr); }
                         }
-                        WorkerCmd::WipeLocalData => {
-                            let account = session.lock().await.login.as_ref().map(|login| login.uin.clone()).unwrap_or_default();
+                        WorkerCmd::WipeLocalData { account } => {
+                            let captured = session.lock().await.clone();
+                            if captured.login.as_ref().map(|login| login.uin.as_str()) != Some(account.as_str()) { continue; }
+                            let transition_account = account.clone();
                             let Ok(Ok(wipe_scope)) = tokio::task::spawn_blocking(move || {
-                                crate::runtime_scope::transition_if_current(generation, &account, || {
-                                    for path in ["zalo_history.db", "zalo_history.db-wal", "zalo_history.db-shm", "threads_cache.json"] {
-                                        let _ = std::fs::remove_file(path);
-                                    }
-                                })
+                                crate::runtime_scope::transition_if_current(generation, &transition_account, || {})
                             }).await else { continue; };
-                            let _ = gui_tx.send(GuiEvent::Scoped {
-                                scope: wipe_scope, event: Box::new(GuiEvent::LocalDataWiped),
+                            let session = session.clone();
+                            let sender = gui_tx.clone();
+                            crate::runtime_scope::spawn_scoped(wipe_scope, async move {
+                                match account_history(session, captured, account, history::Request::Clear).await {
+                                    Ok(_) => { let _ = sender.send(GuiEvent::LocalDataWiped); }
+                                    Err(error) => { let _ = sender.send(GuiEvent::HistoryClearFailed(error)); }
+                                }
                             });
                             egui_ctx.request_repaint();
                         }
@@ -1129,15 +1180,18 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             last_cli_msg_id,
                         } => {
                             let session_clone = session.clone();
+                            let sender = gui_tx.clone();
                             crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
-                                let _ = crate::chat::delete_conversation(
-                                    &s,
-                                    &thread_id,
-                                    is_group,
-                                    &last_cli_msg_id,
-                                )
-                                .await;
+                                let account = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
+                                let result = match crate::chat::delete_conversation(&s, &thread_id, is_group, &last_cli_msg_id).await {
+                                    Ok(response) if resp_error_code(&response).is_none() => {
+                                        account_history(session_clone, s, account.clone(), history::Request::DeleteThread(thread_id.clone())).await
+                                            .map(|_| ())
+                                    }
+                                    _ => Err("Chưa xóa được cuộc trò chuyện trên máy chủ".into()),
+                                };
+                                let _ = sender.send(GuiEvent::HistoryThreadDeleted { account, thread_id, result });
                             });
                         }
                         WorkerCmd::RequestQr => {
@@ -1256,6 +1310,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                             let _ = s.save_to_file("session.json");
                                                         }
 
+                                                        let snapshot = s.clone();
+                                                        drop(s);
+                                                        let s = snapshot;
                                                         let uin = s
                                                             .login
                                                             .as_ref()
@@ -1280,23 +1337,18 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                         );
                                                         ctx_clone.request_repaint();
 
-                                                        let mut list = crate::chat::get_friends(&s)
+                                                        let mut list = crate::chat::get_friends_network(&s)
                                                             .await
                                                             .unwrap_or_default();
-                                                        crate::store::load_history_into_threads(
-                                                            "zalo_history.db",
-                                                            &mut list,
-                                                            crate::store::MessageStore::PRELOAD_MSGS,
-                                                        );
+                                                        list = load_account_threads(session_clone.clone(), s.clone(), list).await;
                                                         {
                                                             let mut ps = poll_clone.lock().await;
-                                                            let _ = crate::chat::poll_new_messages(
+                                                            let _ = crate::chat::poll_new_messages_network(
                                                                 &s, &mut ps, &mut list,
                                                             )
                                                             .await;
                                                         }
-                                                        let _ = gui_tx_clone
-                                                            .send(GuiEvent::ThreadsUpdated(list));
+                                                        publish_account_threads(session_clone.clone(), s.clone(), gui_tx_clone.clone(), list, false).await;
                                                         ctx_clone.request_repaint();
 
                                                         let s_kw = s.clone();
@@ -1396,9 +1448,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         "⏳ Đang làm mới danh bạ & nhóm từ máy chủ Zalo (1/3)…".into(),
                                     ));
                                     ctx_clone.request_repaint();
-                                    let mut list = crate::chat::load_threads_cache();
+                                    let mut list: Vec<Thread> = Vec::new();
                                     let mut errors = Vec::new();
-                                    match crate::chat::get_friends(&s).await {
+                                    match crate::chat::get_friends_network(&s).await {
                                         Ok(friends) => {
                                             for ft in friends {
                                                 if let Some(ex) = list.iter_mut().find(|t| t.id == ft.id) {
@@ -1450,18 +1502,14 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             errors.push(format!("Nhóm: {e}"));
                                         }
                                     }
-                                    crate::store::load_history_into_threads(
-                                        "zalo_history.db",
-                                        &mut list,
-                                        crate::store::MessageStore::PRELOAD_MSGS,
-                                    );
+                                    list = load_account_threads(session_clone.clone(), s.clone(), list).await;
                                     let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
                                         format!("⏳ Đang làm mới tin nhắn cho {} hội thoại (3/3)…", list.len()),
                                     ));
                                     ctx_clone.request_repaint();
                                     let mut fresh_ps = crate::chat::PollState::default();
                                     if let Err(e) =
-                                        crate::chat::poll_new_messages(&s, &mut fresh_ps, &mut list)
+                                        crate::chat::poll_new_messages_network(&s, &mut fresh_ps, &mut list)
                                             .await
                                     {
                                         crate::logger::log_error("gui::refresh_poll", &e.to_string());
@@ -1474,7 +1522,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     let total_msgs: usize =
                                         list.iter().map(|t| t.messages.len()).sum();
                                     let n_threads = list.len();
-                                    let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(list));
+                                    publish_account_threads(session_clone.clone(), s.clone(), gui_tx_clone.clone(), list, false).await;
                                     let _ = gui_tx_clone.send(GuiEvent::RefreshFinished {
                                         threads: n_threads,
                                         messages: total_msgs,
@@ -1625,8 +1673,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                         }
                                                     }
                                                 }
-                                                let _ = gui_tx_clone
-                                                    .send(GuiEvent::LiveThreadsUpdated(temp_threads));
+                                                publish_account_threads(session_clone.clone(), s.clone(), gui_tx_clone.clone(), temp_threads, true).await;
                                                 ctx_clone.request_repaint();
                                             }
                                         }
@@ -1669,7 +1716,24 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         messages: Vec::new(),
                                         ..Default::default()
                                     };
-                                    match crate::history_sync::sync_thread(&s, &mut t).await {
+                                    let account = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
+                                    let cursor = match account_history(session_clone.clone(), s.clone(), account.clone(), history::Request::OldestCursor(t.id.clone())).await {
+                                        Ok(history::Reply::Cursor(cursor)) => cursor,
+                                        _ => { errors.push(format!("{}: chưa đọc được con trỏ lịch sử", t.name)); continue; }
+                                    };
+                                    let storage_session = session_clone.clone();
+                                    let storage_capture = s.clone();
+                                    match crate::history_sync::sync_thread_network(&s, &mut t, cursor, move |snapshot| {
+                                        let session = storage_session.clone();
+                                        let captured = storage_capture.clone();
+                                        let account = account.clone();
+                                        async move {
+                                            match account_history(session, captured, account, history::Request::Persist(vec![snapshot])).await {
+                                                Ok(history::Reply::Written(inserted)) => Ok(inserted),
+                                                _ => anyhow::bail!("Account history write failed"),
+                                            }
+                                        }
+                                    }).await {
                                         Ok(n) => added += n,
                                         Err(e) => errors.push(format!("{}: {e}", t.name)),
                                     }
@@ -1709,17 +1773,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         is_group: is_group && !is_send2me,
                                         messages: Vec::new(),
                                     };
-                                    let mut t_list = vec![t];
-                                    crate::store::load_history_into_threads(
-                                        "zalo_history.db",
-                                        &mut t_list,
-                                        (have + 300).max(500),
-                                    );
-                                    let Some(mut t) =
-                                        t_list.into_iter().find(|x| x.id == group_id)
-                                    else {
-                                        return;
-                                    };
+                                    let mut t = t;
+                                    let _ = have; // Local archive paging uses an exact cursor, not a growing LIMIT.
                                     if !is_group && !is_send2me {
                                         let mut one_list = vec![t.clone()];
                                         if let Ok(resp) = crate::chat::get_last_msgs(
@@ -1838,15 +1893,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     }
                                     let cnt = t.messages.len();
                                     if !t.messages.is_empty() || !t.name.is_empty() {
-                                        if let Ok(mut store) =
-                                            crate::store::MessageStore::open("zalo_history.db")
-                                        {
-                                            let _ = crate::store::persist_threads(
-                                                &mut store,
-                                                std::slice::from_ref(&t),
-                                            );
-                                        }
-                                        let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(vec![t]));
+                                        publish_account_threads(session_clone.clone(), s.clone(), gui_tx_clone.clone(), vec![t], false).await;
                                     }
                                     let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                         "✅ Đã đồng bộ {cnt} tin nhắn lịch sử"
@@ -2179,16 +2226,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 };
                                 match res {
                                     Ok(resp) if resp_error_code(&resp).is_none() => {
-                                        let (tid, mid, ts) =
-                                            (to_id.clone(), msg.id.clone(), msg.ts);
-                                        let _ = crate::runtime_scope::spawn_blocking(move || {
-                                            if let Ok(mut store) =
-                                                crate::store::MessageStore::open("zalo_history.db")
-                                            {
-                                                let _ = store.delete_message(&tid, &mid, ts);
-                                            }
-                                        })
-                                        .await;
+                                        let account = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
+                                        if account_history(session_clone.clone(), s.clone(), account, history::Request::Delete { thread: to_id.clone(), message: msg.id.clone() }).await.is_err() {
+                                            let _ = gui_tx_clone.send(GuiEvent::StatusUpdate("Chưa lưu được thao tác xóa tin nhắn".into()));
+                                            return;
+                                        }
                                         let _ = gui_tx_clone.send(GuiEvent::MessageDeleted {
                                             thread_id: to_id,
                                             msg_id: msg.id.clone(),
@@ -2904,18 +2946,17 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 ctx_clone.request_repaint();
 
                                                 if let Ok(mut list) =
-                                                    crate::chat::get_friends(&s).await
+                                                    crate::chat::get_friends_network(&s).await
                                                 {
                                                     {
                                                         let mut ps = poll_clone.lock().await;
                                                         *ps = crate::chat::PollState::default();
-                                                        let _ = crate::chat::poll_new_messages(
+                                                        let _ = crate::chat::poll_new_messages_network(
                                                             &s, &mut ps, &mut list,
                                                         )
                                                         .await;
                                                     }
-                                                    let _ = gui_tx_clone
-                                                        .send(GuiEvent::ThreadsUpdated(list));
+                                                    publish_account_threads(session_clone.clone(), s.clone(), gui_tx_clone.clone(), list, false).await;
                                                     ctx_clone.request_repaint();
                                                 }
                                             }
@@ -3439,6 +3480,7 @@ mod reaction_consumer_tests {
 }
 
 
+#[cfg(test)]
 async fn import_history_async(path: std::path::PathBuf, database: String) -> Result<(crate::store::ImportReport, Vec<Thread>), String> {
     crate::runtime_scope::spawn_blocking(move || crate::store::import_history_delta_from_path(&path, &database).map_err(|_| "History import failed".to_owned()))
         .await.map_err(|_| "Import task failed".to_owned())?
@@ -4012,5 +4054,33 @@ mod integrated_epoch_tests {
         assert_eq!(std::fs::read(source).unwrap(), bytes);
         assert!(rx.try_recv().is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+
+async fn account_history(session: std::sync::Arc<tokio::sync::Mutex<Session>>, captured: Session, account: String, request: history::Request) -> Result<history::Reply, String> {
+    history::execute(history::root()?, session, captured, account, request).await
+}
+
+async fn load_account_threads(session: std::sync::Arc<tokio::sync::Mutex<Session>>, captured: Session, live: Vec<Thread>) -> Vec<Thread> {
+    let account = captured.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
+    match account_history(session, captured, account, history::Request::Load(live.clone())).await {
+        Ok(history::Reply::Threads(threads)) => threads,
+        _ => live,
+    }
+}
+
+async fn publish_account_threads(session: std::sync::Arc<tokio::sync::Mutex<Session>>, captured: Session, sender: GuiTx, threads: Vec<Thread>, live: bool) {
+    match history::root() {
+        Ok(root) => publish_account_threads_at(root, session, captured, sender, threads, live).await,
+        Err(message) => { let _ = sender.send(GuiEvent::StatusUpdate(message)); }
+    }
+}
+
+pub(super) async fn publish_account_threads_at(root: std::path::PathBuf, session: std::sync::Arc<tokio::sync::Mutex<Session>>, captured: Session, sender: GuiTx, threads: Vec<Thread>, live: bool) {
+    let account = captured.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
+    match history::execute(root, session, captured, account.clone(), history::Request::Reconcile(threads)).await {
+        Ok(history::Reply::Threads(threads)) => { let _ = sender.send(GuiEvent::AccountThreadsUpdated { account, threads, live }); }
+        _ => { let _ = sender.send(GuiEvent::StatusUpdate("Chưa lưu được bản cập nhật lịch sử".into())); }
     }
 }

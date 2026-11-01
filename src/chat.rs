@@ -1263,6 +1263,18 @@ pub fn save_threads_cache(threads: &[Thread]) {
 /// Uses `s.domains.friend` (defaulting to `tt-friend-wpa.chat.zalo.me`), falling back
 /// to `s.domains.profile` only if `domains.friend` is empty.
 pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
+    get_friends_with_storage(s, true).await
+}
+
+/// Fetch contacts without reading unowned legacy history into an account-scoped GUI.
+///
+/// # Errors
+/// Returns the same transport/protocol errors as the legacy contact API.
+pub async fn get_friends_network(s: &Session) -> Result<Vec<Thread>> {
+    get_friends_with_storage(s, false).await
+}
+
+async fn get_friends_with_storage(s: &Session, hydrate_legacy: bool) -> Result<Vec<Thread>> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -1331,11 +1343,13 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
     }
 
     // Hydrate with locally persisted history from SQLite (`zalo_history.db`)
-    crate::store::load_history_into_threads(
-        "zalo_history.db",
-        &mut threads,
-        crate::store::MessageStore::PRELOAD_MSGS,
-    );
+    if hydrate_legacy {
+        crate::store::load_history_into_threads(
+            "zalo_history.db",
+            &mut threads,
+            crate::store::MessageStore::PRELOAD_MSGS,
+        );
+    }
 
     // Merge user groups (`getlg/v4` + `getmg-v2`) into threads list, upgrading any placeholder group names
     if let Ok(mut groups) = get_groups(s).await {
@@ -4356,6 +4370,18 @@ pub async fn poll_new_messages(
     state: &mut PollState,
     threads: &mut Vec<Thread>,
 ) -> Result<()> {
+    poll_new_messages_with_storage(s, state, threads, true).await
+}
+
+/// Poll and reduce network messages without legacy persistence or inferred thread aliases.
+///
+/// # Errors
+/// Returns an error when the session is not authenticated or a required operation fails.
+pub async fn poll_new_messages_network(s: &Session, state: &mut PollState, threads: &mut Vec<Thread>) -> Result<()> {
+    poll_new_messages_with_storage(s, state, threads, false).await
+}
+
+async fn poll_new_messages_with_storage(s: &Session, state: &mut PollState, threads: &mut Vec<Thread>, persist_legacy: bool) -> Result<()> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -4424,11 +4450,16 @@ pub async fn poll_new_messages(
     // 3. Resolve display names for any newly discovered threads
     resolve_thread_names(s, threads).await;
     threads.retain(|t| !t.messages.is_empty() || !t.name.starts_with("Người dùng "));
-    deduplicate_threads(threads, None);
-    if let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") {
-        let _ = crate::store::persist_threads(&mut store, threads);
+    if persist_legacy {
+        deduplicate_threads(threads, None);
+        if let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") {
+            let _ = crate::store::persist_threads(&mut store, threads);
+        }
+        save_threads_cache(threads);
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        threads.retain(|thread| seen.insert(thread.id.clone()));
     }
-    save_threads_cache(threads);
     Ok(())
 }
 

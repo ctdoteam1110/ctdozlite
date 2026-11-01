@@ -2,7 +2,9 @@
 
 Kho lịch sử mới lưu riêng từng tài khoản tại
 `accounts/<sha256(account_id)>/history-v2.sqlite3`. Tệp cũ và các bảng lịch đồng bộ,
-hẹn giờ, API vẫn giữ nguyên. Nền tảng này chưa tự chuyển GUI sang kho mới.
+hẹn giờ, API vẫn giữ nguyên. GUI dùng kho mới qua worker cho tải, lưu, phân trang,
+tìm kiếm và mở trích dẫn ngoài phần tin nhắn đã tải. GUI không tự nhập tệp cũ hoặc
+cache của tài khoản khác khi đăng nhập.
 
 ## Dữ liệu được giữ
 
@@ -28,3 +30,26 @@ chưa từng được lưu. Kho mới lưu trạng thái này bền vững cho c
 Ứng dụng từ chối tệp có phiên bản mới hơn hoặc chủ tài khoản khác trước khi sửa tệp.
 Quyền tệp/thư mục mới trên Unix là 0600/0700. Thiết kế và phạm vi tích hợp nằm tại
 [ADR-0004](adr/0004-account-owned-history-store.md).
+
+## Luồng GUI
+
+Nút tải thêm đọc một trang cục bộ tối đa 200 tin theo con trỏ thời gian và ID,
+không tăng dần một lệnh LIMIT để nạp lại toàn bộ hội thoại. Đồng bộ lịch sử từ máy
+chủ vẫn là thao tác riêng, giữ nguyên giao thức hiện có và ghi từng phần vào kho
+của tài khoản đang đăng nhập. Tìm kiếm trong hội thoại và mở trích dẫn có thể đọc
+những tin cũ chưa nằm trong cửa sổ gần nhất.
+
+Xóa một tin tạo dấu xóa đúng ID. Xóa lịch sử một hội thoại loại bỏ metadata và trạng
+thái chưa đọc của hội thoại, đồng thời giữ dấu xóa cho các ID đã có; bản snapshot cũ
+không khôi phục chúng. Một tin mới có ID khác vẫn được phép xuất hiện bình thường.
+Xóa dữ liệu cục bộ chỉ tác động kho của tài khoản hiện tại, không xóa tệp legacy,
+bảng hẹn giờ hoặc phiên đăng nhập. Đăng xuất giữ nguyên lịch sử theo tài khoản.
+
+### Phần tích hợp còn lại
+
+- API HTTP/MCP và TUI vẫn đọc kho legacy, chưa phản chiếu đầy đủ lịch sử GUI mới.
+- Snapshot lưu từ GUI cần bước coalescing dùng LatestSnapshot chung với composer.
+- Kiểm chứng đổi tài khoản cùng định danh phiên nhiều lần cần runtime epoch fence;
+  kiểm tra tài khoản và khóa phiên tại adapter không thay thế hàng rào generation.
+- Các test consumer chứng minh luồng worker thực tế với dữ liệu disposable, không
+  thay cho nghiệm thu thao tác GUI với tài khoản thật.

@@ -21,6 +21,7 @@ use crate::logger::{self, FindingLevel, LogEntry, ScanFinding};
 use crate::qr::QrLogin;
 use crate::session::Session;
 
+mod history;
 mod media_preview;
 mod native_photo_viewer;
 mod messages;
@@ -70,8 +71,18 @@ pub enum GuiEvent {
     /// Terminal result of background history import and hydration.
     HistoryImported {
         account: String,
-        result: Result<(crate::store::ImportReport, Vec<Thread>), String>,
+        result: Result<(crate::store_v2::MigrationReport, Vec<Thread>), String>,
     },
+    /// Terminal result after server confirmation and exact local conversation deletion.
+    HistoryThreadDeleted { account: String, thread_id: String, result: Result<(), String> },
+    /// Account-scoped worker projection after durable history reconciliation.
+    AccountThreadsUpdated { account: String, threads: Vec<Thread>, live: bool },
+    /// One bounded archived page, separate from live arrival notifications.
+    HistoryPageLoaded { account: String, thread_id: String, result: Result<(Vec<ChatMessage>, bool), String> },
+    /// Exact offscreen quote navigation result, capped at 200 bodies.
+    HistoryNavigationLoaded { account: String, thread_id: String, reference: String, result: Result<Option<(String, Vec<ChatMessage>)>, String> },
+    /// Bounded durable literal-search matches for the still-current query.
+    HistorySearchLoaded { account: String, thread_id: String, query: String, result: Result<Vec<ChatMessage>, String> },
     /// Terminal result of an account-isolated photo request.
     PhotoPreviewReady {
         account: String,
@@ -220,7 +231,7 @@ pub enum GuiEvent {
     SessionExpired(String),
     /// The server could not be reached: the session is intact, show it and retry (#21).
     SessionUnreachable(String),
-    /// `zalo_history.db` + `threads_cache.json` were removed on request (#21).
+    /// The current account-owned history was cleared without touching legacy stores.
     LocalDataWiped,
     CallStateChanged(String),
     IncomingCall {
@@ -587,6 +598,7 @@ pub struct ZaloGuiApp {
 
     // Chat screen state
     threads: Vec<Thread>,
+    local_history_tombstones: HashSet<(String, String)>,
     selected_thread_index: usize,
     thread_filter: ThreadFilter,
     search_query: String,
@@ -614,6 +626,7 @@ pub struct ZaloGuiApp {
     phone_lookup_error: Option<String>,
     in_chat_search_open: bool,
     in_chat_search_query: String,
+    archive_search_request: (String, String),
     in_chat_search_focus_pending: bool,
     // Sticker picker & image cache state
     sticker_picker_open: bool,
@@ -766,16 +779,9 @@ impl ZaloGuiApp {
         // main() already read threads_cache.json and hydrated it from SQLite; reading, merging,
         // hydrating and rewriting the cache again here doubled startup I/O.
         let mut threads = initial_threads;
-        if let Some(li) = session.login.as_ref() {
-            if !li.send2me_id.is_empty() {
-                for t in threads.iter_mut() {
-                    if !t.is_group && t.name.contains("Cloud của tôi") {
-                        t.id = li.send2me_id.clone();
-                    }
-                }
-            }
-        }
-        crate::chat::deduplicate_threads(&mut threads, None);
+        // A display name or avatar is not evidence that two conversation IDs alias.
+        let mut seen = HashSet::new();
+        threads.retain(|thread| seen.insert(thread.id.clone()));
 
         let selected_thread_index = threads
             .iter()
@@ -800,6 +806,7 @@ impl ZaloGuiApp {
             qr_texture: None,
             qr_status: "Đang tạo mã QR đăng nhập…".into(),
             threads,
+            local_history_tombstones: HashSet::new(),
             selected_thread_index,
             thread_filter: ThreadFilter::All,
             search_query: String::new(),
@@ -823,6 +830,7 @@ impl ZaloGuiApp {
             phone_lookup_error: None,
             in_chat_search_open: false,
             in_chat_search_query: String::new(),
+            archive_search_request: (String::new(), String::new()),
             in_chat_search_focus_pending: false,
             sticker_picker_open: false,
             sticker_tab: StickerTab::Popular,
@@ -1048,7 +1056,7 @@ impl ZaloGuiApp {
         self.publish_known_threads();
         let snapshot = self.threads.clone();
         if let Some(wtx) = WORKER_TX.get() {
-            let _ = wtx.send(WorkerCmd::PersistThreads(snapshot));
+            let _ = wtx.send(WorkerCmd::PersistThreads { account: self.user_uin.clone(), threads: snapshot });
         }
     }
 
@@ -1069,6 +1077,13 @@ impl ZaloGuiApp {
                 }
                 event => event,
             };
+            let event = match event {
+                GuiEvent::AccountThreadsUpdated { account, threads, live } => {
+                    if !self.is_logged_in || account != self.user_uin { continue; }
+                    if live { GuiEvent::LiveThreadsUpdated(threads) } else { GuiEvent::ThreadsUpdated(threads) }
+                }
+                other => other,
+            };
             let live_arrival = matches!(&event, GuiEvent::LiveThreadsUpdated(_));
             match event {
                 GuiEvent::AuthenticationStarted => {
@@ -1085,15 +1100,76 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::Scoped { .. } => continue,
+                GuiEvent::AccountThreadsUpdated { .. } => unreachable!("account event normalized above"),
+                GuiEvent::HistoryThreadDeleted { account, thread_id, result } => {
+                    if self.is_logged_in && account == self.user_uin {
+                        match result {
+                            Ok(()) => {
+                                if let Some(thread) = self.threads.iter().find(|thread| thread.id == thread_id) {
+                                    self.local_history_tombstones.extend(thread.messages.iter().map(|message| (thread_id.clone(), message.id.clone())));
+                                }
+                                self.threads.retain(|thread| thread.id != thread_id);
+                                self.selected_thread_index = self.selected_thread_index.min(self.threads.len().saturating_sub(1));
+                                self.unread_counts.remove(&thread_id);
+                                self.settings.pinned_threads.retain(|id| id != &thread_id);
+                                self.settings.save();
+                                self.show_toast("Đã xóa lịch sử hội thoại ở phía bạn");
+                            }
+                            Err(message) => self.show_toast(message),
+                        }
+                    }
+                }
+                GuiEvent::HistoryPageLoaded { account, thread_id, result } => {
+                    if self.is_logged_in && account == self.user_uin {
+                        match result {
+                            Ok((messages, has_more)) => {
+                                history::merge_cached_page(&mut self.threads, &self.local_history_tombstones, &thread_id, messages);
+                                if !has_more { self.show_toast("Đã tải hết trang lịch sử cục bộ hiện có"); }
+                            }
+                            Err(message) => self.show_toast(message),
+                        }
+                    }
+                }
+                GuiEvent::HistoryNavigationLoaded { account, thread_id, reference, result } => {
+                    if self.is_logged_in && account == self.user_uin
+                        && self.threads.get(self.selected_thread_index).is_some_and(|t| t.id == thread_id) {
+                        match result {
+                            Ok(Some((_, messages))) => {
+                                history::merge_cached_page(&mut self.threads, &self.local_history_tombstones, &thread_id, messages);
+                                self.filter_starred_only = false;
+                                self.in_chat_search_open = false;
+                                self.in_chat_search_query.clear();
+                                self.quote_jump = Some(QuoteJump { thread_id, reference, highlight_until: std::time::Instant::now() + Duration::from_secs(3), scroll_pending: true });
+                            }
+                            Ok(None) => self.show_toast("Không có tin nhắn gốc với định danh duy nhất trong lịch sử đã lưu"),
+                            Err(message) => self.show_toast(message),
+                        }
+                    }
+                }
+                GuiEvent::HistorySearchLoaded { account, thread_id, query, result } => {
+                    if self.is_logged_in && account == self.user_uin && self.in_chat_search_open
+                        && self.archive_search_request == (thread_id.clone(), query) {
+                        match result {
+                            Ok(messages) => {
+                                history::merge_cached_page(&mut self.threads, &self.local_history_tombstones, &thread_id, messages);
+                            }
+                            Err(message) => self.show_toast(message),
+                        }
+                    }
+                }
                 GuiEvent::HistoryImported { account, result } => {
                     if self.is_logged_in && account == self.user_uin {
                         match result {
-                            Ok((report, threads)) => {
+                            Ok((report, mut threads)) => {
+                                for thread in &mut threads {
+                                    thread.messages.retain(|message| !self.local_history_tombstones.contains(&(thread.id.clone(), message.id.clone())));
+                                }
+                                threads.retain(|thread| !thread.messages.is_empty() || !self.local_history_tombstones.iter().any(|(id,_)| id == &thread.id));
                                 apply_import_delta(&mut self.threads, threads);
                                 self.persist_threads_async();
                                 self.show_toast(format!(
                                     "Đã nhập {} tin nhắn từ {} hội thoại",
-                                    report.messages_imported, report.threads_imported
+                                    report.messages, report.threads
                                 ));
                             }
                             Err(_) => self
@@ -1165,6 +1241,11 @@ impl ZaloGuiApp {
                         self.composer_mentions = Default::default();
                         self.input_message.clear();
                         self.replying_to = None;
+                        self.threads.clear();
+                        self.local_history_tombstones.clear();
+                        self.selected_thread_index = 0;
+                        self.quote_jump = None;
+                        self.archive_search_request = (String::new(), String::new());
                     }
                     self.user_uin = uin;
                     if avatar.is_some() {
@@ -1226,15 +1307,10 @@ impl ZaloGuiApp {
                 GuiEvent::ThreadsUpdated(updates) | GuiEvent::LiveThreadsUpdated(updates) => {
                     ensure_cjk_font(ctx, thread_texts(&updates));
                     if self.is_logged_in && !updates.is_empty() {
-                        let prev_selected_name = self
+                        let prev_selected_id = self
                             .threads
                             .get(self.selected_thread_index)
-                            .map(|t| (t.name.clone(), t.is_group));
-                        let live_ids: HashSet<String> = updates
-                            .iter()
-                            .filter(|u| !u.id.is_empty() && u.id != "0")
-                            .map(|u| u.id.clone())
-                            .collect();
+                            .map(|t| t.id.clone());
 
                         let active_tid = self
                             .threads
@@ -1248,7 +1324,8 @@ impl ZaloGuiApp {
                         }
 
 
-                        for nt in updates {
+                        for mut nt in updates {
+                            nt.messages.retain(|message| !self.local_history_tombstones.contains(&(nt.id.clone(), message.id.clone())));
                             if let Some(existing) = self.threads.iter_mut().find(|t| t.id == nt.id)
                             {
                                 let old_len = existing.messages.len();
@@ -1270,11 +1347,6 @@ impl ZaloGuiApp {
                                         new_incoming_alert = true;
                                     }
                                 }
-                            } else if let Some(existing) = self.threads.iter_mut().find(|t| {
-                                !live_ids.contains(&t.id)
-                                    && crate::chat::threads_represent_same_contact(t, &nt)
-                            }) {
-                                crate::chat::merge_thread_into(existing, nt, true);
                             } else if !nt.id.is_empty() && nt.id != "0" {
                                 self.threads.push(nt);
                             }
@@ -1294,13 +1366,14 @@ impl ZaloGuiApp {
                                 ));
                             }
                         }
-                        crate::chat::deduplicate_threads(&mut self.threads, Some(&live_ids));
+                        let mut seen = HashSet::new();
+                        self.threads.retain(|thread| seen.insert(thread.id.clone()));
 
-                        if let Some((sel_name, sel_grp)) = prev_selected_name {
+                        if let Some(selected_id) = prev_selected_id {
                             if let Some(idx) = self
                                 .threads
                                 .iter()
-                                .position(|t| t.is_group == sel_grp && t.name == sel_name)
+                                .position(|t| t.id == selected_id)
                             {
                                 self.selected_thread_index = idx;
                             }
@@ -1338,6 +1411,7 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::LoggedOut => {
                     self.native_photo_pending = false;
+                    self.local_history_tombstones.clear();
                     self.original_reaction_import_pending = false;
                     self.is_logged_in = false;
                     self.user_name.clear();
@@ -1504,6 +1578,7 @@ impl ZaloGuiApp {
                     msg_id,
                     ts,
                 } => {
+                    self.local_history_tombstones.insert((thread_id.clone(), msg_id.clone()));
                     if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
                         t.messages.retain(|m| {
                             !((!msg_id.is_empty() && m.id == msg_id)

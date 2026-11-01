@@ -311,6 +311,23 @@ impl AccountStore {
         Ok(())
     }
 
+    /// Delete one conversation's cached history while tombstoning its existing exact rows.
+    /// Future messages with different IDs may recreate the conversation normally.
+    ///
+    /// # Errors
+    /// Returns an error for an empty thread identity or failed SQLite operation; all writes roll back.
+    pub fn delete_thread_history(&mut self, thread_id: &str) -> Result<()> {
+        ensure!(!thread_id.is_empty(), "Thread identity required");
+        let tx = self.conn.transaction()?;
+        tx.execute("INSERT OR IGNORE INTO message_tombstones(thread_id,msg_id) SELECT thread_id,msg_id FROM messages WHERE thread_id=?1", [thread_id])?;
+        tx.execute("DELETE FROM message_search WHERE rowid IN (SELECT rowid FROM messages WHERE thread_id=?1)", [thread_id])?;
+        tx.execute("DELETE FROM messages WHERE thread_id=?1", [thread_id])?;
+        tx.execute("DELETE FROM thread_unread WHERE thread_id=?1", [thread_id])?;
+        tx.execute("DELETE FROM threads WHERE thread_id=?1", [thread_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Erase this account's cached history atomically without changing its owner.
     /// The import manifest remains so a restart cannot silently restore deleted history.
     ///
@@ -813,6 +830,16 @@ impl AccountStore {
         let tx = self.conn.unchecked_transaction()?;
         let mut stats = WriteStats::default();
         for t in threads {
+            // An old full snapshot must not restore the metadata/unread of a deleted
+            // conversation when every supplied message is an existing tombstone.
+            if !t.messages.is_empty() && self.thread_is_group(&t.id)?.is_none() {
+                let mut all_deleted = true;
+                for message in &t.messages {
+                    if !self.is_deleted(&t.id, &message.id)? { all_deleted = false; break; }
+                }
+                if all_deleted { stats.unchanged += t.messages.len(); continue; }
+            }
+
             let prior: Option<String> = self
                 .conn
                 .query_row(

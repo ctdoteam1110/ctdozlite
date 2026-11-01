@@ -1785,22 +1785,8 @@ impl ZaloGuiApp {
                             self.selected_thread_index = idx;
                             self.schedule_modal_open = true;
                         }
-                        ThreadCtxAction::DeleteConv(idx, tid, tname, is_group, last_msg_id) => {
-                            if let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") {
-                                let _ = store.delete_thread(&tid);
-                            }
-                            if idx < self.threads.len() && self.threads[idx].id == tid {
-                                self.threads.remove(idx);
-                                if self.selected_thread_index >= self.threads.len() {
-                                    self.selected_thread_index =
-                                        self.threads.len().saturating_sub(1);
-                                }
-                                self.unread_counts.remove(&tid);
-                                self.settings.pinned_threads.retain(|x| x != &tid);
-                                self.settings.save();
-                                self.persist_threads_async();
-                            }
-                            self.show_toast(format!("🗑️ Đã xóa hội thoại \"{tname}\""));
+                        ThreadCtxAction::DeleteConv(_idx, tid, _tname, is_group, last_msg_id) => {
+                            // The worker confirms both server success and durable exact deletion.
                             if let Some(tx) = WORKER_TX.get() {
                                 let _ = tx.send(WorkerCmd::DeleteThread {
                                     thread_id: tid,
@@ -3195,6 +3181,17 @@ impl ZaloGuiApp {
                             });
                     }
 
+                    if self.in_chat_search_open {
+                        let query = self.in_chat_search_query.trim().to_owned();
+                        let key = (thread_id.clone(), query.clone());
+                        if !query.is_empty() && self.archive_search_request != key {
+                            self.archive_search_request = key;
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(WorkerCmd::SearchHistory { account: self.user_uin.clone(), thread_id: thread_id.clone(), query });
+                            }
+                        }
+                    }
+
                     // 2. Scrollable Messages Area
                     let contextual_stickers = self.resolve_contextual_sticker_suggestions(ctx);
                     let composer_link_preview = self.resolve_composer_link_preview(ctx);
@@ -3301,7 +3298,7 @@ impl ZaloGuiApp {
                                                         .add(hist_btn)
                                                         .on_hover_cursor(CursorIcon::PointingHand)
                                                         .on_hover_text(
-                                                            "Đồng bộ thêm lịch sử tin nhắn cũ từ máy chủ Zalo",
+                                                            "Tải tối đa 200 tin nhắn cũ từ lịch sử tài khoản đã lưu",
                                                         )
                                                         .clicked()
                                                     {
@@ -3310,10 +3307,10 @@ impl ZaloGuiApp {
                                                         } else {
                                                             if let Some(tx) = WORKER_TX.get() {
                                                                 let _ = tx.send(
-                                                                    WorkerCmd::LoadGroupHistory {
-                                                                        group_id: thread_id.clone(),
-                                                                        is_group,
-                                                                        have: thread.messages.len(),
+                                                                    WorkerCmd::LoadHistoryPage {
+                                                                        account: self.user_uin.clone(),
+                                                                        thread_id: thread_id.clone(),
+                                                                        before: thread.messages.first().map(|message| crate::store_v2::HistoryCursor { ts: message.ts, msg_id: message.id.clone() }),
                                                                     },
                                                                 );
                                                             }
@@ -3507,8 +3504,8 @@ impl ZaloGuiApp {
                                             scroll_pending: true,
                                         });
                                         ctx.request_repaint();
-                                    } else {
-                                        self.show_toast("Chưa có tin nhắn gốc đã tải với ID duy nhất. Hãy tải thêm lịch sử rồi thử lại.");
+                                    } else if let Some(tx) = WORKER_TX.get() {
+                                        let _ = tx.send(WorkerCmd::NavigateHistory { account: self.user_uin.clone(), thread_id: thread_id.clone(), reference });
                                     }
                                 }
                                 BubbleAction::Forward => {

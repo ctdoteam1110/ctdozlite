@@ -205,7 +205,7 @@ impl ZaloGuiApp {
                                 .rounding(Rounding::same(7.0)),
                             )
                             .on_hover_text(
-                                "Xoá zalo_history.db và threads_cache.json. Phiên đăng nhập giữ nguyên.",
+                                "Xóa lịch sử cục bộ của tài khoản hiện tại. Phiên đăng nhập và dữ liệu legacy giữ nguyên.",
                             )
                             .on_hover_cursor(CursorIcon::PointingHand)
                             .clicked()
@@ -1215,7 +1215,7 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::same(14.0))
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Tải lịch sử cũ của các nhóm và Cloud của tôi từ máy chủ Zalo về zalo_history.db, mỗi lần tối đa 1.000 tin/hội thoại; bấm lần nữa để lùi xa hơn.").color(pal.text_primary).size(13.0));
+                                                        ui.label(RichText::new("Tải lịch sử cũ của các nhóm và Cloud của tôi vào kho riêng của tài khoản, mỗi lần tối đa 1.000 tin/hội thoại; bấm lần nữa để lùi xa hơn.").color(pal.text_primary).size(13.0));
                                                         ui.add_space(4.0);
                                                         ui.label(RichText::new("Zalo không cho tải lịch sử cũ của chat 1-1 qua máy chủ; tin 1-1 chỉ có từ lúc đăng nhập app.").color(pal.text_secondary).size(12.2));
                                                         if ui
@@ -1259,7 +1259,7 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::same(14.0))
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Nhập lịch sử tin nhắn từ bản sao lưu SQLite (.db / .sqlite) hoặc JSON (threads_cache.json / bản xuất lịch sử) vào zalo_history.db hiện tại mà không làm mất tin nhắn đang có.").color(pal.text_secondary).size(12.2));
+                                                        ui.label(RichText::new("Nhập lịch sử tin nhắn từ bản sao lưu SQLite (.db / .sqlite) hoặc JSON (threads_cache.json / bản xuất lịch sử) vào kho riêng của tài khoản hiện tại mà không sửa tệp nguồn hoặc làm mất tin nhắn đang có.").color(pal.text_secondary).size(12.2));
                                                         ui.add_space(8.0);
                                                         if ui.button(RichText::new("Chọn file lịch sử (.db / .sqlite / .json) để nhập…").size(12.8).strong()).clicked() {
                                                             pick_migrate_file = true;
@@ -4165,8 +4165,8 @@ impl ZaloGuiApp {
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(
-                        "Xoá zalo_history.db và threads_cache.json trên máy này. \
-                         Không thể hoàn tác, và tin nhắn cũ chỉ tải lại được từ đám mây Zalo.",
+                        "Xóa lịch sử cục bộ của tài khoản đang đăng nhập trên máy này. \
+                         Lịch sử cũ có thể tải lại từ máy chủ hoặc nhập từ bản sao lưu bạn chọn.",
                     )
                     .size(12.5)
                     .color(pal.text_secondary),
@@ -4213,7 +4213,7 @@ impl ZaloGuiApp {
         if confirm {
             self.wipe_confirm_open = false;
             if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::WipeLocalData);
+                let _ = tx.send(WorkerCmd::WipeLocalData { account: self.user_uin.clone() });
             }
         } else if cancel || !open {
             self.wipe_confirm_open = false;
