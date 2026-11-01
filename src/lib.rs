@@ -50,3 +50,5 @@ pub mod native_notifications;
 pub mod store_v2;
 /// Pure local read-state transitions without network receipts.
 pub mod read_receipts;
+/// Strict source-derived remote delivery and read receipt parsing.
+pub mod delivery_receipts;

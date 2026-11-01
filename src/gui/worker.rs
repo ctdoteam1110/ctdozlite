@@ -222,6 +222,42 @@ pub enum WorkerCmd {
     },
 }
 
+/// Dispatch only receipts belonging to the still-current authenticated session.
+/// The runtime integration must additionally scope this event by session generation.
+async fn dispatch_delivery_receipts(
+    session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+    captured: &Session,
+    sender: &GuiTx,
+    cmd: u16,
+    sub_cmd: u8,
+    payload: &serde_json::Value,
+) {
+    let account = captured
+        .login
+        .as_ref()
+        .map(|login| login.uin.as_str())
+        .unwrap_or_default();
+    let events = crate::delivery_receipts::parse_delivery_events(cmd, sub_cmd, payload, account);
+    if events.is_empty() {
+        return;
+    }
+    // Keep the session check and channel emission in one short, I/O-free section.
+    let current = session.lock().await;
+    if current.login.as_ref().map(|login| login.uin.as_str()) != Some(account)
+        || current.zpw_sek != captured.zpw_sek
+    {
+        return;
+    }
+    let result = sender.send(GuiEvent::DeliveryEvents {
+        account: account.into(),
+        events,
+    });
+    drop(current);
+    if result.is_err() {
+        crate::logger::log_error("gui::delivery_receipts", "UI event receiver closed");
+    }
+}
+
 async fn process_original_reaction_import(
     root: std::path::PathBuf,
     session: std::sync::Arc<tokio::sync::Mutex<Session>>,
@@ -661,6 +697,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             if !reactions.is_empty() {
                                                 process_reaction_journal(s_ws.clone(), s_snap.clone(), gui_tx_ws.clone(), reactions, Vec::new()).await;
                                             }
+                                            dispatch_delivery_receipts(&s_ws, &s_snap, &gui_tx_ws, ev.cmd, ev.sub_cmd, &ev.payload).await;
                                             if ev.is_chat_ish() {
                                                 let mut ws_threads = Vec::new();
                                                 if let Some(li) = s_snap.login.as_ref() {
@@ -1337,6 +1374,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         };
                                         match poll_res {
                                             Ok(lp_resp) => {
+                                                dispatch_delivery_receipts(&session_clone, &s, &gui_tx_clone, crate::socket::CMD_PULL_DELIVERIES, 0, &lp_resp).await;
                                                 let account = s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or_default();
                                                 let reactions = crate::reaction_journal::account_events(&lp_resp, account);
                                                 if !reactions.is_empty() {
@@ -3611,5 +3649,75 @@ mod composer_tests {
         assert_eq!(row.text, "😀 @An");
         assert_eq!(row.reply_to_text.as_deref(), Some("Reply :+1:"));
         assert_eq!(crate::message_navigation::message_mentions(&row)[0].user_id, "22");
+    }
+}
+
+#[cfg(test)]
+mod delivery_consumer_tests {
+    use super::*;
+
+    fn session(account: &str, token: &str) -> Session {
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo {
+            uin: account.into(),
+            ..Default::default()
+        });
+        session.zpw_sek = Some(token.into());
+        session
+    }
+
+    #[tokio::test]
+    async fn delivery_consumer_socket_and_poll_emit_receipt_only_packets() {
+        let captured = session("account-fixture", "token-fixture");
+        let current = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = GuiTx {
+            tx,
+            ctx: egui::Context::default(),
+        };
+        let packet = serde_json::json!({"error_code":0,"data":{"delivereds":[{"threadId":"peer-fixture","msgId":"message-fixture"}]}});
+        for cmd in [
+            crate::socket::CMD_GROUP_DELIVERIES,
+            crate::socket::CMD_PULL_DELIVERIES,
+        ] {
+            dispatch_delivery_receipts(&current, &captured, &sender, cmd, 0, &packet).await;
+            match rx.try_recv().unwrap() {
+                GuiEvent::DeliveryEvents { account, events } => {
+                    assert_eq!(account, "account-fixture");
+                    assert_eq!(events.len(), 1);
+                    assert_eq!(events[0].message_id.as_deref(), Some("message-fixture"));
+                }
+                _ => panic!("expected receipt-only event"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_consumer_rejects_stale_account_token_and_malformed_packet() {
+        let captured = session("account-fixture", "token-fixture");
+        let current = std::sync::Arc::new(tokio::sync::Mutex::new(session(
+            "other-fixture",
+            "token-fixture",
+        )));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = GuiTx {
+            tx,
+            ctx: egui::Context::default(),
+        };
+        let packet = serde_json::json!({"delivereds":[{"threadId":"peer-fixture","msgId":"message-fixture"}]});
+        dispatch_delivery_receipts(&current, &captured, &sender, 502, 0, &packet).await;
+        *current.lock().await = session("account-fixture", "other-token-fixture");
+        dispatch_delivery_receipts(&current, &captured, &sender, 502, 0, &packet).await;
+        *current.lock().await = captured.clone();
+        dispatch_delivery_receipts(
+            &current,
+            &captured,
+            &sender,
+            502,
+            0,
+            &serde_json::json!({"delivereds":[{"msgId":1.5}]}),
+        )
+        .await;
+        assert!(rx.try_recv().is_err());
     }
 }

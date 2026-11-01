@@ -50,6 +50,10 @@ pub const CMD_CTRL_PULL_VOIP: u16 = 604;
 
 pub const CMD_PUSH_MSG_1_1: u16 = 501;
 pub const CMD_PUSH_MSG_GROUP: u16 = 521;
+/// Original direct delivery-status handler command, also used for polling responses.
+pub const CMD_PULL_DELIVERIES: u16 = 502;
+/// Original group delivery-status handler command.
+pub const CMD_GROUP_DELIVERIES: u16 = 522;
 pub const CMD_PULL_MSG_1_1: u16 = 510;
 pub const CMD_PULL_MSG_GROUP: u16 = 511;
 pub const CMD_PULL_MSG_513: u16 = 513;

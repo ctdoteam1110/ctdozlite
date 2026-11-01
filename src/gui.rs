@@ -83,6 +83,11 @@ pub enum GuiEvent {
     },
     LoginFailed(String),
     ThreadsUpdated(Vec<Thread>),
+    /// Exact remote progress, applied only to current outgoing message identities.
+    DeliveryEvents {
+        account: String,
+        events: Vec<crate::delivery_receipts::DeliveryEvent>,
+    },
     /// Structured terminal result from the explicit Settings cache-import action.
     OriginalReactionImportFinished {
         account: String,
@@ -1047,6 +1052,16 @@ impl ZaloGuiApp {
                             Ok(None) => self.show_toast("Đã hủy nhập cache cảm xúc"),
                             Err(error) => self.show_toast(error.message()),
                         }
+                    }
+                }
+                GuiEvent::DeliveryEvents { account, events } => {
+                    if self.is_logged_in
+                        && self.user_uin == account
+                        && !crate::delivery_receipts::apply_delivery_events(
+                            &mut self.threads, &events,
+                        ).is_empty()
+                    {
+                        self.persist_threads_async();
                     }
                 }
                 GuiEvent::ReactionEvents { account } => {
