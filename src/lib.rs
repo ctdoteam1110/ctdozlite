@@ -16,3 +16,6 @@ pub mod store;
 pub mod tui;
 pub mod ui;
 pub mod voip_log;
+
+/// Independent resource and transaction primitives.
+pub mod media_resources;
