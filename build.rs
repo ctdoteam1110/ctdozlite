@@ -64,11 +64,17 @@ fn embed_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
     res.extend_from_slice(&grp_dir);
     align4(&mut res);
 
-    // 4. Emit RT_VERSION (type = 16, ID = 1) with CompanyName, FileDescription, ProductName, FileVersion
-    // so Windows Defender / SmartScreen sees a complete PE VERSIONINFO block.
-    let ver_data = build_vs_version_info();
-    write_res_header(&mut res, ver_data.len() as u32, 16, 1, 0x0030);
-    res.extend_from_slice(&ver_data);
+    // 4. Emit RT_VERSION (type = 16, id = 1) with VS_VERSIONINFO + StringFileInfo (#58)
+    let pkg_ver = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+    let ver_blob = build_vs_version_info(&pkg_ver);
+    write_res_header(&mut res, ver_blob.len() as u32, 16, 1, 0x0030);
+    res.extend_from_slice(&ver_blob);
+    align4(&mut res);
+
+    // 5. Emit RT_MANIFEST (type = 24, id = 1) with asInvoker + Win10/11 compatibility (#58)
+    let manifest = build_windows_manifest(&pkg_ver);
+    write_res_header(&mut res, manifest.len() as u32, 24, 1, 0x1030);
+    res.extend_from_slice(manifest.as_bytes());
     align4(&mut res);
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
@@ -120,81 +126,137 @@ fn align4(buf: &mut Vec<u8>) {
 }
 
 #[cfg(target_os = "windows")]
-fn build_vs_version_info() -> Vec<u8> {
-    fn push_wstr(buf: &mut Vec<u8>, s: &str) {
-        for u in s.encode_utf16() {
-            buf.extend_from_slice(&u.to_le_bytes());
+fn push_utf16_z(buf: &mut Vec<u8>, s: &str) {
+    for u in s.encode_utf16() {
+        buf.extend_from_slice(&u.to_le_bytes());
+    }
+    buf.extend_from_slice(&0u16.to_le_bytes());
+}
+
+#[cfg(target_os = "windows")]
+fn build_version_node(key: &str, w_type: u16, value: &[u8], children: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&0u16.to_le_bytes()); // placeholder wLength
+    let val_len = if w_type == 1 {
+        (value.len() / 2) as u16
+    } else {
+        value.len() as u16
+    };
+    out.extend_from_slice(&val_len.to_le_bytes());
+    out.extend_from_slice(&w_type.to_le_bytes());
+    push_utf16_z(&mut out, key);
+    align4(&mut out);
+    if !value.is_empty() {
+        out.extend_from_slice(value);
+        align4(&mut out);
+    }
+    for (idx, child) in children.iter().enumerate() {
+        out.extend_from_slice(child);
+        if idx + 1 < children.len() {
+            align4(&mut out);
         }
-        buf.extend_from_slice(&0u16.to_le_bytes());
     }
+    let total_len = out.len() as u16;
+    out[0..2].copy_from_slice(&total_len.to_le_bytes());
+    out
+}
 
-    fn make_node(key: &str, value: &[u8], is_text: bool, children: &[Vec<u8>]) -> Vec<u8> {
-        let mut node = Vec::new();
-        node.extend_from_slice(&0u16.to_le_bytes()); // wLength placeholder
-        let w_val_len = if is_text {
-            (value.len() / 2) as u16
-        } else {
-            value.len() as u16
-        };
-        node.extend_from_slice(&w_val_len.to_le_bytes());
-        node.extend_from_slice(&(if is_text { 1u16 } else { 0u16 }).to_le_bytes());
-        push_wstr(&mut node, key);
-        align4(&mut node);
-        node.extend_from_slice(value);
-        align4(&mut node);
-        for ch in children {
-            node.extend_from_slice(ch);
-            align4(&mut node);
-        }
-        let total_len = node.len() as u16;
-        node[0..2].copy_from_slice(&total_len.to_le_bytes());
-        node
-    }
+#[cfg(target_os = "windows")]
+fn build_vs_version_info(pkg_ver: &str) -> Vec<u8> {
+    let mut parts = pkg_ver
+        .trim_start_matches(['v', 'V'])
+        .split(['.', '-', '+'])
+        .filter_map(|p| p.parse::<u16>().ok());
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    let build = 0u16;
 
-    fn make_str_pair(k: &str, v: &str) -> Vec<u8> {
-        let mut val_bytes = Vec::new();
-        push_wstr(&mut val_bytes, v);
-        make_node(k, &val_bytes, true, &[])
-    }
-
-    let ver_str = env!("CARGO_PKG_VERSION");
-    let mut parts = ver_str.split('.').map(|x| x.parse::<u16>().unwrap_or(0));
-    let maj = parts.next().unwrap_or(0);
-    let min = parts.next().unwrap_or(0);
-    let pat = parts.next().unwrap_or(3);
+    let file_ver_ms = ((major as u32) << 16) | (minor as u32);
+    let file_ver_ls = ((patch as u32) << 16) | (build as u32);
 
     // VS_FIXEDFILEINFO (52 bytes)
-    let mut ffi = Vec::with_capacity(52);
-    ffi.extend_from_slice(&0xFEEF04BDu32.to_le_bytes()); // dwSignature
-    ffi.extend_from_slice(&0x00010000u32.to_le_bytes()); // dwStrucVersion
-    ffi.extend_from_slice(&(((maj as u32) << 16) | (min as u32)).to_le_bytes()); // dwFileVersionMS
-    ffi.extend_from_slice(&((pat as u32) << 16).to_le_bytes()); // dwFileVersionLS
-    ffi.extend_from_slice(&(((maj as u32) << 16) | (min as u32)).to_le_bytes()); // dwProductVersionMS
-    ffi.extend_from_slice(&((pat as u32) << 16).to_le_bytes()); // dwProductVersionLS
-    ffi.extend_from_slice(&0x3Fu32.to_le_bytes()); // dwFileFlagsMask
-    ffi.extend_from_slice(&0u32.to_le_bytes()); // dwFileFlags
-    ffi.extend_from_slice(&0x00040004u32.to_le_bytes()); // dwFileOS = VOS_NT_WINDOWS32
-    ffi.extend_from_slice(&0x00000001u32.to_le_bytes()); // dwFileType = VFT_APP
-    ffi.extend_from_slice(&0u32.to_le_bytes()); // dwFileSubtype
-    ffi.extend_from_slice(&0u32.to_le_bytes()); // dwFileDateMS
-    ffi.extend_from_slice(&0u32.to_le_bytes()); // dwFileDateLS
+    let mut fixed = Vec::with_capacity(52);
+    fixed.extend_from_slice(&0xFEEF04BDu32.to_le_bytes()); // dwSignature
+    fixed.extend_from_slice(&0x00010000u32.to_le_bytes()); // dwStrucVersion
+    fixed.extend_from_slice(&file_ver_ms.to_le_bytes()); // dwFileVersionMS
+    fixed.extend_from_slice(&file_ver_ls.to_le_bytes()); // dwFileVersionLS
+    fixed.extend_from_slice(&file_ver_ms.to_le_bytes()); // dwProductVersionMS
+    fixed.extend_from_slice(&file_ver_ls.to_le_bytes()); // dwProductVersionLS
+    fixed.extend_from_slice(&0x0000003Fu32.to_le_bytes()); // dwFileFlagsMask
+    fixed.extend_from_slice(&0x00000000u32.to_le_bytes()); // dwFileFlags
+    fixed.extend_from_slice(&0x00040004u32.to_le_bytes()); // dwFileOS = VOS_NT_WINDOWS32
+    fixed.extend_from_slice(&0x00000001u32.to_le_bytes()); // dwFileType = VFT_APP
+    fixed.extend_from_slice(&0x00000000u32.to_le_bytes()); // dwFileSubtype
+    fixed.extend_from_slice(&0x00000000u32.to_le_bytes()); // dwFileDateMS
+    fixed.extend_from_slice(&0x00000000u32.to_le_bytes()); // dwFileDateLS
 
-    let str_entries = vec![
-        make_str_pair("CompanyName", "ctdoteam1110"),
-        make_str_pair("FileDescription", "ctdozlite Native Zalo Desktop Client"),
-        make_str_pair("FileVersion", ver_str),
-        make_str_pair("InternalName", "ctdozlite.exe"),
-        make_str_pair("LegalCopyright", "Copyright (c) 2026 ctdoteam1110 (MIT OR Apache-2.0)"),
-        make_str_pair("OriginalFilename", "ctdozlite.exe"),
-        make_str_pair("ProductName", "ctdozlite"),
-        make_str_pair("ProductVersion", ver_str),
+    let ver_quad = format!("{major}.{minor}.{patch}.{build}");
+    let string_pairs = [
+        ("CompanyName", "ctdoteam1110"),
+        ("FileDescription", "ctdozlite Native Desktop Client"),
+        ("FileVersion", ver_quad.as_str()),
+        ("InternalName", "ctdozlite.exe"),
+        ("LegalCopyright", "Copyright (c) 2026 ctdoteam1110 (MIT OR Apache-2.0)"),
+        ("OriginalFilename", "ctdozlite.exe"),
+        ("ProductName", "ctdozlite"),
+        ("ProductVersion", pkg_ver),
     ];
-    let str_table = make_node("040904B0", &[], true, &str_entries);
-    let str_file_info = make_node("StringFileInfo", &[], true, &[str_table]);
 
-    let trans_val = [0x09u8, 0x04, 0xB0, 0x04]; // 0x0409 (en-US), 1200 (UTF-16)
-    let var_node = make_node("Translation", &trans_val, false, &[]);
-    let var_file_info = make_node("VarFileInfo", &[], true, &[var_node]);
+    let mut string_nodes = Vec::with_capacity(string_pairs.len());
+    for (k, v) in string_pairs {
+        let mut val_utf16 = Vec::new();
+        push_utf16_z(&mut val_utf16, v);
+        string_nodes.push(build_version_node(k, 1, &val_utf16, &[]));
+    }
 
-    make_node("VS_VERSION_INFO", &ffi, false, &[str_file_info, var_file_info])
+    let string_table = build_version_node("040904B0", 1, &[], &string_nodes);
+    let string_file_info = build_version_node("StringFileInfo", 1, &[], &[string_table]);
+
+    let translation_val = [0x09, 0x04, 0xB0, 0x04]; // 0x0409 (en-US), 1200 (UTF-16)
+    let var_node = build_version_node("Translation", 0, &translation_val, &[]);
+    let var_file_info = build_version_node("VarFileInfo", 1, &[], &[var_node]);
+
+    build_version_node(
+        "VS_VERSION_INFO",
+        0,
+        &fixed,
+        &[string_file_info, var_file_info],
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn build_windows_manifest(pkg_ver: &str) -> String {
+    let mut parts = pkg_ver
+        .trim_start_matches(['v', 'V'])
+        .split(['.', '-', '+'])
+        .filter_map(|p| p.parse::<u16>().ok());
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="ctdoteam1110.ctdozlite" version="{major}.{minor}.{patch}.0" processorArchitecture="amd64"/>
+  <description>ctdozlite Native Desktop Client</description>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}}"/>
+      <supportedOS Id="{{1f676c76-80e1-4239-95bb-83d0f6d0da78}}"/>
+    </application>
+  </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>"#
+    )
 }

@@ -1,0 +1,36 @@
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+      - duplicate
+      - invalid
+      - wontfix
+    authors:
+      - dependabot
+  categories:
+    - title: "✨ Tính năng mới (Features)"
+      labels:
+        - feat
+        - feature
+        - enhancement
+    - title: "🐛 Sửa lỗi (Fixes)"
+      labels:
+        - fix
+        - bug
+    - title: "⚡ Hiệu năng (Performance)"
+      labels:
+        - perf
+        - performance
+    - title: "📚 Tài liệu (Documentation)"
+      labels:
+        - docs
+        - documentation
+    - title: "🔧 CI / Đóng gói (CI & Build)"
+      labels:
+        - ci
+        - build
+        - release
+        - chore
+    - title: "📦 Thay đổi khác (Other Changes)"
+      labels:
+        - "*"

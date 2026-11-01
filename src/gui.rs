@@ -139,6 +139,18 @@ pub enum GuiEvent {
         reason: String,
     },
     StatusUpdate(String),
+    RefreshFinished {
+        threads: usize,
+        messages: usize,
+        errors: Vec<String>,
+        manual: bool,
+    },
+    ScheduledListUpdated,
+    SyncFinished {
+        added: usize,
+        errors: Vec<String>,
+        cancelled: bool,
+    },
     UpdateCheckFinished {
         result: Result<UpdateCheckResult, String>,
         silent: bool,
@@ -177,21 +189,12 @@ pub struct UpdateCheckResult {
 
 /// Compare semantic versions (`"v0.0.2"` > `"0.0.1"`).
 pub fn is_newer_semver(remote: &str, current: &str) -> bool {
-    let parse = |s: &str| -> (u64, u64, u64) {
-        let clean = s
-            .trim()
-            .trim_start_matches(['v', 'V'])
-            .split(['-', '+'])
-            .next()
-            .unwrap_or("");
-        let mut parts = clean.split('.').filter_map(|p| p.trim().parse::<u64>().ok());
-        (
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-        )
-    };
-    parse(remote) > parse(current)
+    crate::updater::is_newer_semver(remote, current)
+}
+
+/// Query GitHub Releases API (`/repos/ctdoteam1110/ctdozlite/releases/latest`) for updates.
+pub async fn check_github_release_cli() -> Result<UpdateCheckResult, String> {
+    worker::fetch_github_latest_release().await
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +287,9 @@ struct AppSettings {
     muted_threads: HashMap<String, i64>,
     hidden_threads: HashSet<String>,
     thread_labels: HashMap<String, String>,
+    // 9. Cập nhật tự động qua GitHub Releases API
+    auto_check_updates: bool,
+    skipped_update_version: String,
 }
 
 impl Default for AppSettings {
@@ -332,6 +338,8 @@ impl Default for AppSettings {
             muted_threads: HashMap::new(),
             hidden_threads: HashSet::new(),
             thread_labels: HashMap::new(),
+            auto_check_updates: true,
+            skipped_update_version: String::new(),
         }
     }
 }
@@ -354,6 +362,24 @@ impl AppSettings {
 
 /// Bubbles rendered per step in the chat view; "Tải thêm tin nhắn cũ" adds another step.
 const CHAT_RENDER_STEP: usize = 150;
+
+/// Worker → GUI channel that wakes the UI on every send. The GUI no longer repaints on a
+/// 1.2 s timer, so an event sent without a repaint would sit unseen until the next mouse move.
+#[derive(Clone)]
+pub struct GuiTx {
+    tx: Sender<GuiEvent>,
+    ctx: egui::Context,
+}
+
+impl GuiTx {
+    /// Same contract as `Sender::send` (callers already `let _ =` it), plus the wake-up.
+    #[allow(clippy::result_large_err)]
+    pub fn send(&self, ev: GuiEvent) -> Result<(), std::sync::mpsc::SendError<GuiEvent>> {
+        let res = self.tx.send(ev);
+        self.ctx.request_repaint();
+        res
+    }
+}
 
 pub struct ZaloGuiApp {
     // Theme state
@@ -451,6 +477,9 @@ pub struct ZaloGuiApp {
     update_progress: Option<(u64, u64)>,
     update_status: String,
     update_info: Option<UpdateCheckResult>,
+    update_modal_open: bool,
+    update_banner_dismissed: bool,
+    last_notified_update_version: Option<String>,
     dev_mode: bool,
     dev_panel_open: bool,
     dev_tab: DevTab,
@@ -475,6 +504,10 @@ pub struct ZaloGuiApp {
     feed_pkt_tab: u32,
     feed_pkt_page: u32,
     feed_pkt_count: u32,
+    schedule_modal_open: bool,
+    schedule_custom_input: String,
+    schedule_editing_id: Option<i64>,
+    scheduled_items: Vec<crate::scheduler::ScheduledMessage>,
 
     // Background channels
     event_rx: Receiver<GuiEvent>,
@@ -482,9 +515,6 @@ pub struct ZaloGuiApp {
     event_tx: Sender<GuiEvent>,
     /// (thread id, number of newest bubbles rendered) — see `CHAT_RENDER_STEP`.
     chat_render_window: (String, usize),
-
-    // Background poll trigger
-    last_poll: std::time::Instant,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -519,11 +549,7 @@ impl ZaloGuiApp {
         crate::media::set_selected_mic_device(&loaded_settings.selected_mic_device);
         crate::media::set_selected_camera_device(&loaded_settings.selected_camera_device);
         let dark_mode = loaded_settings.theme_mode != "light";
-        if dark_mode {
-            ThemePalette::dark().apply_to_ctx(&cc.egui_ctx);
-        } else {
-            ThemePalette::light().apply_to_ctx(&cc.egui_ctx);
-        }
+        ThemePalette::load_with_custom_override(dark_mode).apply_to_ctx(&cc.egui_ctx);
 
         let (tx, rx) = channel();
 
@@ -655,6 +681,9 @@ impl ZaloGuiApp {
             update_progress: None,
             update_status: String::new(),
             update_info: None,
+            update_modal_open: false,
+            update_banner_dismissed: false,
+            last_notified_update_version: None,
             dev_mode,
             dev_panel_open: false,
             dev_tab: DevTab::Logs,
@@ -679,11 +708,17 @@ impl ZaloGuiApp {
             feed_pkt_tab: 0,
             feed_pkt_page: 1,
             feed_pkt_count: 20,
+            schedule_modal_open: false,
+            schedule_custom_input: String::new(),
+            schedule_editing_id: None,
+            scheduled_items: crate::scheduler::list_pending_scheduled("zalo_history.db", None)
+                .unwrap_or_default(),
             event_rx: rx,
             event_tx: tx.clone(),
             chat_render_window: (String::new(), CHAT_RENDER_STEP),
-            last_poll: std::time::Instant::now(),
         };
+        let mut app = app;
+        let _ = app.reload_custom_sticker_packs();
 
         // Clean up any leftover `.old` executable from a previous in-place self-update
         if let Ok(exe_path) = std::env::current_exe() {
@@ -693,7 +728,15 @@ impl ZaloGuiApp {
             let _ = std::fs::remove_file(&old_unix);
         }
 
-        spawn_session_worker(session, tx, cc.egui_ctx.clone());
+        app.publish_known_threads();
+        spawn_session_worker(
+            session,
+            GuiTx {
+                tx,
+                ctx: cc.egui_ctx.clone(),
+            },
+            cc.egui_ctx.clone(),
+        );
         ensure_cjk_font(&cc.egui_ctx, thread_texts(&app.threads));
 
         if let Some(wtx) = WORKER_TX.get() {
@@ -708,14 +751,45 @@ impl ZaloGuiApp {
     }
 
     fn palette(&self) -> ThemePalette {
-        if self.dark_mode {
-            ThemePalette::dark()
-        } else {
-            ThemePalette::light()
+        ThemePalette::load_with_custom_override(self.dark_mode)
+    }
+
+    pub(super) fn reload_custom_sticker_packs(&mut self) -> usize {
+        let packs = load_custom_sticker_packs();
+        let count = packs.len();
+        for p in packs {
+            if !self
+                .pinned_sticker_packs
+                .iter()
+                .any(|(cid, _)| *cid == p.cate_id)
+            {
+                self.pinned_sticker_packs.push((p.cate_id, p.name.clone()));
+            }
+            if let Some(items) = builtin_pack_stickers(p.cate_id) {
+                self.sticker_pack_items.insert(p.cate_id, items);
+            }
+        }
+        count
+    }
+
+    pub(super) fn refresh_scheduled_items(&mut self) {
+        self.scheduled_items =
+            crate::scheduler::list_pending_scheduled("zalo_history.db", None).unwrap_or_default();
+    }
+
+    /// Hand the worker's poll timer the thread ids/names it maps incoming messages onto.
+    fn publish_known_threads(&self) {
+        if let Ok(mut known) = KNOWN_THREADS.lock() {
+            *known = self
+                .threads
+                .iter()
+                .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
+                .collect();
         }
     }
 
     fn persist_threads_async(&self) {
+        self.publish_known_threads();
         let snapshot = self.threads.clone();
         if let Some(wtx) = WORKER_TX.get() {
             let _ = wtx.send(WorkerCmd::PersistThreads(snapshot));
@@ -1259,6 +1333,46 @@ impl ZaloGuiApp {
                 GuiEvent::StatusUpdate(msg) => {
                     self.status_msg = msg;
                 }
+                GuiEvent::RefreshFinished {
+                    threads,
+                    messages,
+                    errors,
+                    manual,
+                } => {
+                    let msg = if errors.is_empty() {
+                        format!("✅ Đã làm mới {threads} hội thoại ({messages} tin nhắn)")
+                    } else {
+                        format!(
+                            "⚠️ Làm mới {threads} hội thoại · {} lỗi (vd. {})",
+                            errors.len(),
+                            errors[0]
+                        )
+                    };
+                    self.status_msg = msg.clone();
+                    if manual {
+                        self.show_toast(msg);
+                    }
+                }
+                GuiEvent::ScheduledListUpdated => {
+                    self.refresh_scheduled_items();
+                }
+                GuiEvent::SyncFinished {
+                    added,
+                    errors,
+                    cancelled,
+                } => {
+                    let head = if cancelled {
+                        "Đã dừng đồng bộ"
+                    } else {
+                        "Đồng bộ xong"
+                    };
+                    let mut msg = format!("{head}: lưu thêm {added} tin cũ");
+                    if let Some(first) = errors.first() {
+                        msg.push_str(&format!(" · {} lỗi (vd. {first})", errors.len()));
+                    }
+                    self.status_msg = msg.clone();
+                    self.show_toast(msg);
+                }
                 GuiEvent::UpdateCheckFinished { result, silent } => {
                     self.update_checking = false;
                     match result {
@@ -1269,7 +1383,27 @@ impl ZaloGuiApp {
                                     info.latest_version, info.current_version
                                 );
                                 self.update_status = msg.clone();
-                                self.show_toast(msg);
+                                let is_skipped = silent
+                                    && !self.settings.skipped_update_version.is_empty()
+                                    && self.settings.skipped_update_version == info.latest_version;
+                                let already_notified = self.last_notified_update_version.as_deref()
+                                    == Some(info.latest_version.as_str());
+                                if !is_skipped {
+                                    self.show_toast(msg);
+                                    if !already_notified || !silent {
+                                        self.last_notified_update_version =
+                                            Some(info.latest_version.clone());
+                                        self.update_modal_open = true;
+                                        self.update_banner_dismissed = false;
+                                        if self.settings.enable_notifications {
+                                            crate::updater::notify_os_new_update(
+                                                &info.latest_version,
+                                                &info.current_version,
+                                                &info.release_title,
+                                            );
+                                        }
+                                    }
+                                }
                             } else {
                                 self.update_status = format!(
                                     "✅ Bạn đang sử dụng phiên bản mới nhất (v{})",
@@ -1379,22 +1513,7 @@ impl eframe::App for ZaloGuiApp {
 
         self.check_events(ctx);
 
-        // Non-overlapping long-poll trigger; wakes only every 1.2s to keep idle CPU ~0%
-        if self.is_logged_in && self.last_poll.elapsed() >= Duration::from_millis(1200) {
-            self.last_poll = std::time::Instant::now();
-            if let Some(tx) = WORKER_TX.get() {
-                let known: Vec<(String, String, bool)> = self
-                    .threads
-                    .iter()
-                    .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
-                    .collect();
-                let _ = tx.send(WorkerCmd::PollMessages {
-                    known_threads: known,
-                });
-            }
-        }
-
-        ctx.request_repaint_after(Duration::from_millis(1200));
+        // No timer repaint: the worker owns the poll timer and every GuiTx send wakes the UI.
 
         let pal = self.palette();
 
@@ -1456,6 +1575,9 @@ impl eframe::App for ZaloGuiApp {
         } else {
             self.render_chat_workspace(ctx, &pal);
         }
+
+        // Auto-notification modal for new GitHub Releases (works on both Login & Chat screens)
+        self.render_update_notification_modal(ctx, &pal);
 
         if !ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
             let screen = ctx.screen_rect();
@@ -1755,6 +1877,43 @@ impl ZaloGuiApp {
                         }
 
                         buttons_left_x = th_rect.left();
+
+                        if let Some(ref upd) = self.update_info {
+                            if upd.has_update {
+                                ui.add_space(6.0);
+                                let badge_txt = if self.update_downloading {
+                                    let (dl, tot) = self.update_progress.unwrap_or((0, 0));
+                                    if tot > 0 {
+                                        let pct = ((dl as f64 / tot as f64) * 100.0).clamp(0.0, 100.0);
+                                        format!("⏳ Đang cập nhật {pct:.0}%")
+                                    } else {
+                                        "⏳ Đang tải cập nhật…".to_string()
+                                    }
+                                } else {
+                                    format!("🚀 Cập nhật mới v{}", upd.latest_version)
+                                };
+                                let upd_pill = egui::Button::new(
+                                    RichText::new(badge_txt)
+                                        .size(11.2)
+                                        .color(Color32::WHITE)
+                                        .strong(),
+                                )
+                                .fill(pal.accent_online)
+                                .rounding(Rounding::same(5.0));
+                                let r = ui
+                                    .add(upd_pill)
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text(format!(
+                                        "Đã có phiên bản v{} trên GitHub Releases — Bấm để xem chi tiết & cập nhật tự động",
+                                        upd.latest_version
+                                    ));
+                                buttons_left_x = r.rect.left() - 8.0;
+                                if r.clicked() {
+                                    self.update_modal_open = true;
+                                    self.update_banner_dismissed = false;
+                                }
+                            }
+                        }
 
                         if !self.is_logged_in && !self.threads.is_empty() {
                             ui.add_space(8.0);

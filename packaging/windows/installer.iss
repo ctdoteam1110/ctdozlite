@@ -3,7 +3,7 @@
 ;   iscc /DMyAppVersion=<version> packaging/windows/installer.iss
 ; A local build without that flag intentionally gets 0.0.0 instead of a stale version.
 #ifndef MyAppVersion
-#define MyAppVersion "0.0.4"
+#define MyAppVersion "0.0.0"
 #endif
 #define MyAppPublisher "ctdoteam1110"
 #define MyAppURL "https://github.com/ctdoteam1110/ctdozlite"
@@ -25,13 +25,19 @@ PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=..\..\dist
 OutputBaseFilename=ctdozlite-setup-windows-x86_64
 SetupIconFile=..\..\src\assets\app_icon.ico
-Compression=zip
+; Use standard ZIP/DEFLATE non-solid packaging instead of solid LZMA2 streams and
+; embed complete PE VersionInfo metadata so unsigned Inno Setup installers do not
+; trigger Microsoft Defender ML Trojan false positives (#58).
+Compression=zip/9
 SolidCompression=no
+SignedUninstaller=no
 VersionInfoVersion={#MyAppVersion}.0
 VersionInfoCompany={#MyAppPublisher}
-VersionInfoDescription=ctdozlite Native Zalo Desktop Client Installer
+VersionInfoDescription=ctdozlite Native Desktop Client Installer
+VersionInfoTextVersion={#MyAppVersion}
 VersionInfoProductName={#MyAppName}
-VersionInfoProductVersion={#MyAppVersion}
+VersionInfoProductVersion={#MyAppVersion}.0
+VersionInfoCopyright=Copyright (C) 2026 ctdoteam1110 (MIT OR Apache-2.0)
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible

@@ -1,8 +1,4 @@
 [env]
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
-LIBOPUS_STATIC = "1"
-LIBOPUS_NO_PKG = "1"
-OPUS_STATIC = "1"
-OPUS_NO_PKG = "1"
 CMAKE_TOOLCHAIN_FILE_aarch64_apple_darwin = { value = "packaging/macos/toolchain-arm64.cmake", relative = true }
 CMAKE_TOOLCHAIN_FILE_x86_64_apple_darwin = { value = "packaging/macos/toolchain-x86_64.cmake", relative = true }

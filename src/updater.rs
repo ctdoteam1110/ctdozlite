@@ -350,3 +350,419 @@ pub fn install_release(
     };
     prepare_install(bytes, destination, portable)?.finish(launch)
 }
+
+/// Metadata parsed from GitHub Releases REST API (`/repos/{owner}/{repo}/releases/latest`)
+/// or the static `latest.json` release manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubReleaseMetadata {
+    pub current_version: String,
+    pub latest_version: String,
+    pub has_update: bool,
+    pub release_title: String,
+    pub release_notes: String,
+    pub html_url: String,
+    pub download_url: Option<String>,
+    pub asset_name: Option<String>,
+    pub asset_size: u64,
+    pub expected_sha256: Option<String>,
+    pub published_at: String,
+    pub sha256sums_url: Option<String>,
+}
+
+/// Compare semantic versions (`"v0.0.4"` > `"0.0.3"`).
+pub fn is_newer_semver(remote: &str, current: &str) -> bool {
+    let parse = |s: &str| -> (u64, u64, u64, bool) {
+        let trimmed = s.trim().trim_start_matches(['v', 'V']);
+        let (core, rest) = trimmed
+            .split_once(['-', '+'])
+            .map_or((trimmed, ""), |(c, r)| (c, r));
+        let is_stable = !trimmed.contains('-') || rest.is_empty();
+        let mut parts = core.split('.').filter_map(|p| p.trim().parse::<u64>().ok());
+        (
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            is_stable,
+        )
+    };
+    parse(remote) > parse(current)
+}
+
+/// Score a release asset filename for a target `(os, arch)` pair.
+/// Returns `<= 0` when the asset is incompatible with the platform.
+pub fn select_platform_asset_score(name: &str, target_os: &str, target_arch: &str) -> i32 {
+    let n_low = name.to_ascii_lowercase();
+    if n_low.is_empty()
+        || n_low.ends_with(".txt")
+        || n_low.ends_with(".json")
+        || n_low.ends_with(".sig")
+        || n_low.ends_with(".asc")
+    {
+        return -1;
+    }
+    match target_os {
+        "windows" => {
+            if n_low.ends_with(".exe") && n_low.contains("portable") {
+                110
+            } else if n_low.ends_with(".exe") && n_low.contains("setup") {
+                90
+            } else if n_low.ends_with(".exe") {
+                80
+            } else {
+                0
+            }
+        }
+        "macos" => {
+            if !n_low.ends_with(".dmg") {
+                return 0;
+            }
+            if target_arch == "aarch64" && (n_low.contains("arm64") || n_low.contains("aarch64")) {
+                110
+            } else if target_arch == "x86_64"
+                && (n_low.contains("x86_64") || n_low.contains("intel"))
+            {
+                110
+            } else if !n_low.contains("arm64")
+                && !n_low.contains("aarch64")
+                && !n_low.contains("x86_64")
+                && !n_low.contains("intel")
+            {
+                100
+            } else {
+                50
+            }
+        }
+        _ => {
+            if n_low.ends_with(".appimage") {
+                100
+            } else if n_low.ends_with(".deb") && !n_low.contains("legacy") {
+                90
+            } else if n_low.ends_with(".tar.gz") && !n_low.contains("legacy") {
+                80
+            } else if n_low.ends_with(".rpm") {
+                70
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// Extract a 64-character lowercase SHA-256 hex digest from `SHA256SUMS.txt` content for `asset_name`.
+pub fn parse_sha256sums_for_asset(sha256sums_text: &str, asset_name: &str) -> Option<String> {
+    for line in sha256sums_text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else { continue };
+        let Some(fname) = parts.next() else { continue };
+        let clean_fname = fname.trim_start_matches('*').trim_start_matches("./");
+        if clean_fname == asset_name
+            && hash.len() == 64
+            && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+/// Parse either a GitHub Releases API JSON object (`/releases/latest`) or a `latest.json`
+/// manifest object into [`GitHubReleaseMetadata`].
+pub fn parse_github_release_value(
+    rel: &serde_json::Value,
+    current_ver: &str,
+    repo_slug: &str,
+    target_os: &str,
+    target_arch: &str,
+) -> GitHubReleaseMetadata {
+    let raw_tag = rel
+        .get("tag_name")
+        .or_else(|| rel.get("version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(current_ver);
+    let latest_ver = raw_tag.trim().trim_start_matches(['v', 'V']).to_string();
+    let has_update = is_newer_semver(&latest_ver, current_ver);
+
+    let release_title = rel
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("ctdozlite v{latest_ver}"));
+
+    let release_notes = rel
+        .get("body")
+        .or_else(|| rel.get("notes"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let html_url = rel
+        .get("html_url")
+        .or_else(|| rel.get("release_url"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://github.com/{repo_slug}/releases/tag/v{latest_ver}"));
+
+    let published_at = rel
+        .get("published_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .split('T')
+        .next()
+        .unwrap_or("")
+        .to_string();
+
+    let mut best_url: Option<String> = None;
+    let mut best_name: Option<String> = None;
+    let mut best_size: u64 = 0;
+    let mut best_sha256: Option<String> = None;
+    let mut best_score: i32 = 0;
+    let mut sha256sums_url: Option<String> = None;
+
+    if let Some(assets) = rel.get("assets").and_then(|v| v.as_array()) {
+        for a in assets {
+            let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let dl = a
+                .get("browser_download_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let sz = a.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            if name.eq_ignore_ascii_case("SHA256SUMS.txt") && !dl.is_empty() {
+                sha256sums_url = Some(dl.to_string());
+                continue;
+            }
+            if name.is_empty() || dl.is_empty() {
+                continue;
+            }
+            let score = select_platform_asset_score(name, target_os, target_arch);
+            if score > best_score {
+                best_score = score;
+                best_url = Some(dl.to_string());
+                best_name = Some(name.to_string());
+                best_size = sz;
+                // Extract SHA-256 from `latest.json` (`sha256`) or GitHub API asset (`digest: "sha256:..."`)
+                best_sha256 = a
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        a.get("digest")
+                            .and_then(|v| v.as_str())
+                            .and_then(|d| d.strip_prefix("sha256:"))
+                    })
+                    .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .map(|h| h.to_ascii_lowercase());
+            }
+        }
+    }
+
+    // Legacy single-asset `latest.json` fallback when `assets` array is absent
+    if best_url.is_none() && rel.get("assets").is_none() {
+        let fallback_name = match target_os {
+            "windows" => format!("ctdozlite-{latest_ver}-portable-windows-x86_64.exe"),
+            "macos" => match target_arch {
+                "aarch64" => format!("ctdozlite-{latest_ver}-macos-arm64.dmg"),
+                "x86_64" => format!("ctdozlite-{latest_ver}-macos-x86_64.dmg"),
+                _ => format!("ctdozlite-{latest_ver}-macos.dmg"),
+            },
+            _ => format!("ctdozlite-{latest_ver}-x86_64.AppImage"),
+        };
+        best_url = Some(format!(
+            "https://github.com/{repo_slug}/releases/download/v{latest_ver}/{fallback_name}"
+        ));
+        best_name = Some(fallback_name);
+        best_sha256 = rel
+            .get("sha256")
+            .and_then(|v| v.as_str())
+            .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(|h| h.to_ascii_lowercase());
+    }
+
+    GitHubReleaseMetadata {
+        current_version: current_ver.to_string(),
+        latest_version: latest_ver,
+        has_update,
+        release_title,
+        release_notes,
+        html_url,
+        download_url: best_url,
+        asset_name: best_name,
+        asset_size: best_size,
+        expected_sha256: best_sha256,
+        published_at,
+        sha256sums_url,
+    }
+}
+
+/// Dispatch a non-blocking native OS desktop notification announcing a new GitHub release.
+pub fn notify_os_new_update(latest_version: &str, current_version: &str, release_title: &str) {
+    let title = format!("ctdozlite — Có bản cập nhật mới v{latest_version}");
+    let body = if release_title.trim().is_empty() {
+        format!("Phiên bản mới v{latest_version} đã sẵn sàng trên GitHub (hiện tại: v{current_version}). Mở ứng dụng để cập nhật tự động.")
+    } else {
+        format!("{release_title} đã sẵn sàng trên GitHub (hiện tại: v{current_version}). Mở ứng dụng để cập nhật ngay!")
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        let esc_title = title.replace('\\', "\\\\").replace('"', "\\\"");
+        let esc_body = body.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "display notification \"{esc_body}\" with title \"{esc_title}\" sound name \"Glass\""
+        );
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("notify-send")
+            .args([
+                "-a",
+                "ctdozlite",
+                "-i",
+                "software-update-available",
+                &title,
+                &body,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let esc_title = title.replace('\'', "''");
+        let esc_body = body.replace('\'', "''");
+        let ps_script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             $n = New-Object System.Windows.Forms.NotifyIcon; \
+             $n.Icon = [System.Drawing.SystemIcons]::Information; \
+             $n.BalloonTipTitle = '{esc_title}'; \
+             $n.BalloonTipText = '{esc_body}'; \
+             $n.Visible = $true; \
+             $n.ShowBalloonTip(6000); \
+             Start-Sleep -Seconds 6; \
+             $n.Dispose();"
+        );
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &ps_script,
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
+#[cfg(test)]
+mod github_api_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_newer_semver_comparisons() {
+        assert!(is_newer_semver("0.0.4", "0.0.3"));
+        assert!(is_newer_semver("v0.0.4", "0.0.3"));
+        assert!(is_newer_semver("v0.1.0", "v0.0.9"));
+        assert!(!is_newer_semver("0.0.3", "0.0.3"));
+        assert!(!is_newer_semver("0.0.2", "0.0.3"));
+        assert!(is_newer_semver("0.0.4", "0.0.4-rc.1"));
+    }
+
+    #[test]
+    fn test_parse_github_release_api_payload_with_native_digest() {
+        let api_json = serde_json::json!({
+            "tag_name": "v0.0.4",
+            "name": "ctdozlite v0.0.4",
+            "body": "- Sửa lỗi Windows Defender\n- Tự động thông báo cập nhật qua GitHub API",
+            "html_url": "https://github.com/ctdoteam1110/ctdozlite/releases/tag/v0.0.4",
+            "published_at": "2026-11-02T03:00:00Z",
+            "assets": [
+                {
+                    "name": "SHA256SUMS.txt",
+                    "size": 512,
+                    "browser_download_url": "https://github.com/ctdoteam1110/ctdozlite/releases/download/v0.0.4/SHA256SUMS.txt"
+                },
+                {
+                    "name": "ctdozlite-0.0.4-setup-windows-x86_64.exe",
+                    "size": 9500000,
+                    "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                    "browser_download_url": "https://github.com/ctdoteam1110/ctdozlite/releases/download/v0.0.4/ctdozlite-0.0.4-setup-windows-x86_64.exe"
+                },
+                {
+                    "name": "ctdozlite-0.0.4-portable-windows-x86_64.exe",
+                    "size": 8400000,
+                    "digest": "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                    "browser_download_url": "https://github.com/ctdoteam1110/ctdozlite/releases/download/v0.0.4/ctdozlite-0.0.4-portable-windows-x86_64.exe"
+                },
+                {
+                    "name": "ctdozlite-0.0.4-macos-arm64.dmg",
+                    "size": 10200000,
+                    "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                    "browser_download_url": "https://github.com/ctdoteam1110/ctdozlite/releases/download/v0.0.4/ctdozlite-0.0.4-macos-arm64.dmg"
+                }
+            ]
+        });
+
+        let win_meta = parse_github_release_value(
+            &api_json,
+            "0.0.3",
+            "ctdoteam1110/ctdozlite",
+            "windows",
+            "x86_64",
+        );
+        assert!(win_meta.has_update);
+        assert_eq!(win_meta.latest_version, "0.0.4");
+        assert_eq!(
+            win_meta.asset_name.as_deref(),
+            Some("ctdozlite-0.0.4-portable-windows-x86_64.exe")
+        );
+        assert_eq!(
+            win_meta.expected_sha256.as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+        );
+        assert_eq!(win_meta.published_at, "2026-11-02");
+
+        let mac_meta = parse_github_release_value(
+            &api_json,
+            "0.0.3",
+            "ctdoteam1110/ctdozlite",
+            "macos",
+            "aarch64",
+        );
+        assert_eq!(
+            mac_meta.asset_name.as_deref(),
+            Some("ctdozlite-0.0.4-macos-arm64.dmg")
+        );
+        assert_eq!(
+            mac_meta.expected_sha256.as_deref(),
+            Some("2222222222222222222222222222222222222222222222222222222222222222")
+        );
+    }
+
+    #[test]
+    fn test_parse_sha256sums_for_asset() {
+        let sums = "\
+abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789  ctdozlite-0.0.4-portable-windows-x86_64.exe\n\
+2222222222222222222222222222222222222222222222222222222222222222 *./ctdozlite-0.0.4-macos-arm64.dmg\n";
+        assert_eq!(
+            parse_sha256sums_for_asset(sums, "ctdozlite-0.0.4-macos-arm64.dmg").as_deref(),
+            Some("2222222222222222222222222222222222222222222222222222222222222222")
+        );
+    }
+}

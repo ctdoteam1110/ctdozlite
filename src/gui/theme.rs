@@ -139,6 +139,114 @@ impl ThemePalette {
         style.visuals = visuals;
         ctx.set_style(style);
     }
+
+    /// Load either the built-in dark/light palette or apply custom overrides from `theme.json` (#7).
+    pub(super) fn load_with_custom_override(dark_mode: bool) -> Self {
+        let mut base = if dark_mode { Self::dark() } else { Self::light() };
+        if let Ok(raw) = std::fs::read_to_string("theme.json") {
+            base.apply_json_overrides(&raw);
+        }
+        base
+    }
+
+    /// Apply any `#RRGGBB` color overrides from a JSON string (`theme.json`) (#7).
+    pub(super) fn apply_json_overrides(&mut self, json_text: &str) {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(json_text) else {
+            return;
+        };
+        let sub = if self.is_dark {
+            val.get("dark").unwrap_or(&val)
+        } else {
+            val.get("light").unwrap_or(&val)
+        };
+        for (key, target) in [
+            ("bg_app", &mut self.bg_app),
+            ("bg_sidebar", &mut self.bg_sidebar),
+            ("bg_chat_canvas", &mut self.bg_chat_canvas),
+            ("bg_elevated", &mut self.bg_elevated),
+            ("bg_hover", &mut self.bg_hover),
+            ("bg_selected", &mut self.bg_selected),
+            ("bg_input", &mut self.bg_input),
+            ("border", &mut self.border),
+            ("text_primary", &mut self.text_primary),
+            ("text_secondary", &mut self.text_secondary),
+            ("text_muted", &mut self.text_muted),
+            ("primary", &mut self.primary),
+            ("primary_hover", &mut self.primary_hover),
+            ("accent_online", &mut self.accent_online),
+            ("danger", &mut self.danger),
+            ("warning", &mut self.warning),
+            ("bubble_out_bg", &mut self.bubble_out_bg),
+            ("bubble_out_text", &mut self.bubble_out_text),
+            ("bubble_out_meta", &mut self.bubble_out_meta),
+            ("bubble_in_bg", &mut self.bubble_in_bg),
+            ("bubble_in_border", &mut self.bubble_in_border),
+            ("bubble_in_text", &mut self.bubble_in_text),
+            ("bubble_in_meta", &mut self.bubble_in_meta),
+        ] {
+            if let Some(hex) = sub.get(key).and_then(|v| v.as_str()) {
+                if let Some(c) = parse_hex_color(hex) {
+                    *target = c;
+                }
+            }
+        }
+    }
+
+    /// Export a sample `theme.json` containing both `dark` and `light` token maps (#7).
+    pub(super) fn export_template(path: &str) -> std::io::Result<()> {
+        let d = Self::dark();
+        let l = Self::light();
+        let to_map = |p: &Self| {
+            serde_json::json!({
+                "bg_app": format_hex_color(p.bg_app),
+                "bg_sidebar": format_hex_color(p.bg_sidebar),
+                "bg_chat_canvas": format_hex_color(p.bg_chat_canvas),
+                "bg_elevated": format_hex_color(p.bg_elevated),
+                "bg_hover": format_hex_color(p.bg_hover),
+                "bg_selected": format_hex_color(p.bg_selected),
+                "bg_input": format_hex_color(p.bg_input),
+                "border": format_hex_color(p.border),
+                "text_primary": format_hex_color(p.text_primary),
+                "text_secondary": format_hex_color(p.text_secondary),
+                "text_muted": format_hex_color(p.text_muted),
+                "primary": format_hex_color(p.primary),
+                "primary_hover": format_hex_color(p.primary_hover),
+                "accent_online": format_hex_color(p.accent_online),
+                "danger": format_hex_color(p.danger),
+                "warning": format_hex_color(p.warning),
+                "bubble_out_bg": format_hex_color(p.bubble_out_bg),
+                "bubble_out_text": format_hex_color(p.bubble_out_text),
+                "bubble_out_meta": format_hex_color(p.bubble_out_meta),
+                "bubble_in_bg": format_hex_color(p.bubble_in_bg),
+                "bubble_in_border": format_hex_color(p.bubble_in_border),
+                "bubble_in_text": format_hex_color(p.bubble_in_text),
+                "bubble_in_meta": format_hex_color(p.bubble_in_meta),
+            })
+        };
+        let doc = serde_json::json!({
+            "_comment": "ctdozlite custom theme file (#7). Edit hex colors (#RRGGBB) under dark/light and reload in Settings.",
+            "dark": to_map(&d),
+            "light": to_map(&l),
+        });
+        let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
+        std::fs::write(path, text)
+    }
+}
+
+pub(super) fn parse_hex_color(s: &str) -> Option<Color32> {
+    let hex = s.trim().trim_start_matches('#');
+    if hex.len() == 6 {
+        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+        Some(Color32::from_rgb(r, g, b))
+    } else {
+        None
+    }
+}
+
+pub(super) fn format_hex_color(c: Color32) -> String {
+    format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
 }
 
 // ---------------------------------------------------------------------------

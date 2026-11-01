@@ -123,6 +123,58 @@ impl MessageStore {
         Ok(())
     }
 
+    /// Delete an entire conversation and all its messages from local SQLite store (#24).
+    pub fn delete_thread(&mut self, thread_id: &str) -> Result<()> {
+        if thread_id.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "DELETE FROM messages WHERE thread_id = ?1",
+            params![thread_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM threads WHERE thread_id = ?1",
+            params![thread_id],
+        )?;
+        Ok(())
+    }
+
+    /// Search messages across all threads by keyword (case-insensitive substring match) (#35).
+    pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<StoredMessage>> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{}%", q.replace('%', "\\%").replace('_', "\\_"));
+        let mut stmt = self.conn.prepare(
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
+             FROM messages
+             WHERE LOWER(text) LIKE LOWER(?1) ESCAPE '\\'
+                OR LOWER(sender_name) LIKE LOWER(?1) ESCAPE '\\'
+             ORDER BY ts DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+            let is_outgoing_num: i64 = row.get(7)?;
+            Ok(StoredMessage {
+                msg_id: row.get(0)?,
+                thread_id: row.get(1)?,
+                sender_id: row.get(2).unwrap_or_default(),
+                sender_name: row.get(3).unwrap_or_default(),
+                text: row.get(4).unwrap_or_default(),
+                msg_type: row.get(5).unwrap_or_default(),
+                ts: row.get(6)?,
+                is_outgoing: is_outgoing_num != 0,
+                raw_json: row.get(8).unwrap_or_default(),
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Insert or update thread metadata.
     pub fn upsert_thread(&mut self, t: &StoredThread) -> Result<()> {
         self.conn.execute(
@@ -131,7 +183,7 @@ impl MessageStore {
              ON CONFLICT(thread_id) DO UPDATE SET
                  name = excluded.name,
                  is_group = excluded.is_group,
-                 last_ts = excluded.last_ts",
+                 last_ts = MAX(COALESCE(last_ts, 0), excluded.last_ts)",
             params![
                 t.thread_id,
                 t.name,
@@ -140,6 +192,20 @@ impl MessageStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Id of the oldest stored server message in a thread, where a history sync resumes from.
+    /// Local ids (`out_*`, `{thread}_{ts}`) are skipped: the server rejects them as cursors.
+    pub fn oldest_msg_id(&self, thread_id: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT msg_id FROM messages
+                 WHERE thread_id = ?1 AND msg_id <> '' AND msg_id NOT GLOB '*[^0-9]*'
+                 ORDER BY ts ASC LIMIT 1",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .ok()
     }
 
     /// Retrieve the newest `limit` messages for a thread, ordered by timestamp ascending.
@@ -559,6 +625,157 @@ pub fn load_history_into_threads(path: &str, threads: &mut Vec<Thread>, limit_pe
     }
 }
 
+/// Summary returned after migrating/importing history from an external file or directory (#9).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportReport {
+    pub threads_imported: usize,
+    pub messages_imported: usize,
+    pub sources_read: Vec<String>,
+}
+
+/// Import / migrate message history from an existing SQLite database (`.db`/`.sqlite`),
+/// a JSON backup (`threads_cache.json` or export JSON), or a directory containing them (#9).
+pub fn import_history_from_path(
+    src: &std::path::Path,
+    dst_db_path: &str,
+) -> Result<ImportReport> {
+    if !src.exists() {
+        anyhow::bail!("Đường dẫn nguồn không tồn tại: {}", src.display());
+    }
+    let mut dst = MessageStore::open(dst_db_path)?;
+    let mut report = ImportReport::default();
+
+    let mut files_to_import = Vec::new();
+    if src.is_dir() {
+        for candidate in [
+            "zalo_history.db",
+            "ctdozlite_history.db",
+            "threads_cache.json",
+            "export.json",
+        ] {
+            let p = src.join(candidate);
+            if p.is_file() {
+                files_to_import.push(p);
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(src) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() && !files_to_import.contains(&p) {
+                    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                        if matches!(ext.to_ascii_lowercase().as_str(), "db" | "sqlite" | "sqlite3" | "json") {
+                            files_to_import.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        files_to_import.push(src.to_path_buf());
+    }
+
+    if files_to_import.is_empty() {
+        anyhow::bail!(
+            "Không tìm thấy tệp dữ liệu lịch sử (.db, .sqlite, .json) trong {}",
+            src.display()
+        );
+    }
+
+    for file_path in files_to_import {
+        if let Ok(canon_src) = std::fs::canonicalize(&file_path) {
+            if let Ok(canon_dst) = std::fs::canonicalize(dst_db_path) {
+                if canon_src == canon_dst {
+                    continue;
+                }
+            }
+        }
+        let ext = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let bytes = std::fs::read(&file_path)?;
+        if bytes.starts_with(b"SQLite format 3") || matches!(ext.as_str(), "db" | "sqlite" | "sqlite3") {
+            let src_store = MessageStore::open(file_path.to_string_lossy().as_ref())?;
+            let src_threads = src_store.all_threads().unwrap_or_default();
+            dst.conn.execute_batch("BEGIN")?;
+            let step = (|| -> Result<(usize, usize)> {
+                let mut t_cnt = 0;
+                let mut m_cnt = 0;
+                for st in &src_threads {
+                    dst.upsert_thread(st)?;
+                    t_cnt += 1;
+                }
+                let mut stmt = src_store.conn.prepare(
+                    "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
+                     FROM messages ORDER BY ts ASC",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    let is_out: i64 = row.get(7).unwrap_or(0);
+                    Ok(StoredMessage {
+                        msg_id: row.get(0)?,
+                        thread_id: row.get(1)?,
+                        sender_id: row.get(2).unwrap_or_default(),
+                        sender_name: row.get(3).unwrap_or_default(),
+                        text: row.get(4).unwrap_or_default(),
+                        msg_type: row.get(5).unwrap_or_default(),
+                        ts: row.get(6).unwrap_or(0),
+                        is_outgoing: is_out != 0,
+                        raw_json: row.get(8).unwrap_or_default(),
+                    })
+                })?;
+                for r in rows {
+                    let sm = r?;
+                    if dst.upsert_message(&sm)? {
+                        m_cnt += 1;
+                    }
+                }
+                Ok((t_cnt, m_cnt))
+            })();
+            match step {
+                Ok((tc, mc)) => {
+                    dst.conn.execute_batch("COMMIT")?;
+                    report.threads_imported += tc;
+                    report.messages_imported += mc;
+                    report
+                        .sources_read
+                        .push(file_path.file_name().unwrap_or_default().to_string_lossy().into());
+                }
+                Err(e) => {
+                    let _ = dst.conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            }
+        } else if let Ok(text) = std::str::from_utf8(&bytes) {
+            if let Ok(threads) = serde_json::from_str::<Vec<Thread>>(text) {
+                let added = persist_threads(&mut dst, &threads)?;
+                report.threads_imported += threads.len();
+                report.messages_imported += added;
+                report
+                    .sources_read
+                    .push(file_path.file_name().unwrap_or_default().to_string_lossy().into());
+            } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+                if let Some(arr) = val.get("threads").and_then(|v| v.as_array()) {
+                    let threads: Vec<Thread> = arr
+                        .iter()
+                        .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                        .collect();
+                    if !threads.is_empty() {
+                        let added = persist_threads(&mut dst, &threads)?;
+                        report.threads_imported += threads.len();
+                        report.messages_imported += added;
+                        report
+                            .sources_read
+                            .push(file_path.file_name().unwrap_or_default().to_string_lossy().into());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,6 +896,39 @@ mod tests {
     }
 
     #[test]
+    fn oldest_msg_id_skips_local_ids_and_last_ts_never_goes_back() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        for (id, ts) in [("out_1", 50), ("g1_60", 60), ("1002", 100), ("1003", 300)] {
+            store
+                .upsert_message(&StoredMessage {
+                    msg_id: id.into(),
+                    thread_id: "g1".into(),
+                    sender_id: "u1".into(),
+                    sender_name: "User".into(),
+                    text: id.into(),
+                    msg_type: "chat.text".into(),
+                    ts,
+                    is_outgoing: false,
+                    raw_json: "".into(),
+                })
+                .unwrap();
+        }
+        assert_eq!(store.oldest_msg_id("g1").as_deref(), Some("1002"));
+        assert_eq!(store.oldest_msg_id("missing"), None);
+
+        // Persisting a page of older history must not move the thread down the list.
+        let st = |last_ts| StoredThread {
+            thread_id: "g1".into(),
+            name: "Nhóm".into(),
+            is_group: true,
+            last_ts,
+        };
+        store.upsert_thread(&st(300)).unwrap();
+        store.upsert_thread(&st(100)).unwrap();
+        assert_eq!(store.all_threads().unwrap()[0].last_ts, 300);
+    }
+
+    #[test]
     fn test_persist_threads_and_upsert_thread() {
         let mut store = MessageStore::open(":memory:").unwrap();
         let thread = Thread {
@@ -733,5 +983,84 @@ mod tests {
         assert_eq!(hydrated[0].name, "Test Thread");
         assert_eq!(hydrated[0].messages.len(), 2);
         assert_eq!(hydrated[0].preview, "Hi Alice");
+    }
+
+    #[test]
+    fn delete_thread_and_search_messages_work() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        store
+            .upsert_thread(&StoredThread {
+                thread_id: "t1".into(),
+                name: "Nhóm Kỹ Thuật".into(),
+                is_group: true,
+                last_ts: 500,
+            })
+            .unwrap();
+        store
+            .upsert_message(&StoredMessage {
+                msg_id: "m_search_1".into(),
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "Minh".into(),
+                text: "Triển khai bản cập nhật ctdozlite".into(),
+                msg_type: "chat.text".into(),
+                ts: 500,
+                is_outgoing: false,
+                raw_json: String::new(),
+            })
+            .unwrap();
+
+        let hits = store.search_messages("ctdozlite", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].msg_id, "m_search_1");
+
+        store.delete_thread("t1").unwrap();
+        assert!(store.messages_for("t1", 10).unwrap().is_empty());
+        assert!(store.all_threads().unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_history_from_path_migrates_sqlite_and_json_directory() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ctdozlite-import-test-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_db = dir.join("zalo_history.db");
+        {
+            let mut src_store = MessageStore::open(src_db.to_str().unwrap()).unwrap();
+            src_store
+                .upsert_thread(&StoredThread {
+                    thread_id: "g_mig".into(),
+                    name: "Migrated Group".into(),
+                    is_group: true,
+                    last_ts: 999,
+                })
+                .unwrap();
+            src_store
+                .upsert_message(&StoredMessage {
+                    msg_id: "mig_1".into(),
+                    thread_id: "g_mig".into(),
+                    sender_id: "u1".into(),
+                    sender_name: "Alice".into(),
+                    text: "Tin nhắn cũ đã migrate".into(),
+                    msg_type: "chat.text".into(),
+                    ts: 999,
+                    is_outgoing: false,
+                    raw_json: String::new(),
+                })
+                .unwrap();
+        }
+        let dst_db = dir.join("dest.db");
+        let rep = import_history_from_path(&src_db, dst_db.to_str().unwrap()).unwrap();
+        assert_eq!(rep.threads_imported, 1);
+        assert_eq!(rep.messages_imported, 1);
+
+        let dst_store = MessageStore::open(dst_db.to_str().unwrap()).unwrap();
+        let msgs = dst_store.messages_for("g_mig", 10).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].text, "Tin nhắn cũ đã migrate");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -11,6 +11,9 @@ session*.bak
 threads_cache.json
 threads_cache*.json
 app_settings.json
+theme.json
+custom_stickers.json
+autoreply_rules.json
 *.db
 *.db-shm
 *.db-wal

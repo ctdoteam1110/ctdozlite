@@ -258,6 +258,7 @@ impl ZaloGuiApp {
                                     let _ = tx.send(WorkerCmd::LoadGroupHistory {
                                         group_id: gid,
                                         is_group: true,
+                                        have: 0,
                                     });
                                 }
                             }
@@ -323,6 +324,7 @@ impl ZaloGuiApp {
                                 let _ = tx.send(WorkerCmd::LoadGroupHistory {
                                     group_id: cid,
                                     is_group: false,
+                                    have: 0,
                                 });
                             }
                         }
@@ -397,19 +399,16 @@ impl ZaloGuiApp {
                     if sync_resp
                         .on_hover_cursor(CursorIcon::PointingHand)
                         .on_hover_text(format!(
-                            "Trạng thái: {} · {} hội thoại (Bấm để đồng bộ ngay)",
+                            "Trạng thái: {} · {} hội thoại (Bấm để làm mới hội thoại)",
                             self.status_msg,
                             self.threads.len()
                         ))
                         .clicked()
                     {
                         if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::RefreshThreads);
+                            let _ = tx.send(WorkerCmd::RefreshThreadsManual);
                         }
-                        self.show_toast(format!(
-                            "Đang đồng bộ ngầm {} hội thoại…",
-                            self.threads.len()
-                        ));
+                        self.status_msg = "⏳ Đang làm mới danh sách hội thoại…".into();
                     }
 
                     ui.add_space(6.0);
@@ -768,6 +767,7 @@ impl ZaloGuiApp {
                                                 let _ = tx.send(WorkerCmd::LoadGroupHistory {
                                                     group_id: gid,
                                                     is_group: true,
+                                                    have: 0,
                                                 });
                                             }
                                         }
@@ -788,7 +788,9 @@ impl ZaloGuiApp {
                                 let pinned_cnt = self
                                     .threads
                                     .iter()
-                                    .filter(|t| t.name.contains("Cloud của tôi"))
+                                    .filter(|t| {
+                                        t.name.contains("Cloud của tôi") || t.presentation.pinned
+                                    })
                                     .count();
                                 if pinned_cnt > 0 {
                                     ui.label(
@@ -888,7 +890,9 @@ impl ZaloGuiApp {
                                 ThreadFilter::Direct => !t.is_group,
                                 ThreadFilter::Groups => t.is_group,
                             };
+                            let not_hidden = !t.presentation.hidden || !query.is_empty();
                             pass_filter
+                                && not_hidden
                                 && (query.is_empty()
                                     || matches_vn_query(&t.name, &query, &query_folded)
                                     || t.id.contains(&query))
@@ -905,6 +909,9 @@ impl ZaloGuiApp {
                             || self.settings.pinned_threads.contains(&tb.id);
                         if a_pinned != b_pinned {
                             return b_pinned.cmp(&a_pinned);
+                        }
+                        if ta.presentation.pinned != tb.presentation.pinned {
+                            return tb.presentation.pinned.cmp(&ta.presentation.pinned);
                         }
                         let ts_a = ta
                             .messages
@@ -965,6 +972,7 @@ impl ZaloGuiApp {
                     ToggleUnread(String, bool, bool),
                     SetMute(String, bool, Option<i64>, String),
                     ToggleHide(String, bool, bool),
+                    OpenSchedule(usize),
                     DeleteConv(usize, String, String, bool, String),
                     ReportConv(String),
                 }
@@ -982,7 +990,8 @@ impl ZaloGuiApp {
                         for &i in &filtered_indices {
                             let t = &self.threads[i];
                             let is_selected = i == self.selected_thread_index;
-                            let is_user_pinned = self.settings.pinned_threads.contains(&t.id);
+                            let is_user_pinned =
+                                self.settings.pinned_threads.contains(&t.id) || t.presentation.pinned;
                             let is_pinned_cloud =
                                 t.name.contains("Cloud của tôi") || is_user_pinned;
                             let is_muted = self
@@ -990,8 +999,10 @@ impl ZaloGuiApp {
                                 .muted_threads
                                 .get(&t.id)
                                 .map(|&until| until == -1 || until > now_unix)
-                                .unwrap_or(false);
-                            let is_hidden = self.settings.hidden_threads.contains(&t.id);
+                                .unwrap_or(false)
+                                || t.presentation.muted;
+                            let is_hidden =
+                                self.settings.hidden_threads.contains(&t.id) || t.presentation.hidden;
                             let cur_label = self.settings.thread_labels.get(&t.id).cloned();
                             let row_height = if is_narrow_w { 50.0 } else { 58.0 };
                             let (alloc_rect, row_resp) = ui.allocate_exact_size(
@@ -1463,6 +1474,23 @@ impl ZaloGuiApp {
                                     ui.close_menu();
                                 }
 
+                                // 5b. Hẹn giờ gửi tin nhắn / Nhắc hẹn (#38)
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Hẹn giờ gửi tin nhắn / Nhắc hẹn")
+                                                .size(13.5)
+                                                .color(pal.text_primary),
+                                        )
+                                        .frame(false)
+                                        .min_size(Vec2::new(195.0, 28.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    pending_ctx_action = Some(ThreadCtxAction::OpenSchedule(i));
+                                    ui.close_menu();
+                                }
+
                                 ui.separator();
 
                                 // 6. Xóa hội thoại (màu đỏ)
@@ -1635,6 +1663,7 @@ impl ZaloGuiApp {
                             let _ = tx.send(WorkerCmd::LoadGroupHistory {
                                 group_id: tid,
                                 is_group,
+                                have: 0,
                             });
                         }
                     }
@@ -1651,7 +1680,11 @@ impl ZaloGuiApp {
                                 self.settings.pinned_threads.retain(|x| x != &tid);
                                 self.show_toast("Đã bỏ ghim hội thoại");
                             }
+                            if let Some(th) = self.threads.iter_mut().find(|t| t.id == tid) {
+                                th.presentation.pinned = pin;
+                            }
                             self.settings.save();
+                            self.persist_threads_async();
                             if let Some(tx) = WORKER_TX.get() {
                                 let _ = tx.send(WorkerCmd::PinThread {
                                     thread_id: tid,
@@ -1710,7 +1743,11 @@ impl ZaloGuiApp {
                                     (-1, false)
                                 }
                             };
+                            if let Some(th) = self.threads.iter_mut().find(|t| t.id == tid) {
+                                th.presentation.muted = mute;
+                            }
                             self.settings.save();
+                            self.persist_threads_async();
                             self.show_toast(toast_txt);
                             if let Some(tx) = WORKER_TX.get() {
                                 let _ = tx.send(WorkerCmd::MuteThread {
@@ -1731,7 +1768,11 @@ impl ZaloGuiApp {
                                 self.settings.hidden_threads.remove(&tid);
                                 self.show_toast("Đã bỏ ẩn trò chuyện");
                             }
+                            if let Some(th) = self.threads.iter_mut().find(|t| t.id == tid) {
+                                th.presentation.hidden = hide;
+                            }
                             self.settings.save();
+                            self.persist_threads_async();
                             if let Some(tx) = WORKER_TX.get() {
                                 let _ = tx.send(WorkerCmd::HideThread {
                                     thread_id: tid,
@@ -1740,7 +1781,14 @@ impl ZaloGuiApp {
                                 });
                             }
                         }
+                        ThreadCtxAction::OpenSchedule(idx) => {
+                            self.selected_thread_index = idx;
+                            self.schedule_modal_open = true;
+                        }
                         ThreadCtxAction::DeleteConv(idx, tid, tname, is_group, last_msg_id) => {
+                            if let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") {
+                                let _ = store.delete_thread(&tid);
+                            }
                             if idx < self.threads.len() && self.threads[idx].id == tid {
                                 self.threads.remove(idx);
                                 if self.selected_thread_index >= self.threads.len() {
@@ -1934,6 +1982,7 @@ impl ZaloGuiApp {
                                                 let _ = tx.send(WorkerCmd::LoadGroupHistory {
                                                     group_id: d_id.clone(),
                                                     is_group: d_is_group,
+                                                    have: d_msg_count,
                                                 });
                                             }
                                             self.show_toast("Đang đồng bộ lịch sử hội thoại…");
@@ -2841,6 +2890,114 @@ impl ZaloGuiApp {
                         self.status_msg = "Đã bỏ ghim tin nhắn".into();
                     }
 
+                    // 1c-0. GitHub Release Update Available Notification Banner
+                    if let Some(upd) = self.update_info.clone() {
+                        if upd.has_update
+                            && !self.update_banner_dismissed
+                            && self.settings.skipped_update_version != upd.latest_version
+                        {
+                            egui::Frame::none()
+                                .fill(pal.accent_online.linear_multiply(0.14))
+                                .stroke(Stroke::new(1.0_f32, pal.accent_online))
+                                .inner_margin(Margin::symmetric(14.0, 6.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let msg_txt = if self.update_downloading {
+                                            let (dl, tot) = self.update_progress.unwrap_or((0, 0));
+                                            if tot > 0 {
+                                                let pct = ((dl as f64 / tot as f64) * 100.0)
+                                                    .clamp(0.0, 100.0);
+                                                format!(
+                                                    "⏳ Đang tải bản cập nhật v{} từ GitHub ({pct:.0}%)…",
+                                                    upd.latest_version
+                                                )
+                                            } else {
+                                                format!(
+                                                    "⏳ Đang tải bản cập nhật v{} từ GitHub…",
+                                                    upd.latest_version
+                                                )
+                                            }
+                                        } else {
+                                            format!(
+                                                "🚀 Đã có bản cập nhật mới ctdozlite v{} trên GitHub Releases!",
+                                                upd.latest_version
+                                            )
+                                        };
+                                        ui.label(
+                                            RichText::new(msg_txt)
+                                                .size(12.0)
+                                                .color(pal.accent_online)
+                                                .strong(),
+                                        );
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .small_button(lucide::X)
+                                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                                    .on_hover_text("Ẩn thanh thông báo cập nhật")
+                                                    .clicked()
+                                                {
+                                                    self.update_banner_dismissed = true;
+                                                }
+                                                if ui
+                                                    .small_button("Chi tiết")
+                                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                                    .clicked()
+                                                {
+                                                    self.update_modal_open = true;
+                                                }
+                                                if !self.update_downloading {
+                                                    if let (Some(dl_url), Some(asset_name)) =
+                                                        (upd.download_url.clone(), upd.asset_name.clone())
+                                                    {
+                                                        if ui
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    RichText::new(format!(
+                                                                        "⬇ Cập nhật v{}",
+                                                                        upd.latest_version
+                                                                    ))
+                                                                    .size(11.5)
+                                                                    .color(Color32::WHITE)
+                                                                    .strong(),
+                                                                )
+                                                                .fill(pal.accent_online)
+                                                                .rounding(Rounding::same(5.0)),
+                                                            )
+                                                            .on_hover_cursor(
+                                                                CursorIcon::PointingHand,
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            self.update_downloading = true;
+                                                            self.update_progress =
+                                                                Some((0, upd.asset_size));
+                                                            self.update_modal_open = true;
+                                                            if let Some(tx) = WORKER_TX.get() {
+                                                                let _ = tx.send(
+                                                                    WorkerCmd::DownloadAndApplyUpdate {
+                                                                        download_url: dl_url,
+                                                                        asset_name,
+                                                                        target_version: upd
+                                                                            .latest_version
+                                                                            .clone(),
+                                                                        expected_sha256: upd
+                                                                            .expected_sha256
+                                                                            .clone(),
+                                                                    },
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+                        }
+                    }
+
                     // 1c. Starred filter active banner
                     if self.filter_starred_only {
                         egui::Frame::none()
@@ -3129,6 +3286,7 @@ impl ZaloGuiApp {
                                                                     WorkerCmd::LoadGroupHistory {
                                                                         group_id: thread_id.clone(),
                                                                         is_group,
+                                                                        have: thread.messages.len(),
                                                                     },
                                                                 );
                                                             }
@@ -3554,6 +3712,56 @@ impl ZaloGuiApp {
                         }
                     }
 
+                    // 3d. Pending Scheduled Messages Banner (#38)
+                    let thread_sched: Vec<crate::scheduler::ScheduledMessage> = self
+                        .scheduled_items
+                        .iter()
+                        .filter(|s| s.thread_id == thread_id)
+                        .cloned()
+                        .collect();
+                    if let Some(next_sched) = thread_sched.first() {
+                        let mut open_sched_mgr = false;
+                        let mut cancel_sched_id: Option<i64> = None;
+                        egui::Frame::none()
+                            .fill(pal.bg_elevated)
+                            .inner_margin(Margin::symmetric(14.0, 5.0))
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "🕒 Hẹn giờ gửi ({}) · Tiếp theo lúc {}: \"{}\"",
+                                            thread_sched.len(),
+                                            crate::scheduler::format_schedule_time(
+                                                next_sched.deliver_at
+                                            ),
+                                            truncate_chars(&next_sched.text, 36)
+                                        ))
+                                        .size(11.6)
+                                        .color(pal.primary_hover)
+                                        .strong(),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.small_button("Hủy").clicked() {
+                                            cancel_sched_id = Some(next_sched.id);
+                                        }
+                                        if ui.small_button("Quản lý").clicked() {
+                                            open_sched_mgr = true;
+                                        }
+                                    });
+                                });
+                            });
+                        if let Some(cid) = cancel_sched_id {
+                            let _ =
+                                crate::scheduler::cancel_scheduled_message("zalo_history.db", cid);
+                            self.refresh_scheduled_items();
+                            self.show_toast("Đã hủy tin nhắn hẹn giờ");
+                        }
+                        if open_sched_mgr {
+                            self.schedule_modal_open = true;
+                        }
+                    }
+
                     // 4. Bottom Message Composer Bar (Compact Icon Actions + Spacious Input + Padded Send Button)
                     let composer_frame = egui::Frame::none()
                         .fill(pal.bg_sidebar)
@@ -3710,8 +3918,12 @@ impl ZaloGuiApp {
                                         );
                                         // Responsive Borderless Input Field (shrinks gracefully down to 50px)
                                         let send_btn_w = if is_narrow_w { 52.0 } else { 76.0 };
-                                        let input_w =
-                                            (ui.available_width() - send_btn_w - 12.0).max(50.0);
+                                        let sched_btn_w = 34.0;
+                                        let input_w = (ui.available_width()
+                                            - send_btn_w
+                                            - sched_btn_w
+                                            - 16.0)
+                                            .max(50.0);
                                         let text_edit =
                                             egui::TextEdit::singleline(&mut self.input_message)
                                                 .id(Id::new(("chat_composer_input", &thread_id)))
@@ -3810,6 +4022,37 @@ impl ZaloGuiApp {
                                                 }
                                             }
                                         }
+                                        // Schedule Send Button (`🕒`, #38)
+                                        let (sched_rect, sched_resp) = ui.allocate_exact_size(
+                                            Vec2::new(32.0, 34.0),
+                                            Sense::click(),
+                                        );
+                                        if self.schedule_modal_open || sched_resp.hovered() {
+                                            ui.painter().rect_filled(
+                                                sched_rect,
+                                                Rounding::same(8.0),
+                                                pal.bg_hover,
+                                            );
+                                        }
+                                        ui.painter().text(
+                                            sched_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "🕒",
+                                            FontId::proportional(14.5),
+                                            if self.schedule_modal_open || sched_resp.hovered() {
+                                                pal.primary_hover
+                                            } else {
+                                                pal.text_secondary
+                                            },
+                                        );
+                                        if sched_resp
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .on_hover_text("Hẹn giờ gửi tin nhắn & Nhắc hẹn")
+                                            .clicked()
+                                        {
+                                            self.schedule_modal_open = !self.schedule_modal_open;
+                                        }
+
                                         // Responsive Padded Send Button (shows icon-only on very tight widths)
                                         let can_send = !self.input_message.trim().is_empty()
                                             || self.pending_clipboard_image.is_some();
@@ -3817,6 +4060,9 @@ impl ZaloGuiApp {
                                             Vec2::new(send_btn_w, 34.0),
                                             Sense::click(),
                                         );
+                                        if send_resp.secondary_clicked() {
+                                            self.schedule_modal_open = true;
+                                        }
                                         let send_bg = if !can_send {
                                             pal.primary.linear_multiply(0.42)
                                         } else if send_resp.hovered() {
@@ -3975,6 +4221,7 @@ impl ZaloGuiApp {
         self.render_call_overlay(ctx, pal);
         self.render_image_viewer_modal(ctx, pal);
         self.render_phone_lookup_modal(ctx, pal);
+        self.render_schedule_modal(ctx, pal);
         self.render_settings_modal(ctx, pal);
     }
 
