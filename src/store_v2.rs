@@ -810,6 +810,10 @@ impl AccountStore {
         let mut normalized = message.clone();
         let Some(server) = verified_server_id(message) else { return Ok(normalized); };
         let canonical = self.get_message(thread_id, &message.id)?;
+        // A deleted legacy canonical key has no retained wire provenance. Never silently
+        // discard a distinct server packet or guess that it is the deleted identity.
+        ensure!(canonical.is_some() || message.id == server || !self.is_deleted(thread_id, &message.id)?,
+            "Tombstoned canonical alias has no verified server provenance");
         let conflicting = canonical.as_ref().and_then(verified_server_id).is_some_and(|id| id != server);
         if conflicting {
             ensure!(message.id != server, "Conflicting server identity occupies the canonical key");
@@ -889,7 +893,8 @@ impl AccountStore {
             if !t.messages.is_empty() && self.thread_is_group(&t.id)?.is_none() {
                 let mut all_deleted = true;
                 for message in &t.messages {
-                    if !self.is_deleted(&t.id, &message.id)? { all_deleted = false; break; }
+                    let normalized = self.storage_message(&t.id, message)?;
+                    if !self.is_deleted(&t.id, &normalized.id)? { all_deleted = false; break; }
                 }
                 if all_deleted { stats.unchanged += t.messages.len(); continue; }
             }

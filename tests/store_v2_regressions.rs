@@ -1407,3 +1407,28 @@ fn verified_distinct_server_ids_survive_a_reused_client_canonical_key_and_restar
     assert!(store.navigation_page("same","777").unwrap().is_none());
     drop(store);std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn tombstoned_canonical_alias_rejects_unproven_server_reuse_instead_of_silent_loss() {
+    use zalo_rust::message_model::WireMessageRef;
+    let mut store = AccountStore::in_memory("deleted-alias").unwrap();
+    let mut row = ChatMessage {
+        id: "777".into(),
+        client_message_id: "777".into(),
+        wire_ref: WireMessageRef::from_raw(&serde_json::json!({"cliMsgId":"777","globalMsgId":"111"})),
+        text: "Deleted body".into(),
+        ..Default::default()
+    };
+    let mut t = thread("same");
+    t.messages = vec![row.clone()];
+    store.persist_threads(&[t.clone()]).unwrap();
+    store.apply_delta(StoreDelta {
+        deleted_messages: &[MessageKey { thread_id: "same".into(), msg_id: "777".into() }],
+        ..Default::default()
+    }).unwrap();
+    row.wire_ref = WireMessageRef::from_raw(&serde_json::json!({"cliMsgId":"777","globalMsgId":"222"}));
+    t.messages = vec![row];
+    assert!(store.persist_threads(&[t]).is_err(), "A lost canonical/server provenance must produce an explicit error");
+    assert!(store.get_message("same", "777").unwrap().is_none());
+    assert!(store.navigation_page("same", "111").unwrap().is_none());
+}
