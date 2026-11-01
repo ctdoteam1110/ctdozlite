@@ -151,6 +151,7 @@ impl ZaloGuiApp {
                 bottom: 6.0,
             })
             .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     let (icon, color) = if done {
