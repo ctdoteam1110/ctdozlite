@@ -5125,53 +5125,9 @@ pub async fn get_user_online_status(s: &Session, uid: &str) -> Result<(bool, Str
         s.common_params()
     );
     let resp = s.get(&url).await?;
-    let mut dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    if let Some(d_str) = dec.get("data").and_then(Value::as_str) {
-        if let Ok(parsed) = serde_json::from_str::<Value>(d_str.trim()) {
-            dec["data"] = parsed;
-        }
-    }
-    let d = dec
-        .pointer("/data/data")
-        .or_else(|| dec.get("data"))
-        .unwrap_or(&dec);
-    let show_online = d
-        .pointer("/settings/show_online_status")
-        .and_then(|v| v.as_bool().or_else(|| v.as_i64().map(|n| n != 0)))
-        .unwrap_or(true);
-    if !show_online {
-        return Ok((false, String::new()));
-    }
-    let last_onl_raw = d
-        .get("lastOnline")
-        .and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
-        })
-        .unwrap_or(0);
-    if last_onl_raw <= 0 {
-        return Ok((false, String::new()));
-    }
-    let last_sec = if last_onl_raw > 10_000_000_000 {
-        last_onl_raw / 1000
-    } else {
-        last_onl_raw
-    };
-    let now_sec = crate::login::unix_now() as i64;
-    let diff_sec = (now_sec - last_sec).max(0);
-    if diff_sec <= 300 {
-        return Ok((true, "Vừa mới truy cập".into()));
-    }
-    let mins = diff_sec / 60;
-    if mins < 60 {
-        return Ok((false, format!("Truy cập {mins} phút trước")));
-    }
-    let hours = diff_sec / 3600;
-    if hours < 24 {
-        return Ok((false, format!("Truy cập {hours} giờ trước")));
-    }
-    let days = (diff_sec / 86400).min(7);
-    Ok((false, format!("Truy cập {days} ngày trước")))
+    let decoded = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    let now_second = crate::login::unix_now() as i64;
+    Ok(crate::presence::LastOnline::parse(&decoded, now_second)?.status(now_second))
 }
 
 /// Send a friend request to a target user (`/api/friend/sendreq`, cmd `11424`).

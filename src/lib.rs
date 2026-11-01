@@ -14,6 +14,8 @@ pub mod message_model;
 /// Exact quoted-message references in loaded conversations.
 pub mod message_navigation;
 pub mod param_cipher;
+/// Strict validation of the existing last-online response.
+pub mod presence;
 pub mod qr;
 pub mod reactions;
 pub mod session;
