@@ -492,3 +492,51 @@ fn hydration_preserves_known_typed_wire_slots_across_alias_field_names() {
         Some(&json!("live-client"))
     );
 }
+
+#[test]
+fn hydration_never_restores_content_metadata_onto_live_or_legacy_recall() {
+    for legacy_text in [false, true] {
+        for sticker in [false, true] {
+            let mut store = MessageStore::open(":memory:").unwrap();
+            let mut cached = metadata_message();
+            if !sticker {
+                cached.sticker_id = None;
+                cached.sticker_cate_id = None;
+                cached.sticker_type = None;
+            }
+            persist_threads(&mut store, &[thread("contact-a", vec![cached])]).unwrap();
+            let mut recalled = message("server-a", "client-a");
+            recalled.kind = if legacy_text {
+                MessageKind::Unknown
+            } else {
+                MessageKind::Recall
+            };
+            recalled.text = "[Tin nhắn đã thu hồi]".into();
+            recalled.wire_ref = WireMessageRef::from_raw(
+                &json!({"msgId":"server-a","cliMsgId":"client-a","uidFrom":"sender-a","msgType":"chat.undo"}),
+            );
+            let mut hydrated = vec![thread("contact-a", vec![recalled.clone()])];
+            for _ in 0..2 {
+                store.hydrate_threads(&mut hydrated, 20).unwrap();
+                let actual = &hydrated[0].messages[0];
+                assert_eq!(actual.text, recalled.text);
+                assert_eq!(actual.kind, recalled.kind);
+                assert_eq!(actual.sticker_id, None);
+                assert_eq!(actual.sticker_cate_id, None);
+                assert_eq!(actual.sticker_type, None);
+                assert_eq!(actual.link_url, None);
+                assert_eq!(actual.link_title, None);
+                assert_eq!(actual.link_desc, None);
+                assert_eq!(actual.link_thumb, None);
+                assert_eq!(actual.link_src, None);
+                assert_eq!(actual.reply_to_id, None);
+                assert_eq!(actual.reply_to_sender, None);
+                assert_eq!(actual.reply_to_text, None);
+                assert_eq!(actual.history_source, None);
+                assert!(actual.resolved_mention_uids.is_empty());
+                assert!(!actual.wire_ref.fields.contains_key("content"));
+                assert_eq!(actual.wire_ref.original_type, Some(json!("chat.undo")));
+            }
+        }
+    }
+}

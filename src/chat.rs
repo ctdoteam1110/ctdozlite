@@ -1015,22 +1015,53 @@ fn merge_thread_into_with_source(
         if let Some(idx) = found {
             let existing_msg = &mut target.messages[idx];
             identities.remove(existing_msg, idx);
-            let cached_wire = incoming_is_cache
-                .then(|| merge_cached_wire_ref(&existing_msg.wire_ref, &msg.wire_ref));
+            let cached_recall = incoming_is_cache
+                && (existing_msg.kind == crate::message_model::MessageKind::Recall
+                    || existing_msg.text.trim() == "[Tin nhắn đã thu hồi]");
+            let cached_wire = incoming_is_cache.then(|| {
+                if cached_recall {
+                    // A recall is terminal: cached body/type/mention payloads are not enrichment.
+                    let mut envelope = msg.wire_ref.clone();
+                    envelope.fields.retain(|key, _| matches!(key.as_str(),
+                        "msgId" | "globalMsgId" | "lastMsgId" | "id" | "cliMsgId" | "clientId"
+                        | "client_message_id" | "uidFrom" | "fromUid" | "fromId" | "senderId"
+                        | "sender" | "idTo" | "toId" | "toUid" | "grid" | "groupId"
+                        | "cmd" | "st" | "ts"));
+                    envelope.original_type = None;
+                    envelope.at = None;
+                    merge_cached_wire_ref(&existing_msg.wire_ref, &envelope)
+                } else {
+                    merge_cached_wire_ref(&existing_msg.wire_ref, &msg.wire_ref)
+                }
+            });
             if incoming_is_cache {
                 // Stored history enriches unknown fields; it is not a newer network event.
-                if existing_msg.kind != crate::message_model::MessageKind::Unknown {
+                if cached_recall || existing_msg.kind != crate::message_model::MessageKind::Unknown {
                     msg.kind = existing_msg.kind;
                 }
                 if existing_msg.unread_policy.params_ext_present {
                     msg.unread_policy = existing_msg.unread_policy.clone();
                 }
-                if existing_msg.history_source.is_some() {
+                if cached_recall || existing_msg.history_source.is_some() {
                     msg.history_source = None;
+                }
+                if cached_recall {
+                    msg.sticker_id = None;
+                    msg.sticker_cate_id = None;
+                    msg.sticker_type = None;
+                    msg.reply_to_id = None;
+                    msg.reply_to_sender = None;
+                    msg.reply_to_text = None;
+                    msg.link_url = None;
+                    msg.link_title = None;
+                    msg.link_desc = None;
+                    msg.link_thumb = None;
+                    msg.link_src = None;
+                    msg.resolved_mention_uids.clear();
                 }
                 msg.resolved_mention_uids
                     .extend(existing_msg.resolved_mention_uids.clone());
-                if existing_msg.text.is_empty() {
+                if !cached_recall && existing_msg.text.is_empty() {
                     existing_msg.text = msg.text.clone();
                 }
             }
