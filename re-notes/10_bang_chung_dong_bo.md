@@ -123,7 +123,10 @@ Trong lúc QTzalo tắt (23:01:56 → khoảng 23:11:50), người dùng nhận 
 | 8 | 1 | **1** | 0 | 0 | 0 | null |
 
 - 8 nhóm trả `hasMore = 1` nhưng không có tin nào: **[I]** có tin nhưng máy chủ lọc khỏi thiết bị này. Lọc theo tiêu chí gì **[U]**: không phải theo thời điểm vào nhóm (`isFilteredByTimeJoin = 0`).
-- Không thấy tin nhóm nào qua bất kỳ đường nào trong cả ba lượt (`511_1` rỗng, long-poll `groupMsgs` rỗng, không có `521`). Chưa rõ trong thời gian đo có tin nhóm thật hay không; cần người dùng xác nhận.
+- Không thấy tin nhóm nào qua bất kỳ đường nào trong cả ba lượt (`511_1` rỗng, long-poll `groupMsgs` rỗng, không có `521`). Người dùng xác nhận trong thời gian đo **không có tin nhóm nào**, nên điều này chưa nói lên gì về hàng đợi nhóm.
+- Người dùng nhận thấy thứ tự danh sách hội thoại không giống điện thoại: thiết bị mới không có tin xem trước (`get-last-msgs` trả `msgs: []`), danh sách gồm cả 1165 bạn bè/nhóm và chỉ sắp theo tin có trong DB.
+- `msgId` trong DB (75 tin, từ 03/2026 đến nay) tăng gần tuyến tính theo `ts` (khoảng 41 id/ms; đúng 1 lần đảo thứ tự, hai tin cách nhau 22 ms). → `clearUnreads[].lastMsgId` dùng được để sắp thứ tự hội thoại theo thời gian.
+- Tin ảnh/video từ queue được lưu thành tin chữ có link (`link_url`, `link_thumb`), vì `parse_chat_message` không đặt `link_src` "Hình ảnh Zalo"/"Video Zalo" cho `chat.photo`/`chat.video.msg`. Giao diện vì vậy hiện link thô và mở trình duyệt.
 - DB sau lượt 3: hội thoại 1-1 có 25 tin (13 gửi đi, 12 nhận), không trùng.
 
 ### 10. Bằng chứng phụ: chỉ báo "đang nhập" [O]
@@ -140,7 +143,7 @@ Khi đối phương gõ: socket nhận `602_0`, và `lp_control` trả `actions:
 | Nhóm đủ lịch sử nhờ `getrecentv2` (09 §1 B) | **Bác bỏ** với thiết bị mới: 0 tin, có cờ lọc |
 | Có `resetLastActionId` / `evict = true` | Chưa gặp (ba lượt đều `evict = 0`, không có `resetLastActionId`); trường `evict` có thật trong `queueStatus` |
 | Hàng đợi 1-1 giữ tin trong lúc app tắt; `lastId: 1` lấy lại được (10 phút) | **Xác nhận**. Kéo về không xoá khỏi hàng đợi: mỗi lần mở app tải lại toàn bộ từ lúc đăng nhập |
-| Tin nhóm về qua hàng đợi offline `511_x` | Chưa rõ: `511_1` rỗng trong cả ba lượt, chưa xác nhận có tin nhóm thật |
+| Tin nhóm về qua hàng đợi offline `511_x` | Chưa rõ: không có tin nhóm nào trong thời gian đo; kiểm tra lại ở nghiệm thu A7 |
 | Lịch sử nhóm từ `getrecentv2` nối được khoảng thiếu (A4) | **Bác bỏ** trên thiết bị này: 0 tin ở cả 60 nhóm, có cờ `isFiltered` |
 | Tin E2EE đến qua `513/713` | **Bác bỏ** queue: phiên này dùng `515/517`. Có tin E2EE thật hay không: chưa rõ |
 | PC nhận `temp_key` sau đăng nhập QR (Phần B) | **Xác nhận**: `transfer_after_login` / `transfer_sync2` trong `603_1` |

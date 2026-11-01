@@ -90,6 +90,12 @@ pub enum WorkerCmd {
         thread_id: String,
         dest_dir: String,
     },
+    /// Fetch a chat video into `paths::video_cache_dir()` for in-app playback (reusing a cached
+    /// copy) → `GuiEvent::Video{Progress,Ready,Failed}` keyed by `url`. `url` is untrusted; the
+    /// URL policy is [`crate::download::download_to_dir`]'s.
+    PrepareVideo {
+        url: String,
+    },
     /// Measure `paths::cache_dir()` → `GuiEvent::CacheSizeComputed`.
     ComputeCacheSize,
     /// Delete the contents of `paths::cache_dir()` (`stickers_cache/` only) →
@@ -1903,6 +1909,49 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         crate::logger::log_error("gui::download", &error);
                                         let _ = gui_tx_clone
                                             .send(GuiEvent::DownloadFailed { url, error });
+                                    }
+                                }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::PrepareVideo { url } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let dir = crate::paths::video_cache_dir();
+                                let name = format!("{}.mp4", crate::crypto::md5_hex(url.trim()));
+                                let cached = dir.join(&name);
+                                let result = if cached.is_file() {
+                                    Ok(cached)
+                                } else {
+                                    let client = { session_clone.lock().await.clone().http };
+                                    let tx = gui_tx_clone.clone();
+                                    let ctx = ctx_clone.clone();
+                                    let key = url.clone();
+                                    crate::download::download_to_dir(
+                                        &client,
+                                        &url,
+                                        &name,
+                                        &dir,
+                                        move |p| {
+                                            let _ = tx.send(GuiEvent::VideoProgress {
+                                                url: key.clone(),
+                                                received: p.received,
+                                                total: p.total,
+                                            });
+                                            ctx.request_repaint();
+                                        },
+                                    )
+                                    .await
+                                };
+                                match result {
+                                    Ok(path) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::VideoReady { url, path });
+                                    }
+                                    Err(error) => {
+                                        crate::logger::log_error("gui::video", &error);
+                                        let _ = gui_tx_clone.send(GuiEvent::VideoFailed { url, error });
                                     }
                                 }
                                 ctx_clone.request_repaint();

@@ -110,6 +110,14 @@ pub fn cache_dir() -> PathBuf {
     dir
 }
 
+/// Videos fetched for in-app playback (`stickers_cache/videos/`, one `<md5(url)>.mp4` per
+/// video). Lives under [`cache_dir`] so "Xoá cache" and the cache size include it. Created on demand.
+pub fn video_cache_dir() -> PathBuf {
+    let dir = cache_dir().join("videos");
+    let _ = create_private_dir(&dir);
+    dir
+}
+
 /// Delete `clipboard_*.png` files in [`cache_dir`] older than `max_age`; returns how many.
 ///
 /// Pasting an image from the clipboard writes a temporary PNG into the cache before upload.

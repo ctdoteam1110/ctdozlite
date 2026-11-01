@@ -22,6 +22,7 @@ use crate::qr::QrLogin;
 use crate::session::Session;
 
 
+mod media_view;
 mod messages;
 mod modals;
 mod stickers;
@@ -156,6 +157,25 @@ pub enum GuiEvent {
     ImageCacheCleared {
         freed: u64,
         failed: usize,
+    },
+    /// `WorkerCmd::PrepareVideo` progress / result, keyed by URL (see `gui/media_view.rs`).
+    VideoProgress {
+        url: String,
+        received: u64,
+        total: Option<u64>,
+    },
+    VideoReady {
+        url: String,
+        path: std::path::PathBuf,
+    },
+    VideoFailed {
+        url: String,
+        error: String,
+    },
+    /// Offline catch-up: messages fetched so far by the current catch-up, `done` at the end.
+    SyncProgress {
+        fetched: usize,
+        done: bool,
     },
 }
 
@@ -407,6 +427,10 @@ pub struct ZaloGuiApp {
     filter_starred_only: bool,
     active_call: Option<ActiveCallOverlay>,
     image_viewer: Option<ImageViewerModal>,
+    /// In-app media windows (video player); see `gui/media_view.rs`.
+    media: media_view::MediaViewState,
+    /// Offline catch-up progress: `(fetched, done, last update)`.
+    sync_progress: Option<(usize, bool, std::time::Instant)>,
 
     info_drawer_open: bool,
     profile_menu_open: bool,
@@ -735,6 +759,8 @@ impl ZaloGuiApp {
             filter_starred_only: false,
             active_call: None,
             image_viewer: None,
+            media: media_view::MediaViewState::default(),
+            sync_progress: None,
             status_msg: "Trực tuyến · Sẵn sàng".into(),
             info_drawer_open: false,
             profile_menu_open: false,
@@ -996,6 +1022,16 @@ impl ZaloGuiApp {
                             "Đã xoá {freed_s}; {failed} mục không xoá được (đang được dùng?)."
                         ));
                     }
+                }
+                GuiEvent::VideoProgress {
+                    url,
+                    received,
+                    total,
+                } => self.on_video_progress(url, received, total),
+                GuiEvent::VideoReady { url, path } => self.on_video_ready(url, path),
+                GuiEvent::VideoFailed { url, error } => self.on_video_failed(url, error),
+                GuiEvent::SyncProgress { fetched, done } => {
+                    self.sync_progress = Some((fetched, done, std::time::Instant::now()));
                 }
                 GuiEvent::LoggedOut => {
                     self.is_logged_in = false;

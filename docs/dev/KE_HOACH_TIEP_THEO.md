@@ -40,6 +40,22 @@ Mục đích: xác nhận các giả thiết **[I]/[U]** trong `re-notes/09` tr�
    - Có tin E2EE không (queue `513`/`713`, trường `e2eeStatus`, nội dung là bản mã)?
 4. Kết luận cho từng giả thiết: **xác nhận / bác bỏ / chưa rõ**. Thiết kế A1–A5 phải theo kết luận này.
 
+### Thiết kế đã chốt sau A0 (2026-11-01)
+
+Bằng chứng: `re-notes/10_bang_chung_dong_bo.md` (3 lượt chạy với tài khoản thật). Thay đổi so với A1–A5 bên dưới:
+
+| Mục | Quyết định |
+|---|---|
+| A1 | Giữ. Queue thật là `510_1, 511_1, 515_0, 517_0, 518_0` + ctrl `603_1, 610_1, 611_1`; long-poll `1, 15, 16`. Kéo về không xoá tin khỏi hàng đợi, nên `lastId: 1` tải lại mọi thứ từ lúc đăng nhập. Con trỏ do `socket.rs` tự cập nhật trong một bản đồ dùng chung; worker lưu xuống `sync_state_<uin>.json`. |
+| A2 | Giữ, và thêm: `RefreshThreads` phải thử lại khi `check_session` trả `Unreachable` (lượt 2 bị kẹt và không thử lại). |
+| A3 | Giữ. `evict` có thật trong `queueStatus` của mọi queue; chưa gặp giá trị khác 0. |
+| A4 | Thu nhỏ: thiết bị mới nhận 0 tin nhóm từ `getrecentv2` (cờ `isFiltered`). Chỉ nối lịch sử cho "Cloud của tôi" và nhóm nào có trả tin. |
+| A5 | **Bỏ** khỏi v0.1.2: không thấy tin E2EE nào; queue E2EE của phiên là `515/517` (web). |
+| A8 (mới) | Tin ảnh/video/tệp đến từ queue đang hiện thành link thô và mở trình duyệt. Sửa parse để hiện thẻ ảnh/video/tệp; bấm ảnh → cửa sổ xem ảnh riêng của app; bấm video → cửa sổ phát video của app (ffmpeg nếu có, không có thì tải vào cache rồi mở bằng trình phát mặc định); không mở trình duyệt. Người dùng chọn phương án này. |
+| A9 (mới) | Danh sách hội thoại giống điện thoại: tab Tin nhắn chỉ hiện hội thoại có hoạt động, sắp theo thời điểm hoạt động cuối. Nguồn thứ tự: tin trong DB + `clearUnreads[].lastMsgId` của `get-last-msgs` (137 hội thoại). `msgId` tăng gần tuyến tính theo thời gian (khoảng 41 id/ms, 1 đảo thứ tự trong 75 tin) nên đổi được ra thời điểm ước lượng. Người dùng chọn "chỉ hội thoại có hoạt động". |
+
+Phân công: coordinator làm A1–A4, A9 và các điểm nối (`GuiEvent::{Video*, SyncProgress}`, `WorkerCmd::PrepareVideo`, `paths::video_cache_dir`, khung `src/gui/media_view.rs`); một agent làm A8 trong worktree riêng.
+
 ### A1. Lưu con trỏ hàng đợi bền theo tài khoản
 
 - File mới `src/sync_state.rs` (module thuần + I/O nhỏ, có unit test):

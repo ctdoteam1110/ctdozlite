@@ -2104,6 +2104,7 @@ impl ZaloGuiApp {
         self.render_forward_dialog(ctx, pal);
         self.render_call_overlay(ctx, pal);
         self.render_image_viewer_modal(ctx, pal);
+        self.render_media_windows(ctx, pal);
         self.render_phone_lookup_modal(ctx, pal);
         self.render_settings_modal(ctx, pal);
     }
