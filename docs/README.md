@@ -16,6 +16,7 @@ Tài liệu cho người dùng và người phát triển QTzalo (`zalo-rust`).
 |---|---|
 | [Kiến trúc hệ thống](KIEN_TRUC_HE_THONG.md) | Phân tách UI thread / Tokio worker, WebSocket + HTTP polling, lưu trữ SQLite. |
 | [Đặc tả giao thức Zalo](GIAO_THUC_ZALO.md) | `zpw_ver=694`, `ParamCipher v2`, `PasswordCipher`, `signkey`, mã hoá AES. |
+| [Bàn giao dự án](dev/BAN_GIAO.md) | Trạng thái hiện tại, quyết định đã chốt, quy trình build/phát hành, phạm vi phiên bản kế tiếp, bài học điều phối agent. |
 | [Rà soát bảo mật](SECURITY_AUDIT.md) | Các vấn đề bảo mật và lỗi chức năng đã phát hiện, trạng thái khắc phục. |
 | [Kế hoạch production](KE_HOACH_PRODUCTION.md) | Lộ trình kế thừa từ dự án gốc. |
 | [../re-notes/](../re-notes/) | Ghi chú reverse-engineering giao thức (đăng nhập, dữ liệu chat, cuộc gọi). |
