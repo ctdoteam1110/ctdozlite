@@ -5,6 +5,7 @@ pub mod clock;
 pub mod crypto;
 pub mod endpoints;
 pub mod gui;
+pub mod history_sync;
 pub mod logger;
 pub mod login;
 pub mod media;

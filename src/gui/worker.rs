@@ -18,6 +18,13 @@ pub enum WorkerCmd {
     LoadGroupHistory {
         group_id: String,
         is_group: bool,
+        /// Messages the GUI already holds. SQLite is read `have + 300` deep, so each
+        /// "Tải thêm" reaches further back instead of re-reading the same newest 500.
+        have: usize,
+    },
+    /// Page group / Cloud history back from the server into SQLite: (id, name, is_group).
+    SyncHistory {
+        threads: Vec<(String, String, bool)>,
     },
     SendMessage {
         to_id: String,
@@ -889,7 +896,58 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 IS_POLLING.store(false, std::sync::atomic::Ordering::SeqCst);
                             });
                         }
-                        WorkerCmd::LoadGroupHistory { group_id, is_group } => {
+                        WorkerCmd::SyncHistory { threads } => {
+                            use std::sync::atomic::Ordering;
+                            if crate::history_sync::RUNNING.swap(true, Ordering::SeqCst) {
+                                continue;
+                            }
+                            crate::history_sync::CANCEL.store(false, Ordering::Relaxed);
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let total = threads.len();
+                                let mut added = 0;
+                                let mut errors = Vec::new();
+                                for (i, (id, name, is_group)) in threads.into_iter().enumerate() {
+                                    if crate::history_sync::CANCEL.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                        "Đang đồng bộ {}/{total} · {name}",
+                                        i + 1
+                                    )));
+                                    ctx_clone.request_repaint();
+                                    let mut t = Thread {
+                                        id,
+                                        name,
+                                        preview: String::new(),
+                                        time: String::new(),
+                                        avatar: None,
+                                        is_group,
+                                        messages: Vec::new(),
+                                        ..Default::default()
+                                    };
+                                    match crate::history_sync::sync_thread(&s, &mut t).await {
+                                        Ok(n) => added += n,
+                                        Err(e) => errors.push(format!("{}: {e}", t.name)),
+                                    }
+                                }
+                                let _ = gui_tx_clone.send(GuiEvent::SyncFinished {
+                                    added,
+                                    errors,
+                                    cancelled: crate::history_sync::CANCEL.load(Ordering::Relaxed),
+                                });
+                                ctx_clone.request_repaint();
+                                crate::history_sync::RUNNING.store(false, Ordering::SeqCst);
+                            });
+                        }
+                        WorkerCmd::LoadGroupHistory {
+                            group_id,
+                            is_group,
+                            have,
+                        } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -916,7 +974,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     crate::store::load_history_into_threads(
                                         "zalo_history.db",
                                         &mut t_list,
-                                        500,
+                                        (have + 300).max(500),
                                     );
                                     let Some(mut t) =
                                         t_list.into_iter().find(|x| x.id == group_id)

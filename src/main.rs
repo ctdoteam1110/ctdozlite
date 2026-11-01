@@ -12,6 +12,7 @@ mod crypto;
 mod data_dir;
 mod endpoints;
 mod gui;
+mod history_sync;
 mod logger;
 mod login;
 mod media;

@@ -139,6 +139,11 @@ pub enum GuiEvent {
         reason: String,
     },
     StatusUpdate(String),
+    SyncFinished {
+        added: usize,
+        errors: Vec<String>,
+        cancelled: bool,
+    },
     UpdateCheckFinished {
         result: Result<UpdateCheckResult, String>,
         silent: bool,
@@ -331,11 +336,9 @@ impl AppSettings {
 }
 
 
-<<<<<<< HEAD
 /// Bubbles rendered per step in the chat view; "Tải thêm tin nhắn cũ" adds another step.
 const CHAT_RENDER_STEP: usize = 150;
-||||||| a133d01
-=======
+
 /// Worker → GUI channel that wakes the UI on every send. The GUI no longer repaints on a
 /// 1.2 s timer, so an event sent without a repaint would sit unseen until the next mouse move.
 #[derive(Clone)]
@@ -353,7 +356,6 @@ impl GuiTx {
         res
     }
 }
->>>>>>> pr-46
 
 pub struct ZaloGuiApp {
     // Theme state
@@ -1236,6 +1238,23 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::StatusUpdate(msg) => {
                     self.status_msg = msg;
+                }
+                GuiEvent::SyncFinished {
+                    added,
+                    errors,
+                    cancelled,
+                } => {
+                    let head = if cancelled {
+                        "Đã dừng đồng bộ"
+                    } else {
+                        "Đồng bộ xong"
+                    };
+                    let mut msg = format!("{head}: lưu thêm {added} tin cũ");
+                    if let Some(first) = errors.first() {
+                        msg.push_str(&format!(" · {} lỗi (vd. {first})", errors.len()));
+                    }
+                    self.status_msg = msg.clone();
+                    self.show_toast(msg);
                 }
                 GuiEvent::UpdateCheckFinished { result, silent } => {
                     self.update_checking = false;

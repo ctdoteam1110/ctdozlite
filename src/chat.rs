@@ -386,7 +386,7 @@ impl ChatMessage {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Thread {
     #[serde(default)]
     pub presentation: SidebarPresentation,
