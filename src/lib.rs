@@ -20,6 +20,8 @@ pub mod qr;
 pub mod reactions;
 /// Durable account-owned incremental reaction inbox and replay.
 pub mod reaction_journal;
+/// Explicit validated import of account-bound original reaction aggregates.
+pub mod original_reactions;
 pub mod session;
 pub mod socket;
 pub mod store;

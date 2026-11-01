@@ -756,6 +756,7 @@ impl ZaloGuiApp {
         let mut pick_dl_dir = false;
         let mut open_dl_dir = false;
         let mut pick_migrate_file = false;
+        let mut import_original_reactions = false;
         let mut export_theme_tpl = false;
         let mut reload_theme_json = false;
         let mut export_sticker_tpl = false;
@@ -1266,6 +1267,13 @@ impl ZaloGuiApp {
                                                         }
                                                     });
                                                 });
+                                            ui.add_space(16.0);
+                                            ui.label(RichText::new("Nhập cache cảm xúc đã chuẩn hóa").color(pal.text_primary).size(13.5).strong());
+                                            ui.label(RichText::new("Chỉ nhận tệp JSON schema 1 đúng tài khoản và nhãn nguồn được hỗ trợ. Tệp được chọn được giữ nguyên; bản nhập riêng tư sẽ được dùng khi tải lại tin nhắn. Không tự tìm dữ liệu ứng dụng khác.").color(pal.text_secondary).size(12.2));
+                                            if ui.add_enabled(self.is_logged_in && !self.original_reaction_import_pending,
+                                                egui::Button::new("Chọn tệp cache cảm xúc JSON để nhập…")).clicked() {
+                                                import_original_reactions = true;
+                                            }
                                         }
                                         SettingsTab::Appearance => {
                                             ui.label(RichText::new("Cài đặt giao diện").color(pal.text_primary).size(13.5).strong());
@@ -2320,6 +2328,14 @@ impl ZaloGuiApp {
             }
         }
 
+        if import_original_reactions {
+            if let Some(tx) = WORKER_TX.get() {
+                self.original_reaction_import_pending = tx.send(WorkerCmd::ImportOriginalReactions {
+                    account: self.user_uin.clone(), path: None,
+                }).is_ok();
+                if !self.original_reaction_import_pending { self.show_toast("Tác vụ nhập cache cảm xúc chưa được tiếp nhận"); }
+            } else { self.show_toast("Worker chưa sẵn sàng để nhập cache cảm xúc"); }
+        }
         if pick_migrate_file {
             if let Some(src_path) = pick_native_file_dialog(false) {
                 let sent = WORKER_TX.get().is_some_and(|tx| tx.send(WorkerCmd::ImportHistory {

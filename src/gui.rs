@@ -82,6 +82,14 @@ pub enum GuiEvent {
     },
     LoginFailed(String),
     ThreadsUpdated(Vec<Thread>),
+    /// Structured terminal result from the explicit Settings cache-import action.
+    OriginalReactionImportFinished {
+        account: String,
+        result: Result<
+            Option<crate::original_reactions::OriginalReactionCache>,
+            crate::original_reactions::ImportError,
+        >,
+    },
     /// A durable batch arrived; request replay against currently loaded targets.
     ReactionEvents {
         account: String,
@@ -493,6 +501,7 @@ pub struct ZaloGuiApp {
 
     // Session state
     is_logged_in: bool,
+    original_reaction_import_pending: bool,
     user_name: String,
     user_uin: String,
     user_avatar: Option<String>,
@@ -707,6 +716,7 @@ impl ZaloGuiApp {
             dark_mode,
             theme_dirty: false,
             is_logged_in,
+            original_reaction_import_pending: false,
             user_name,
             user_uin,
             user_avatar,
@@ -992,6 +1002,7 @@ impl ZaloGuiApp {
                         format!("Đã quét bởi {name} — Vui lòng bấm 'Đăng nhập' trên điện thoại…");
                 }
                 GuiEvent::LoginSuccess { name, uin, avatar } => {
+                    self.original_reaction_import_pending = false;
                     self.is_logged_in = true;
                     self.user_name = name;
                     self.user_uin = uin;
@@ -1005,6 +1016,25 @@ impl ZaloGuiApp {
                 GuiEvent::LoginFailed(err) => {
                     self.login_in_progress = false;
                     self.login_status_msg = format!("Lỗi đăng nhập: {err}");
+                }
+                GuiEvent::OriginalReactionImportFinished { account, result } => {
+                    if self.user_uin == account && self.is_logged_in {
+                        self.original_reaction_import_pending = false;
+                        match result {
+                            Ok(Some(cache)) => {
+                                // Pure reducer on the current UI state protects edits and live clears
+                                // that arrived while the worker validated and retained the file.
+                                let summary = cache.apply_to_threads(&mut self.threads);
+                                if summary.messages_updated > 0 {
+                                    self.persist_threads_async();
+                                }
+                                self.replay_reactions_async();
+                                self.show_toast(format!("Đã lưu {} snapshot cảm xúc; cập nhật {} tin đang tải, giữ nguyên {} tin có trạng thái mới, bỏ qua {} kết quả không duy nhất", summary.snapshots_loaded, summary.messages_updated, summary.messages_protected, summary.ambiguous_matches));
+                            }
+                            Ok(None) => self.show_toast("Đã hủy nhập cache cảm xúc"),
+                            Err(error) => self.show_toast(error.message()),
+                        }
+                    }
                 }
                 GuiEvent::ReactionEvents { account } => {
                     if self.is_logged_in && self.user_uin == account {
@@ -1113,6 +1143,7 @@ impl ZaloGuiApp {
                     self.status_msg = format!("Trực tuyến · Cập nhật {}", crate::ui::clock());
                 }
                 GuiEvent::SessionExpired(reason) => {
+                    self.original_reaction_import_pending = false;
                     self.is_logged_in = false;
                     self.qr_texture = None;
                     self.qr_status = format!(
@@ -1131,6 +1162,7 @@ impl ZaloGuiApp {
                     self.status_msg = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên)".into();
                 }
                 GuiEvent::LoggedOut => {
+                    self.original_reaction_import_pending = false;
                     self.is_logged_in = false;
                     self.user_name.clear();
                     self.user_uin.clear();

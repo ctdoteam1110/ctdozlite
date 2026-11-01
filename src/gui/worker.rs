@@ -6,6 +6,11 @@ pub(super) static KNOWN_THREADS: std::sync::Mutex<Vec<(String, String, bool)>> =
     std::sync::Mutex::new(Vec::new());
 
 pub enum WorkerCmd {
+    /// Explicitly select and adopt a validated original reaction-cache export.
+    ImportOriginalReactions {
+        account: String,
+        path: Option<std::path::PathBuf>,
+    },
     /// Render one exact grapheme through the bounded native emoji helper off the UI thread.
     RenderInlineEmoji { cluster: String, sprite_id: Option<u16> },
     /// Import and hydrate local history on the blocking pool.
@@ -210,6 +215,60 @@ pub enum WorkerCmd {
     },
 }
 
+async fn process_original_reaction_import(
+    root: std::path::PathBuf,
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
+    captured: Session,
+    sender: GuiTx,
+    account: String,
+    selected: Option<std::path::PathBuf>,
+    pick_file: bool,
+) {
+    use crate::original_reactions::ImportError;
+    let result = if captured.login.as_ref().map(|l| l.uin.as_str()) != Some(account.as_str()) {
+        Err(ImportError::StaleAccount)
+    } else {
+        // No session or journal locks are held while an explicit native picker is open.
+        let selected = if pick_file {
+            tokio::task::spawn_blocking(|| pick_native_file_dialog(false))
+                .await
+                .map_err(|_| ImportError::Worker)
+        } else {
+            Ok(selected)
+        };
+        match selected {
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
+            Ok(Some(selected)) => {
+                let _lane = REACTION_JOURNAL_LANE.lock().await;
+                let import_account = account.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let current = session.blocking_lock();
+                    if current.login.as_ref().map(|l| l.uin.as_str())
+                        != Some(import_account.as_str())
+                        || current.zpw_sek != captured.zpw_sek
+                    {
+                        return Err(ImportError::StaleAccount);
+                    }
+                    crate::original_reactions::import_selected_cache(
+                        &root,
+                        &selected,
+                        &import_account,
+                    )
+                    .map(Some)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(ImportError::Worker),
+                }
+            }
+        }
+    };
+    // The UI may have closed or rejected the initiating scope while the import ran.
+    let _ = sender.send(GuiEvent::OriginalReactionImportFinished { account, result });
+}
+
 // A single lane serializes append/replay across accounts, bounding concurrent SQLite writers.
 static REACTION_JOURNAL_LANE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -261,7 +320,12 @@ async fn process_reaction_journal_at(
             }
             let mut journal = crate::reaction_journal::ReactionJournal::open(&root, &account)?;
             journal.append(&events)?;
-            if !threads.is_empty() { journal.apply_loaded(&mut threads)?; }
+            if !threads.is_empty() {
+                if let Some(cache) = crate::original_reactions::load_imported_cache(&root, &account)? {
+                    cache.apply_to_threads(&mut threads);
+                }
+                journal.apply_loaded(&mut threads)?;
+            }
             Ok(Some((account, threads)))
         })
         .await;
@@ -696,6 +760,15 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
 
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
+                        WorkerCmd::ImportOriginalReactions { account, path } => {
+                            let captured = session.lock().await.clone();
+                            let session = session.clone();
+                            let sender = gui_tx.clone();
+                            tokio::spawn(async move {
+                                let pick_file = path.is_none();
+                                process_original_reaction_import(std::path::PathBuf::from("."), session, captured, sender, account, path, pick_file).await;
+                            });
+                        }
                         WorkerCmd::ReplayReactions { account, threads } => {
                             let captured = session.lock().await.clone();
                             if captured.login.as_ref().map(|l| l.uin.as_str()) == Some(account.as_str()) {
@@ -3288,5 +3361,191 @@ mod inline_emoji_native_tests {
             color_meshes >= 4,
             "Native worker images must become visible color meshes"
         );
+    }
+}
+
+#[cfg(test)]
+mod original_reaction_import_consumer_tests {
+    use super::*;
+    use crate::original_reactions::ImportError;
+
+    fn session_fixture(account: &str) -> Session {
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo {
+            uin: account.into(),
+            ..Default::default()
+        });
+        session.zpw_sek = Some("fixture-session".into());
+        session
+    }
+    fn fixture_root(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "zl-original-import-consumer-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
+    fn write_source(root: &std::path::Path) -> std::path::PathBuf {
+        let path = root.join("explicit-selection.json");
+        std::fs::write(&path,serde_json::to_vec(&serde_json::json!({"schema":1,"account_id":"account-a","source":"zalo-macos-local-cache","captured_at_ms":1700000000000_i64,
+            "snapshots":[{"idTo":"peer-fixture","rClientMsgId":"client-fixture","rMsgId":"message-fixture","reactions":{"reactor-fixture":{"5":2}}}]})).unwrap()).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn explicit_import_consumer_adopts_file_and_late_replay_uses_only_managed_artifact() {
+        let root = fixture_root("flow");
+        let managed = root.join("managed");
+        let path = write_source(&root);
+        let captured = session_fixture("account-a");
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let (tx, rx) = channel();
+        let sender = GuiTx {
+            tx,
+            ctx: egui::Context::default(),
+        };
+        process_original_reaction_import(
+            managed.clone(),
+            session.clone(),
+            captured.clone(),
+            sender.clone(),
+            "account-a".into(),
+            Some(path.clone()),
+            false,
+        )
+        .await;
+        let GuiEvent::OriginalReactionImportFinished {
+            account,
+            result: Ok(Some(cache)),
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("successful import result missing");
+        };
+        assert_eq!(account, "account-a");
+        assert_eq!(cache.provenance().captured_at_ms, 1700000000000);
+        std::fs::remove_file(path).unwrap();
+        let loaded = vec![Thread {
+            id: "peer-fixture".into(),
+            messages: vec![ChatMessage {
+                id: "message-fixture".into(),
+                client_message_id: "client-fixture".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        process_reaction_journal_at(managed, session, captured, sender, Vec::new(), loaded).await;
+        let GuiEvent::ReactionThreadsUpdated { threads, .. } = rx.try_recv().unwrap() else {
+            panic!("managed replay result missing");
+        };
+        assert_eq!(threads[0].messages[0].reaction_summaries[0].count, 2);
+        assert!(threads[0].messages[0].reaction_authoritative_snapshot);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_import_consumer_cancel_invalid_and_stale_have_structured_terminal_results() {
+        let root = fixture_root("terminal");
+        let managed = root.join("managed");
+        let path = write_source(&root);
+        let captured = session_fixture("account-a");
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let (tx, rx) = channel();
+        let sender = GuiTx {
+            tx,
+            ctx: egui::Context::default(),
+        };
+        process_original_reaction_import(
+            managed.clone(),
+            session.clone(),
+            captured.clone(),
+            sender.clone(),
+            "account-a".into(),
+            None,
+            false,
+        )
+        .await;
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            GuiEvent::OriginalReactionImportFinished {
+                result: Ok(None),
+                ..
+            }
+        ));
+        std::fs::write(&path, "not an envelope: private-value").unwrap();
+        process_original_reaction_import(
+            managed.clone(),
+            session.clone(),
+            captured.clone(),
+            sender.clone(),
+            "account-a".into(),
+            Some(path.clone()),
+            false,
+        )
+        .await;
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            GuiEvent::OriginalReactionImportFinished {
+                result: Err(ImportError::InvalidCache),
+                ..
+            }
+        ));
+        *session.lock().await = session_fixture("account-b");
+        process_original_reaction_import(
+            managed.clone(),
+            session,
+            captured,
+            sender,
+            "account-a".into(),
+            Some(path),
+            false,
+        )
+        .await;
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            GuiEvent::OriginalReactionImportFinished {
+                result: Err(ImportError::StaleAccount),
+                ..
+            }
+        ));
+        assert!(!managed.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_import_consumer_storage_failure_never_reports_imported_cache() {
+        let root = fixture_root("disk");
+        let managed = root.join("managed");
+        let path = write_source(&root);
+        std::fs::write(&managed, "fixture prevents directory creation").unwrap();
+        let captured = session_fixture("account-a");
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let (tx, rx) = channel();
+        let sender = GuiTx {
+            tx,
+            ctx: egui::Context::default(),
+        };
+        process_original_reaction_import(
+            managed,
+            session,
+            captured,
+            sender,
+            "account-a".into(),
+            Some(path),
+            false,
+        )
+        .await;
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            GuiEvent::OriginalReactionImportFinished {
+                result: Err(ImportError::Storage),
+                ..
+            }
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
