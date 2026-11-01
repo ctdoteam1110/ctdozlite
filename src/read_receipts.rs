@@ -104,8 +104,10 @@ impl SeenBatch {
                 .into_iter()
                 .flatten()
             {
-                if !value.is_number() && !value.as_str().is_some_and(|s| s.len() <= 256) {
-                    bail!("Invalid receipt field");
+                match value {
+                    Value::Number(_) => {}
+                    Value::String(text) if text.len() <= 256 => {}
+                    _ => bail!("Invalid receipt field"),
                 }
             }
             data.push(json!({"cmi":cmi,"gmi":gmi,"si":si,"di":di,"mt":mt,
@@ -185,7 +187,10 @@ pub fn parse_seen_response(response: &Value) -> Result<()> {
 /// Logical focus alone is insufficient when a native macOS window is behind another application.
 #[cfg(target_os = "macos")]
 pub fn native_visible_window_foreground() -> bool {
-    use std::ffi::{c_char, c_void};
+    use std::ffi::{c_char, c_void, CStr};
+    fn static_cstr(bytes: &'static [u8]) -> &'static CStr {
+        CStr::from_bytes_with_nul(bytes).expect("Static C string")
+    }
     #[link(name = "AppKit", kind = "framework")]
     extern "C" {}
     #[link(name = "objc")]
@@ -197,17 +202,17 @@ pub fn native_visible_window_foreground() -> bool {
     unsafe fn object(receiver: *mut c_void, selector: &'static [u8]) -> *mut c_void {
         let send: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        send(receiver, sel_registerName(selector.as_ptr().cast()))
+        send(receiver, sel_registerName(static_cstr(selector).as_ptr()))
     }
     unsafe fn flag(receiver: *mut c_void, selector: &'static [u8]) -> bool {
         let send: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i8 =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        !receiver.is_null() && send(receiver, sel_registerName(selector.as_ptr().cast())) != 0
+        !receiver.is_null() && send(receiver, sel_registerName(static_cstr(selector).as_ptr())) != 0
     }
     // SAFETY: These read-only AppKit getters run on the main GUI thread with static NUL-terminated selectors and matching signatures.
     unsafe {
         let workspace = object(
-            objc_getClass(b"NSWorkspace\0".as_ptr().cast()),
+            objc_getClass(static_cstr(b"NSWorkspace\0").as_ptr()),
             b"sharedWorkspace\0",
         );
         let front = object(workspace, b"frontmostApplication\0");
@@ -218,13 +223,13 @@ pub fn native_visible_window_foreground() -> bool {
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
         if pid(
             front,
-            sel_registerName(b"processIdentifier\0".as_ptr().cast()),
+            sel_registerName(static_cstr(b"processIdentifier\0").as_ptr()),
         ) != std::process::id() as i32
         {
             return false;
         }
         let app = object(
-            objc_getClass(b"NSApplication\0".as_ptr().cast()),
+            objc_getClass(static_cstr(b"NSApplication\0").as_ptr()),
             b"sharedApplication\0",
         );
         if !flag(app, b"isActive\0") {
@@ -335,11 +340,10 @@ impl ReadVisibilityGate {
     }
     /// Capture only after a complete dwell for the current viewport.
     pub fn ticket(&self) -> Option<VisibilityTicket> {
-        if !self
-            .last
-            .zip(self.since)
-            .is_some_and(|(last, since)| last.saturating_sub(since) >= 500)
-        {
+        let (Some(last), Some(since)) = (self.last, self.since) else {
+            return None;
+        };
+        if last.saturating_sub(since) < 500 {
             return None;
         }
         Some(VisibilityTicket {
@@ -650,7 +654,7 @@ mod tests {
             Ok(())
         })
         .await;
-        assert!(!submitted && result.unwrap() == false);
+        assert!(!submitted && !result.unwrap());
         assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
         ledger.release_unsent("thread-fixture", &reserved);
         for now in [600, 700, 800, 900, 1000, 1100] {
@@ -670,7 +674,7 @@ mod tests {
         let batch = SeenBatch::from_wire(
             "sender-fixture",
             false,
-            &[message.wire_ref.clone()],
+            std::slice::from_ref(&message.wire_ref),
             "imei-fixture",
         )
         .unwrap();
@@ -681,7 +685,7 @@ mod tests {
         assert!(SeenBatch::from_wire(
             "other-sender",
             false,
-            &[message.wire_ref.clone()],
+            std::slice::from_ref(&message.wire_ref),
             "fixture"
         )
         .is_err());
@@ -732,7 +736,7 @@ mod tests {
             ..Default::default()
         };
         let mut ledger = LiveReadLedger::default();
-        ledger.observe("account-fixture", &[], &[update.clone()]);
+        ledger.observe("account-fixture", &[], std::slice::from_ref(&update));
         assert_eq!(ledger.claim("thread-fixture", false, &rows).len(), 50);
         assert_eq!(ledger.claim("thread-fixture", false, &rows).len(), 20);
         ledger.observe("account-fixture", &[], &[update]);

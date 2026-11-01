@@ -1410,16 +1410,18 @@ mod tests {
 
     #[test]
     fn heal_restores_every_verified_domain() {
-        let mut domains = Domains::default();
-        domains.chat = "https://p4-msg-chat.zaloapp.com".into();
-        domains.conversation = "https://p4-ctl-chat.zaloapp.com".into();
-        domains.convers_api = "https://tt-convers-wpa.zaloapp.com/".into();
-        domains.friend = "https://tt-friend-wpa.zaloapp.com".into();
-        domains.profile = "https://tt-profile-wpa.zaloapp.com".into();
-        domains.group = String::new();
-        domains.file = "https://wrong.example/".into();
-        domains.voice_call = String::new();
-        domains.sticker = String::new();
+        let mut domains = Domains {
+            chat: "https://p4-msg-chat.zaloapp.com".into(),
+            conversation: "https://p4-ctl-chat.zaloapp.com".into(),
+            convers_api: "https://tt-convers-wpa.zaloapp.com/".into(),
+            friend: "https://tt-friend-wpa.zaloapp.com".into(),
+            profile: "https://tt-profile-wpa.zaloapp.com".into(),
+            group: String::new(),
+            file: "https://wrong.example/".into(),
+            voice_call: String::new(),
+            sticker: String::new(),
+            ..Default::default()
+        };
 
         domains.heal_from_verified();
 
@@ -1444,11 +1446,13 @@ mod tests {
 
     #[test]
     fn heal_leaves_server_owned_endpoints_untouched() {
-        let mut domains = Domains::default();
-        domains.lp_chat = "https://p9-msg-chat.zaloapp.com".into();
-        domains.lp_control = "https://p9-ctl-chat.zaloapp.com".into();
-        domains.cloud_msg = "https://tt-group-cm.example.test".into();
-        domains.ws = vec!["wss://ws99-msg.chat.zalo.me".into()];
+        let mut domains = Domains {
+            lp_chat: "https://p9-msg-chat.zaloapp.com".into(),
+            lp_control: "https://p9-ctl-chat.zaloapp.com".into(),
+            cloud_msg: "https://tt-group-cm.example.test".into(),
+            ws: vec!["wss://ws99-msg.chat.zalo.me".into()],
+            ..Default::default()
+        };
 
         domains.heal_from_verified();
 
@@ -1579,8 +1583,11 @@ mod tests {
 
     #[test]
     fn candidates_preserve_priority_order_verified_then_service_map_then_saved() {
-        let mut domains = Domains::default();
-        domains.chat = "https://legacy-saved-chat.zaloapp.com/".into();
+        let mut domains = Domains {
+            chat: "https://legacy-saved-chat.zaloapp.com/".into(),
+            ..Default::default()
+        };
+
         domains.heal_from_verified();
         domains.apply_service_map(&serde_json::json!({
             "chat": [
