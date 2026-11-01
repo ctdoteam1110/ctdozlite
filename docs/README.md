@@ -11,6 +11,22 @@ Thư mục này chứa tài liệu chi tiết về cách sử dụng, cấu trú
 | [3. Đặc tả giao thức Zalo](GIAO_THUC_ZALO.md) | Cấu trúc tham số `zpw_ver=694`, `ParamCipher v2`, `PasswordCipher`, `signkey` và cơ chế mã hóa AES. |
 | [4. Xử lý sự cố](KHAC_PHUC_SU_CO.md) | Bảng mã lỗi máy chủ Zalo (`18012`, `18060`, `18022`, `600`, `102`, `114`, `429`) và cách khắc phục. |
 
+## Tiêu chuẩn kỹ thuật (Engineering Standards)
+
+Bộ quy chuẩn bắt buộc cho mọi thay đổi mã nguồn, nằm tại [`docs/standards/`](standards/) và được tóm tắt trong [`AGENTS.md`](../AGENTS.md):
+
+| Tiêu chuẩn | Nội dung |
+|---|---|
+| [Issue tracking](standards/issue-tracker.md) | Quy trình GitHub Issues, nhãn triage, sub-issue. |
+| [Domain docs](standards/domain-docs.md) | `GLOSSARY.md`, `INV-N`, ADR tại [`docs/adr/`](adr/). |
+| [Code comments](standards/code-comment-taxonomy.md) | Rustdoc 4 tầng, `// SAFETY:`, `// TODO(#id):`. |
+| [API & errors](standards/api-design-and-error-handling.md) | Endpoint Zalo, `error_code`, retry, IPC worker. |
+| [Database](standards/database-and-migrations.md) | SQLite, `PRAGMA user_version`, expand/contract. |
+| [Concurrency](standards/concurrency-and-locking.md) | Luồng UI/worker, channel, lock, deadlock. |
+| [Testing](standards/testing-and-fixtures.md) | `cargo test`, fixture, builder, benchmark. |
+| [Security](standards/security-and-cryptography.md) | `session.json`, secret, crypto, logging. |
+| [Git flow](standards/git-flow-and-pr-matrix.md) | Branch, Conventional Commits, 3-tier PR. |
+
 ## Biên dịch và chạy nhanh
 
 ```bash
