@@ -498,3 +498,50 @@ mod authoritative_identity_regressions {
         assert!(message_identity(&crate::chat::ChatMessage::default()).is_none());
     }
 }
+
+/// A private viewer copy that is neither a saved original nor a cache-pruning candidate.
+pub(super) struct NativePhotoLease(std::path::PathBuf);
+impl NativePhotoLease {
+    /// Return the verified local path while this lease remains alive.
+    pub(super) fn path(&self) -> &std::path::Path { &self.0 }
+}
+impl Drop for NativePhotoLease {
+    fn drop(&mut self) {
+        // Best-effort cleanup also runs if the owning viewer task is cancelled.
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Validate through the bounded Original pipeline, then lease a private local copy for a viewer.
+///
+/// # Errors
+/// Returns bounded download/decode, cache validation or private-file errors.
+pub(super) async fn prepare_native_photo(client: &reqwest::Client, key: crate::media_resources::MediaKey, url: &str, root: &std::path::Path, generation: &crate::media_resources::RequestGeneration, ticket: u64) -> Result<NativePhotoLease, crate::media_resources::MediaError> {
+    use crate::media_resources::{AtomicPrivateFile, PrivateMediaCache, MediaError, MediaQuality, PREVIEW_LIMIT};
+    if key.quality != MediaQuality::Original { return Err(MediaError::Decoder); }
+    let _validated = load_one(client, key.clone(), url, generation, ticket, root).await?;
+    generation.check(ticket)?;
+    let root = root.to_owned();
+    let generation = generation.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let cache = PrivateMediaCache::new(&root, &key.account)?;
+        let source = cache.path_for(&key)?;
+        let metadata = std::fs::symlink_metadata(&source).map_err(|_| MediaError::Io)?;
+        if !metadata.is_file() { return Err(MediaError::Io); }
+        if metadata.len() == 0 || metadata.len() > PREVIEW_LIMIT as u64 { return Err(MediaError::TooLarge); }
+        let mut bytes = Vec::new();
+        std::fs::File::open(&source).map_err(|_| MediaError::Io)?.take(PREVIEW_LIMIT as u64 + 1).read_to_end(&mut bytes).map_err(|_| MediaError::Io)?;
+        if bytes.len() > PREVIEW_LIMIT { return Err(MediaError::TooLarge); }
+        generation.check(ticket)?;
+        let name = format!("viewer-{}-{}.media",std::process::id(),NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed));
+        let directory = source.parent().ok_or(MediaError::Io)?.canonicalize().map_err(|_| MediaError::Io)?;
+        let lease = directory.join(name);
+        let mut file = AtomicPrivateFile::create(&lease,"viewer")?;
+        file.write_all(&bytes)?;
+        generation.check(ticket)?;
+        file.commit()?;
+        Ok(NativePhotoLease(lease))
+    }).await.map_err(|_| MediaError::Io)?
+}

@@ -2142,6 +2142,7 @@ impl ZaloGuiApp {
                                                 .clicked()
                                             {
                                                 self.image_viewer = Some(ImageViewerModal {
+                                                    native_photo: None,
                                                     tex_key: tkey.clone(),
                                                     hd_tex_key: self.request_hd_texture(full_u),
                                                     full_url: full_u.clone(),
@@ -3642,6 +3643,11 @@ impl ZaloGuiApp {
                                     sender,
                                     time,
                                 } => {
+                                    let native_photo = if tex_key.starts_with("photo_") {
+                                        let mut key = super::media_preview::photo_key_for_message(&self.user_uin, &thread_id, &m);
+                                        key.quality = crate::media_resources::MediaQuality::Original;
+                                        Some(key)
+                                    } else { None };
                                     let hd_tex_key = if tex_key.starts_with("photo_") {
                                         let mut key = super::media_preview::photo_key_for_message(&self.user_uin, &thread_id, &m);
                                         key.quality = crate::media_resources::MediaQuality::Original;
@@ -3654,6 +3660,7 @@ impl ZaloGuiApp {
                                         Some(texture)
                                     } else { self.request_hd_texture(&full_url) };
                                     self.image_viewer = Some(ImageViewerModal {
+                                        native_photo,
                                         tex_key,
                                         hd_tex_key,
                                         full_url,

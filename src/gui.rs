@@ -22,6 +22,7 @@ use crate::qr::QrLogin;
 use crate::session::Session;
 
 mod media_preview;
+mod native_photo_viewer;
 mod messages;
 mod emoji_text;
 mod composer;
@@ -43,6 +44,8 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 }
 
 pub enum GuiEvent {
+    /// Terminal native-viewer result after its child closes or fails.
+    NativePhotoViewerFinished { account: String, result: Result<(), crate::media_resources::MediaError> },
     /// Terminal result of background history import and hydration.
     HistoryImported {
         account: String,
@@ -284,10 +287,12 @@ struct ActiveCallOverlay {
     error_reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ImageViewerModal {
     tex_key: String,
     hd_tex_key: Option<String>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    native_photo: Option<crate::media_resources::MediaKey>,
     full_url: String,
     title: String,
     sender: String,
@@ -598,6 +603,7 @@ pub struct ZaloGuiApp {
     notification_authorization: crate::native_notifications::AuthorizationState,
     notification_delivery: crate::native_notifications::DeliveryGate,
     failed_photo_previews: HashSet<String>,
+    native_photo_pending: bool,
     photo_texture_budget: crate::media_resources::ResourceLru,
     settings: AppSettings,
     settings_blur_tex: Option<TextureHandle>,
@@ -809,6 +815,7 @@ impl ZaloGuiApp {
             notification_authorization: Default::default(),
             notification_delivery: Default::default(),
             failed_photo_previews: HashSet::new(),
+            native_photo_pending: false,
             photo_texture_budget: crate::media_resources::ResourceLru::new(
                 crate::media_resources::TEXTURE_BUDGET,
             ),
@@ -967,6 +974,12 @@ impl ZaloGuiApp {
                             Err(_) => self
                                 .show_toast("Lỗi nhập lịch sử. Hãy kiểm tra tệp nguồn và thử lại."),
                         }
+                    }
+                }
+                GuiEvent::NativePhotoViewerFinished { account, result } => {
+                    if account == self.user_uin { self.native_photo_pending = false; }
+                    if self.is_logged_in && account == self.user_uin && result.is_err() {
+                        self.show_toast("Lỗi mở trình xem gốc. Ảnh vẫn có trong trình xem hiện tại; bạn có thể thử lại.");
                     }
                 }
                 GuiEvent::PhotoPreviewReady {
@@ -1193,6 +1206,7 @@ impl ZaloGuiApp {
                     self.status_msg = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên)".into();
                 }
                 GuiEvent::LoggedOut => {
+                    self.native_photo_pending = false;
                     self.original_reaction_import_pending = false;
                     self.is_logged_in = false;
                     self.user_name.clear();

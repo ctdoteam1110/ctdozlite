@@ -6,6 +6,8 @@ pub(super) static KNOWN_THREADS: std::sync::Mutex<Vec<(String, String, bool)>> =
     std::sync::Mutex::new(Vec::new());
 
 pub enum WorkerCmd {
+    /// Open a native photo viewer only following an explicit viewer-button click.
+    OpenNativePhoto { key: crate::media_resources::MediaKey, url: String },
     /// Explicitly select and adopt a validated original reaction-cache export.
     ImportOriginalReactions {
         account: String,
@@ -831,6 +833,22 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 };
                                 let _ = tx.send(GuiEvent::HistoryImported { account, result });
                                 ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::OpenNativePhoto { key, url } => {
+                            let tx = gui_tx.clone();
+                            static VIEWERS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+                            let permit = VIEWERS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1))).clone().try_acquire_owned();
+                            let Ok(permit) = permit else {
+                                let _ = tx.send(GuiEvent::NativePhotoViewerFinished { account: key.account, result: Err(crate::media_resources::MediaError::Cancelled) });
+                                continue;
+                            };
+                            let snapshot = session.lock().await.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let account = snapshot.login.as_ref().map(|info| info.uin.as_str()).unwrap_or_default();
+                                let result = super::native_photo_viewer::open(&snapshot.http, account, key.clone(), &url).await;
+                                let _ = tx.send(GuiEvent::NativePhotoViewerFinished { account: key.account, result });
                             });
                         }
                         WorkerCmd::FetchPhotoPreview { key, thumbnail, source } => {

@@ -4568,6 +4568,15 @@ impl ZaloGuiApp {
                                     should_close = true;
                                 }
 
+                                #[cfg(target_os = "macos")]
+                                if let Some(key) = viewer.native_photo.as_ref().filter(|key| key.account == self.user_uin) {
+                                    if ui.add_enabled(!self.native_photo_pending, egui::Button::new("Mở trình xem gốc"))
+                                        .on_hover_text("Mở cửa sổ gốc cho ảnh này; trình xem hiện tại vẫn được giữ.").clicked() {
+                                        self.native_photo_pending = WORKER_TX.get().is_some_and(|tx| tx.send(WorkerCmd::OpenNativePhoto { key: key.clone(), url: viewer.full_url.clone() }).is_ok());
+                                        if !self.native_photo_pending { self.show_toast("Lỗi khởi động trình xem gốc. Hãy thử lại."); }
+                                    }
+                                }
+
                                 if !viewer.full_url.is_empty() {
                                     let ext_btn = egui::Button::new(
                                         RichText::new(format!("{} Mở gốc", lucide::EXTERNAL_LINK))
@@ -5287,6 +5296,7 @@ impl ZaloGuiApp {
                             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                                 let hd = self.request_hd_texture(&prof.cover_url);
                                 self.image_viewer = Some(ImageViewerModal {
+                                    native_photo: None,
                                     tex_key: ckey,
                                     hd_tex_key: hd,
                                     full_url: prof.cover_url.clone(),
@@ -5705,6 +5715,7 @@ impl ZaloGuiApp {
         if let Some((tkey, full_u, title, sender)) = clicked_image {
             let hd = self.request_hd_texture(&full_u);
             self.image_viewer = Some(ImageViewerModal {
+                native_photo: None,
                 tex_key: tkey,
                 hd_tex_key: hd,
                 full_url: full_u,
@@ -5787,6 +5798,7 @@ impl ZaloGuiApp {
                         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             let hd = self.request_hd_texture(&item.url);
                             self.image_viewer = Some(ImageViewerModal {
+                                native_photo: None,
                                 tex_key: tkey,
                                 hd_tex_key: hd,
                                 full_url: item.url.clone(),
