@@ -940,6 +940,53 @@ pub fn merge_thread_into(
     incoming: Thread,
     incoming_id_is_authoritative: bool,
 ) {
+    merge_thread_into_with_source(target, incoming, incoming_id_is_authoritative, false);
+}
+
+/// Enrich live messages from persisted history without rewinding known content or clocks.
+pub(crate) fn merge_cached_messages(target: &mut Thread, messages: Vec<ChatMessage>) {
+    merge_thread_into_with_source(
+        target,
+        Thread {
+            messages,
+            ..Default::default()
+        },
+        false,
+        true,
+    );
+}
+
+fn merge_cached_wire_ref(
+    live: &crate::message_model::WireMessageRef,
+    cached: &crate::message_model::WireMessageRef,
+) -> crate::message_model::WireMessageRef {
+    let mut merged = live.clone();
+    for (key, value) in &cached.fields {
+        merged
+            .fields
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+    merged.server_id = merged.server_id.or_else(|| cached.server_id.clone());
+    merged.client_id = merged.client_id.or_else(|| cached.client_id.clone());
+    merged.sender = merged.sender.or_else(|| cached.sender.clone());
+    merged.destination = merged.destination.or_else(|| cached.destination.clone());
+    merged.original_type = merged
+        .original_type
+        .or_else(|| cached.original_type.clone());
+    merged.cmd = merged.cmd.or_else(|| cached.cmd.clone());
+    merged.st = merged.st.or_else(|| cached.st.clone());
+    merged.at = merged.at.or_else(|| cached.at.clone());
+    merged.ts = merged.ts.or_else(|| cached.ts.clone());
+    merged
+}
+
+fn merge_thread_into_with_source(
+    target: &mut Thread,
+    incoming: Thread,
+    incoming_id_is_authoritative: bool,
+    incoming_is_cache: bool,
+) {
     if incoming_id_is_authoritative && !incoming.id.is_empty() && incoming.id != "0" {
         target.id = incoming.id;
     }
@@ -960,7 +1007,7 @@ pub fn merge_thread_into(
         identities.insert(message, index);
     }
 
-    for msg in incoming.messages {
+    for mut msg in incoming.messages {
         if msg.text == "sendBubbleMessage" {
             continue;
         }
@@ -968,18 +1015,47 @@ pub fn merge_thread_into(
         if let Some(idx) = found {
             let existing_msg = &mut target.messages[idx];
             identities.remove(existing_msg, idx);
+            let cached_wire = incoming_is_cache
+                .then(|| merge_cached_wire_ref(&existing_msg.wire_ref, &msg.wire_ref));
+            if incoming_is_cache {
+                // Stored history enriches unknown fields; it is not a newer network event.
+                if existing_msg.kind != crate::message_model::MessageKind::Unknown {
+                    msg.kind = existing_msg.kind;
+                }
+                if existing_msg.unread_policy.params_ext_present {
+                    msg.unread_policy = existing_msg.unread_policy.clone();
+                }
+                if existing_msg.history_source.is_some() {
+                    msg.history_source = None;
+                }
+                msg.resolved_mention_uids
+                    .extend(existing_msg.resolved_mention_uids.clone());
+                if existing_msg.text.is_empty() {
+                    existing_msg.text = msg.text.clone();
+                }
+            }
             existing_msg.merge_reaction_metadata(&msg);
+            if let Some(wire) = cached_wire {
+                // Different raw alias names can coexist without replacing a known typed slot.
+                existing_msg.wire_ref = wire;
+                if msg.unread_policy.params_ext_present {
+                    existing_msg.unread_policy = msg.unread_policy.clone();
+                }
+            }
             if existing_msg.id.starts_with("out_")
                 && !msg.id.is_empty()
                 && !msg.id.starts_with("out_")
             {
                 existing_msg.id = msg.id.clone();
             }
-            if msg.ts > 0 && existing_msg.ts != msg.ts {
+            if msg.ts > 0
+                && existing_msg.ts != msg.ts
+                && (!incoming_is_cache || existing_msg.ts <= 0)
+            {
                 existing_msg.ts = msg.ts;
                 existing_msg.time = msg.time;
             }
-            if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
+            if !incoming_is_cache && msg.text.trim() == "[Tin nhắn đã thu hồi]" {
                 existing_msg.text = "[Tin nhắn đã thu hồi]".to_string();
                 existing_msg.sticker_id = None;
                 existing_msg.link_url = None;
@@ -1001,13 +1077,12 @@ pub fn merge_thread_into(
                 existing_msg.link_desc = msg.link_desc;
                 existing_msg.link_thumb = msg.link_thumb;
                 existing_msg.link_src = msg.link_src;
-                if !msg.text.is_empty() {
+                if !incoming_is_cache && !msg.text.is_empty() {
                     existing_msg.text = msg.text;
                 }
             }
-            if existing_msg.reactions.is_empty() && !msg.reactions.is_empty() {
-                existing_msg.reactions = msg.reactions;
-            }
+            // merge_reaction_metadata already handles legacy emojis and authoritative
+            // empty snapshots; a second fallback would resurrect a cleared reaction.
             existing_msg.is_pinned = existing_msg.is_pinned || msg.is_pinned;
             existing_msg.is_starred = existing_msg.is_starred || msg.is_starred;
             identities.insert(existing_msg, idx);

@@ -33,6 +33,35 @@ pub struct MessageStore {
     pub conn: Connection,
 }
 
+fn metadata_field<T: serde::de::DeserializeOwned + Default>(
+    metadata: &serde_json::Value,
+    key: &str,
+) -> T {
+    metadata
+        .get(key)
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Display names and avatars do not prove that persisted thread IDs are aliases.
+fn deduplicate_exact_threads(threads: &mut Vec<Thread>) {
+    let mut indices = std::collections::HashMap::new();
+    let mut merged: Vec<Thread> = Vec::with_capacity(threads.len());
+    for thread in std::mem::take(threads) {
+        if thread.id.is_empty() || thread.id == "0" {
+            continue;
+        }
+        let key = (thread.is_group, thread.id.clone());
+        if let Some(&index) = indices.get(&key) {
+            crate::chat::merge_thread_into(&mut merged[index], thread, false);
+        } else {
+            indices.insert(key, merged.len());
+            merged.push(thread);
+        }
+    }
+    *threads = merged;
+}
+
 impl MessageStore {
     /// Messages per thread loaded at startup / on refresh. The list only needs the newest one
     /// for ordering and preview; opening a thread reads deeper (`LoadGroupHistory`).
@@ -271,40 +300,18 @@ impl MessageStore {
     /// Hydrate `threads` with persisted threads and message history from SQLite.
     /// Returns the total number of messages loaded into `threads`.
     pub fn hydrate_threads(&self, threads: &mut Vec<Thread>, limit_per_thread: usize) -> Result<usize> {
-        crate::chat::deduplicate_threads(threads, None);
+        deduplicate_exact_threads(threads);
 
-        let stored_threads = self.all_threads().unwrap_or_default();
+        let stored_threads = self.all_threads()?;
         for st in stored_threads {
             if st.thread_id.is_empty() || st.thread_id == "0" {
                 continue;
             }
             if let Some(existing) = threads.iter_mut().find(|t| t.id == st.thread_id) {
-                if crate::chat::is_generic_thread_name(&existing.name)
-                    && !st.name.is_empty()
-                {
+                if crate::chat::is_generic_thread_name(&existing.name) && !st.name.is_empty() {
                     existing.name = st.name;
                 }
                 existing.is_group = existing.is_group || st.is_group;
-            } else if !crate::chat::is_generic_thread_name(&st.name)
-                && threads
-                    .iter()
-                    .any(|t| t.is_group == st.is_group && t.name.trim() == st.name.trim())
-            {
-                // Migrate stale session-scoped `thread_id` in SQLite to the active contact's `id`
-                if let Some(live_id) = threads
-                    .iter()
-                    .find(|t| t.is_group == st.is_group && t.name.trim() == st.name.trim())
-                    .map(|t| t.id.clone())
-                {
-                    let _ = self.conn.execute(
-                        "UPDATE messages SET thread_id = ?1 WHERE thread_id = ?2",
-                        params![live_id, st.thread_id],
-                    );
-                    let _ = self.conn.execute(
-                        "DELETE FROM threads WHERE thread_id = ?1",
-                        params![st.thread_id],
-                    );
-                }
             } else {
                 threads.push(Thread {
                     presentation: Default::default(),
@@ -329,7 +336,9 @@ impl MessageStore {
         // around them: in autocommit every SELECT takes and drops the file lock, ~50 µs on
         // Windows, which made 62k lookups cost 3 s.
         let tx = self.conn.unchecked_transaction()?;
-        let mut owner_of = self.conn.prepare("SELECT thread_id FROM messages WHERE msg_id = ?1")?;
+        let mut owner_of = self
+            .conn
+            .prepare("SELECT thread_id FROM messages WHERE msg_id = ?1")?;
 
         let mut loaded_count = 0;
         for t in threads.iter_mut() {
@@ -349,6 +358,7 @@ impl MessageStore {
                 );
             }
             let saved_msgs = self.messages_for(&t.id, limit_per_thread)?;
+            let mut saved_messages = Vec::with_capacity(saved_msgs.len());
             for sm in saved_msgs {
                 let time = if sm.ts > 0 {
                     crate::clock::message_time(sm.ts)
@@ -362,6 +372,18 @@ impl MessageStore {
                 let mut reply_to_sender = None;
                 let mut reply_to_text = None;
                 let mut reactions = Vec::new();
+                let mut kind = Default::default();
+                let mut wire_ref = Default::default();
+                let mut unread_policy = Default::default();
+                let mut delivery = Default::default();
+                let mut history_source = Default::default();
+                let mut reaction_summaries = Default::default();
+                let mut reaction_snapshot = Default::default();
+                let mut reaction_authoritative_snapshot = Default::default();
+                let mut reaction_snapshot_provenance = Default::default();
+                let mut reaction_versions = Default::default();
+                let mut client_message_id = Default::default();
+                let mut resolved_mention_uids = Default::default();
                 let mut is_pinned = false;
                 let mut is_starred = false;
                 let mut link_url = None;
@@ -371,6 +393,20 @@ impl MessageStore {
                 let mut link_src = None;
                 if !sm.raw_json.is_empty() {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sm.raw_json) {
+                        kind = metadata_field(&val, "kind");
+                        wire_ref = metadata_field(&val, "wire_ref");
+                        unread_policy = metadata_field(&val, "unread_policy");
+                        delivery = metadata_field(&val, "delivery");
+                        reaction_summaries = metadata_field(&val, "reaction_summaries");
+                        reaction_snapshot = metadata_field(&val, "reaction_snapshot");
+                        reaction_authoritative_snapshot =
+                            metadata_field(&val, "reaction_authoritative_snapshot");
+                        reaction_snapshot_provenance =
+                            metadata_field(&val, "reaction_snapshot_provenance");
+                        reaction_versions = metadata_field(&val, "reaction_versions");
+                        client_message_id = metadata_field(&val, "client_message_id");
+                        resolved_mention_uids = metadata_field(&val, "resolved_mention_uids");
+                        history_source = val.get("history_source").cloned();
                         sticker_id = val
                             .get("stickerId")
                             .or_else(|| val.get("id"))
@@ -379,10 +415,7 @@ impl MessageStore {
                             .get("cateId")
                             .or_else(|| val.get("catId"))
                             .and_then(|v| v.as_u64());
-                        sticker_type = val
-                            .get("type")
-                            .and_then(|v| v.as_u64())
-                            .map(|n| n as u32);
+                        sticker_type = val.get("type").and_then(|v| v.as_u64()).map(|n| n as u32);
                         reply_to_id = val
                             .get("reply_to_id")
                             .and_then(|v| v.as_str())
@@ -449,6 +482,19 @@ impl MessageStore {
                     reply_to_sender,
                     reply_to_text,
                     reactions,
+                    kind,
+                    wire_ref,
+                    unread_policy,
+                    delivery,
+                    history_source,
+                    reaction_summaries,
+                    reaction_snapshot,
+                    reaction_authoritative_snapshot,
+                    reaction_snapshot_provenance,
+                    reaction_versions,
+                    client_message_id,
+                    resolved_mention_uids,
+                    reaction_snapshot_fresh: false,
                     is_pinned,
                     is_starred,
                     link_url,
@@ -459,42 +505,15 @@ impl MessageStore {
 
                     ..Default::default()
                 };
-                if let Some(existing) = t.messages.iter_mut().find(|existing| {
-                    (!existing.id.is_empty() && existing.id == cm.id)
-                        || (existing.text == cm.text
-                            && existing.is_outgoing == cm.is_outgoing
-                            && (existing.ts == cm.ts || (existing.ts != 0 && cm.ts != 0 && (existing.ts - cm.ts).abs() < 5000)))
-                }) {
-                    if existing.sticker_id.is_none() && cm.sticker_id.is_some() {
-                        existing.sticker_id = cm.sticker_id;
-                        existing.sticker_cate_id = cm.sticker_cate_id;
-                        existing.sticker_type = cm.sticker_type;
-                    }
-                    if existing.reply_to_text.is_none() && cm.reply_to_text.is_some() {
-                        existing.reply_to_id = cm.reply_to_id;
-                        existing.reply_to_sender = cm.reply_to_sender;
-                        existing.reply_to_text = cm.reply_to_text;
-                    }
-                    if existing.link_url.is_none() && cm.link_url.is_some() {
-                        existing.link_url = cm.link_url;
-                        existing.link_title = cm.link_title;
-                        existing.link_desc = cm.link_desc;
-                        existing.link_thumb = cm.link_thumb;
-                        existing.link_src = cm.link_src;
-                        if !cm.text.is_empty() {
-                            existing.text = cm.text;
-                        }
-                    }
-                    if existing.reactions.is_empty() && !cm.reactions.is_empty() {
-                        existing.reactions = cm.reactions;
-                    }
-                    existing.is_pinned = existing.is_pinned || cm.is_pinned;
-                    existing.is_starred = existing.is_starred || cm.is_starred;
-                } else {
-                    t.messages.push(cm);
-                    loaded_count += 1;
-                }
+                saved_messages.push(cm);
             }
+            let before = t
+                .messages
+                .iter()
+                .filter(|message| message.text != "sendBubbleMessage")
+                .count();
+            crate::chat::merge_cached_messages(t, saved_messages);
+            loaded_count += t.messages.len().saturating_sub(before);
             if !t.messages.is_empty() {
                 t.messages.sort_by_key(|m| m.ts);
                 if let Some(newest) = t.messages.last() {
@@ -507,7 +526,7 @@ impl MessageStore {
         }
         drop(owner_of);
         tx.commit()?;
-        crate::chat::deduplicate_threads(threads, None);
+        deduplicate_exact_threads(threads);
         Ok(loaded_count)
     }
 }
@@ -515,6 +534,64 @@ impl MessageStore {
 impl From<&ChatMessage> for StoredMessage {
     fn from(m: &ChatMessage) -> Self {
         let mut meta = serde_json::Map::new();
+        if m.kind != Default::default() {
+            meta.insert("kind".into(), serde_json::json!(m.kind));
+        }
+        if m.wire_ref != Default::default() {
+            meta.insert("wire_ref".into(), serde_json::json!(m.wire_ref));
+        }
+        if m.unread_policy != Default::default() {
+            meta.insert("unread_policy".into(), serde_json::json!(m.unread_policy));
+        }
+        if m.delivery != Default::default() {
+            meta.insert("delivery".into(), serde_json::json!(m.delivery));
+        }
+        if let Some(source) = &m.history_source {
+            meta.insert("history_source".into(), source.clone());
+        }
+        if !m.reaction_summaries.is_empty() {
+            meta.insert(
+                "reaction_summaries".into(),
+                serde_json::json!(m.reaction_summaries),
+            );
+        }
+        if m.reaction_snapshot {
+            meta.insert(
+                "reaction_snapshot".into(),
+                serde_json::json!(m.reaction_snapshot),
+            );
+        }
+        if m.reaction_authoritative_snapshot {
+            meta.insert(
+                "reaction_authoritative_snapshot".into(),
+                serde_json::json!(m.reaction_authoritative_snapshot),
+            );
+        }
+        if m.reaction_snapshot_provenance != Default::default() {
+            meta.insert(
+                "reaction_snapshot_provenance".into(),
+                serde_json::json!(m.reaction_snapshot_provenance),
+            );
+        }
+        if !m.reaction_versions.is_empty() {
+            meta.insert(
+                "reaction_versions".into(),
+                serde_json::json!(m.reaction_versions),
+            );
+        }
+        if !m.client_message_id.is_empty() {
+            meta.insert(
+                "client_message_id".into(),
+                serde_json::json!(m.client_message_id),
+            );
+        }
+        if !m.resolved_mention_uids.is_empty() {
+            meta.insert(
+                "resolved_mention_uids".into(),
+                serde_json::json!(m.resolved_mention_uids),
+            );
+        }
+
         let msg_type = if let Some(sid) = m.sticker_id {
             let cid = m.sticker_cate_id.unwrap_or(0);
             let st = m.sticker_type.unwrap_or(7);
@@ -570,7 +647,11 @@ impl From<&ChatMessage> for StoredMessage {
                 format!("msg_{}", m.ts)
             },
             thread_id: String::new(),
-            sender_id: if m.is_outgoing { "0".into() } else { m.sender.clone() },
+            sender_id: if m.is_outgoing {
+                "0".into()
+            } else {
+                m.sender.clone()
+            },
             sender_name: m.sender.clone(),
             text: m.text.clone(),
             msg_type,
