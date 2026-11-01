@@ -1,12 +1,4 @@
-name: Docs
-
-# Build trang tài liệu tĩnh (mdBook) từ docs/*.md.
-#
-# CHỈ build, CHƯA deploy. Lý do: Hostinger không cấp quyền truy cập cho contributor.
-# Khi maintainer tạo được secret FTP/SFTP, thêm bước upload vào `public_html/docs/`
-# (phương án C trong issue #20) — không cần sửa gì khác trong workflow này.
-#
-# TODO(#20): deploy sang https://ctdozlite.ctdo.net/docs/ qua FTP/SFTP.
+name: Docs & PR Guard
 
 on:
   push:
@@ -14,42 +6,104 @@ on:
     paths:
       - "docs/**"
       - "book.toml"
-      - "scripts/**"
-      - ".github/workflows/docs.yml"
+      - "scripts/generate_feature_matrix.py"
   pull_request:
-    paths:
-      - "docs/**"
-      - "book.toml"
-      - "scripts/**"
-      - ".github/workflows/docs.yml"
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  pr-guard:
+    name: PR Quality & Security Guard
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Inspect PR Diff & Security
+        id: check
+        shell: bash
+        run: |
+          set -e
+
+          echo "::group::1. Kiểm tra rò rỉ file nhạy cảm (Anti-Leak)"
+          LEAKED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '^(session\.json|.*\.db|.*\.log|dump/|.*\.pem|.*\.key|re-notes/voicecall_capture\.log|app_settings\.json)$' || true)
+          if [ -n "$LEAKED_FILES" ]; then
+            echo "::error::Phát hiện file nhạy cảm trong PR: $LEAKED_FILES"
+            echo "LEAK_FOUND=yes" >> $GITHUB_ENV
+          else
+            echo "✓ An toàn: Không có file credentials/database rò rỉ."
+          fi
+          echo "::endgroup::"
+
+          echo "::group::2. Kiểm tra chuẩn tiêu đề Conventional Commits"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          if echo "$PR_TITLE" | grep -Eq '^(feat|fix|refactor|perf|test|docs|chore|ci|style)(\([a-z0-9_-]+\))?: .+'; then
+            echo "✓ Tiêu đề đúng chuẩn: $PR_TITLE"
+          else
+            echo "::warning::Tiêu đề PR chưa đúng chuẩn Conventional Commits (ví dụ: feat(ui): thêm nút...)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::3. Kiểm tra mô tả PR"
+          BODY="${{ github.event.pull_request.body }}"
+          if [ ${#BODY} -gt 30 ]; then
+            echo "✓ Mô tả PR đầy đủ (${#BODY} ký tự)."
+          else
+            echo "::warning::Mô tả PR khá ngắn. Vui lòng ghi rõ mục tiêu ## What và lý do ## Why."
+          fi
+          echo "::endgroup::"
+
+          # Tự động xuất bảng đánh giá vào GitHub Step Summary
+          cat << 'EOF' >> $GITHUB_STEP_SUMMARY
+### 🤖 ctdozlite PR Check Bot (Miễn phí 100%)
+
+Chào bạn! Bot tự động đã phân tích Pull Request của bạn theo quy chuẩn của dự án:
+
+| Hạng mục kiểm tra | Kết quả | Chi tiết |
+| :--- | :---: | :--- |
+EOF
+
+          if [ "$LEAK_FOUND" = "yes" ]; then
+            echo "| **Bảo mật & Tránh rò rỉ** | ❌ **KHÔNG ĐẠT** | Có file nhạy cảm: `$LEAKED_FILES` |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ❌ **PR bị chặn**: Vui lòng xóa bỏ file nhạy cảm khỏi commit rồi push lại!" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "| **Bảo mật & Tránh rò rỉ** | ✅ **ĐẠT** | Không có file `session.json`, `*.db`, file log hay credentials |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if echo "$PR_TITLE" | grep -Eq '^(feat|fix|refactor|perf|test|docs|chore|ci|style)(\([a-z0-9_-]+\))?: .+'; then
+            echo "| **Chuẩn tiêu đề (Conventional Commits)** | ✅ **ĐẠT** | `$PR_TITLE` |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| **Chuẩn tiêu đề (Conventional Commits)** | ⚠️ **LƯU Ý** | Chưa đúng chuẩn Conventional Commits |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ ${#BODY} -gt 30 ]; then
+            echo "| **Mô tả PR** | ✅ **ĐẠT** | Đầy đủ thông tin |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| **Mô tả PR** | ⚠️ **LƯU Ý** | Khá ngắn, nên bổ sung `## What` và `## Why` |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  build-docs:
     name: Build docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
       - name: Install mdBook
-        uses: taiki-e/install-action@v2
-        with:
-          tool: mdbook@0.5.4
+        run: |
+          mkdir -p ~/.local/bin
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C ~/.local/bin
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Ghi trang "Đã biết" từ GitHub Issues
-        run: ./scripts/gen-known-issues.sh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build
-        run: mdbook build
-
-      - name: Upload site
-        uses: actions/upload-artifact@v4
-        with:
-          name: docs-site
-          path: book/
-          retention-days: 14
+      - name: Build User Docs Site
+        run: |
+          python3 scripts/generate_feature_matrix.py || true
+          mdbook build
