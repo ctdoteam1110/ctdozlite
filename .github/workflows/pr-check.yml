@@ -2,7 +2,7 @@ name: PR Quality & Security Guard
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    branches: [main]
 
 permissions:
   pull-requests: write
