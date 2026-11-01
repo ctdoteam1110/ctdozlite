@@ -30,6 +30,7 @@ mod messages;
 mod emoji_text;
 mod composer;
 mod durable_composer;
+mod confirmed_history;
 mod modals;
 mod stickers;
 mod theme;
