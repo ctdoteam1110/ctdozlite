@@ -6,6 +6,10 @@ pub(super) static KNOWN_THREADS: std::sync::Mutex<Vec<(String, String, bool)>> =
     std::sync::Mutex::new(Vec::new());
 
 pub enum WorkerCmd {
+    /// Read OS authorization without prompting.
+    ReadNotificationAuthorization { request_id: u64 },
+    /// Request OS authorization following an explicit Settings click.
+    RequestNotificationAuthorization { request_id: u64 },
     RequestQr,
     LoginPassword {
         phone: String,
@@ -587,6 +591,24 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
 
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
+                        WorkerCmd::ReadNotificationAuthorization { request_id }
+                        | WorkerCmd::RequestNotificationAuthorization { request_id } => {
+                            let request = matches!(
+                                cmd, WorkerCmd::RequestNotificationAuthorization { .. }
+                            );
+                            let tx = gui_tx.clone();
+                            tokio::spawn(async move {
+                                let result = if request {
+                                    crate::native_notifications::request_if_user_action(true).await
+                                } else {
+                                    crate::native_notifications::status().await
+                                };
+                                // Closing the UI receiver is normal during shutdown.
+                                let _ = tx.send(GuiEvent::NotificationAuthorization {
+                                    request_id, result,
+                                });
+                            });
+                        }
                         WorkerCmd::PersistThreads(threads_snapshot) => {
                             tokio::task::spawn_blocking(move || {
                                 if let Ok(mut store) =
