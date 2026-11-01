@@ -455,6 +455,13 @@ enum DevTab {
     CryptoState,
 }
 
+/// Every user-visible string in `threads` (names + message bodies), for font coverage checks.
+fn thread_texts(threads: &[Thread]) -> impl Iterator<Item = &str> {
+    threads.iter().flat_map(|t| {
+        std::iter::once(t.name.as_str()).chain(t.messages.iter().map(|m| m.text.as_str()))
+    })
+}
+
 impl ZaloGuiApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
@@ -622,6 +629,7 @@ impl ZaloGuiApp {
         }
 
         spawn_session_worker(session, tx, cc.egui_ctx.clone());
+        ensure_cjk_font(&cc.egui_ctx, thread_texts(&app.threads));
 
         if let Some(wtx) = WORKER_TX.get() {
             if is_logged_in {
@@ -681,6 +689,7 @@ impl ZaloGuiApp {
                     self.login_status_msg = format!("Lỗi đăng nhập: {err}");
                 }
                 GuiEvent::ThreadsUpdated(updates) => {
+                    ensure_cjk_font(ctx, thread_texts(&updates));
                     if self.is_logged_in && !updates.is_empty() {
                         let prev_selected_name = self
                             .threads

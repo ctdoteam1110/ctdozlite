@@ -3138,6 +3138,12 @@ impl ZaloGuiApp {
                                                 .desired_width(input_w);
 
                                         let response = ui.add(text_edit);
+                                        if response.changed() {
+                                            ensure_cjk_font(
+                                                ui.ctx(),
+                                                std::iter::once(self.input_message.as_str()),
+                                            );
+                                        }
                                         if self.composer_focus_pending {
                                             response.request_focus();
                                             self.composer_focus_pending = false;
