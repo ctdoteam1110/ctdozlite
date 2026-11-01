@@ -1,5 +1,8 @@
 # ctdozlite
 
+**[Tiếng Việt](README.md)** · **[English](README_EN.md)** · **[한국어](README_KO.md)** · **[日本語](README_JA.md)** · **[简体中文](README_ZH.md)**
+
+
 Client Zalo Desktop viết bằng Rust (`eframe`/`egui` + `ratatui`), giao tiếp trực tiếp với hệ thống API và WebSocket của Zalo Web/PC mà không qua Electron hay Chromium.
 
 - **Trang chủ dự án (Website & Tải nhanh):** [https://ctdozlite.ctdo.net/](https://ctdozlite.ctdo.net/)
@@ -243,6 +246,96 @@ Lịch sử phát hành và ghi chú thay đổi: **[GitHub Releases](https://gi
 - Các tệp dữ liệu cục bộ (`session.json`, `zalo_history.db`, `threads_cache.json`, `stickers_cache/`, `*.log`) đã được cấu hình loại trừ trong `.gitignore`.
 
 ---
+
+
+## 🏆 Key Contributors
+
+Dự án ghi nhận các thành viên có đóng góp mã nguồn tiêu biểu trực tiếp vào repository:
+
+| Contributor | GitHub | Đóng góp chính | Khối lượng |
+| :--- | :--- | :--- | :---: |
+| **TIPC1110** | [@TIPC1110](https://github.com/TIPC1110) | Kiến trúc lõi, VoIP call engine, egui framework, đa nền tảng | **> 73,000+ lines** |
+| **thanhdo1110** | [@thanhdo1110](https://github.com/thanhdo1110) | Tái cấu trúc GUI modular, tối ưu hóa giao diện Atom One Dark | **> 14,000+ lines** |
+| **ngxccc** | [@ngxccc](https://github.com/ngxccc) | Tiêu chuẩn kỹ thuật, bảo toàn session an toàn, phân giải domain mạng | **> 3,000+ lines** |
+| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | Bản vá múi giờ hệ điều hành, tùy biến thư mục dữ liệu macOS | **~840+ lines** |
+| **GrootTheDeveloper** | [@GrootTheDeveloper](https://github.com/GrootTheDeveloper) | Tối ưu hóa khởi động SQLite, virtualization tin nhắn, lazy load Font CJK | **~370+ lines** |
+
+> *Ghi chú: Toàn bộ danh sách vinh danh mọi cá nhân đóng góp (báo lỗi, đề xuất tính năng, pull request) được cập nhật công khai tại trang [Người đóng góp](https://ctdozlite.ctdo.net/contributors.html).*
+
+<details>
+<summary><b>👉 Nhấn vào đây để xem toàn bộ danh sách 66 người đóng góp (Community & GitHub)</b></summary>
+
+| # | Người đóng góp | Hạng mục | Đóng góp chi tiết |
+| :---: | :--- | :--- | :--- |
+| 1 | **Le Nhat** | `Lỗi crash` | Báo cáo lỗi văng app nghiêm trọng khi thực hiện tìm kiếm tên liên hệ hoặc hội thoại trên Windows 11. |
+| 2 | **Ken Đoàn** | `Đồng bộ` | Báo lỗi bấm nút đồng bộ nhưng mãi không đồng bộ được tin nhắn cũ từ máy chủ Zalo. |
+| 3 | **Nguyễn Vang** | `Độ ổn định` | Thử nghiệm bản phát hành đầu tiên và phản hồi về độ ổn định trong quá trình duy trì kết nối chat. |
+| 4 | **Không Là Gì Cả** | `Tính năng` | Đề xuất chức năng backup tin nhắn và ảnh qua Telegram, vì Zalo tự xóa ảnh sau 1 năm làm mất ảnh kỷ niệm. Tác giả đã đồng ý ('oce bác'). |
+| 5 | **Tuấn Anh Pham** | `Quyền riêng tư` | Đề xuất chặn trạng thái 'Đã xem' (Seen) và ẩn đang gõ (Typing); sau đó bổ sung đề nghị thêm tuỳ chỉnh theme. Tác giả xác nhận đã có tính năng nhưng chưa có thời gian kiểm chứng. |
+| 6 | **Khoai Possible** | `macOS` | Thử nghiệm bản dựng cho hệ điều hành macOS (Apple Silicon ARM64, Intel x86_64 & Universal DMG) và phản hồi trải nghiệm. |
+| 7 | **So Dep Thanh Nam** | `iOS` | Đề xuất phát triển phiên bản iOS và lưu ý ưu tiên khả năng tương thích với các máy iOS đời thấp. |
+| 8 | **Xanh Chín** | `iOS` | Bày tỏ nhu cầu trải nghiệm client Zalo gọn nhẹ trên hệ sinh thái Apple iOS. |
+| 9 | **Huy Nguyen** | `iOS` | Đề xuất mở rộng ctdozlite sang nền tảng iOS và thảo luận về tính bảo mật mã nguồn mở trên di động. |
+| 10 | **Nguyễn Đức Huy** | `Android` | Đề xuất phát triển phiên bản client mã nguồn mở gọn nhẹ cho các thiết bị Android. |
+| 11 | **Trương Công Huy** | `Phản hồi` | Đánh giá cao chất lượng và tính đột phá của ứng dụng ctdozlite. |
+| 12 | **Dân Bách Phong** | `Phản hồi` | Động viên và tương tác tích cực với dự án ngay từ những giờ đầu phát hành v0.0.1. |
+| 13 | **Vũ Minh Khang** | `Kết nối` | Giới thiệu bạn bè và cộng đồng kỹ thuật tham gia kiểm thử phần mềm. |
+| 14 | **Nam Khánh** | `Thử nghiệm` | Tham gia đánh giá chất lượng trải nghiệm của client Rust so với bản web. |
+| 15 | **Bùi Phương** | `Tìm hiểu` | Thảo luận về cơ chế hoạt động và cách thức cài đặt ứng dụng. |
+| 16 | **Trương Ngọc Khánh** | `Tương tác` | Tương tác, theo dõi và đóng góp phản hồi trong bài viết công bố sản phẩm. |
+| 17 | **Nhat Nguyen** | `Lỗi crash` | Bản cài Win 11 gặp 5 vấn đề: phải End Task trong Task Manager mới thoát được app; bấm đồng bộ nhưng không thấy tin nhắn; luôn hiển thị online ở mọi user; gọi đi không được; không bật được camera khi video call. Sẵn sàng test tiếp cho tác giả. |
+| 18 | **Nguyễn Vĩnh Huy** | `Kiến trúc` | Trao đổi về cách một tài khoản đăng nhập song song 2 thiết bị: nhiều khả năng client trên máy thứ hai dùng slot của bản Zalo Web. |
+| 19 | **Giao Chung** | `Phản hồi` | Khen chất lượng sản phẩm dù bản thân đã ngừng sử dụng Zalo. |
+| 20 | **Nguyen Hoa** | `Theo dõi` | Theo dõi và chờ đợi các bản cập nhật tiếp theo của ctdozlite. |
+| 21 | **Nguyễn Thành Công** | `Android` | Hưởng ứng đề xuất phát triển bản Android và tham gia thảo luận về nhu cầu đa nền tảng. |
+| 22 | **Ngô Hoàng Trọng Tín** | `Tính năng` | Xin khôi phục lại bộ icon con mèo trong giao diện. Bình luận nhận được 20 lượt thả tim, nhiều người dùng quan tâm. |
+| 23 | **Sơn Minh** | `Định hướng` | Đề nghị cân nhắc phát triển lâu dài để tính năng chạy tốt và mượt mà; nếu có thời gian thì thử viết lại toàn bộ backend theo hướng thay thế Zalo, và cam kết sẽ đóng góp nếu làm. |
+| 24 | **Nguyễn Lợi** | `Tính năng` | Đề xuất làm thêm bản Telegram vì bản chạy nền hiện đã ăn tới 1GB RAM. |
+| 25 | **Tiến Bộ** | `Thử nghiệm` | Dự định thử nghiệm trên macOS; nhận xét bản chuẩn thì nặng, bản basic dùng ctdozlite, khi cần tác vụ nặng thì quay lại bản chuẩn. |
+| 26 | **Giang Tran Vu** | `Kinh nghiệm` | Cho AI reverse-engineer để viết lại bằng Rust kèm Liquid Glass, treo máy liên tục khoảng 7 giờ thì hoàn thành. |
+| 27 | **Hoàng Sanh** | `Động viên` | Dành lời khen và động viên tác giả sau khi dùng thử sản phẩm. |
+| 28 | **Trần Văn Quốc** | `iOS` | Bày tỏ mong đợi bản phát hành dành cho iOS. |
+| 29 | **Cốn Cái Lò** | `Kiến trúc` | Tham gia trao đổi về cách một tài khoản đăng nhập song song trên hai thiết bị. |
+| 30 | **Mai Anh Tuan** | `Cảnh báo` | Nhận xét sản phẩm chưa ổn và lưu ý tác giả cẩn thận về vấn đề luật sở hữu trí tuệ. |
+| 31 | **Jason Wu** | `Tương tác` | Tham gia bình luận, trao đổi cùng cộng đồng dưới bài phát hành. |
+| 32 | **Phúc** | `Lỗi macOS` | Hỏi phiên bản macOS tối thiểu; dùng Sonoma trên máy Intel thì không mở được ứng dụng. Tác giả đã trả lời: cần chip Apple Silicon (chip M). |
+| 33 | **Dương** | `Phản hồi` | Bình luận tương tác dưới bài phát hành, nhận 8 lượt thả tim. |
+| 34 | **Nguyen Quang Huy** | `iOS` | Bày tỏ mong đợi bản phát hành cho iOS. |
+| 35 | **Phan Quoc Trieu** | `Đa nền tảng` | Đề nghị nghiên cứu thêm chức năng cho iPhone và các dòng máy Android khác để dùng được đa thiết bị. |
+| 36 | **Minh Phung** | `iOS` | Mong bản iOS có và hỗ trợ được cả các dòng iPhone đời cũ. |
+| 37 | **Le Quang Huy** | `Kiến trúc` | Nhận xét cơ chế này giống việc một bên dùng app còn một bên dùng nền web. |
+| 38 | **Trung Minh** | `Tính năng` | Đề xuất làm luôn tính năng chat từ Telegram tới bạn bè bên Zalo, để không phải mở ứng dụng Zalo nữa. |
+| 39 | **Thanh Dev** | `Kỹ thuật` | Hỏi lại cách dùng AI để reverse-engineer, mở ra một chuỗi trao đổi kỹ thuật có giá trị trong phần bình luận. |
+| 40 | **Ngoc Do** | `Kỹ thuật` | Xin prompt để dùng AI reverse-engineer; được tác giả khác chia sẻ lại quy trình chi tiết gồm đọc file cài, so sánh với bản gốc và thảo luận chéo giữa các model. |
+| 41 | **Hoa Thiên Lý** | `Động viên` | Cho biết sẽ tải ứng dụng về dùng chỉ vì bộ icon con mèo được nhắc trong bình luận. |
+| 42 | **Nguyễn Duy Khánh** | `Ủng hộ` | Hưởng ứng đề xuất khôi phục bộ icon con mèo của Ngô Hoàng Trọng Tín. |
+| 43 | **Cao Nhật Minh** | `Bình luận` | Đưa ra góc nhìn so sánh giữa Zalo và dự án mã nguồn mở trong phần bình luận. |
+| 44 | **Subaru Wrx** | `Bảo mật` | Đặt câu hỏi về rủi ro bảo mật: lưu lịch sử chat vào SQLite cục bộ thì có dễ bị thu thập dữ liệu hay không. |
+| 45 | **Phạm Hoàn** | `Định hướng` | Bình luận mới nhất trong bài: cho rằng sản phẩm hay và cần được phát triển thêm tính năng. |
+| 46 | **Long Nguyễn** | `Góp ý` | Trao đổi với Ngô Hoàng Trọng Tín về việc có 3 gói và một số gói bị gỡ tính năng. |
+| 47 | **Ông An Bà Ngân (@OngAnBaNgan)** | `GitHub Issue` | Issue #34: Rủi ro pháp lý về thương hiệu & bản quyền từ VNG và đề xuất hướng khắc phục |
+| 48 | **@maiminhdung** | `GitHub Issue` | Issue #33: Lỗi phông chữ ở mục đăng nhập Zalo, không hiển thị trên tên/logo app ở chuyển tab |
+| 49 | **Ngoc Tran (@ngxccc)** | `GitHub PR` | Issue #32: fix(ui): trạng thái online đang đặt cứng — mọi hội thoại 1-1 đều hiện chấm xanh / Issue #27: task(net): try multiple host candidates per endpoint instead of one verified constant / Issue #23: fix(ui): "Đồng bộ tin nhắn" only refreshes previews — rename, show real progr |
+| 50 | **Trung Nguyễn  (@trungnt1000vn)** | `GitHub Issue` | Issue #31: Issue trên MacOS version đầu |
+| 51 | **@DEWE-ex** | `GitHub Issue` | Issue #24: Lỗi (windows) và đề xuất tính năng |
+| 52 | **Hà Trung Triển (@T1st-isme)** | `GitHub Issue` | Issue #10: Đồng bộ tin nhắn |
+| 53 | **khoasoma (@Khoasoma)** | `GitHub Issue` | Issue #9: Cập nhật thứ tự nhắn tin sai , không hiện nhóm , tin nhắn được ghim lên đầu nên thêm tự import tin nhắn từ folder có sẵn ( migrate ) |
+| 54 | **@slothteabar** | `GitHub Issue` | Issue #8: Không có tên nhóm, không đồng bộ được đoạn chat cũ + Lỗi UI cài đặt. Win11 |
+| 55 | **Ruiseki (@Shigure-Ruiseki)** | `GitHub Issue` | Issue #7: [Feature Request] Thêm API hỗ trợ Dev Plugin và Theme |
+| 56 | **@Nghia323223** | `GitHub Issue` | Issue #6: Không thể hiển thị được chữ |
+| 57 | **@heroes1412** | `GitHub Issue` | Issue #5: k hiển thị dc chữ tàu, k hiển thị dc ảnh, group nhiều thành viên bị chớp chớp??? |
+| 58 | **Nguyen Huu Tung (@tinzisreal)** | `GitHub Issue` | Issue #4: Hiện không đúng giờ |
+| 59 | **Đỗ Quang Minh (@shinishiho)** | `GitHub Issue` | Issue #3: `session.json`, TUI và đồng bộ tin nhắn / Issue #2: CI release version |
+| 60 | **Võ Duy Ân (@duyan0)** | `GitHub Issue` | Issue #1: Bug UI |
+| 61 | **@vuhuymicrosoft-bot** | `GitHub PR` | PR #28: Add macOS x86_64 build to CI workflow |
+| 62 | **@quangnguyenn98** | `GitHub PR` | PR #26: ci(macos): build native Intel (x86_64) .dmg alongside Apple Silicon |
+| 63 | **Ông An Bà Ngân (@OngAnBaNgan)** | `GitHub Issue` | Issue #34: Rủi ro pháp lý về thương hiệu & bản quyền từ VNG và đề xuất hướng khắc phục (Disclaimer, không đóng gói tài nguyên bản quyền, cam kết phi thương mại). |
+| 64 | **@maiminhdung** | `GitHub Issue` | Issue #33: Báo lỗi phông chữ ở mục đăng nhập và không hiển thị tên/logo ứng dụng khi chuyển tab trên Nobara Linux 44 (GNOME Wayland). |
+| 65 | **Thuong Tin (@thuongtin)** | `GitHub PR #40 & #41` | Đóng góp PR #40 (hiển thị giờ tin nhắn theo múi giờ OS) và PR #41 (tùy chọn --data-dir, --print-data-dir, bảo đảm quyền ghi an toàn cho macOS app bundle). |
+| 66 | **Dang Phuc An Khang (@GrootTheDeveloper)** | `GitHub PRs #43, #44, #47, #48, #49, #50` | Đóng góp loạt 6 Pull Requests tối ưu hóa: Sửa query tin nhắn mới nhất (#43), Tăng tốc mở app với SQLite lớn (#44), Lazy load Font CJK (#48), Virtualize danh sách chat tránh giật lag (#47), Sửa icon Windows GNU (#49), Thu nhỏ dung lượng binary release (#50). |
+
+</details>
+
 
 ## Giấy phép
 

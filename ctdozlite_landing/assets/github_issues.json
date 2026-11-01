@@ -1,9 +1,33 @@
 {
-  "fetchedAt": "2026-11-01T10:40:44.256Z",
+  "fetchedAt": "2026-11-01T13:31:33.173Z",
   "repo": "ctdoteam1110/ctdozlite",
-  "totalIssues": 27,
-  "totalPrs": 7,
+  "totalIssues": 29,
+  "totalPrs": 22,
   "issues": [
+    {
+      "number": 38,
+      "title": "feat(<scope>): <summary> Hẹn giờ gửi tin nhắn (Schedule message)",
+      "state": "OPEN",
+      "author": {
+        "login": "vuduc810",
+        "name": "vuduc810"
+      },
+      "createdAt": "2026-11-01T11:16:06Z",
+      "body": "### Summary\n\nỨng dụng hiện tại chưa hỗ trợ lập lịch gửi tin nhắn vào một thời điểm cụ thể trong tương lai. \n\nTính năng này giúp người dùng chủ động gửi tin nhắn công việc, đặt lịch nhắc nhở hoặc nhắn tin ngoài giờ làm việc mà không làm phiền người nhận ngay lập tức (tương tự như trải nghiệm hẹn giờ gửi trên app tin nhắn của Google trên Android).\n\n### Proposal\n\nThêm tính năng \"Hẹn giờ gửi tin nhắn\" (Schedule Send) tương tự app tin nhắn của Google trên Android:\n\n- Luồng thao tác: Nhấn giữ nút \"Gửi\" (hoặc qua một icon hẹn giờ cạnh khung nhập liệu) để mở menu chọn thời gian.\n- Tùy chọn thời gian: ",
+      "labels": []
+    },
+    {
+      "number": 35,
+      "title": "Bổ sung REST API, MCP",
+      "state": "OPEN",
+      "author": {
+        "login": "congnvp",
+        "name": "congnvp"
+      },
+      "createdAt": "2026-11-01T10:48:21Z",
+      "body": "Mình đang rất kỳ vọng dự án này có thể phát triển mở các tính năng tích hợp công cụ thứ ba vào để quản lý tin nhắn, trả lời tự động... Và có phương thức trả dữ liệu/đồng bộ dữ liệu cho công cụ thứ ba để dễ quản lý và lưu trữ. ",
+      "labels": []
+    },
     {
       "number": 34,
       "title": "Rủi ro pháp lý về thương hiệu & bản quyền từ VNG và đề xuất hướng khắc phục",
@@ -19,7 +43,7 @@
     {
       "number": 33,
       "title": "Lỗi phông chữ ở mục đăng nhập Zalo, không hiển thị trên tên/logo app ở chuyển tab",
-      "state": "OPEN",
+      "state": "CLOSED",
       "author": {
         "login": "maiminhdung",
         "name": "maiminhdung"
@@ -31,7 +55,7 @@
     {
       "number": 32,
       "title": "fix(ui): trạng thái online đang đặt cứng — mọi hội thoại 1-1 đều hiện chấm xanh",
-      "state": "OPEN",
+      "state": "CLOSED",
       "author": {
         "login": "ngxccc",
         "name": "Ngoc Tran"
@@ -43,7 +67,7 @@
     {
       "number": 31,
       "title": "Issue trên MacOS version đầu",
-      "state": "OPEN",
+      "state": "CLOSED",
       "author": {
         "login": "trungnt1000vn",
         "name": "Trung Nguyễn "
@@ -91,7 +115,7 @@
     {
       "number": 22,
       "title": "fix(net): zpw_service_map_v3 overrides verified domains — TUI friend list 404s on tt-friend-wpa.zaloapp.com",
-      "state": "OPEN",
+      "state": "CLOSED",
       "author": {
         "login": "ngxccc",
         "name": "Ngoc Tran"
@@ -103,7 +127,7 @@
     {
       "number": 21,
       "title": "fix(session): network/HTTP errors are treated as \"expired\" and delete session.json",
-      "state": "OPEN",
+      "state": "CLOSED",
       "author": {
         "login": "ngxccc",
         "name": "Ngoc Tran"
@@ -235,7 +259,7 @@
     {
       "number": 8,
       "title": "Không có tên nhóm, không đồng bộ được đoạn chat cũ + Lỗi UI cài đặt. Win11",
-      "state": "OPEN",
+      "state": "CLOSED",
       "author": {
         "login": "slothteabar",
         "name": "slothteabar"
@@ -259,7 +283,7 @@
     {
       "number": 6,
       "title": "Không thể hiển thị được chữ",
-      "state": "OPEN",
+      "state": "CLOSED",
       "author": {
         "login": "Nghia323223",
         "name": "Nghia323223"
@@ -283,7 +307,7 @@
     {
       "number": 4,
       "title": "Hiện không đúng giờ",
-      "state": "OPEN",
+      "state": "CLOSED",
       "author": {
         "login": "tinzisreal",
         "name": "Nguyen Huu Tung"
@@ -295,7 +319,7 @@
     {
       "number": 3,
       "title": "`session.json`, TUI và đồng bộ tin nhắn",
-      "state": "OPEN",
+      "state": "CLOSED",
       "author": {
         "login": "shinishiho",
         "name": "Đỗ Quang Minh"
@@ -307,7 +331,7 @@
     {
       "number": 2,
       "title": "CI release version",
-      "state": "OPEN",
+      "state": "CLOSED",
       "author": {
         "login": "shinishiho",
         "name": "Đỗ Quang Minh"
@@ -331,9 +355,189 @@
   ],
   "prs": [
     {
+      "number": 51,
+      "title": "feat(ci): đóng gói và kiểm tra helper macOS độc lập",
+      "state": "OPEN",
+      "author": {
+        "login": "thuongtin",
+        "name": "Ethan"
+      },
+      "createdAt": "2026-11-01T13:09:23Z",
+      "body": "## What\n- Tách nền tảng helper macOS thành PR độc lập: EmojiPreview, MediaPreview, DailyMediaViewer, DailyNotifier và HistoryCodec, cùng contract đóng gói và CI.\n- Đây là đóng góp tính năng và hạ tầng helper, chưa có Rust UI wiring. UI hiện chưa được tối ưu và PR này không tuyên bố hoàn thiện trải nghiệm giao diện.\n\n## Why\n- Giảm kích thước PR #42 để review phần native/build/CI mà không phụ thuộc feature tree Rust.\n- Giữ đủ năm helper trong các gói arm64, x86_64 và universal; chặn bundle thiếu executable, sai kiến trúc hoặc liên kết thư viện Homebrew.\n\n## How\n- Build Swift từng slice bằng SDK ",
+      "labels": []
+    },
+    {
+      "number": 50,
+      "title": "chore(ci): strip symbols from release binaries",
+      "state": "MERGED",
+      "author": {
+        "login": "GrootTheDeveloper",
+        "name": "Dang Phuc An Khang"
+      },
+      "createdAt": "2026-11-01T13:04:31Z",
+      "body": "## What\n- `[profile.release] strip = true`: Windows release exe 33.4 MB → 24.9 MB\n\n## Why\n- The release exe carried its symbol table\n\n## How\n- strip only; codegen unchanged. Thin LTO + `codegen-units = 1` reached 15.3 MB but used more CPU during the first seconds after start in my measurements, so it is left out\n\n## Verification\n- [x] `cargo test --locked` (107 passed)\n- [ ] `cargo clippy --all-targets -- -D warnings`: `main` already fails it (56 lib warnings); this branch adds none (per-lint counts compared with `main`)\n- [ ] `cargo fmt --all --check`: `main` is not fmt-clean; the touched hun",
+      "labels": []
+    },
+    {
+      "number": 49,
+      "title": "fix(ci): link the Windows icon on the GNU toolchain",
+      "state": "MERGED",
+      "author": {
+        "login": "GrootTheDeveloper",
+        "name": "Dang Phuc An Khang"
+      },
+      "createdAt": "2026-11-01T13:04:28Z",
+      "body": "## What\n- `cargo build` works on `x86_64-pc-windows-gnu` (MSYS2 / MinGW) again\n\n## Why\n- `build.rs` passes the raw `app_icon.res` to the linker; GNU ld cannot read `.res`, so the GNU build fails at link time\n\n## How\n- On `target_env = \"gnu\"`, `windres` (MinGW binutils) converts the `.res` to a COFF object which is linked instead; MSVC path unchanged\n\n## Verification\n- [x] `cargo test --locked` (107 passed)\n- [ ] `cargo clippy --all-targets -- -D warnings`: `main` already fails it (56 lib warnings); this branch adds none (per-lint counts compared with `main`)\n- [ ] `cargo fmt --all --check`: `m",
+      "labels": []
+    },
+    {
+      "number": 48,
+      "title": "perf(ui): load the CJK fallback font only when CJK text appears",
+      "state": "MERGED",
+      "author": {
+        "login": "GrootTheDeveloper",
+        "name": "Dang Phuc An Khang"
+      },
+      "createdAt": "2026-11-01T13:04:25Z",
+      "body": "## What\n- Startup RAM 253 MB → 196 MB when no Han / Kana / Hangul text is present (offline fixture: fake session, 303 threads, 200 messages per 1-1 thread, 62k rows in `zalo_history.db`, network blocked); unchanged once CJK text shows up\n\n## Why\n- `setup_custom_fonts` read `msyh.ttc` (~20 MB) or another CJK font at every start and egui kept it for the whole run\n\n## How\n- Fonts are built without it; `ensure_cjk_font` rebuilds them with the same CJK fallback the first time such text appears in the loaded threads, a `ThreadsUpdated` batch or the composer\n- Same font list and fallback order as bef",
+      "labels": []
+    },
+    {
+      "number": 47,
+      "title": "perf(ui): render only what is on screen",
+      "state": "MERGED",
+      "author": {
+        "login": "GrootTheDeveloper",
+        "name": "Dang Phuc An Khang"
+      },
+      "createdAt": "2026-11-01T13:04:21Z",
+      "body": "## What\n- Idle RAM 208 MB → 162–166 MB, idle CPU 3.0–3.4 % → 0.6–1.2 % (offline fixture: fake session, 303 threads, 200 messages per 1-1 thread, 62k rows in `zalo_history.db`, network blocked, a 2 000-message group open)\n\n## Why\n- egui laid out every bubble of the open chat each frame (2 000 galleys per repaint in a large group) and painted every thread row, downloading every avatar\n- Each group bubble scanned all threads to find the sender avatar\n- Images were decoded twice (validate, then use) on the 2-thread async runtime and kept as full-size textures (~8 MB per 1080p photo, never freed) a",
+      "labels": []
+    },
+    {
+      "number": 46,
+      "title": "perf(ui): move the message poll timer into the worker",
+      "state": "OPEN",
+      "author": {
+        "login": "GrootTheDeveloper",
+        "name": "Dang Phuc An Khang"
+      },
+      "createdAt": "2026-11-01T13:04:19Z",
+      "body": "## What\n- The GUI no longer repaints every 1.2 s while idle; idle CPU 3.0–3.4 % → 2.3–2.7 % of one core (offline fixture: fake session, 303 threads, 200 messages per 1-1 thread, 62k rows in `zalo_history.db`, network blocked; the fixture itself triggers a reconnect event every ~2.4 s, so a real idle session saves more)\n\n## Why\n- The `PollMessages` trigger lived in `update()`, so `request_repaint_after(1200 ms)` re-laid out the whole UI forever just to fire a timer\n\n## How\n- A tokio interval in the worker sends `PollMessages` (the handler already skips while a long-poll is in flight or logged o",
+      "labels": []
+    },
+    {
+      "number": 45,
+      "title": "feat(chat): resumable history sync for groups and Cloud",
+      "state": "OPEN",
+      "author": {
+        "login": "GrootTheDeveloper",
+        "name": "Dang Phuc An Khang"
+      },
+      "createdAt": "2026-11-01T13:04:15Z",
+      "body": "> Draft. Stacked on #43 (first commit). Not yet exercised against a live account (my phone camera cannot scan the login QR right now); it reuses the same `getoldv2` call and digit-only cursor rule as the existing `LoadGroupHistory` backfill. Overlaps in purpose with the history parts of #42; happy to close if that lands first.\n\n## What\n- Settings → \"Đồng bộ ngay\" pages old history for every group and \"Cloud của tôi\" into `zalo_history.db`, with progress in the status line and a \"Dừng\" button\n- Each run resumes from the oldest stored server message, so pressing it again goes further back\n- \"Tải",
+      "labels": []
+    },
+    {
+      "number": 44,
+      "title": "perf(store): open the window faster with a large history",
+      "state": "MERGED",
+      "author": {
+        "login": "GrootTheDeveloper",
+        "name": "Dang Phuc An Khang"
+      },
+      "createdAt": "2026-11-01T13:04:13Z",
+      "body": "> Stacked on #43 (first commit). Please review the last 3 commits; I will rebase once #43 lands.\n\n## What\n- Window shows in 0.61–0.70 s instead of 1.04–1.12 s with a large history (Windows 11, release build, offline fixture: fake session, 303 threads, 200 messages per 1-1 thread, 62k rows in `zalo_history.db`, network blocked)\n\n## Why\n- Every hydrate ran `DELETE FROM messages WHERE text = 'sendBubbleMessage'` (full table scan) and loaded every `(msg_id, thread_id)` row in the database into a HashMap\n- `new()` hydrated from SQLite a second time and rewrote `threads_cache.json` right after `main",
+      "labels": []
+    },
+    {
+      "number": 43,
+      "title": "fix(store): return the newest rows from messages_for",
+      "state": "MERGED",
+      "author": {
+        "login": "GrootTheDeveloper",
+        "name": "Dang Phuc An Khang"
+      },
+      "createdAt": "2026-11-01T13:04:04Z",
+      "body": "## What\n- `messages_for(thread, n)` returns the newest `n` messages (still oldest-first) instead of the oldest `n`\n- `persist_threads` runs in one transaction\n\n## Why\n- `ORDER BY ts ASC LIMIT n` handed back the *oldest* rows, so any thread with more stored history than the hydrate limit (200 at startup, 500 when opened) reopened on stale messages and the newest ones were missing\n- In autocommit every inserted row was its own fsync\n\n## How\n- `SELECT ... FROM (SELECT ... ORDER BY ts DESC LIMIT ?2) ORDER BY ts ASC`\n- `BEGIN` / `COMMIT` around the existing loop, `ROLLBACK` on error\n\n## Verificatio",
+      "labels": []
+    },
+    {
+      "number": 42,
+      "title": "feat(chat): bổ sung emoji, media và đồng bộ trạng thái hội thoại",
+      "state": "OPEN",
+      "author": {
+        "login": "thuongtin",
+        "name": "Ethan"
+      },
+      "createdAt": "2026-11-01T12:30:11Z",
+      "body": "## Nội dung thay đổi (What)\n\nĐưa lên đầy đủ nhóm sửa tính năng hội thoại đã được phát triển trên nền `v0.0.3`, không chỉ hai fix thời gian và thư mục dữ liệu. **Các thay đổi UI cần cho chức năng cũng nằm trong PR. UI hiện chưa được tối ưu/hoàn thiện về thiết kế; điều này không có nghĩa loại UI hoặc tính năng khỏi đóng góp.**\n\n**Chỉ mới kiểm thử trên Mac: macOS 27.0.1, Apple Silicon arm64. Windows, Linux, Mac Intel/Universal chưa được kiểm thử/nghiệm thu.** PR để dạng draft vì còn các hạng mục kỹ thuật trước merge được ghi bên dưới, không phải vì giữ lại tính năng có UI.\n\n### 1. Emoji và font\n\n",
+      "labels": []
+    },
+    {
+      "number": 41,
+      "title": "fix(store): chọn thư mục dữ liệu ghi được trước khi khởi động",
+      "state": "MERGED",
+      "author": {
+        "login": "thuongtin",
+        "name": "Ethan"
+      },
+      "createdAt": "2026-11-01T12:06:21Z",
+      "body": "## Thay đổi (What)\n\nBổ sung cơ chế chọn và kiểm tra thư mục dữ liệu **trước khi mở phiên đăng nhập, cache, log hoặc cơ sở dữ liệu**:\n\n- `--data-dir <PATH>` và `--data-dir=PATH` để chọn rõ thư mục dữ liệu.\n- `--print-data-dir` để chuẩn bị, in thư mục được chọn rồi thoát trước các thao tác khác.\n- `--version`/`-V` thoát trước khi chuẩn bị nơi lưu dữ liệu, không tạo Application Support chỉ để xem phiên bản.\n\n**Phạm vi PR: fix độc lập về khởi động/lưu trữ. UI tổng thể chưa được tối ưu/hoàn thiện, không phải lý do loại các tính năng có UI khỏi đóng góp. Chỉ mới kiểm thử trên Mac (macOS 27.0.1, Appl",
+      "labels": []
+    },
+    {
+      "number": 40,
+      "title": "fix(chat): hiển thị giờ tin nhắn theo múi giờ hệ điều hành",
+      "state": "MERGED",
+      "author": {
+        "login": "thuongtin",
+        "name": "Ethan"
+      },
+      "createdAt": "2026-11-01T12:06:16Z",
+      "body": "## Thay đổi (What)\n\nSửa cách hiển thị thời gian tin nhắn và hội thoại để dùng **múi giờ của hệ điều hành**, thay vì mặc định hiển thị UTC từ phép chia epoch.\n\n**Phạm vi PR: fix độc lập về tính đúng đắn của thời gian. UI tổng thể chưa được tối ưu/hoàn thiện, không phải lý do loại các tính năng có UI khỏi đóng góp. Chỉ mới kiểm thử trên Mac (macOS 27.0.1, Apple Silicon arm64); Windows và Linux chưa được kiểm thử.**\n\n## Lý do (Why)\n\nCách tính giờ cũ lấy epoch, chia giây rồi modulo 24. Kết quả là giờ UTC chứ không phải giờ địa phương của người dùng. Ví dụ với timestamp `1793467800000` và `TZ=Asia/",
+      "labels": []
+    },
+    {
+      "number": 39,
+      "title": "ci(pr): thêm bot kiểm tra PR tự động miễn phí 100%",
+      "state": "CLOSED",
+      "author": {
+        "login": "cypherdo37",
+        "name": "Đỗ Thành Công"
+      },
+      "createdAt": "2026-11-01T11:19:38Z",
+      "body": "## What\n- Thêm job `pr-guard` vào workflow CI.\n- Tự động quét và chặn commit nhầm `session.json`, database `*.db`, file log hoặc credentials.\n- Kiểm tra chuẩn tiêu đề Conventional Commits.\n- Kiểm tra độ dài mô tả PR.\n- Xuất bảng Checklist đánh giá tự động trực tiếp trên tab Summary của PR.\n\n## Why\n- Miễn phí 100%, bảo vệ repo an toàn mà không cần thêm API key nào.\n\n## Verification\n- Chạy thử nghiệm trên chính PR này.",
+      "labels": []
+    },
+    {
+      "number": 37,
+      "title": "ci(pr): thêm bot kiểm tra PR tự động miễn phí 100%",
+      "state": "CLOSED",
+      "author": {
+        "login": "cypherdo37",
+        "name": "Đỗ Thành Công"
+      },
+      "createdAt": "2026-11-01T11:08:00Z",
+      "body": "## What\n- Thêm workflow `.github/workflows/pr-check.yml` kiểm tra tự động cho mọi Pull Request.\n- Kiểm tra bảo mật: chặn commit nhầm `session.json`, `*.db`, file log hoặc credentials.\n- Kiểm tra chuẩn tiêu đề Conventional Commits và mô tả PR.\n- Kiểm tra format mã nguồn Rust (`cargo fmt`).\n- Tự động comment bảng checklist đánh giá lên PR bằng `github-actions[bot]` mà không cần bất kỳ API key nào.\n\n## Why\n- Team nhỏ, cần tự động hóa việc review cơ bản và chặn rò rỉ dữ liệu nhạy cảm mà hoàn toàn miễn phí.\n\n## Verification\n- Workflow tự kích hoạt và chạy trên chính PR này.",
+      "labels": []
+    },
+    {
+      "number": 36,
+      "title": "docs: test gemini code assist bot",
+      "state": "CLOSED",
+      "author": {
+        "login": "TIPC1110",
+        "name": "ctdo"
+      },
+      "createdAt": "2026-11-01T11:02:25Z",
+      "body": "Test PR to verify @gemini-code-assist bot review",
+      "labels": []
+    },
+    {
       "number": 30,
       "title": "fix(session): keep session.json on network errors, prompt only on a real expiry",
-      "state": "OPEN",
+      "state": "MERGED",
       "author": {
         "login": "ngxccc",
         "name": "Ngoc Tran"
@@ -345,7 +549,7 @@
     {
       "number": 29,
       "title": "fix(net): let verified endpoints win over zpw_service_map_v3",
-      "state": "OPEN",
+      "state": "MERGED",
       "author": {
         "login": "ngxccc",
         "name": "Ngoc Tran"
@@ -357,10 +561,10 @@
     {
       "number": 28,
       "title": "Add macOS x86_64 build to CI workflow",
-      "state": "OPEN",
+      "state": "MERGED",
       "author": {
         "login": "vuhuymicrosoft-bot",
-        "name": "vuhuymicrosoft-bot"
+        "name": "jesse"
       },
       "createdAt": "2026-11-01T07:47:58Z",
       "body": "",
@@ -369,7 +573,7 @@
     {
       "number": 26,
       "title": "ci(macos): build native Intel (x86_64) .dmg alongside Apple Silicon",
-      "state": "OPEN",
+      "state": "MERGED",
       "author": {
         "login": "quangnguyenn98",
         "name": "quangnguyenn98"
@@ -381,7 +585,7 @@
     {
       "number": 25,
       "title": "docs: user-facing feature matrix + mdBook docs site (build only, deploy pending)",
-      "state": "OPEN",
+      "state": "MERGED",
       "author": {
         "login": "ngxccc",
         "name": "Ngoc Tran"
@@ -393,7 +597,7 @@
     {
       "number": 18,
       "title": "fix(release): derive version from Cargo.toml and generate release notes",
-      "state": "OPEN",
+      "state": "MERGED",
       "author": {
         "login": "ngxccc",
         "name": "Ngoc Tran"
@@ -405,7 +609,7 @@
     {
       "number": 11,
       "title": "docs(harness): add engineering standards and issue workflow",
-      "state": "OPEN",
+      "state": "MERGED",
       "author": {
         "login": "ngxccc",
         "name": "Ngoc Tran"

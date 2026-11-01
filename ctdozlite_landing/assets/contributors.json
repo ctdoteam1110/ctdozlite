@@ -766,5 +766,29 @@
     "status": "active",
     "statusText": "Đóng góp trên GitHub",
     "source": "GitHub ctdozlite"
+  },
+  {
+    "id": 65,
+    "name": "Thuong Tin (@thuongtin)",
+    "avatar": "TT",
+    "type": "bug",
+    "tag": "GitHub PR #40 & #41",
+    "role": "Sửa múi giờ tin nhắn & Tùy biến thư mục lưu dữ liệu",
+    "detail": "Đóng góp PR #40 (hiển thị giờ tin nhắn theo múi giờ OS) và PR #41 (tùy chọn --data-dir, --print-data-dir, bảo đảm quyền ghi an toàn cho macOS app bundle).",
+    "status": "active",
+    "statusText": "Đã đóng góp & Merge",
+    "source": "GitHub ctdozlite"
+  },
+  {
+    "id": 66,
+    "name": "Dang Phuc An Khang (@GrootTheDeveloper)",
+    "avatar": "GD",
+    "type": "feat",
+    "tag": "GitHub PRs #43, #44, #47, #48, #49, #50",
+    "role": "Tối ưu hóa hiệu năng toàn diện (SQLite, Font CJK, Chat Virtualize)",
+    "detail": "Đóng góp loạt 6 Pull Requests tối ưu hóa: Sửa query tin nhắn mới nhất (#43), Tăng tốc mở app với SQLite lớn (#44), Lazy load Font CJK (#48), Virtualize danh sách chat tránh giật lag (#47), Sửa icon Windows GNU (#49), Thu nhỏ dung lượng binary release (#50).",
+    "status": "active",
+    "statusText": "Đã đóng góp & Merge",
+    "source": "GitHub ctdozlite"
   }
 ]
