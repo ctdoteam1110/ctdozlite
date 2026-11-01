@@ -242,10 +242,35 @@ jobs:
           name: ctdozlite-macos-dmg
           path: dist/*.dmg
 
+  macos-dmg-x86_64:
+    name: macOS (Intel x86_64 + .dmg)
+    runs-on: macos-15-intel
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Homebrew dependencies
+        run: brew install cmake pkg-config opus
+      - name: Build release app bundle & .dmg
+        run: |
+          cargo build --release --locked --bin zalo-rust
+          mkdir -p dist/dmg/ctdozlite.app/Contents/MacOS
+          mkdir -p dist/dmg/ctdozlite.app/Contents/Resources
+          cp target/release/zalo-rust dist/dmg/ctdozlite.app/Contents/MacOS/zalo-rust
+          cp packaging/macos/Info.plist dist/dmg/ctdozlite.app/Contents/Info.plist
+          ln -s /Applications dist/dmg/Applications
+          hdiutil create -volname "ctdozlite" -srcfolder dist/dmg -ov -format UDZO dist/ctdozlite-0.0.1-macos-x86_64.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ctdozlite-macos-x86_64-dmg
+          path: dist/*.dmg
+
   release:
     name: Publish GitHub Release
-    needs: [linux-packages, linux-legacy-glibc231, windows-exe, macos-dmg]
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.linux-packages.result == 'success' && needs.windows-exe.result == 'success' && needs.macos-dmg.result == 'success'
+    needs: [linux-packages, linux-legacy-glibc231, windows-exe, macos-dmg, macos-dmg-x86_64]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.linux-packages.result == 'success' && needs.windows-exe.result == 'success' && needs.macos-dmg.result == 'success' && needs.macos-dmg-x86_64.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -296,3 +321,4 @@ jobs:
 
             #### 🍎 Bản cài đặt cho macOS
             - `ctdozlite-0.0.1-macos.dmg`
+            - `ctdozlite-0.0.1-macos-x86_64.dmg` (Mac Intel)
