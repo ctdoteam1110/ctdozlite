@@ -301,6 +301,64 @@ pub(super) fn open_external_url(url: &str) {
         let _ = std::process::Command::new("xdg-open").arg(trimmed).spawn();
     }
 }
+/// Open a native OS folder picker (for "Thư mục lưu file") and return the chosen folder.
+pub(super) fn pick_native_folder_dialog(title: &str) -> Option<std::path::PathBuf> {
+    let non_empty = |out: std::process::Output| -> Option<std::path::PathBuf> {
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then(|| std::path::PathBuf::from(s))
+    };
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let title = title.replace('\'', "''");
+        let script = format!(
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+             Add-Type -AssemblyName System.Windows.Forms; \
+             $f = New-Object System.Windows.Forms.FolderBrowserDialog; \
+             $f.Description = '{title}'; \
+             $f.ShowNewFolderButton = $true; \
+             $top = New-Object System.Windows.Forms.Form; \
+             $top.TopMost = $true; \
+             if ($f.ShowDialog($top) -eq [System.Windows.Forms.DialogResult]::OK) {{ Write-Output $f.SelectedPath }}"
+        );
+        return std::process::Command::new("powershell")
+            .args(["-NoProfile", "-STA", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()
+            .and_then(non_empty);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let title = title.replace('"', "'");
+        let script = format!("POSIX path of (choose folder with prompt \"{title}\")");
+        return std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+            .ok()
+            .and_then(non_empty);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::process::Command::new("zenity")
+            .args(["--file-selection", "--directory", &format!("--title={title}")])
+            .output()
+            .ok()
+            .and_then(non_empty)
+            .or_else(|| {
+                std::process::Command::new("kdialog")
+                    .args(["--getexistingdirectory", ".", "--title", title])
+                    .output()
+                    .ok()
+                    .and_then(non_empty)
+            })
+    }
+}
+
 /// Open a native OS file-picker dialog on a worker thread and return the selected path.
 pub(super) fn pick_native_file_dialog(images_only: bool) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]

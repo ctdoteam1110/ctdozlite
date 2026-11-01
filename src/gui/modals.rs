@@ -1624,28 +1624,23 @@ impl ZaloGuiApp {
             self.show_toast("Đang làm mới danh sách hội thoại…");
         }
         if pick_dl_dir {
-            if let Some(folder) = pick_native_file_dialog(false) {
-                let dir_path = folder.parent().unwrap_or(&folder).to_path_buf();
-                self.settings.download_dir = dir_path.display().to_string();
-                self.settings.save();
-                self.show_toast(format!("Đã đổi thư mục lưu file: {}", self.settings.download_dir));
+            if let Some(dir_path) = pick_native_folder_dialog("Chọn thư mục lưu file nhận từ Zalo") {
+                if dir_path.is_absolute() {
+                    self.settings.download_dir = dir_path.display().to_string();
+                    self.settings.save();
+                    self.show_toast(format!(
+                        "Đã đổi thư mục lưu file: {}",
+                        self.settings.download_dir
+                    ));
+                } else {
+                    self.show_toast("Thư mục lưu file phải là đường dẫn tuyệt đối.");
+                }
             }
         }
         if open_dl_dir {
             let p = std::path::PathBuf::from(&self.settings.download_dir);
             let _ = std::fs::create_dir_all(&p);
-            #[cfg(target_os = "windows")]
-            {
-                let _ = std::process::Command::new("explorer").arg(&p).spawn();
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("open").arg(&p).spawn();
-            }
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            {
-                let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
-            }
+            crate::download::open_folder(&p);
         }
         if open_data_dir {
             crate::download::open_folder(crate::paths::data_dir());
