@@ -1013,6 +1013,43 @@ pub(super) fn same_message_cluster(a: &ChatMessage, b: &ChatMessage) -> bool {
     true
 }
 
+fn render_message_text(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    text: &str,
+    size: f32,
+    color: Color32,
+    width: f32,
+) -> Option<BubbleAction> {
+    let mut mentions = crate::message_navigation::message_mentions(msg);
+    if text != msg.text {
+        let mut locations = msg.text.match_indices(text);
+        let offset = locations.next().map(|(offset, _)| offset);
+        if text.is_empty() || locations.next().is_some() {
+            mentions.clear();
+        } else if let Some(offset) = offset {
+            mentions.retain(|span| {
+                span.byte_range.start >= offset && span.byte_range.end <= offset + text.len()
+            });
+            for span in &mut mentions {
+                span.byte_range.start -= offset;
+                span.byte_range.end -= offset;
+            }
+        } else {
+            mentions.clear();
+        }
+    }
+    super::emoji_text::show_with_mentions(ui, text, size, color, width, &mentions).map(|index| {
+        let mention = &mentions[index];
+        BubbleAction::OpenMention {
+            user_id: mention.user_id.clone(),
+            display_name: text[mention.byte_range.clone()]
+                .trim_start_matches('@')
+                .to_owned(),
+        }
+    })
+}
+
 pub(super) fn render_message_body(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
@@ -1182,12 +1219,10 @@ pub(super) fn render_message_body(
             }
             if let Some(cap) = msg.link_desc.as_deref().filter(|c| !c.trim().is_empty()) {
                 ui.add_space(5.0);
-                ui.add(egui::Label::new(RichText::new(cap).color(text_col).size(14.2)).wrap());
+                body_action = render_message_text(ui, msg, cap, 14.2, text_col, max_text_width).or(body_action);
             } else if !trimmed_text.starts_with("[Hình ảnh]") && !trimmed_text.is_empty() {
                 ui.add_space(5.0);
-                ui.add(
-                    egui::Label::new(RichText::new(trimmed_text).color(text_col).size(14.2)).wrap(),
-                );
+                body_action = render_message_text(ui, msg, trimmed_text, 14.2, text_col, max_text_width).or(body_action);
             }
             return body_action;
         }
@@ -1244,8 +1279,7 @@ pub(super) fn render_message_body(
     }
 
     let Some((caption, url, domain)) = extract_message_link_view(msg) else {
-        ui.add(egui::Label::new(RichText::new(&msg.text).color(text_col).size(14.0)).wrap());
-        return None;
+        return render_message_text(ui, msg, &msg.text, 14.0, text_col, max_text_width);
     };
 
     let link_col = if pal.is_dark {
@@ -1277,7 +1311,7 @@ pub(super) fn render_message_body(
 
     // 1. Optional user comment above the link
     if !caption.is_empty() && caption != url {
-        ui.add(egui::Label::new(RichText::new(&caption).color(text_col).size(13.8)).wrap());
+        body_action = render_message_text(ui, msg, &caption, 13.8, text_col, max_text_width).or(body_action);
         ui.add_space(4.0);
     }
 
@@ -1542,16 +1576,7 @@ pub(super) fn render_chat_bubble(
         } else {
             msg.text.as_str()
         };
-        let text_w = ui.fonts(|f| {
-            f.layout(
-                display_str.to_string(),
-                FontId::proportional(14.2),
-                Color32::WHITE,
-                max_text_width,
-            )
-            .size()
-            .x
-        });
+        let text_w = super::emoji_text::measure(ui, display_str, 14.2, max_text_width).x;
         let quote_w = match msg.reply_to_text.as_ref() {
             Some(qt) => {
                 let q_body_w = ui.fonts(|f| {
@@ -1870,6 +1895,7 @@ pub(super) fn render_chat_bubble(
 pub(super) enum BubbleAction {
     Reply,
     JumpToQuoted(String),
+    OpenMention { user_id: String, display_name: String },
     Forward,
     React(&'static str),
     TogglePin,
@@ -2067,14 +2093,8 @@ pub(super) fn render_quote_block(
                         .filter(|sn| !sn.is_empty() && !sn.chars().all(|c| c.is_ascii_digit()))
                         .unwrap_or("Tin nhắn trích dẫn");
                     ui.label(RichText::new(who).color(bar_col).size(11.5).strong());
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(truncate_chars(qt, 84))
-                                .color(meta_col)
-                                .size(12.0),
-                        )
-                        .wrap(),
-                    );
+                    super::emoji_text::show(ui, &super::emoji_text::truncate_graphemes(qt, 84),
+                        12.0, meta_col, inner_col_w);
                 });
             });
         });
@@ -2307,5 +2327,91 @@ mod quote_navigation_tests {
             }
         }
         panic!("Quote with an exact reference must advertise a clickable target");
+    }
+}
+
+#[cfg(test)]
+mod inline_mention_tests {
+    use super::*;
+
+    #[test]
+    fn inline_mention_bubble_click_opens_exact_uid_after_emoji_and_duplicate_names() {
+        for is_outgoing in [false, true] {
+            let ctx = egui::Context::default();
+            setup_custom_fonts(&ctx);
+            let text = "😀 :)) @An @An";
+            let second = text.rfind('@').unwrap();
+            let pos = text[..second].encode_utf16().count();
+            let msg = ChatMessage {
+                text: text.into(),
+                is_outgoing,
+                wire_ref: crate::message_model::WireMessageRef::from_raw(&serde_json::json!({
+                    "mentions":[{"uid":"11","pos":pos - 4,"len":3},{"uid":"22","pos":pos,"len":3}]
+                })),
+                ..Default::default()
+            };
+            let mut target = Pos2::ZERO;
+            let mut action = None;
+            for frame in 0..4 {
+                let mut events = vec![egui::Event::PointerMoved(target)];
+                if frame >= 2 {
+                    events.push(egui::Event::PointerButton {
+                        pos: target,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame == 2,
+                        modifiers: Default::default(),
+                    });
+                }
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
+                        events,
+                        time: Some(frame as f64 * 0.016),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            action = render_chat_bubble(
+                                ui,
+                                &msg,
+                                false,
+                                false,
+                                false,
+                                false,
+                                "Thread",
+                                None,
+                                &ThemePalette::light(),
+                                &HashMap::new(),
+                                &mut HashSet::new(),
+                                &HashMap::new(),
+                                0,
+                            );
+                        });
+                    },
+                );
+                if frame == 0 {
+                    target = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(shape) if shape.galley.job.text == text => Some(
+                                shape.pos
+                                    + shape
+                                        .galley
+                                        .pos_from_ccursor(egui::text::CCursor::new(
+                                            text[..second].chars().count() + 1,
+                                        ))
+                                        .center()
+                                        .to_vec2(),
+                            ),
+                            _ => None,
+                        })
+                        .expect("Raw selectable message galley must exist");
+                }
+            }
+            assert!(
+                matches!(action, Some(BubbleAction::OpenMention {user_id, ..}) if user_id == "22")
+            );
+        }
     }
 }

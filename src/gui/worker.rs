@@ -6,6 +6,8 @@ pub(super) static KNOWN_THREADS: std::sync::Mutex<Vec<(String, String, bool)>> =
     std::sync::Mutex::new(Vec::new());
 
 pub enum WorkerCmd {
+    /// Render one exact grapheme through the bounded native emoji helper off the UI thread.
+    RenderInlineEmoji { cluster: String, sprite_id: Option<u16> },
     /// Import and hydrate local history on the blocking pool.
     ImportHistory {
         account: String,
@@ -2035,6 +2037,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 }
                             });
                         }
+                        WorkerCmd::RenderInlineEmoji { cluster, sprite_id } => {
+                            tokio::spawn(render_inline_emoji(cluster, sprite_id, gui_tx.clone()));
+                        }
                         WorkerCmd::FetchStickerImage { key, url } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -3164,5 +3169,101 @@ mod media_import_regressions {
         );
         assert!(!include_str!("modals.rs").contains("crate::store::import_history_from_path"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Bound concurrent native helper processes independently of the 32-entry UI pending budget.
+async fn render_inline_emoji(cluster: String, sprite_id: Option<u16>, gui_tx: GuiTx) {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let slots = SLOTS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+        .clone();
+    let key = cluster.clone();
+    let image = match slots.acquire_owned().await {
+        Ok(permit) => tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            match sprite_id {
+                Some(sprite) => super::emoji_text::render_original(sprite),
+                None => super::emoji_text::render_native(&cluster),
+            }
+        })
+        .await
+        .ok()
+        .flatten(),
+        Err(_) => None,
+    };
+    // GuiTx also schedules the UI repaint; failure means the app has closed.
+    let _ = gui_tx.send(GuiEvent::InlineEmojiReady {
+        cluster: key,
+        sprite_id,
+        image,
+    });
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod inline_emoji_native_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "Requires native/macos/build-emoji-preview.sh"]
+    async fn inline_emoji_worker_native_color_reaches_actual_inline_mesh() {
+        let ctx = egui::Context::default();
+        setup_custom_fonts(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut images = Vec::new();
+        for cluster in ["👍🏽", "👩‍💻", "🇻🇳", "1️⃣"] {
+            render_inline_emoji(
+                cluster.into(),
+                None,
+                GuiTx {
+                    tx: tx.clone(),
+                    ctx: ctx.clone(),
+                },
+            )
+            .await;
+            let GuiEvent::InlineEmojiReady {
+                cluster: key,
+                image,
+                ..
+            } = rx.recv_timeout(Duration::from_secs(3)).unwrap()
+            else {
+                panic!("Expected terminal native render result")
+            };
+            assert_eq!(key, cluster);
+            let image = image.expect("Existing native helper must render a complete grapheme");
+            assert_eq!(image.size, [64, 64]);
+            assert!(image
+                .pixels
+                .iter()
+                .any(|pixel| pixel.a() > 0 && pixel.r().abs_diff(pixel.g()) > 20));
+            images.push(image);
+        }
+        // The bridge must preserve distinct sequences rather than draw their base scalar.
+        let base_thumb = tokio::task::spawn_blocking(|| super::super::emoji_text::render_native("👍")).await.unwrap().unwrap();
+        let base_woman = tokio::task::spawn_blocking(|| super::super::emoji_text::render_native("👩")).await.unwrap().unwrap();
+        assert_ne!(images[0].pixels, base_thumb.pixels);
+        assert_ne!(images[1].pixels, base_woman.pixels);
+        super::super::emoji_text::seed_worker_results(
+            &ctx,
+            ["👍🏽", "👩‍💻", "🇻🇳", "1️⃣"].into_iter().zip(images),
+        );
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::super::emoji_text::show(ui, "👍🏽 👩‍💻 🇻🇳 1️⃣", 16.0, Color32::WHITE, 300.0);
+            });
+        });
+        let meshes = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let color_meshes = meshes
+            .iter()
+            .filter(|mesh| {
+                matches!(&mesh.primitive, egui::epaint::Primitive::Mesh(mesh)
+                if mesh.texture_id != egui::TextureId::Managed(0))
+            })
+            .count();
+        assert!(
+            color_meshes >= 4,
+            "Native worker images must become visible color meshes"
+        );
     }
 }

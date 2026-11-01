@@ -3482,6 +3482,24 @@ impl ZaloGuiApp {
                         if let Some(m) = target {
                             match action {
                                 BubbleAction::Reply => self.replying_to = Some(m),
+                                BubbleAction::OpenMention { user_id, display_name: _ } => {
+                                    self.feed_target_uid = user_id.clone();
+                                    self.feed_profile = None;
+                                    self.feed_items.clear();
+                                    self.feed_profile_error = None;
+                                    self.feed_loading_profile = true;
+                                    self.feed_modal_tab = FeedModalTab::Profile;
+                                    self.feed_modal_open = true;
+                                    if let Some(tx) = WORKER_TX.get() {
+                                        if tx.send(WorkerCmd::FetchSocialProfile { target_uid: user_id }).is_err() {
+                                            self.feed_loading_profile = false;
+                                            self.feed_profile_error = Some("Kết nối xử lý đã đóng.".into());
+                                        }
+                                    } else {
+                                        self.feed_loading_profile = false;
+                                        self.feed_profile_error = Some("Chưa kết nối để tải hồ sơ.".into());
+                                    }
+                                }
                                 BubbleAction::JumpToQuoted(reference) => {
                                     let index = self
                                         .threads

@@ -780,6 +780,7 @@ pub(super) fn load_default_emoji_textures(ctx: &egui::Context) -> HashMap<String
             map.insert(name.to_string(), tex);
         }
     }
+    super::emoji_text::register_reactions(ctx, &map);
     map
 }
 
@@ -842,6 +843,13 @@ pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
 
 fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
     let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("noto_emoji".into(), egui::FontData::from_static(
+        include_bytes!("../assets/fonts/NotoEmoji-Variable.ttf")));
+
+    fonts.font_data.insert("emoji_slot".into(), egui::FontData::from_static(
+        include_bytes!("../assets/emojis/zalo/slot.ttf")));
+    fonts.families.insert(egui::FontFamily::Name("emoji_slot".into()), vec!["emoji_slot".into()]);
+
 
     // 1. Embed official Lucide Icon Font (vector glyphs for all UI icons)
     const LUCIDE_BYTES: &[u8] = include_bytes!("../assets/fonts/lucide.ttf");
@@ -918,6 +926,7 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
         prop.push("cjk_font".to_owned());
     }
     prop.push("lucide_font".to_owned());
+    prop.push("noto_emoji".to_owned());
 
     let mono = fonts.families.entry(egui::FontFamily::Monospace).or_default();
     mono.push("bundled_sans".to_owned());
@@ -928,6 +937,7 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
         mono.push("cjk_font".to_owned());
     }
     mono.push("lucide_font".to_owned());
+    mono.push("noto_emoji".to_owned());
 
     ctx.set_fonts(fonts);
 }

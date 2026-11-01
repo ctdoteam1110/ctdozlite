@@ -1,6 +1,8 @@
 //! Exact quoted-message lookup within the currently loaded conversation.
 use crate::chat::ChatMessage;
 use serde_json::Value;
+use std::ops::Range;
+use unicode_segmentation::UnicodeSegmentation;
 
 fn exact_id(value: &Value) -> Option<String> {
     match value {
@@ -138,5 +140,175 @@ mod tests {
         assert_eq!(limit, 991);
         assert!(1000 - limit <= 12);
         assert_eq!(render_limit_for_target(150, 1000, 999), 150);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// A verified exact identity and a grapheme-aligned source-text span.
+pub struct MentionSpan {
+    /// Protocol UID, never inferred from display text.
+    pub user_id: String,
+    /// Half-open UTF-8 byte boundaries into the original message.
+    pub byte_range: Range<usize>,
+}
+
+/// JS substring offsets are UTF-16 code units, not bytes or Unicode scalars.
+pub fn utf16_byte_range(text: &str, position: usize, length: usize) -> Option<Range<usize>> {
+    if length == 0 {
+        return None;
+    }
+    let end = position.checked_add(length)?;
+    let boundary = |wanted| {
+        let mut units = 0;
+        for (byte, ch) in text.char_indices() {
+            if units == wanted {
+                return Some(byte);
+            }
+            units += ch.len_utf16();
+            if units > wanted {
+                return None;
+            }
+        }
+        (units == wanted).then_some(text.len())
+    };
+    let range = boundary(position)?..boundary(end)?;
+    let is_grapheme_boundary =
+        |byte| byte == text.len() || text.grapheme_indices(true).any(|(index, _)| index == byte);
+    (is_grapheme_boundary(range.start) && is_grapheme_boundary(range.end)).then_some(range)
+}
+
+/// Original shared-worker-original.js CP143496: mentions[].pos/len are passed to
+/// message.substring(pos, pos + len). Archive meta.mentionsList uses the same spans;
+/// opaque archive UIDs require the exact-key sidecar from the identity decoder.
+pub fn message_mentions(message: &ChatMessage) -> Vec<MentionSpan> {
+    let wire = message.wire_ref.fields.get("mentions");
+    let archive = message
+        .history_source
+        .as_ref()
+        .and_then(|source| source.pointer("/meta/mentionsList"));
+    let Some(mentions) = wire.or(archive).and_then(Value::as_array) else {
+        return vec![];
+    };
+    let mut result = Vec::new();
+    for mention in mentions {
+        let Some(mut user_id) = mention.get("uid").and_then(exact_id) else {
+            continue;
+        };
+        if user_id.trim().is_empty() || matches!(user_id.as_str(), "0" | "-1") {
+            continue;
+        }
+        if wire.is_none() {
+            if !user_id.bytes().all(|byte| byte.is_ascii_digit()) {
+                let Some(resolved) = message.resolved_mention_uids.get(&user_id) else {
+                    continue;
+                };
+                user_id = resolved.clone();
+            }
+            if user_id.is_empty()
+                || !user_id.bytes().all(|byte| byte.is_ascii_digit())
+                || !user_id.bytes().any(|byte| byte != b'0')
+            {
+                continue;
+            }
+        }
+        let Some(position) = mention
+            .get("pos")
+            .and_then(Value::as_u64)
+            .and_then(|number| usize::try_from(number).ok())
+        else {
+            continue;
+        };
+        let Some(length) = mention
+            .get("len")
+            .and_then(Value::as_u64)
+            .and_then(|number| usize::try_from(number).ok())
+        else {
+            continue;
+        };
+        let Some(byte_range) = utf16_byte_range(&message.text, position, length) else {
+            continue;
+        };
+        result.push(MentionSpan {
+            user_id,
+            byte_range,
+        });
+    }
+    result.sort_by_key(|span| (span.byte_range.start, span.byte_range.end));
+    result.dedup();
+    // Conflicting/overlapping claims do not establish a clickable identity.
+    result
+        .iter()
+        .enumerate()
+        .filter(|(index, span)| {
+            !result.iter().enumerate().any(|(other, candidate)| {
+                other != *index
+                    && span.byte_range.start < candidate.byte_range.end
+                    && candidate.byte_range.start < span.byte_range.end
+            })
+        })
+        .map(|(_, span)| span.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn inline_mention_utf16_ranges_reject_partial_graphemes_and_overflow() {
+        let text = "😀👩‍💻e\u{301} @An";
+        let start = text.find('@').unwrap();
+        let units = text[..start].encode_utf16().count();
+        assert_eq!(utf16_byte_range(text, units, 3), Some(start..text.len()));
+        for (position, length) in [(1, 1), (2, 2), (7, 1), (0, 0), (usize::MAX, 2)] {
+            assert_eq!(utf16_byte_range(text, position, length), None);
+        }
+    }
+
+    #[test]
+    fn inline_mention_keeps_duplicate_names_bound_to_exact_uids() {
+        let mut message = ChatMessage {
+            text: "😀 @An @An".into(),
+            ..Default::default()
+        };
+        message.wire_ref.fields.insert(
+            "mentions".into(),
+            json!([
+                {"uid":"11","pos":3,"len":3}, {"uid":"22","pos":7,"len":3}
+            ]),
+        );
+        let spans = message_mentions(&message);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].user_id, "11");
+        assert_eq!(spans[1].user_id, "22");
+        assert_eq!(&message.text[spans[1].byte_range.clone()], "@An");
+    }
+
+    #[test]
+    fn inline_mention_rejects_conflicting_claims_and_unresolved_archive_ids() {
+        let mut message = ChatMessage {
+            text: "@An".into(),
+            ..Default::default()
+        };
+        message.wire_ref.fields.insert(
+            "mentions".into(),
+            json!([
+                {"uid":"11","pos":0,"len":3}, {"uid":"22","pos":0,"len":3}
+            ]),
+        );
+        assert!(message_mentions(&message).is_empty());
+        message.wire_ref.fields.clear();
+        message.history_source =
+            Some(json!({"meta":{"mentionsList":[{"uid":"opaque-key","pos":0,"len":3}]}}));
+        assert!(message_mentions(&message).is_empty());
+        message
+            .resolved_mention_uids
+            .insert("opaque-key".into(), "123".into());
+        assert_eq!(message_mentions(&message)[0].user_id, "123");
+        message
+            .resolved_mention_uids
+            .insert("opaque-key".into(), "000".into());
+        assert!(message_mentions(&message).is_empty());
     }
 }

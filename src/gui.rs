@@ -23,6 +23,7 @@ use crate::session::Session;
 
 mod media_preview;
 mod messages;
+mod emoji_text;
 mod modals;
 mod stickers;
 mod theme;
@@ -108,6 +109,8 @@ pub enum GuiEvent {
         thread_id: String,
         msg: ChatMessage,
     },
+    /// Terminal result of a bounded background native emoji render.
+    InlineEmojiReady { cluster: String, sprite_id: Option<u16>, image: Option<egui::ColorImage> },
     StickerImageReady {
         key: String,
         image: egui::ColorImage,
@@ -1311,6 +1314,9 @@ impl ZaloGuiApp {
                     }
                     self.status_msg = "Đã thu hồi tin nhắn với mọi người".into();
                 }
+                GuiEvent::InlineEmojiReady { cluster, sprite_id, image } => {
+                    emoji_text::accept_result(ctx, cluster, image, sprite_id);
+                }
                 GuiEvent::StickerImageReady { key, image } => {
                     self.loading_stickers.remove(&key);
                     let tex = ctx.load_texture(&key, image, TextureOptions::LINEAR);
@@ -1651,6 +1657,10 @@ impl ZaloGuiApp {
                     std::process::exit(0);
                 }
                 GuiEvent::SocialProfileLoaded(res) => {
+                    // A newer exact-UID selection must not display an older profile response.
+                    if res.as_ref().is_ok_and(|prof| !self.feed_target_uid.is_empty() && prof.uid != self.feed_target_uid) {
+                        continue;
+                    }
                     self.feed_loading_profile = false;
                     match res {
                         Ok(prof) => {
