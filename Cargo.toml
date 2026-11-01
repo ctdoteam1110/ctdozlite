@@ -80,3 +80,6 @@ assets = [
     ["src/assets/app_icon.png", "usr/share/icons/hicolor/256x256/apps/ctdozlite.png", "644"],
     ["README.md", "usr/share/doc/ctdozlite/README.md", "644"],
 ]
+
+[profile.release]
+strip = true
