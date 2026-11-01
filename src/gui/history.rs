@@ -11,6 +11,12 @@ use std::{path::PathBuf, sync::Arc};
 static STORAGE_LANE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub(super) enum Request {
+    #[cfg(test)]
+    PauseBeforeMutation {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        request: Box<Request>,
+    },
     Load(Vec<Thread>),
     Persist(Vec<Thread>),
     Reconcile(Vec<Thread>),
@@ -50,7 +56,7 @@ pub(super) enum Reply {
 }
 
 /// Execute one captured-account request off the async/UI threads.
-/// The runtime epoch fence must additionally reject same-account ABA generations.
+/// The captured runtime epoch rejects same-account ABA generations.
 ///
 /// # Errors
 /// Returns a terminal error for a stale account/session, invalid input or failed storage task.
@@ -64,11 +70,33 @@ pub(super) async fn execute(
     if account.is_empty() || captured.login.as_ref().map(|l| l.uin.as_str()) != Some(&account) {
         return Err("Tài khoản lịch sử không hợp lệ".into());
     }
+    let execution = crate::runtime_scope::execution_scope();
     let _lane = STORAGE_LANE.lock().await;
-    tokio::task::spawn_blocking(move || -> anyhow::Result<Reply> {
+    if crate::runtime_scope::execution_scope() != execution {
+        return Err("Phiên lịch sử đã thay đổi".into());
+    }
+    crate::runtime_scope::spawn_blocking(move || -> anyhow::Result<Reply> {
+        #[cfg(test)]
+        let request = match request {
+            Request::PauseBeforeMutation {
+                entered,
+                release,
+                request,
+            } => {
+                entered
+                    .send(())
+                    .map_err(|_| anyhow::anyhow!("Fixture receiver closed"))?;
+                release
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("Fixture sender closed"))?;
+                *request
+            }
+            request => request,
+        };
         // Prevent account transitions through the irreversible storage operation.
-        // The enclosing runtime fence adds generation ordering when integrated.
+        // The enclosing runtime fence rejects stale and orphaned blocking tasks.
         let current = session.blocking_lock();
+        let _mutation = crate::runtime_scope::mutation()?;
         anyhow::ensure!(
             current.login.as_ref().map(|l| l.uin.as_str()) == Some(&account)
                 && current.zpw_sek == captured.zpw_sek,
@@ -76,6 +104,9 @@ pub(super) async fn execute(
         );
         let mut store = AccountStore::open(&root, &account)?;
         match request {
+            #[cfg(test)]
+            Request::PauseBeforeMutation { .. } => unreachable!("fixture unwrapped above"),
+
             Request::Load(live) => {
                 let mut threads = store.all_thread_metadata()?;
                 store.hydrate_recent(&mut threads)?;
@@ -97,7 +128,7 @@ pub(super) async fn execute(
                 for thread in &mut threads {
                     let mut messages = Vec::new();
                     for message in &thread.messages {
-                        if let Some(message) = store.get_message(&thread.id, &message.id)? {
+                        if let Some(message) = store.message_for(&thread.id, message)? {
                             messages.push(message);
                         }
                     }
@@ -186,6 +217,7 @@ pub(super) async fn execute(
     })
     .await
     .map_err(|_| "Tác vụ lịch sử đã dừng".to_owned())?
+    .map_err(|_| "Phiên lịch sử đã hết hạn".to_owned())?
     .map_err(|_| "Chưa đọc hoặc lưu được lịch sử theo tài khoản".to_owned())
 }
 
@@ -195,6 +227,15 @@ pub(super) async fn execute(
 /// Returns an error when the application data directory cannot be resolved.
 pub(super) fn root() -> Result<PathBuf, String> {
     std::env::current_dir().map_err(|_| "Chưa xác định được thư mục dữ liệu".to_owned())
+}
+
+/// A per-thread revision invalidates all archive replies captured before conversation deletion.
+pub(super) fn revision_matches(
+    revisions: &std::collections::HashMap<String, u64>,
+    thread: &str,
+    revision: u64,
+) -> bool {
+    revisions.get(thread).copied().unwrap_or(0) == revision
 }
 
 /// Merge a background cache page without reviving an exact message deleted while it ran.
@@ -440,6 +481,7 @@ mod tests {
             captured.clone(),
             GuiTx {
                 tx,
+                scope: None,
                 ctx: eframe::egui::Context::default(),
             },
             vec![original],
@@ -612,6 +654,7 @@ mod tests {
             captured.clone(),
             GuiTx {
                 tx,
+                scope: None,
                 ctx: eframe::egui::Context::default(),
             },
             vec![thread(605)],
@@ -643,5 +686,69 @@ mod tests {
         };
         assert_eq!(messages.len(), 200);
         assert!(has_more);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_consumer_blocks_same_key_a_b_a_and_orphaned_blocking_writes() {
+        let _lock = crate::runtime_scope::tests::TEST_LOCK.lock().await;
+        for abort in [false, true] {
+            let root = Fixture::new();
+            let captured = session("account-a");
+            let live = Arc::new(tokio::sync::Mutex::new(captured.clone()));
+            let old = crate::runtime_scope::transition("account-a").unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let path = root.0.clone();
+            let task = tokio::spawn(async move {
+                crate::runtime_scope::run_stale_for_test(old, async move {
+                    execute(
+                        path,
+                        live,
+                        captured,
+                        "account-a".into(),
+                        Request::PauseBeforeMutation {
+                            entered: entered_tx,
+                            release: release_rx,
+                            request: Box::new(Request::Persist(vec![thread(1)])),
+                        },
+                    )
+                    .await
+                })
+                .await
+            });
+            tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+                .await
+                .unwrap();
+            crate::runtime_scope::transition("account-b").unwrap();
+            crate::runtime_scope::transition("account-a").unwrap();
+            if abort {
+                task.abort();
+            }
+            release_tx.send(()).unwrap();
+            if abort {
+                assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+            } else {
+                assert!(task.await.unwrap().is_err());
+            }
+            crate::runtime_scope::drain().await;
+            assert!(!root.0.join("accounts").exists());
+        }
+        crate::runtime_scope::transition("").unwrap();
+    }
+    #[test]
+    fn deleted_thread_revision_rejects_offscreen_pages_after_a_new_message_recreates_it() {
+        let captured = thread(3).messages;
+        let mut revisions = std::collections::HashMap::new();
+        let old_revision = 0;
+        assert!(revision_matches(&revisions, "same-thread", old_revision));
+        revisions.insert("same-thread".into(), 1);
+        let mut fresh = thread(1);
+        fresh.messages[0].id = "new-server-id".into();
+        let mut threads = vec![fresh];
+        if revision_matches(&revisions, "same-thread", old_revision) {
+            merge_cached_page(&mut threads, &Default::default(), "same-thread", captured);
+        }
+        assert_eq!(threads[0].messages.len(), 1);
+        assert_eq!(threads[0].messages[0].id, "new-server-id");
+        assert!(revision_matches(&revisions, "same-thread", 1));
     }
 }

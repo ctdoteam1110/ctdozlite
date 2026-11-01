@@ -3187,7 +3187,7 @@ impl ZaloGuiApp {
                         if !query.is_empty() && self.archive_search_request != key {
                             self.archive_search_request = key;
                             if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::SearchHistory { account: self.user_uin.clone(), thread_id: thread_id.clone(), query });
+                                let _ = tx.send(WorkerCmd::SearchHistory { account: self.user_uin.clone(), thread_id: thread_id.clone(), query, revision: *self.history_revisions.get(&thread_id).unwrap_or(&0) });
                             }
                         }
                     }
@@ -3310,6 +3310,7 @@ impl ZaloGuiApp {
                                                                     WorkerCmd::LoadHistoryPage {
                                                                         account: self.user_uin.clone(),
                                                                         thread_id: thread_id.clone(),
+                                                                        revision: *self.history_revisions.get(&thread_id).unwrap_or(&0),
                                                                         before: thread.messages.first().map(|message| crate::store_v2::HistoryCursor { ts: message.ts, msg_id: message.id.clone() }),
                                                                     },
                                                                 );
@@ -3487,6 +3488,7 @@ impl ZaloGuiApp {
                                     self.request_social_profile(user_id);
                                 }
                                 BubbleAction::JumpToQuoted(reference) => {
+                                    self.quote_lookup_generation = self.quote_lookup_generation.wrapping_add(1);
                                     let index = self
                                         .threads
                                         .get(self.selected_thread_index)
@@ -3505,7 +3507,7 @@ impl ZaloGuiApp {
                                         });
                                         ctx.request_repaint();
                                     } else if let Some(tx) = WORKER_TX.get() {
-                                        let _ = tx.send(WorkerCmd::NavigateHistory { account: self.user_uin.clone(), thread_id: thread_id.clone(), reference });
+                                        let _ = tx.send(WorkerCmd::NavigateHistory { account: self.user_uin.clone(), thread_id: thread_id.clone(), reference, request_id: self.quote_lookup_generation, revision: *self.history_revisions.get(&thread_id).unwrap_or(&0) });
                                     }
                                 }
                                 BubbleAction::Forward => {

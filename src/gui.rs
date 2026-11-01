@@ -55,10 +55,14 @@ fn reset_epoch_loading(
 }
 
 fn is_epoch_transition(event: &GuiEvent) -> bool {
-    matches!(event, GuiEvent::AuthenticationStarted | GuiEvent::LoginSuccess { .. } | GuiEvent::LoggedOut | GuiEvent::LocalDataWiped)
+    matches!(event, GuiEvent::AuthenticationStarted | GuiEvent::LoginSuccess { .. } | GuiEvent::LoggedOut | GuiEvent::LocalDataWiped | GuiEvent::HistoryClearFailed(_))
 }
 fn epoch_event_allowed(ui_generation: u64, generation: u64, event: &GuiEvent) -> bool {
     is_epoch_transition(event) || ui_generation == generation || matches!(event, GuiEvent::CallStateChanged(state) if state == "free")
+}
+
+fn quote_reply_matches(current_thread: &str, current_request: u64, reply_thread: &str, reply_request: u64) -> bool {
+    current_thread == reply_thread && current_request == reply_request
 }
 
 fn profile_reply_matches(target: &str, request: u64, reply_target: &str, reply_request: u64) -> bool {
@@ -71,6 +75,7 @@ pub enum GuiEvent {
     /// Terminal result of background history import and hydration.
     HistoryImported {
         account: String,
+        revisions: HashMap<String, u64>,
         result: Result<(crate::store_v2::MigrationReport, Vec<Thread>), String>,
     },
     /// Terminal result after server confirmation and exact local conversation deletion.
@@ -78,11 +83,11 @@ pub enum GuiEvent {
     /// Account-scoped worker projection after durable history reconciliation.
     AccountThreadsUpdated { account: String, threads: Vec<Thread>, live: bool },
     /// One bounded archived page, separate from live arrival notifications.
-    HistoryPageLoaded { account: String, thread_id: String, result: Result<(Vec<ChatMessage>, bool), String> },
+    HistoryPageLoaded { account: String, thread_id: String, revision: u64, result: Result<(Vec<ChatMessage>, bool), String> },
     /// Exact offscreen quote navigation result, capped at 200 bodies.
-    HistoryNavigationLoaded { account: String, thread_id: String, reference: String, result: Result<Option<(String, Vec<ChatMessage>)>, String> },
+    HistoryNavigationLoaded { account: String, thread_id: String, reference: String, request_id: u64, revision: u64, result: Result<Option<(String, Vec<ChatMessage>)>, String> },
     /// Bounded durable literal-search matches for the still-current query.
-    HistorySearchLoaded { account: String, thread_id: String, query: String, result: Result<Vec<ChatMessage>, String> },
+    HistorySearchLoaded { account: String, thread_id: String, query: String, revision: u64, result: Result<Vec<ChatMessage>, String> },
     /// Terminal result of an account-isolated photo request.
     PhotoPreviewReady {
         account: String,
@@ -233,6 +238,8 @@ pub enum GuiEvent {
     SessionUnreachable(String),
     /// The current account-owned history was cleared without touching legacy stores.
     LocalDataWiped,
+    /// A clear failed after the epoch transition; acknowledge the new generation without clearing UI.
+    HistoryClearFailed(String),
     CallStateChanged(String),
     IncomingCall {
         call_id: i64,
@@ -599,6 +606,7 @@ pub struct ZaloGuiApp {
     // Chat screen state
     threads: Vec<Thread>,
     local_history_tombstones: HashSet<(String, String)>,
+    history_revisions: HashMap<String, u64>,
     selected_thread_index: usize,
     thread_filter: ThreadFilter,
     search_query: String,
@@ -719,6 +727,8 @@ pub struct ZaloGuiApp {
     /// (thread id, number of newest bubbles rendered) — see `CHAT_RENDER_STEP`.
     chat_render_window: (String, usize),
     quote_jump: Option<QuoteJump>,
+    quote_lookup_generation: u64,
+    quote_lookup_thread: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -807,6 +817,7 @@ impl ZaloGuiApp {
             qr_status: "Đang tạo mã QR đăng nhập…".into(),
             threads,
             local_history_tombstones: HashSet::new(),
+            history_revisions: HashMap::new(),
             selected_thread_index,
             thread_filter: ThreadFilter::All,
             search_query: String::new(),
@@ -927,6 +938,8 @@ impl ZaloGuiApp {
             event_tx: tx.clone(),
             chat_render_window: (String::new(), CHAT_RENDER_STEP),
             quote_jump: None,
+            quote_lookup_generation: 0,
+            quote_lookup_thread: String::new(),
         };
         let mut app = app;
         let _ = app.reload_custom_sticker_packs();
@@ -1061,6 +1074,11 @@ impl ZaloGuiApp {
     }
 
     fn check_events(&mut self, ctx: &egui::Context) {
+        let selected = self.threads.get(self.selected_thread_index).map(|thread| thread.id.clone()).unwrap_or_default();
+        if selected != self.quote_lookup_thread {
+            self.quote_lookup_thread = selected;
+            self.quote_lookup_generation = self.quote_lookup_generation.wrapping_add(1);
+        }
         while let Ok(event) = self.event_rx.try_recv() {
             let event = match event {
                 GuiEvent::Scoped { scope, event } => {
@@ -1105,6 +1123,8 @@ impl ZaloGuiApp {
                     if self.is_logged_in && account == self.user_uin {
                         match result {
                             Ok(()) => {
+                                let revision = self.history_revisions.entry(thread_id.clone()).or_default();
+                                *revision = revision.wrapping_add(1);
                                 if let Some(thread) = self.threads.iter().find(|thread| thread.id == thread_id) {
                                     self.local_history_tombstones.extend(thread.messages.iter().map(|message| (thread_id.clone(), message.id.clone())));
                                 }
@@ -1119,8 +1139,8 @@ impl ZaloGuiApp {
                         }
                     }
                 }
-                GuiEvent::HistoryPageLoaded { account, thread_id, result } => {
-                    if self.is_logged_in && account == self.user_uin {
+                GuiEvent::HistoryPageLoaded { account, thread_id, revision, result } => {
+                    if self.is_logged_in && account == self.user_uin && history::revision_matches(&self.history_revisions, &thread_id, revision) {
                         match result {
                             Ok((messages, has_more)) => {
                                 history::merge_cached_page(&mut self.threads, &self.local_history_tombstones, &thread_id, messages);
@@ -1130,9 +1150,10 @@ impl ZaloGuiApp {
                         }
                     }
                 }
-                GuiEvent::HistoryNavigationLoaded { account, thread_id, reference, result } => {
+                GuiEvent::HistoryNavigationLoaded { account, thread_id, reference, request_id, revision, result } => {
                     if self.is_logged_in && account == self.user_uin
-                        && self.threads.get(self.selected_thread_index).is_some_and(|t| t.id == thread_id) {
+                        && history::revision_matches(&self.history_revisions, &thread_id, revision)
+                        && self.threads.get(self.selected_thread_index).is_some_and(|thread| quote_reply_matches(&thread.id, self.quote_lookup_generation, &thread_id, request_id)) {
                         match result {
                             Ok(Some((_, messages))) => {
                                 history::merge_cached_page(&mut self.threads, &self.local_history_tombstones, &thread_id, messages);
@@ -1146,8 +1167,9 @@ impl ZaloGuiApp {
                         }
                     }
                 }
-                GuiEvent::HistorySearchLoaded { account, thread_id, query, result } => {
+                GuiEvent::HistorySearchLoaded { account, thread_id, query, revision, result } => {
                     if self.is_logged_in && account == self.user_uin && self.in_chat_search_open
+                        && history::revision_matches(&self.history_revisions, &thread_id, revision)
                         && self.archive_search_request == (thread_id.clone(), query) {
                         match result {
                             Ok(messages) => {
@@ -1157,10 +1179,11 @@ impl ZaloGuiApp {
                         }
                     }
                 }
-                GuiEvent::HistoryImported { account, result } => {
+                GuiEvent::HistoryImported { account, revisions, result } => {
                     if self.is_logged_in && account == self.user_uin {
                         match result {
                             Ok((report, mut threads)) => {
+                                threads.retain(|thread| history::revision_matches(&self.history_revisions, &thread.id, *revisions.get(&thread.id).unwrap_or(&0)));
                                 for thread in &mut threads {
                                     thread.messages.retain(|message| !self.local_history_tombstones.contains(&(thread.id.clone(), message.id.clone())));
                                 }
@@ -1243,6 +1266,7 @@ impl ZaloGuiApp {
                         self.replying_to = None;
                         self.threads.clear();
                         self.local_history_tombstones.clear();
+                    self.history_revisions.clear();
                         self.selected_thread_index = 0;
                         self.quote_jump = None;
                         self.archive_search_request = (String::new(), String::new());
@@ -1400,6 +1424,7 @@ impl ZaloGuiApp {
                     // let the next poll retry (#21).
                     self.status_msg = format!("⚠️ {reason} — đang thử lại…");
                 }
+                GuiEvent::HistoryClearFailed(error) => { self.status_msg = error.clone(); self.show_toast(error); }
                 GuiEvent::LocalDataWiped => {
                     self.threads.clear();
                     self.composer_mentions = Default::default();
@@ -1412,6 +1437,7 @@ impl ZaloGuiApp {
                 GuiEvent::LoggedOut => {
                     self.native_photo_pending = false;
                     self.local_history_tombstones.clear();
+                    self.history_revisions.clear();
                     self.original_reaction_import_pending = false;
                     self.is_logged_in = false;
                     self.user_name.clear();
@@ -2840,5 +2866,23 @@ mod media_delivery_revision_tests {
         assert!(incoming_notification_commands(&[], &updates, "account", &settings, false, true, &mut gate).is_empty());
         let mut gate = crate::native_notifications::DeliveryGate::default();
         assert!(incoming_notification_commands(&[], &updates, "account", &settings, false, false, &mut gate).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod history_intent_tests {
+    #[test]
+    fn delayed_quote_lookup_cannot_replace_a_newer_local_or_archive_intent() {
+        assert!(!super::quote_reply_matches("thread-a",2,"thread-a",1));
+        assert!(!super::quote_reply_matches("thread-b",2,"thread-a",2));
+        assert!(!super::quote_reply_matches("thread-a",3,"thread-a",1));
+        assert!(super::quote_reply_matches("thread-a",3,"thread-a",3));
+    }
+    #[test]
+    fn clear_failure_acknowledges_new_epoch_without_becoming_a_success_event() {
+        let event=super::GuiEvent::HistoryClearFailed("Fixture write failure".into());
+        assert!(super::is_epoch_transition(&event));
+        assert!(super::epoch_event_allowed(1,2,&event));
+        assert!(!matches!(event,super::GuiEvent::LocalDataWiped));
     }
 }

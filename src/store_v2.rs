@@ -145,12 +145,20 @@ fn private(path: &Path, directory: bool) -> Result<()> {
     }
     Ok(())
 }
+fn account_mutation(account: &str) -> Result<crate::runtime_scope::MutationGuard> {
+    let guard = crate::runtime_scope::mutation()?;
+    if let Some(scope) = crate::runtime_scope::execution_scope() {
+        ensure!(scope.account == account, "History account scope mismatch");
+    }
+    Ok(guard)
+}
 impl AccountStore {
     /// Open a private account-specific file and apply forward-only schema upgrades.
     ///
     /// # Errors
     /// Returns an error for an incompatible version, owner mismatch, invalid schema, or filesystem/SQLite failure.
     pub fn open(root: &Path, account_id: &str) -> Result<Self> {
+        let _mutation = account_mutation(account_id)?;
         ensure!(!account_id.is_empty(), "Account identity required");
         let dir = root.join("accounts").join(digest(account_id.as_bytes()));
         let path = dir.join("history-v2.sqlite3");
@@ -183,6 +191,7 @@ impl AccountStore {
     /// # Errors
     /// Returns an error for an empty account or SQLite initialization failure.
     pub fn in_memory(account_id: &str) -> Result<Self> {
+        let _mutation = account_mutation(account_id)?;
         Self::initialize(Connection::open_in_memory()?, account_id, None)
     }
     fn initialize(mut conn: Connection, account: &str, path: Option<PathBuf>) -> Result<Self> {
@@ -317,6 +326,7 @@ impl AccountStore {
     /// # Errors
     /// Returns an error for an empty thread identity or failed SQLite operation; all writes roll back.
     pub fn delete_thread_history(&mut self, thread_id: &str) -> Result<()> {
+        let _mutation = account_mutation(&self.account)?;
         ensure!(!thread_id.is_empty(), "Thread identity required");
         let tx = self.conn.transaction()?;
         tx.execute("INSERT OR IGNORE INTO message_tombstones(thread_id,msg_id) SELECT thread_id,msg_id FROM messages WHERE thread_id=?1", [thread_id])?;
@@ -334,6 +344,7 @@ impl AccountStore {
     /// # Errors
     /// Returns an error if any deletion fails; the entire clear is then rolled back.
     pub fn clear_local_history(&mut self) -> Result<()> {
+        let _mutation = account_mutation(&self.account)?;
         let tx = self.conn.transaction()?;
         tx.execute_batch(
             "DELETE FROM message_search;
@@ -351,6 +362,7 @@ impl AccountStore {
     /// # Errors
     /// Returns an error for an alias cycle or SQLite failure.
     pub fn register_alias(&mut self, alias: ValidatedAlias) -> Result<()> {
+        let _mutation = account_mutation(&self.account)?;
         let target = self.resolve_thread(&alias.canonical_id)?;
         ensure!(target != alias.old_id, "Identity alias cycle");
         self.conn.execute("INSERT INTO aliases VALUES(?1,?2) ON CONFLICT(old_id) DO UPDATE SET canonical_id=excluded.canonical_id", params![alias.old_id,target])?;
@@ -451,6 +463,7 @@ impl AccountStore {
         thread_id: &str,
         mappings: &[(String, std::collections::BTreeMap<String, String>)],
     ) -> Result<usize> {
+        let _mutation = account_mutation(&self.account)?;
         ensure!(mappings.len() <= 200, "Mention page exceeds bound");
         let tx = self.conn.unchecked_transaction()?;
         let mut changed = 0;
@@ -570,6 +583,7 @@ impl AccountStore {
         thread_id: &str,
         messages: &[ChatMessage],
     ) -> Result<bool> {
+        let _mutation = account_mutation(&self.account)?;
         if thread_id.is_empty() || messages.is_empty() {
             return Ok(false);
         }
@@ -595,6 +609,7 @@ impl AccountStore {
     /// # Errors
     /// Returns an error for missing identities, malformed metadata, or any failed write; all changes roll back.
     pub fn apply_delta(&mut self, delta: StoreDelta<'_>) -> Result<WriteStats> {
+        let _mutation = account_mutation(&self.account)?;
         let tx = self.conn.unchecked_transaction()?;
         let mut stats = WriteStats::default();
         for t in delta.threads {
@@ -669,6 +684,13 @@ impl AccountStore {
             !m.thread_id.is_empty() && !m.msg_id.is_empty(),
             "Composite message identity required"
         );
+        let decoded = decode_message(m, chat)?;
+        let normalized = self.storage_message(&m.thread_id, &decoded)?;
+        if normalized.id != m.msg_id {
+            let mut stored = m.clone();
+            stored.msg_id = normalized.id.clone();
+            return self.write_message(&stored, Some(&serde_json::to_string(&normalized)?), stats);
+        }
         if self.is_deleted(&m.thread_id, &m.msg_id)? {
             stats.unchanged += 1;
             return Ok(());
@@ -782,6 +804,36 @@ impl AccountStore {
         }
         Ok(state)
     }
+    // Preserve legacy canonical keys until verified server identities actually conflict.
+    // A shared client alias never authorizes overwriting another server message.
+    fn storage_message(&self, thread_id: &str, message: &ChatMessage) -> Result<ChatMessage> {
+        let mut normalized = message.clone();
+        let Some(server) = verified_server_id(message) else { return Ok(normalized); };
+        let canonical = self.get_message(thread_id, &message.id)?;
+        let conflicting = canonical.as_ref().and_then(verified_server_id).is_some_and(|id| id != server);
+        if conflicting {
+            ensure!(message.id != server, "Conflicting server identity occupies the canonical key");
+            if let Some(existing) = self.get_message(thread_id, &server)? {
+                ensure!(verified_server_id(&existing).as_deref() == Some(server.as_str()), "Ambiguous server storage key");
+            }
+            normalized.id = server;
+        } else if canonical.is_none() && message.id != server {
+            if let Some(existing) = self.get_message(thread_id, &server)? {
+                if verified_server_id(&existing).as_deref() == Some(server.as_str()) { normalized.id = server; }
+            }
+        }
+        Ok(normalized)
+    }
+
+    /// Retrieve the durable row for the incoming verified identity, including canonical collisions.
+    ///
+    /// # Errors
+    /// Returns an error when an exact storage key is ambiguous or SQLite decoding fails.
+    pub(crate) fn message_for(&self, thread_id: &str, incoming: &ChatMessage) -> Result<Option<ChatMessage>> {
+        let normalized = self.storage_message(thread_id, incoming)?;
+        self.get_message(thread_id, &normalized.id)
+    }
+
     fn merge_message(
         &self,
         thread_id: &str,
@@ -811,6 +863,7 @@ impl AccountStore {
             } else {
                 crate::chat::merge_thread_into(&mut holder, delta, false);
             }
+            ensure!(holder.messages.len() == 1, "Canonical message identity conflicts with stored wire identity");
             let mut merged = holder.messages.pop().unwrap_or_else(|| message.clone());
             if !message.text.is_empty() && !preserve_recall {
                 merged.text = message.text.clone();
@@ -827,6 +880,7 @@ impl AccountStore {
     /// # Errors
     /// Returns an error if an identity, stored value, source file, or SQLite operation is invalid.
     pub fn persist_threads(&mut self, threads: &[Thread]) -> Result<WriteStats> {
+        let _mutation = account_mutation(&self.account)?;
         let tx = self.conn.unchecked_transaction()?;
         let mut stats = WriteStats::default();
         for t in threads {
@@ -933,12 +987,13 @@ impl AccountStore {
             })?;
             self.write_thread_metadata(&metadata)?;
             self.write_unread(&t.id, &self.merge_unread(&t.id, &t.unread)?)?;
-            for message in &t.messages {
+            for incoming in &t.messages {
+                let message = self.storage_message(&t.id, incoming)?;
                 if self.is_deleted(&t.id, &message.id)? {
                     stats.unchanged += 1;
                     continue;
                 }
-                let merged = self.merge_message(&t.id, t.is_group, message)?;
+                let merged = self.merge_message(&t.id, t.is_group, &message)?;
                 let mut stored = StoredMessage::from(&merged);
                 stored.thread_id = t.id.clone();
                 // Preserve unknown legacy wire fields while replacing normalized metadata,
@@ -1183,6 +1238,7 @@ impl AccountStore {
         db: Option<&Path>,
         json: Option<&Path>,
     ) -> Result<MigrationReport> {
+        let _mutation = account_mutation(&self.account)?;
         // An import is a one-time snapshot per explicit source set. Restarts consult
         // the manifest without reading or hashing a potentially huge legacy cache.
         let mut identity = Vec::new();
@@ -1269,7 +1325,8 @@ impl AccountStore {
                 report.threads += 1;
                 report.unread += 1;
                 for m in &t.messages {
-                    let merged = self.merge_message(&t.id, t.is_group, m)?;
+                    let normalized = self.storage_message(&t.id, m)?;
+                    let merged = self.merge_message(&t.id, t.is_group, &normalized)?;
                     let mut stored = StoredMessage::from(&merged);
                     stored.thread_id = t.id.clone();
                     // The database holds opaque raw JSON that cache serialization cannot reproduce.
@@ -1325,6 +1382,14 @@ fn read_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
         is_outgoing: r.get(7)?,
         raw_json: r.get(8)?,
     })
+}
+
+fn verified_server_id(message: &ChatMessage) -> Option<String> {
+    match message.wire_ref.server_id.as_ref()? {
+        serde_json::Value::String(id) if !id.trim().is_empty() && !id.bytes().all(|byte| byte == b'0') => Some(id.clone()),
+        serde_json::Value::Number(id) => id.as_u64().filter(|id| *id > 0).map(|id| id.to_string()),
+        _ => None,
+    }
 }
 
 fn numeric_id(id: &str) -> Option<&str> {

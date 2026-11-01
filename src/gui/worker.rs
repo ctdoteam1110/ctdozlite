@@ -19,6 +19,7 @@ pub enum WorkerCmd {
     /// Import and hydrate local history on the blocking pool.
     ImportHistory {
         account: String,
+        revisions: std::collections::HashMap<String, u64>,
         path: std::path::PathBuf,
     },
     /// Fetch only photo cards with a bounded original-source fallback.
@@ -177,11 +178,11 @@ pub enum WorkerCmd {
     /// Persist only the account that supplied this UI snapshot.
     PersistThreads { account: String, threads: Vec<Thread> },
     /// Load one bounded local-history page without requesting network history.
-    LoadHistoryPage { account: String, thread_id: String, before: Option<crate::store_v2::HistoryCursor> },
+    LoadHistoryPage { account: String, thread_id: String, revision: u64, before: Option<crate::store_v2::HistoryCursor> },
     /// Resolve an offscreen exact quote against durable account history.
-    NavigateHistory { account: String, thread_id: String, reference: String },
+    NavigateHistory { account: String, thread_id: String, reference: String, request_id: u64, revision: u64 },
     /// Search durable history outside the loaded viewport.
-    SearchHistory { account: String, thread_id: String, query: String },
+    SearchHistory { account: String, thread_id: String, query: String, revision: u64 },
     CheckForUpdates {
         silent: bool,
     },
@@ -600,14 +601,17 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     crate::runtime_scope::run(scope, async { let _ = crate::login::get_server_info(&s).await; }).await;
                 }
                 {
-                    let captured = session.lock().await.clone();
-                    let account = captured.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
-                    if !account.is_empty() {
-                        match account_history(session.clone(), captured, account.clone(), history::Request::Load(Vec::new())).await {
-                            Ok(history::Reply::Threads(threads)) => { let _ = gui_tx.send(GuiEvent::AccountThreadsUpdated { account, threads, live: false }); }
-                            _ => { let _ = gui_tx.send(GuiEvent::StatusUpdate("Chưa khôi phục được lịch sử tài khoản".into())); }
+                    let startup_scope = crate::runtime_scope::registry().current();
+                    crate::runtime_scope::run(startup_scope, async {
+                        let captured = session.lock().await.clone();
+                        let account = captured.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
+                        if !account.is_empty() {
+                            match account_history(session.clone(), captured, account.clone(), history::Request::Load(Vec::new())).await {
+                                Ok(history::Reply::Threads(threads)) => { let _ = gui_tx.send(GuiEvent::AccountThreadsUpdated { account, threads, live: false }); }
+                                _ => { let _ = gui_tx.send(GuiEvent::StatusUpdate("Chưa khôi phục được lịch sử tài khoản".into())); }
+                            }
                         }
-                    }
+                    }).await;
                 }
                 // Message poll timer. It used to live in the GUI's update(), which forced a full
                 // repaint every 1.2 s just to fire it. The PollMessages handler skips while a
@@ -927,7 +931,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 });
                             }
                         }
-                        WorkerCmd::ImportHistory { account, path } => {
+                        WorkerCmd::ImportHistory { account, revisions, path } => {
                             let tx = gui_tx.clone();
                             let ctx = egui_ctx.clone();
                             let captured = session.lock().await.clone();
@@ -937,7 +941,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     Ok(history::Reply::Imported(report, threads)) => Ok((report, threads)),
                                     _ => Err("Chưa nhập được lịch sử theo tài khoản".into()),
                                 };
-                                let _ = tx.send(GuiEvent::HistoryImported { account, result });
+                                let _ = tx.send(GuiEvent::HistoryImported { account, revisions, result });
                                 ctx.request_repaint();
                             });
                         }
@@ -1041,7 +1045,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 if result.is_err() { let _ = sender.send(GuiEvent::StatusUpdate("Chưa lưu được lịch sử theo tài khoản".into())); }
                             });
                         }
-                        WorkerCmd::LoadHistoryPage { account, thread_id, before } => {
+                        WorkerCmd::LoadHistoryPage { account, thread_id, revision, before } => {
                             let captured = session.lock().await.clone();
                             let session = session.clone();
                             let sender = gui_tx.clone();
@@ -1051,10 +1055,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     Ok(history::Reply::Page { messages, has_more }) => Ok((messages, has_more)),
                                     _ => Err("Chưa tải được trang lịch sử".into()),
                                 };
-                                let _ = sender.send(GuiEvent::HistoryPageLoaded { account, thread_id, result });
+                                let _ = sender.send(GuiEvent::HistoryPageLoaded { account, thread_id, revision, result });
                             });
                         }
-                        WorkerCmd::NavigateHistory { account, thread_id, reference } => {
+                        WorkerCmd::NavigateHistory { account, thread_id, reference, request_id, revision } => {
                             let captured = session.lock().await.clone();
                             let session = session.clone();
                             let sender = gui_tx.clone();
@@ -1064,10 +1068,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     Ok(history::Reply::Navigation(page)) => Ok(page),
                                     _ => Err("Chưa tra được tin nhắn gốc".into()),
                                 };
-                                let _ = sender.send(GuiEvent::HistoryNavigationLoaded { account, thread_id, reference, result });
+                                let _ = sender.send(GuiEvent::HistoryNavigationLoaded { account, thread_id, reference, request_id, revision, result });
                             });
                         }
-                        WorkerCmd::SearchHistory { account, thread_id, query } => {
+                        WorkerCmd::SearchHistory { account, thread_id, query, revision } => {
                             let captured = session.lock().await.clone();
                             let session = session.clone();
                             let sender = gui_tx.clone();
@@ -1077,7 +1081,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     Ok(history::Reply::Page { messages, .. }) => Ok(messages),
                                     _ => Err("Chưa tìm được lịch sử".into()),
                                 };
-                                let _ = sender.send(GuiEvent::HistorySearchLoaded { account, thread_id, query, result });
+                                let _ = sender.send(GuiEvent::HistorySearchLoaded { account, thread_id, query, revision, result });
                             });
                         }
                         WorkerCmd::Logout => {

@@ -49,7 +49,9 @@ bảng hẹn giờ hoặc phiên đăng nhập. Đăng xuất giữ nguyên lị
 
 - API HTTP/MCP và TUI vẫn đọc kho legacy, chưa phản chiếu đầy đủ lịch sử GUI mới.
 - Snapshot lưu từ GUI cần bước coalescing dùng LatestSnapshot chung với composer.
-- Kiểm chứng đổi tài khoản cùng định danh phiên nhiều lần cần runtime epoch fence;
-  kiểm tra tài khoản và khóa phiên tại adapter không thay thế hàng rào generation.
+- Adapter dùng runtime epoch fence, kiểm tra lại phiên dưới mutation guard trước I/O.
+  Test consumer chặn A/B/A cùng khóa phiên và tác vụ blocking còn lại sau hủy.
+- Lượt ghi thất bại hiện báo lỗi và chặn kết quả chiếu lên GUI; cơ chế giữ delta để
+  thử lại và flush khi chuyển phiên hoặc đóng ứng dụng thuộc bước A4 tiếp theo.
 - Các test consumer chứng minh luồng worker thực tế với dữ liệu disposable, không
   thay cho nghiệm thu thao tác GUI với tài khoản thật.

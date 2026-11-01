@@ -1383,3 +1383,27 @@ fn import_reads_a_readonly_source_and_leaves_an_exact_reopenable_backup() {
     drop(store);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn verified_distinct_server_ids_survive_a_reused_client_canonical_key_and_restart() {
+    use zalo_rust::message_model::WireMessageRef;
+    let root = temp("wire-collision");
+    let first = ChatMessage { id:"777".into(),client_message_id:"777".into(),text:"First body".into(),wire_ref:WireMessageRef::from_raw(&serde_json::json!({"cliMsgId":"777","globalMsgId":"111"})),..Default::default() };
+    let mut second=first.clone();second.text="Second body".into();
+    second.wire_ref=WireMessageRef::from_raw(&serde_json::json!({"cliMsgId":"777","globalMsgId":"222"}));
+    let mut store=AccountStore::open(&root,"wire-collision").unwrap();
+    for message in [&first,&second,&first,&second] {
+        let mut t=thread("same");t.messages=vec![message.clone()];
+        store.persist_threads(&[t]).unwrap();
+    }
+    drop(store);
+    let store=AccountStore::open(&root,"wire-collision").unwrap();
+    let page=store.history_page("same",None,PageDirection::Before).unwrap();
+    assert_eq!(page.messages.len(),2);
+    for (reference,text) in [("111","First body"),("222","Second body")] {
+        let (key,messages)=store.navigation_page("same",reference).unwrap().unwrap();
+        assert_eq!(messages.iter().find(|message|message.id==key).unwrap().text,text);
+    }
+    assert!(store.navigation_page("same","777").unwrap().is_none());
+    drop(store);std::fs::remove_dir_all(root).unwrap();
+}
