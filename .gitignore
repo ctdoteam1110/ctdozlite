@@ -28,6 +28,14 @@ call_trace.log
 # Generated graph/tooling output
 graphify-out/
 
+# Local agent tooling & skill kit (machine-specific, symlinked paths)
+.claude/
+.omp/
+.agents/
+.opencode/
+.engineered-config.json
+.scratch/
+
 # Temporary and backup files
 *.tmp
 *.bak
