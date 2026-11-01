@@ -43,3 +43,8 @@ pub mod api_mcp;
 
 /// Native notification authorization without delivery.
 pub mod native_notifications;
+
+/// Account-isolated incremental history, explicit copy-on-write import, and bounded queries.
+pub mod store_v2;
+/// Pure local read-state transitions without network receipts.
+pub mod read_receipts;

@@ -135,20 +135,20 @@ impl MessageStore {
         Ok(rows > 0)
     }
 
-    /// Delete a message from local SQLite store when user selects "Xóa chỉ ở phía tôi".
-    pub fn delete_message(&mut self, thread_id: &str, msg_id: &str, ts: i64) -> Result<()> {
-        if !msg_id.is_empty() {
-            let _ = self.conn.execute(
-                "DELETE FROM messages WHERE msg_id = ?1",
-                params![msg_id],
-            );
-        }
-        if ts > 0 && !thread_id.is_empty() {
-            let _ = self.conn.execute(
-                "DELETE FROM messages WHERE thread_id = ?1 AND ts = ?2",
-                params![thread_id, ts],
-            );
-        }
+    /// Delete one exact conversation/message identity from the local store.
+    /// The legacy timestamp argument remains for call-site compatibility, not matching.
+    ///
+    /// # Errors
+    /// Returns an error for an empty identity or failed SQLite deletion.
+    pub fn delete_message(&mut self, thread_id: &str, msg_id: &str, _ts: i64) -> Result<()> {
+        anyhow::ensure!(
+            !thread_id.is_empty() && !msg_id.is_empty(),
+            "Cần định danh cuộc trò chuyện và tin nhắn để xóa lịch sử"
+        );
+        self.conn.execute(
+            "DELETE FROM messages WHERE thread_id = ?1 AND msg_id = ?2",
+            params![thread_id, msg_id],
+        )?;
         Ok(())
     }
 
