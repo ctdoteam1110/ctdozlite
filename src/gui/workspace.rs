@@ -3216,6 +3216,32 @@ impl ZaloGuiApp {
                     if self.chat_render_window.0 != thread_id {
                         self.chat_render_window = (thread_id.clone(), CHAT_RENDER_STEP);
                     }
+                    let jump_index = self.quote_jump.as_ref().and_then(|jump| {
+                        self.threads
+                            .get(self.selected_thread_index)
+                            .and_then(|thread| jump.target_index(&thread_id, &thread.messages))
+                    });
+                    if jump_index.is_none() {
+                        self.quote_jump = None;
+                    }
+                    let jump_scroll_pending = self
+                        .quote_jump
+                        .as_ref()
+                        .map(|jump| jump.scroll_pending)
+                        .unwrap_or(false);
+                    let mut jump_scrolled = false;
+                    if let Some(index) = jump_index {
+                        let count = self
+                            .threads
+                            .get(self.selected_thread_index)
+                            .map(|thread| thread.messages.len())
+                            .unwrap_or(0);
+                        self.chat_render_window.1 = crate::message_navigation::render_limit_for_target(
+                            self.chat_render_window.1,
+                            count,
+                            index,
+                        );
+                    }
                     let render_limit = self.chat_render_window.1;
                     let mut widen_window = false;
                     // Group sender -> avatar, built once per frame instead of a scan per bubble.
@@ -3235,7 +3261,7 @@ impl ZaloGuiApp {
                         .id_salt(Id::new(("chat_scroll", &thread_id)))
                         .max_height(msg_area_height)
                         .auto_shrink([false, false])
-                        .stick_to_bottom(true)
+                        .stick_to_bottom(jump_index.is_none())
                         .show(ui, |ui| {
                             egui::Frame::none()
                                 .inner_margin(Margin::symmetric(18.0, 12.0))
@@ -3374,53 +3400,69 @@ impl ZaloGuiApp {
                                                     ui.add_space(6.0);
                                                 }
 
-                                                if is_system_notice_message(msg) {
-                                                    render_system_notice_pill(ui, msg, pal);
-                                                    ui.add_space(6.0);
-                                                    continue;
-                                                }
+                                                let row = ui.scope(|ui| {
+                                                    if is_system_notice_message(msg) {
+                                                        render_system_notice_pill(ui, msg, pal);
+                                                        ui.add_space(6.0);
+                                                        return;
+                                                    }
 
-                                                let prev_same_sender = prev_msg
-                                                    .map(|pm| same_message_cluster(pm, msg))
-                                                    .unwrap_or(false);
-                                                let next_same_sender = next_msg
-                                                    .map(|nm| same_message_cluster(msg, nm))
-                                                    .unwrap_or(false);
-                                                let is_latest_outgoing =
-                                                    last_outgoing_idx == Some(idx);
+                                                    let prev_same_sender = prev_msg
+                                                        .map(|pm| same_message_cluster(pm, msg))
+                                                        .unwrap_or(false);
+                                                    let next_same_sender = next_msg
+                                                        .map(|nm| same_message_cluster(msg, nm))
+                                                        .unwrap_or(false);
+                                                    let is_latest_outgoing =
+                                                        last_outgoing_idx == Some(idx);
 
-                                                let sender_ava_opt = if !is_group {
-                                                    thread_avatar.as_deref()
-                                                } else {
-                                                    avatar_by_name.get(msg.sender.as_str()).copied()
-                                                };
-                                                if let Some(action) = render_chat_bubble(
-                                                    ui,
-                                                    msg,
-                                                    prev_same_sender,
-                                                    next_same_sender,
-                                                    is_latest_outgoing,
-                                                    is_group,
-                                                    &thread_name,
-                                                    sender_ava_opt,
-                                                    pal,
-                                                    &self.sticker_textures,
-                                                    &mut self.loading_stickers,
-                                                    &self.emoji_textures,
-                                                    idx,
-                                                ) {
-                                                    pending_action = Some((idx, action));
-                                                }
-                                                ui.add_space(if next_same_sender {
-                                                    2.5
-                                                } else {
-                                                    9.0
+                                                    let sender_ava_opt = if !is_group {
+                                                        thread_avatar.as_deref()
+                                                    } else {
+                                                        avatar_by_name.get(msg.sender.as_str()).copied()
+                                                    };
+                                                    if let Some(action) = render_chat_bubble(
+                                                        ui,
+                                                        msg,
+                                                        prev_same_sender,
+                                                        next_same_sender,
+                                                        is_latest_outgoing,
+                                                        is_group,
+                                                        &thread_name,
+                                                        sender_ava_opt,
+                                                        pal,
+                                                        &self.sticker_textures,
+                                                        &mut self.loading_stickers,
+                                                        &self.emoji_textures,
+                                                        idx,
+                                                    ) {
+                                                        pending_action = Some((idx, action));
+                                                    }
+                                                    ui.add_space(if next_same_sender {
+                                                        2.5
+                                                    } else {
+                                                        9.0
+                                                    });
                                                 });
+                                                if jump_index == Some(idx) {
+                                                    render_quote_target(
+                                                        ui,
+                                                        row.response.rect,
+                                                        jump_scroll_pending,
+                                                        pal.primary,
+                                                    );
+                                                    jump_scrolled |= jump_scroll_pending;
+                                                }
                                             }
                                         }
                                     }
                                 });
                         });
+                    if jump_scrolled {
+                        if let Some(jump) = &mut self.quote_jump {
+                            jump.scroll_pending = false;
+                        }
+                    }
                     if widen_window {
                         self.chat_render_window.1 += CHAT_RENDER_STEP;
                     }
@@ -3437,6 +3479,28 @@ impl ZaloGuiApp {
                         if let Some(m) = target {
                             match action {
                                 BubbleAction::Reply => self.replying_to = Some(m),
+                                BubbleAction::JumpToQuoted(reference) => {
+                                    let index = self
+                                        .threads
+                                        .get(self.selected_thread_index)
+                                        .and_then(|thread| {
+                                            crate::message_navigation::unique_reference_index(&thread.messages, &reference)
+                                        });
+                                    if index.is_some() {
+                                        self.filter_starred_only = false;
+                                        self.in_chat_search_open = false;
+                                        self.in_chat_search_query.clear();
+                                        self.quote_jump = Some(QuoteJump {
+                                            thread_id: thread_id.clone(),
+                                            reference,
+                                            highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(3),
+                                            scroll_pending: true,
+                                        });
+                                        ctx.request_repaint();
+                                    } else {
+                                        self.show_toast("Chưa có tin nhắn gốc đã tải với ID duy nhất. Hãy tải thêm lịch sử rồi thử lại.");
+                                    }
+                                }
                                 BubbleAction::Forward => {
                                     self.forward_msg = Some(m);
                                     self.forward_filter.clear();
@@ -4225,4 +4289,120 @@ impl ZaloGuiApp {
         self.render_settings_modal(ctx, pal);
     }
 
+}
+
+/// Highlight the exact resolved row and optionally center it in the message viewport.
+fn render_quote_target(ui: &egui::Ui, rect: egui::Rect, scroll_pending: bool, color: Color32) {
+    ui.painter().rect_stroke(
+        rect.expand(2.0),
+        Rounding::same(8.0),
+        Stroke::new(2.0, color),
+    );
+    if scroll_pending {
+        ui.scroll_to_rect(rect, Some(Align::Center));
+    }
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(100));
+}
+
+#[cfg(test)]
+mod quote_navigation_tests {
+    use super::*;
+
+    #[test]
+    fn quote_navigation_invalidates_when_thread_changes_or_highlight_expires() {
+        let messages = [ChatMessage {
+            id: "original".into(),
+            ..Default::default()
+        }];
+        let mut jump = QuoteJump {
+            thread_id: "thread-1".into(),
+            reference: "original".into(),
+            highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(3),
+            scroll_pending: true,
+        };
+        assert_eq!(jump.target_index("thread-1", &messages), Some(0));
+        assert_eq!(jump.target_index("thread-2", &messages), None);
+        jump.highlight_until = std::time::Instant::now();
+        assert_eq!(jump.target_index("thread-1", &messages), None);
+    }
+
+    #[test]
+    fn quote_navigation_keeps_animated_jump_visible_after_highlight_expires() {
+        for (count, target) in [(1000, 12), (1000, 900), (150, 12)] {
+            let ctx = egui::Context::default();
+            let color = Color32::from_rgb(1, 2, 3);
+            let mut before = 0.0;
+            let mut after = 0.0;
+            let mut highlighted = false;
+            let mut target_visible = false;
+            for frame in 0..10 {
+                let jumping = frame > 0;
+                let highlighting = jumping && frame < 7;
+                let limit = if jumping {
+                    crate::message_navigation::render_limit_for_target(150, count, target)
+                } else {
+                    150
+                };
+                if count == 1000 && target == 12 {
+                    assert!(jumping || count - limit > target);
+                }
+                let output = ctx.run(
+                    egui::RawInput {
+                        time: Some(frame as f64 * 0.5),
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(400.0, 300.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let scroll = egui::ScrollArea::vertical()
+                                .id_salt("quote_jump_test")
+                                .max_height(200.0)
+                                .stick_to_bottom(!highlighting)
+                                .show(ui, |ui| {
+                                    for index in count - limit..count {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            Vec2::new(200.0, 30.0),
+                                            Sense::hover(),
+                                        );
+                                        if jumping && index == target {
+                                            if highlighting {
+                                                render_quote_target(ui, rect, frame == 1, color);
+                                                highlighted = true;
+                                            }
+                                            if frame == 9 {
+                                                target_visible =
+                                                    ui.clip_rect().contains(rect.center());
+                                            }
+                                        }
+                                    }
+                                });
+                            if jumping {
+                                after = scroll.state.offset.y;
+                            } else {
+                                before = scroll.state.offset.y;
+                            }
+                        });
+                    },
+                );
+                if frame == 4 {
+                    assert!(output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Rect(rect) if rect.stroke.color == color)
+                }), "Exact target must have a visible highlight shape");
+                }
+            }
+            assert!(highlighted);
+            assert!(
+                before > 1000.0,
+                "Initial viewport must start at the newest messages"
+            );
+            assert!(
+                after < before && target_visible,
+                "Jump must center the older target, not remain at the bottom: {after}"
+            );
+        }
+    }
 }
