@@ -74,8 +74,8 @@ cargo build --release
 | :--- | :--- | :--- | :---: |
 | **TIPC1110** | [@TIPC1110](https://github.com/TIPC1110) | コアアーキテクチャ、VoIP通話エンジン、eguiフレームワーク、マルチOS対応 | **> 73,000+ 行** |
 | **thanhdo1110** | [@thanhdo1110](https://github.com/thanhdo1110) | モジュラーGUIリファクタリング、Atom One Darkデザインシステム | **> 14,000+ 行** |
+| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | 7件のPR: OSタイムゾーン、データディレクトリ、macOSヘルパー、セッションアトミック保存、メディアキャッシュ、アップデータ、メッセージモデル | **> 5,900+ 行** 🏆 |
 | **ngxccc** | [@ngxccc](https://github.com/ngxccc) | エンジニアリング基準策定、セッション安全性向上、ネットワークドメイン解決 | **> 3,000+ 行** |
-| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | OSローカルタイムゾーン修正、macOSデータディレクトリ分離 | **~840+ 行** |
 | **GrootTheDeveloper** | [@GrootTheDeveloper](https://github.com/GrootTheDeveloper) | SQLite高速起動最適化、チャット描画仮想化、CJKフォント遅延読み込み | **~370+ 行** |
 
 > *注: バグ報告、機能提案、プルリクエストを含むすべての貢献者の名簿は[貢献者一覧ウォール](https://ctdozlite.ctdo.net/contributors.html)で公開されています。*

@@ -74,8 +74,8 @@ cargo build --release
 | :--- | :--- | :--- | :---: |
 | **TIPC1110** | [@TIPC1110](https://github.com/TIPC1110) | 핵심 아키텍처, VoIP 통화 엔진, egui 프레임워크, 크로스 플랫폼 | **> 73,000+ 줄** |
 | **thanhdo1110** | [@thanhdo1110](https://github.com/thanhdo1110) | 모듈형 GUI 리팩터링, Atom One Dark 디자인 시스템 | **> 14,000+ 줄** |
+| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | 7개 PR: OS 타임존, 데이터 디렉터리, macOS 헬퍼, 세션 원자적 저장, 미디어 캐시, 업데이터, 메시지 모델 | **> 5,900+ 줄** 🏆 |
 | **ngxccc** | [@ngxccc](https://github.com/ngxccc) | 엔지니어링 표준 수립, 세션 안전성 확보, 네트워크 도메인 확인 | **> 3,000+ 줄** |
-| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | OS 로컬 시간대 패치, macOS 데이터 디렉터리 분리 | **~840+ 줄** |
 | **GrootTheDeveloper** | [@GrootTheDeveloper](https://github.com/GrootTheDeveloper) | SQLite 빠른 시작 최적화, 채팅 가상화, CJK 폰트 지연 로딩 | **~370+ 줄** |
 
 > *참고: 버그 제보, 기능 제안, PR을 포함한 모든 기여자의 전체 명단은 [기여자 명예의 전당](https://ctdozlite.ctdo.net/contributors.html)에서 확인하실 수 있습니다.*

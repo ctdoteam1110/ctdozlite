@@ -772,9 +772,9 @@
     "name": "Thuong Tin (@thuongtin)",
     "avatar": "TT",
     "type": "bug",
-    "tag": "GitHub PR #40 & #41",
-    "role": "Sửa múi giờ tin nhắn & Tùy biến thư mục lưu dữ liệu",
-    "detail": "Đóng góp PR #40 (hiển thị giờ tin nhắn theo múi giờ OS) và PR #41 (tùy chọn --data-dir, --print-data-dir, bảo đảm quyền ghi an toàn cho macOS app bundle).",
+    "tag": "GitHub 7 PRs (> 5,900 LoC)",
+    "role": "Đóng góp 7 PRs lõi (múi giờ OS, data-dir, macOS helpers, session atomic, media cache, updater, message state)",
+    "detail": "Tác giả của 7 Pull Requests quan trọng: PR #40 (múi giờ OS), PR #41 (--data-dir), PR #51 (macOS native helpers), PR #52 (session atomic save), PR #53 (media cache & admission), PR #54 (transactional updater), PR #55 (message state & reactions). Đóng góp hơn 5,900 dòng code.",
     "status": "active",
     "statusText": "Đã đóng góp & Merge",
     "source": "GitHub ctdozlite"

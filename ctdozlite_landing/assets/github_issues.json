@@ -2,7 +2,7 @@
   "fetchedAt": "2026-11-01T13:31:33.173Z",
   "repo": "ctdoteam1110/ctdozlite",
   "totalIssues": 29,
-  "totalPrs": 22,
+  "totalPrs": 20,
   "issues": [
     {
       "number": 38,
@@ -496,30 +496,6 @@
       },
       "createdAt": "2026-11-01T12:06:16Z",
       "body": "## Thay đổi (What)\n\nSửa cách hiển thị thời gian tin nhắn và hội thoại để dùng **múi giờ của hệ điều hành**, thay vì mặc định hiển thị UTC từ phép chia epoch.\n\n**Phạm vi PR: fix độc lập về tính đúng đắn của thời gian. UI tổng thể chưa được tối ưu/hoàn thiện, không phải lý do loại các tính năng có UI khỏi đóng góp. Chỉ mới kiểm thử trên Mac (macOS 27.0.1, Apple Silicon arm64); Windows và Linux chưa được kiểm thử.**\n\n## Lý do (Why)\n\nCách tính giờ cũ lấy epoch, chia giây rồi modulo 24. Kết quả là giờ UTC chứ không phải giờ địa phương của người dùng. Ví dụ với timestamp `1793467800000` và `TZ=Asia/",
-      "labels": []
-    },
-    {
-      "number": 39,
-      "title": "ci(pr): thêm bot kiểm tra PR tự động miễn phí 100%",
-      "state": "CLOSED",
-      "author": {
-        "login": "cypherdo37",
-        "name": "Đỗ Thành Công"
-      },
-      "createdAt": "2026-11-01T11:19:38Z",
-      "body": "## What\n- Thêm job `pr-guard` vào workflow CI.\n- Tự động quét và chặn commit nhầm `session.json`, database `*.db`, file log hoặc credentials.\n- Kiểm tra chuẩn tiêu đề Conventional Commits.\n- Kiểm tra độ dài mô tả PR.\n- Xuất bảng Checklist đánh giá tự động trực tiếp trên tab Summary của PR.\n\n## Why\n- Miễn phí 100%, bảo vệ repo an toàn mà không cần thêm API key nào.\n\n## Verification\n- Chạy thử nghiệm trên chính PR này.",
-      "labels": []
-    },
-    {
-      "number": 37,
-      "title": "ci(pr): thêm bot kiểm tra PR tự động miễn phí 100%",
-      "state": "CLOSED",
-      "author": {
-        "login": "cypherdo37",
-        "name": "Đỗ Thành Công"
-      },
-      "createdAt": "2026-11-01T11:08:00Z",
-      "body": "## What\n- Thêm workflow `.github/workflows/pr-check.yml` kiểm tra tự động cho mọi Pull Request.\n- Kiểm tra bảo mật: chặn commit nhầm `session.json`, `*.db`, file log hoặc credentials.\n- Kiểm tra chuẩn tiêu đề Conventional Commits và mô tả PR.\n- Kiểm tra format mã nguồn Rust (`cargo fmt`).\n- Tự động comment bảng checklist đánh giá lên PR bằng `github-actions[bot]` mà không cần bất kỳ API key nào.\n\n## Why\n- Team nhỏ, cần tự động hóa việc review cơ bản và chặn rò rỉ dữ liệu nhạy cảm mà hoàn toàn miễn phí.\n\n## Verification\n- Workflow tự kích hoạt và chạy trên chính PR này.",
       "labels": []
     },
     {

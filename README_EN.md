@@ -74,8 +74,8 @@ Core contributors with representative code commits in the repository:
 | :--- | :--- | :--- | :---: |
 | **TIPC1110** | [@TIPC1110](https://github.com/TIPC1110) | Core architecture, VoIP call engine, egui framework, cross-platform | **> 73,000+ lines** |
 | **thanhdo1110** | [@thanhdo1110](https://github.com/thanhdo1110) | Modular GUI refactoring, Atom One Dark design system | **> 14,000+ lines** |
+| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | 7 PRs: OS timezone, customizable data-dir, macOS helpers, session atomic, media cache, updater, message state | **> 5,900+ lines** 🏆 |
 | **ngxccc** | [@ngxccc](https://github.com/ngxccc) | Engineering standards, session safety, domain resolution | **> 3,000+ lines** |
-| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | OS local timezone patches, customizable macOS data directory | **~840+ lines** |
 | **GrootTheDeveloper** | [@GrootTheDeveloper](https://github.com/GrootTheDeveloper) | SQLite startup speedup, chat virtualization, CJK font lazy loading | **~370+ lines** |
 
 > *Note: The complete hall of fame honoring all contributors (bug reports, feature requests, pull requests) is published at [Contributors Wall](https://ctdozlite.ctdo.net/contributors.html).*

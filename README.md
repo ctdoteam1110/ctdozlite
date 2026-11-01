@@ -256,8 +256,8 @@ Dự án ghi nhận các thành viên có đóng góp mã nguồn tiêu biểu t
 | :--- | :--- | :--- | :---: |
 | **TIPC1110** | [@TIPC1110](https://github.com/TIPC1110) | Kiến trúc lõi, VoIP call engine, egui framework, đa nền tảng | **> 73,000+ lines** |
 | **thanhdo1110** | [@thanhdo1110](https://github.com/thanhdo1110) | Tái cấu trúc GUI modular, tối ưu hóa giao diện Atom One Dark | **> 14,000+ lines** |
+| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | Loạt 7 PRs: Múi giờ OS, tùy biến data-dir, helpers macOS, session atomic, media cache, updater, message state | **> 5,900+ lines** 🏆 |
 | **ngxccc** | [@ngxccc](https://github.com/ngxccc) | Tiêu chuẩn kỹ thuật, bảo toàn session an toàn, phân giải domain mạng | **> 3,000+ lines** |
-| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | Bản vá múi giờ hệ điều hành, tùy biến thư mục dữ liệu macOS | **~840+ lines** |
 | **GrootTheDeveloper** | [@GrootTheDeveloper](https://github.com/GrootTheDeveloper) | Tối ưu hóa khởi động SQLite, virtualization tin nhắn, lazy load Font CJK | **~370+ lines** |
 
 > *Ghi chú: Toàn bộ danh sách vinh danh mọi cá nhân đóng góp (báo lỗi, đề xuất tính năng, pull request) được cập nhật công khai tại trang [Người đóng góp](https://ctdozlite.ctdo.net/contributors.html).*
