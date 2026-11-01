@@ -36,6 +36,10 @@ use stickers::*;
 use theme::*;
 use worker::*;
 
+fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
+    crate::chat::merge_sent_message(thread, message);
+}
+
 pub enum GuiEvent {
     QrReady {
         qr_login: QrLogin,
@@ -52,11 +56,13 @@ pub enum GuiEvent {
     LoginFailed(String),
     ThreadsUpdated(Vec<Thread>),
     MessageSent {
+        client_message_id: String,
         thread_id: String,
         text: String,
         msg_id: String,
     },
     StickerSent {
+        client_message_id: String,
         thread_id: String,
         msg_id: String,
         sticker_id: u64,
@@ -95,6 +101,7 @@ pub enum GuiEvent {
         online: Option<(bool, String)>,
     },
     QuoteSent {
+        client_message_id: String,
         thread_id: String,
         text: String,
         msg_id: String,
@@ -943,6 +950,7 @@ impl ZaloGuiApp {
                     self.status_msg = "Đã đăng xuất".into();
                 }
                 GuiEvent::MessageSent {
+                    client_message_id,
                     thread_id,
                     text,
                     msg_id,
@@ -952,27 +960,29 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!("out_{}", crate::login::unix_now())
+                            format!("out_{client_message_id}")
                         } else {
                             msg_id
                         };
-                        if !t.messages.iter().any(|m| !m.id.is_empty() && m.id == final_id) {
-                            t.messages.push(ChatMessage {
+                        merge_sent_message(
+                            t,
+                            ChatMessage {
                                 id: final_id,
+                                client_message_id,
                                 sender: "Tôi".into(),
                                 text,
                                 time: now,
                                 is_outgoing: true,
                                 ts: (crate::login::unix_now() * 1000) as i64,
                                 ..Default::default()
-                            });
-                            t.messages.sort_by_key(|m| m.ts);
-                        }
+                            },
+                        );
                         self.persist_threads_async();
                     }
                     self.status_msg = format!("Đã gửi tin nhắn lúc {}", crate::ui::clock());
                 }
                 GuiEvent::StickerSent {
+                    client_message_id,
                     thread_id,
                     msg_id,
                     sticker_id,
@@ -984,13 +994,15 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!("out_{}", crate::login::unix_now())
+                            format!("out_{client_message_id}")
                         } else {
                             msg_id
                         };
-                        if !t.messages.iter().any(|m| !m.id.is_empty() && m.id == final_id) {
-                            t.messages.push(ChatMessage {
+                        merge_sent_message(
+                            t,
+                            ChatMessage {
                                 id: final_id,
+                                client_message_id,
                                 sender: "Tôi".into(),
                                 text: "[Nhãn dán]".into(),
                                 time: now,
@@ -1000,9 +1012,8 @@ impl ZaloGuiApp {
                                 sticker_cate_id: Some(cate_id),
                                 sticker_type: Some(sticker_type),
                                 ..Default::default()
-                            });
-                            t.messages.sort_by_key(|m| m.ts);
-                        }
+                            },
+                        );
                         self.persist_threads_async();
                     }
                     self.status_msg = format!("Đã gửi nhãn dán lúc {}", crate::ui::clock());
@@ -1011,15 +1022,13 @@ impl ZaloGuiApp {
                     if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
                         t.preview = msg.text.clone();
                         t.time = msg.time.clone();
-                        if !t.messages.iter().any(|m| !m.id.is_empty() && m.id == msg.id) {
-                            t.messages.push(msg);
-                            t.messages.sort_by_key(|m| m.ts);
-                        }
+                        merge_sent_message(t, msg);
                         self.persist_threads_async();
                     }
                     self.status_msg = format!("Đã gửi đính kèm lúc {}", crate::ui::clock());
                 }
                 GuiEvent::QuoteSent {
+                    client_message_id,
                     thread_id,
                     text,
                     msg_id,
@@ -1030,13 +1039,15 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!("out_{}", crate::login::unix_now())
+                            format!("out_{client_message_id}")
                         } else {
                             msg_id
                         };
-                        if !t.messages.iter().any(|m| !m.id.is_empty() && m.id == final_id) {
-                            t.messages.push(ChatMessage {
+                        merge_sent_message(
+                            t,
+                            ChatMessage {
                                 id: final_id,
+                                client_message_id,
                                 sender: "Tôi".into(),
                                 text,
                                 time: now,
@@ -1046,9 +1057,8 @@ impl ZaloGuiApp {
                                 reply_to_sender: Some(quoted.sender.clone()),
                                 reply_to_text: Some(quoted.text.clone()),
                                 ..Default::default()
-                            });
-                            t.messages.sort_by_key(|m| m.ts);
-                        }
+                            },
+                        );
                         self.persist_threads_async();
                     }
                     self.status_msg = format!("Đã gửi trả lời lúc {}", crate::ui::clock());
@@ -2177,6 +2187,54 @@ impl ZaloGuiApp {
 #[cfg(test)]
 mod tests {
     use super::is_newer_semver;
+
+    #[test]
+    fn sent_message_reconciles_when_server_push_arrives_first() {
+        let mut thread = crate::chat::Thread::default();
+        let server = crate::chat::ChatMessage {
+            id: "server-a".into(),
+            client_message_id: "client-a".into(),
+            text: "Server push".into(),
+            is_outgoing: true,
+            delivery: crate::message_model::DeliveryState::Delivered,
+            ..Default::default()
+        };
+        super::merge_sent_message(&mut thread, server.clone());
+        for local_id in ["out_client-a", "server-a"] {
+            super::merge_sent_message(
+                &mut thread,
+                crate::chat::ChatMessage {
+                    id: local_id.into(),
+                    client_message_id: "client-a".into(),
+                    text: "Local echo".into(),
+                    is_outgoing: true,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(thread.messages.len(), 1);
+            assert_eq!(thread.messages[0].id, "server-a");
+            assert_eq!(thread.messages[0].delivery, server.delivery);
+        }
+    }
+
+    #[test]
+    fn delayed_local_ack_preserves_server_chronology() {
+        let mut thread = crate::chat::Thread::default();
+        for (id, client, ts) in [("server-a", "client-a", 1000), ("server-b", "client-b", 2000)] {
+            thread.messages.push(crate::chat::ChatMessage {
+                id: id.into(), client_message_id: client.into(), ts, time: ts.to_string(),
+                is_outgoing: true, ..Default::default()
+            });
+        }
+        for ack_id in ["out_client-a", "server-a"] {
+            super::merge_sent_message(&mut thread, crate::chat::ChatMessage {
+                id: ack_id.into(), client_message_id: "client-a".into(), ts: 3000, time: "3000".into(),
+                is_outgoing: true, ..Default::default()
+            });
+            let chronology: Vec<_> = thread.messages.iter().map(|message| (message.id.as_str(), message.ts, message.time.as_str())).collect();
+            assert_eq!(chronology, [("server-a", 1000, "1000"), ("server-b", 2000, "2000")]);
+        }
+    }
 
     #[test]
     fn semver_comparison_handles_v_prefix_and_prerelease() {
