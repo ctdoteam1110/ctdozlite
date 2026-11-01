@@ -589,6 +589,30 @@ impl ZaloGuiApp {
                 };
                 app.confirm_clear_cache = env("QTZALO_DEMO_CONFIRM_CLEAR").as_deref() == Some("1");
             }
+            // Show every download state at once: video ~45%, file done, photo failed (retry), and
+            // the finished toast
+            // (kept on screen for a minute so delayed screenshots still catch it).
+            if env("QTZALO_DEMO_DOWNLOADS").as_deref() == Some("1") {
+                let dir = std::path::PathBuf::from(&app.settings.download_dir);
+                app.downloads.insert(
+                    demo::DEMO_VIDEO_URL.into(),
+                    DownloadState::InProgress {
+                        received: 3_963_000,
+                        total: Some(8_806_000),
+                    },
+                );
+                let done = dir.join("QTzalo-landing.fig");
+                app.downloads
+                    .insert(demo::DEMO_FILE_URL.into(), DownloadState::Done(done.clone()));
+                app.downloads.insert(
+                    demo::DEMO_PHOTO_URL.into(),
+                    DownloadState::Failed("Máy chủ trả về HTTP 403".into()),
+                );
+                app.download_toast = Some((
+                    done,
+                    std::time::Instant::now() + Duration::from_secs(60),
+                ));
+            }
             // Deliberately NOT spawning the session worker: WORKER_TX stays unset, so every
             // `WORKER_TX.get()` send is a no-op and no network request can leave the process.
             drop(session);

@@ -440,12 +440,12 @@ pub(super) fn finalize_clipboard_rgba_image(
     if width == 0 || height == 0 {
         return None;
     }
-    let _ = std::fs::create_dir_all("stickers_cache");
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = std::path::PathBuf::from(format!("stickers_cache/clipboard_{now_ms}.png"));
+    // Absolute path in the data dir's cache (never the process working directory).
+    let path = crate::paths::cache_dir().join(format!("clipboard_{now_ms}.png"));
     rgba.save(&path).ok()?;
 
     let thumb = if width > 240 || height > 240 {
@@ -922,6 +922,7 @@ pub(super) fn same_message_cluster(a: &ChatMessage, b: &ChatMessage) -> bool {
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_message_body(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
@@ -931,8 +932,11 @@ pub(super) fn render_message_body(
     max_text_width: f32,
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
+    downloads: &HashMap<String, DownloadState>,
 ) -> Option<BubbleAction> {
     let mut body_action = None;
+    let dl_target = attachment_download_target(msg);
+    let dl_state = dl_target.as_ref().and_then(|(u, _)| downloads.get(u));
     let (text_col, meta_col) = if outgoing {
         (pal.bubble_out_text, pal.bubble_out_meta)
     } else {
@@ -1034,7 +1038,32 @@ pub(super) fn render_message_body(
                         Color32::WHITE,
                     );
                 }
-                if resp.clicked() {
+                // "Tải về" chip in the top-right corner: on hover, or while a download exists.
+                // Registered after the image so it sits on top for clicks.
+                if let Some(target) = dl_target.as_ref() {
+                    if dl_state.is_some() || ui.rect_contains_pointer(resp.rect) {
+                        let btn = Rect::from_center_size(
+                            Pos2::new(resp.rect.right() - 20.0, resp.rect.top() + 20.0),
+                            Vec2::splat(28.0),
+                        );
+                        let c = DlColors {
+                            muted: Color32::from_gray(200),
+                            track: Color32::from_rgba_unmultiplied(255, 255, 255, 60),
+                            accent: Color32::WHITE,
+                            ok: Color32::from_rgb(134, 239, 172),
+                            err: Color32::from_rgb(252, 165, 165),
+                            btn_bg: Color32::from_rgba_unmultiplied(15, 23, 42, 190),
+                            btn_hover: Color32::from_rgba_unmultiplied(15, 23, 42, 235),
+                        };
+                        let id = Id::new(("photo_dl", &msg.id, msg.ts));
+                        if let Some(a) =
+                            attachment_action_button(ui, btn, id, dl_state, target, &c)
+                        {
+                            body_action = Some(a);
+                        }
+                    }
+                }
+                if body_action.is_none() && resp.clicked() {
                     body_action = Some(BubbleAction::OpenImagePopup {
                         tex_key: key,
                         full_url: open_target,
@@ -1058,11 +1087,29 @@ pub(super) fn render_message_body(
                                     .color(text_col)
                                     .strong(),
                             );
-                        });
+                            if dl_target.is_some() {
+                                ui.add_space(4.0);
+                                ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover()).0
+                            } else {
+                                Rect::NOTHING
+                            }
+                        })
+                        .inner
                     });
+                let btn_rect = ph_frame.inner;
+                let mut click_rect = ph_frame.response.rect;
+                if let Some(target) = dl_target.as_ref() {
+                    click_rect.max.x = btn_rect.left() - 2.0;
+                    let id = Id::new(("photo_ph_dl", &msg.id, msg.ts));
+                    let c = dl_colors(pal, outgoing);
+                    if let Some(a) = attachment_action_button(ui, btn_rect, id, dl_state, target, &c)
+                    {
+                        body_action = Some(a);
+                    }
+                }
                 if ui
                     .interact(
-                        ph_frame.response.rect,
+                        click_rect,
                         Id::new(("photo_ph_click", &msg.id, msg.ts)),
                         Sense::click(),
                     )
@@ -1077,6 +1124,11 @@ pub(super) fn render_message_body(
                         sender: sender_label,
                         time: msg.time.clone(),
                     });
+                }
+            }
+            if let (Some(target), Some(state)) = (dl_target.as_ref(), dl_state) {
+                if let Some(a) = render_photo_download_pill(ui, state, target, pal) {
+                    body_action = Some(a);
                 }
             }
             if let Some(cap) = msg.link_desc.as_deref().filter(|c| !c.trim().is_empty()) {
@@ -1133,19 +1185,46 @@ pub(super) fn render_message_body(
                 19.0,
                 tile_fg,
             );
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 1.0;
-                ui.add_space(1.0);
-                ui.add(
-                    egui::Label::new(RichText::new(title_str).size(14.0).color(text_col).strong())
+            let btn_w = if dl_target.is_some() { 32.0 + 10.0 } else { 0.0 };
+            let text_w = (ui.available_width() - btn_w).max(40.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(text_w, 40.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_width(text_w);
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.add_space(1.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(title_str).size(14.0).color(text_col).strong(),
+                        )
                         .truncate(),
-                );
-                ui.label(RichText::new(sub_str).size(12.0).color(meta_col));
-            });
+                    );
+                    ui.add(
+                        egui::Label::new(RichText::new(sub_str).size(12.0).color(meta_col))
+                            .truncate(),
+                    );
+                },
+            );
+            if dl_target.is_some() {
+                ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover()).0
+            } else {
+                Rect::NOTHING
+            }
         });
+        let dl_c = dl_colors(pal, outgoing);
+        let mut click_rect = row.response.rect;
+        if let Some(target) = dl_target.as_ref() {
+            // Keep the card's "open in browser" click off the download button.
+            click_rect.max.x = row.inner.left() - 4.0;
+            let id = Id::new(("file_dl", &msg.id, msg.ts));
+            if let Some(a) = attachment_action_button(ui, row.inner, id, dl_state, target, &dl_c) {
+                body_action = Some(a);
+            }
+        }
         let can_open = msg.link_url.as_deref().map(|u| !u.is_empty()).unwrap_or(false);
         let resp = ui.interact(
-            row.response.rect,
+            click_rect,
             Id::new(("file_card", &msg.id, msg.ts)),
             Sense::click(),
         );
@@ -1159,7 +1238,13 @@ pub(super) fn render_message_body(
                 }
             }
         }
-        return None;
+        if let (Some(target), Some(state)) = (dl_target.as_ref(), dl_state) {
+            let w = row.response.rect.width();
+            if let Some(a) = render_download_status(ui, state, target, w, &dl_c) {
+                body_action = Some(a);
+            }
+        }
+        return body_action;
     }
 
     let Some((caption, url, domain)) = extract_message_link_view(msg) else {
@@ -1315,6 +1400,7 @@ pub(super) fn render_message_body(
     body_action
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_chat_bubble(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
@@ -1328,6 +1414,7 @@ pub(super) fn render_chat_bubble(
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
     emoji_textures: &HashMap<String, TextureHandle>,
+    downloads: &HashMap<String, DownloadState>,
     idx: usize,
 ) -> Option<BubbleAction> {
     let avail_w = ui.available_width();
@@ -1451,7 +1538,13 @@ pub(super) fn render_chat_bubble(
                 }
             };
             // File cards carry a 40px icon tile + gap in front of the text.
-            let tile_w = if is_file_card { 54.0 } else { 0.0 };
+            // Downloadable cards also carry a 32px "Tải về" button + gap at the right.
+            let dl_btn_w = if is_file_card && attachment_download_target(msg).is_some() {
+                42.0
+            } else {
+                0.0
+            };
+            let tile_w = if is_file_card { 54.0 + dl_btn_w } else { 0.0 };
             let w = measure(title, 13.8)
                 .max(measure(&cap, 13.8))
                 .max(measure(desc, 12.3))
@@ -1461,7 +1554,13 @@ pub(super) fn render_chat_bubble(
             // Narrow chat panes can make the cap smaller than the preferred minimum; never
             // call `clamp` with min > max (it panics).
             let cap = max_text_width.min(340.0);
-            w.clamp(135.0_f32.min(cap), cap).ceil()
+            let w = w.clamp(135.0_f32.min(cap), cap);
+            // Room for the progress / "Đã tải · Mở · Mở thư mục" line under a download.
+            if dl_btn_w > 0.0 {
+                w.max(cap.min(230.0)).ceil()
+            } else {
+                w.ceil()
+            }
         }
     } else {
         let display_str = if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
@@ -1621,6 +1720,7 @@ pub(super) fn render_chat_bubble(
                         sticker_textures,
                         loading_stickers,
                         emoji_textures,
+                        downloads,
                     );
                 });
             (fr.response, card_action)
@@ -1697,6 +1797,7 @@ pub(super) fn render_chat_bubble(
                             sticker_textures,
                             loading_stickers,
                             emoji_textures,
+                            downloads,
                         );
                     });
                 (fr.response, card_action)
@@ -1739,6 +1840,7 @@ fn bubble_contents(
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
     emoji_textures: &HashMap<String, TextureHandle>,
+    downloads: &HashMap<String, DownloadState>,
 ) -> Option<BubbleAction> {
     ui.set_min_width(content_width);
     ui.set_max_width(content_width);
@@ -1757,6 +1859,7 @@ fn bubble_contents(
                 content_width,
                 sticker_textures,
                 loading_stickers,
+                downloads,
             );
         }
         render_reactions(ui, msg, pal, emoji_textures);
@@ -1879,6 +1982,439 @@ pub(super) enum BubbleAction {
         sender: String,
         time: String,
     },
+    /// "Tải về" (or "Thử lại") on a file / video / photo card.
+    Download { url: String, suggested_name: String },
+    /// "Mở" on a finished download.
+    OpenDownloaded(std::path::PathBuf),
+    /// "Mở thư mục" on a finished download.
+    RevealDownloaded(std::path::PathBuf),
+}
+
+// ---------------------------------------------------------------------------
+// Attachment downloads ("Tải về")
+// ---------------------------------------------------------------------------
+
+/// Lucide `download` glyph (not in `theme::lucide`, same font).
+pub(super) const ICON_DOWNLOAD: &str = "\u{e0b2}";
+/// Lucide `alert-circle`.
+const ICON_ALERT: &str = "\u{e077}";
+/// Lucide `rotate-cw`.
+pub(super) const ICON_RETRY: &str = "\u{e149}";
+
+fn is_photo_message(msg: &ChatMessage) -> bool {
+    let t = msg.text.trim();
+    msg.link_src.as_deref() == Some("Hình ảnh Zalo") || t == "[Hình ảnh]" || t.starts_with("[Hình ảnh] ")
+}
+
+fn is_file_or_video_message(msg: &ChatMessage) -> bool {
+    let t = msg.text.trim();
+    matches!(msg.link_src.as_deref(), Some("Tập tin Zalo") | Some("Video Zalo"))
+        || t.starts_with("[Tập tin]")
+        || t.starts_with("[Video]")
+        || t.starts_with("[Tin nhắn thoại]")
+}
+
+/// Strip the `[Tập tin]` / `[Video]` / `[Hình ảnh]` placeholders from an attachment title.
+fn clean_attachment_title(raw: &str) -> &str {
+    let mut t = raw.trim();
+    for p in ["[Tập tin]", "[Video]", "[Hình ảnh]", "[Tin nhắn thoại]"] {
+        t = t.trim_start_matches(p).trim();
+    }
+    t
+}
+
+/// `(url, suggested_name)` to download for a file / video / photo message: the original
+/// (`link_url`, else the photo thumbnail). The name is untrusted and may be empty; the worker
+/// sanitises it and falls back to the URL / a timestamp name.
+pub(super) fn attachment_download_target(msg: &ChatMessage) -> Option<(String, String)> {
+    let photo = is_photo_message(msg);
+    if !photo && !is_file_or_video_message(msg) {
+        return None;
+    }
+    let url = msg
+        .link_url
+        .as_deref()
+        .filter(|u| !u.trim().is_empty())
+        .or(if photo { msg.link_thumb.as_deref() } else { None })
+        .map(str::trim)
+        .filter(|u| u.starts_with("https://") || u.starts_with("http://"))?
+        .to_string();
+    let name = msg
+        .link_title
+        .as_deref()
+        .map(clean_attachment_title)
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            let t = clean_attachment_title(&msg.text);
+            (!photo && !t.is_empty()).then_some(t)
+        })
+        .unwrap_or("")
+        .to_string();
+    Some((url, name))
+}
+
+/// Progress text: `45% · 10,8 MB / 24,1 MB` (`compact`: `Đang tải 45%`) or `Đang tải… 3,20 MB`.
+pub(super) fn download_progress_label(state: &DownloadState, compact: bool) -> String {
+    let DownloadState::InProgress { received, total } = state else {
+        return String::new();
+    };
+    match (state.fraction(), total) {
+        (Some(f), Some(_)) if compact => format!("Đang tải {:.0}%", f * 100.0),
+        (Some(f), Some(t)) => format!(
+            "{:.0}% · {} / {}",
+            f * 100.0,
+            crate::download::format_bytes(*received),
+            crate::download::format_bytes(*t)
+        ),
+        _ if *received == 0 => "Đang tải…".to_string(),
+        _ => format!("Đang tải… {}", crate::download::format_bytes(*received)),
+    }
+}
+
+/// Ring progress (or a spinning arc when the size is unknown) around `center`.
+fn paint_progress_ring(
+    ui: &egui::Ui,
+    center: Pos2,
+    radius: f32,
+    fraction: Option<f32>,
+    track: Color32,
+    fill: Color32,
+) {
+    let painter = ui.painter();
+    painter.circle_stroke(center, radius, Stroke::new(2.2_f32, track));
+    let (start, sweep) = match fraction {
+        Some(f) => (-std::f32::consts::FRAC_PI_2, f.clamp(0.0, 1.0) * std::f32::consts::TAU),
+        None => {
+            let t = ui.input(|i| i.time) as f32;
+            (t * 5.0, std::f32::consts::FRAC_PI_2 * 1.2)
+        }
+    };
+    if sweep <= 0.01 {
+        return;
+    }
+    let steps = ((sweep / std::f32::consts::TAU) * 48.0).ceil().max(4.0) as usize;
+    let pts: Vec<Pos2> = (0..=steps)
+        .map(|i| {
+            let a = start + sweep * (i as f32 / steps as f32);
+            center + Vec2::new(a.cos(), a.sin()) * radius
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts, Stroke::new(2.2_f32, fill)));
+}
+
+/// Colours for download widgets inside a bubble (white on the blue outgoing bubble).
+struct DlColors {
+    muted: Color32,
+    track: Color32,
+    accent: Color32,
+    ok: Color32,
+    err: Color32,
+    btn_bg: Color32,
+    btn_hover: Color32,
+}
+
+fn dl_colors(pal: &ThemePalette, outgoing: bool) -> DlColors {
+    if outgoing {
+        DlColors {
+            muted: pal.bubble_out_meta,
+            track: Color32::from_rgba_unmultiplied(0, 20, 80, 70),
+            accent: Color32::WHITE,
+            ok: Color32::WHITE,
+            err: Color32::WHITE,
+            btn_bg: Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+            btn_hover: Color32::from_rgba_unmultiplied(255, 255, 255, 72),
+        }
+    } else {
+        DlColors {
+            muted: pal.bubble_in_meta,
+            accent: if pal.is_dark { pal.primary_hover } else { pal.primary },
+            track: pal.border,
+            ok: pal.accent_online,
+            err: pal.danger,
+            btn_bg: pal.bg_hover,
+            btn_hover: pal.bg_selected,
+        }
+    }
+}
+
+/// Round action button for an attachment card: download / progress ring / open / retry.
+/// Returns the action for a click (none while the download is running).
+fn attachment_action_button(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    id: Id,
+    state: Option<&DownloadState>,
+    target: &(String, String),
+    c: &DlColors,
+) -> Option<BubbleAction> {
+    let resp = ui.interact(rect, id, Sense::click());
+    let center = rect.center();
+    let r = rect.width() * 0.5;
+    let busy = matches!(state, Some(DownloadState::InProgress { .. }));
+    let bg = if resp.hovered() && !busy { c.btn_hover } else { c.btn_bg };
+    ui.painter().circle_filled(center, r, bg);
+    let icon_sz = (r * 1.05).max(12.0);
+    let tip = match state {
+        None => {
+            draw_lucide_icon(ui.painter(), center, ICON_DOWNLOAD, icon_sz, c.accent);
+            "Tải về thư mục lưu file".to_string()
+        }
+        Some(s @ DownloadState::InProgress { .. }) => {
+            paint_progress_ring(
+                ui,
+                center,
+                r - 5.0,
+                s.fraction(),
+                c.track,
+                c.accent,
+            );
+            ui.ctx().request_repaint_after(Duration::from_millis(60));
+            download_progress_label(s, false)
+        }
+        Some(DownloadState::Done(path)) => {
+            draw_lucide_icon(ui.painter(), center, lucide::CHECK, icon_sz, c.ok);
+            format!("Đã tải · Bấm để mở\n{}", path.display())
+        }
+        Some(DownloadState::Failed(err)) => {
+            draw_lucide_icon(ui.painter(), center, ICON_RETRY, icon_sz * 0.95, c.err);
+            format!("Tải về thất bại: {err}\nBấm để thử lại")
+        }
+    };
+    let resp = if busy {
+        resp.on_hover_text(tip)
+    } else {
+        resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip)
+    };
+    if !resp.clicked() {
+        return None;
+    }
+    match state {
+        Some(DownloadState::InProgress { .. }) => None,
+        Some(DownloadState::Done(path)) => Some(BubbleAction::OpenDownloaded(path.clone())),
+        None | Some(DownloadState::Failed(_)) => Some(BubbleAction::Download {
+            url: target.0.clone(),
+            suggested_name: target.1.clone(),
+        }),
+    }
+}
+
+/// Small clickable text link used in download status lines.
+fn dl_link(ui: &mut egui::Ui, text: &str, col: Color32, tip: &str) -> bool {
+    ui.add(
+        egui::Label::new(RichText::new(text).size(12.0).color(col).strong()).sense(Sense::click()),
+    )
+    .on_hover_cursor(CursorIcon::PointingHand)
+    .on_hover_text(tip)
+    .clicked()
+}
+
+/// Status under a file / video card: progress bar, "Đã tải · Mở · Mở thư mục" or the error with
+/// "Thử lại".
+fn render_download_status(
+    ui: &mut egui::Ui,
+    state: &DownloadState,
+    target: &(String, String),
+    width: f32,
+    c: &DlColors,
+) -> Option<BubbleAction> {
+    let mut action = None;
+    ui.add_space(7.0);
+    match state {
+        DownloadState::InProgress { .. } => {
+            let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 4.0), Sense::hover());
+            ui.painter()
+                .rect_filled(bar, Rounding::same(2.0), c.track);
+            let fill_rect = match state.fraction() {
+                Some(f) => Rect::from_min_size(bar.min, Vec2::new(bar.width() * f, bar.height())),
+                None => {
+                    // Indeterminate: a 30% segment sliding across the track.
+                    let t = (ui.input(|i| i.time) as f32 * 0.8).fract();
+                    let seg = bar.width() * 0.3;
+                    let x0 = bar.left() - seg + (bar.width() + seg) * t;
+                    Rect::from_min_max(
+                        Pos2::new(x0.max(bar.left()), bar.top()),
+                        Pos2::new((x0 + seg).min(bar.right()), bar.bottom()),
+                    )
+                }
+            };
+            if fill_rect.width() > 0.5 {
+                ui.painter().rect_filled(fill_rect, Rounding::same(2.0), c.accent);
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(60));
+            ui.add_space(3.0);
+            ui.label(
+                RichText::new(download_progress_label(state, false))
+                    .size(11.5)
+                    .color(c.muted),
+            );
+        }
+        DownloadState::Done(path) => {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.label(
+                    RichText::new(format!("{} Đã tải", lucide::CHECK))
+                        .size(12.0)
+                        .color(c.ok)
+                        .strong(),
+                );
+                if dl_link(ui, "Mở", c.accent, "Mở tệp đã tải") {
+                    action = Some(BubbleAction::OpenDownloaded(path.clone()));
+                }
+                if dl_link(ui, "Mở thư mục", c.accent, &path.display().to_string()) {
+                    action = Some(BubbleAction::RevealDownloaded(path.clone()));
+                }
+            });
+        }
+        DownloadState::Failed(err) => {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let retry_w = 56.0;
+                ui.add_sized(
+                    Vec2::new((width - retry_w).max(60.0), 16.0),
+                    egui::Label::new(
+                        RichText::new(format!("{ICON_ALERT} {err}"))
+                            .size(11.8)
+                            .color(c.err),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(err);
+                if dl_link(ui, "Thử lại", c.accent, "Tải lại tệp này") {
+                    action = Some(BubbleAction::Download {
+                        url: target.0.clone(),
+                        suggested_name: target.1.clone(),
+                    });
+                }
+            });
+        }
+    }
+    action
+}
+
+/// Compact status pill under a photo (readable on both bubbles and the bare canvas).
+fn render_photo_download_pill(
+    ui: &mut egui::Ui,
+    state: &DownloadState,
+    target: &(String, String),
+    pal: &ThemePalette,
+) -> Option<BubbleAction> {
+    let mut action = None;
+    ui.add_space(5.0);
+    egui::Frame::none()
+        .fill(pal.bg_elevated)
+        .stroke(Stroke::new(1.0_f32, pal.border))
+        .rounding(Rounding::same(10.0))
+        .inner_margin(Margin::symmetric(9.0, 4.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let accent = if pal.is_dark { pal.primary_hover } else { pal.primary };
+                match state {
+                    DownloadState::InProgress { .. } => {
+                        let (r, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                        paint_progress_ring(ui, r.center(), 5.5, state.fraction(), pal.border, accent);
+                        ui.ctx().request_repaint_after(Duration::from_millis(60));
+                        ui.label(
+                            RichText::new(download_progress_label(state, true))
+                                .size(11.5)
+                                .color(pal.text_secondary),
+                        )
+                        .on_hover_text(download_progress_label(state, false));
+                    }
+                    DownloadState::Done(path) => {
+                        ui.label(
+                            RichText::new(format!("{} Đã tải", lucide::CHECK))
+                                .size(11.5)
+                                .color(pal.accent_online)
+                                .strong(),
+                        );
+                        if dl_link(ui, "Mở", accent, "Mở ảnh đã tải") {
+                            action = Some(BubbleAction::OpenDownloaded(path.clone()));
+                        }
+                        if dl_link(ui, "Thư mục", accent, &path.display().to_string()) {
+                            action = Some(BubbleAction::RevealDownloaded(path.clone()));
+                        }
+                    }
+                    DownloadState::Failed(err) => {
+                        ui.label(
+                            RichText::new(format!("{ICON_ALERT} Lỗi tải"))
+                                .size(11.5)
+                                .color(pal.danger),
+                        )
+                        .on_hover_text(err);
+                        if dl_link(ui, "Thử lại", accent, err) {
+                            action = Some(BubbleAction::Download {
+                                url: target.0.clone(),
+                                suggested_name: target.1.clone(),
+                            });
+                        }
+                    }
+                }
+            });
+        });
+    action
+}
+
+impl ZaloGuiApp {
+    /// Start downloading an attachment into "Thư mục lưu file" (`settings.download_dir`).
+    /// Ignored while the same URL is already downloading; the offline demo only shows a toast.
+    pub(super) fn start_attachment_download(
+        &mut self,
+        url: String,
+        suggested_name: String,
+        thread_id: String,
+    ) {
+        if matches!(self.downloads.get(&url), Some(DownloadState::InProgress { .. })) {
+            return;
+        }
+        let tx = if is_demo_mode() { None } else { WORKER_TX.get() };
+        let Some(tx) = tx else {
+            self.show_toast("Chế độ demo: không tải tệp thật.");
+            return;
+        };
+        let cmd = WorkerCmd::DownloadAttachment {
+            url: url.clone(),
+            suggested_name,
+            thread_id,
+            dest_dir: self.settings.download_dir.clone(),
+        };
+        if tx.send(cmd).is_ok() {
+            self.downloads.insert(
+                url,
+                DownloadState::InProgress {
+                    received: 0,
+                    total: None,
+                },
+            );
+            self.status_msg = "Đang tải về…".into();
+        } else {
+            self.show_toast("Không thể bắt đầu tải về (tiến trình nền đã dừng).");
+        }
+    }
+
+    /// "Mở" on a finished download: executables / scripts are only revealed in their folder.
+    pub(super) fn open_downloaded_path(&mut self, path: &std::path::Path) {
+        if is_demo_mode() {
+            self.show_toast("Chế độ demo: không mở tệp thật.");
+            return;
+        }
+        if !path.exists() {
+            self.show_toast("Không tìm thấy tệp — có thể đã bị di chuyển hoặc xoá.");
+            return;
+        }
+        if crate::download::open_downloaded(path) == crate::download::OpenOutcome::RevealedOnly {
+            self.show_toast("Tệp thực thi — chỉ mở thư mục chứa tệp để bạn tự kiểm tra.");
+        }
+    }
+
+    /// "Mở thư mục" on a finished download.
+    pub(super) fn reveal_downloaded_path(&mut self, path: &std::path::Path) {
+        if is_demo_mode() {
+            self.show_toast("Chế độ demo: không mở thư mục thật.");
+            return;
+        }
+        crate::download::reveal_in_folder(path);
+    }
 }
 
 
@@ -1959,6 +2495,15 @@ pub(super) fn bubble_context_menu(
                         msg.sender.clone()
                     },
                     time: msg.time.clone(),
+                });
+                ui.close_menu();
+            }
+        }
+        if let Some((url, suggested_name)) = attachment_download_target(msg) {
+            if ui.button(format!("{ICON_DOWNLOAD} Tải về")).clicked() {
+                action = Some(BubbleAction::Download {
+                    url,
+                    suggested_name,
                 });
                 ui.close_menu();
             }
@@ -2148,4 +2693,59 @@ pub(super) fn render_reactions(
                 });
         }
     });
+}
+
+#[cfg(test)]
+mod download_target_tests {
+    use super::*;
+
+    fn m(text: &str, src: Option<&str>, title: Option<&str>, url: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            text: text.into(),
+            link_src: src.map(Into::into),
+            link_title: title.map(Into::into),
+            link_url: url.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn file_card_uses_title_or_text_name() {
+        let a = m("[Tập tin] a.pdf", None, None, Some("https://f.zdn.vn/x"));
+        assert_eq!(
+            attachment_download_target(&a),
+            Some(("https://f.zdn.vn/x".into(), "a.pdf".into()))
+        );
+        let b = m("x", Some("Tập tin Zalo"), Some("[Tập tin] b.docx"), Some("https://f.zdn.vn/y"));
+        assert_eq!(attachment_download_target(&b).unwrap().1, "b.docx");
+    }
+
+    #[test]
+    fn photo_falls_back_to_thumb_and_empty_name() {
+        let mut p = m("[Hình ảnh]", Some("Hình ảnh Zalo"), Some("[Hình ảnh]"), None);
+        p.link_thumb = Some("https://photo.zdn.vn/t.jpg".into());
+        assert_eq!(
+            attachment_download_target(&p),
+            Some(("https://photo.zdn.vn/t.jpg".into(), String::new()))
+        );
+    }
+
+    #[test]
+    fn no_target_without_web_url_or_for_plain_text() {
+        assert_eq!(attachment_download_target(&m("[Tập tin] a.pdf", None, None, None)), None);
+        assert_eq!(
+            attachment_download_target(&m("[Video]", None, None, Some("file:///etc/passwd"))),
+            None
+        );
+        assert_eq!(attachment_download_target(&m("chào", None, None, Some("https://x.vn"))), None);
+    }
+
+    #[test]
+    fn progress_label_formats() {
+        let s = DownloadState::InProgress { received: 512, total: Some(1024) };
+        assert_eq!(download_progress_label(&s, true), "Đang tải 50%");
+        assert!(download_progress_label(&s, false).starts_with("50% · "));
+        let u = DownloadState::InProgress { received: 0, total: None };
+        assert_eq!(download_progress_label(&u, false), "Đang tải…");
+    }
 }
