@@ -277,7 +277,7 @@ impl ChatMessage {
                 .get("msgType")
                 .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()));
             match kind {
-                Some(2..=4) => Some("Hình ảnh Zalo"),
+                Some(2..=4 | 31) => Some("Hình ảnh Zalo"),
                 Some(19) => Some("Video Zalo"),
                 _ => None,
             }
@@ -4802,6 +4802,7 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     };
 
     Some(ChatMessage {
+        history_source: it.get("historySource").cloned(),
         id: msg_id,
         client_message_id: ["cliMsgId", "clientId", "client_message_id"].iter()
             .find_map(|key| wire_identity(it.get(*key))).unwrap_or_default(),

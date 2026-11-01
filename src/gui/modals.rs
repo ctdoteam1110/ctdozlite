@@ -1250,6 +1250,36 @@ impl ZaloGuiApp {
                                                     });
                                                 });
                                             ui.add_space(16.0);
+                                            ui.label(RichText::new("Lịch sử từ điện thoại và luồng nhóm").strong());
+                                            ui.label(&self.phone_history_status);
+                                            ui.horizontal(|ui| {
+                                                if self.phone_history_active {
+                                                    if ui.button("Thông báo lại trên điện thoại").clicked() {
+                                                        if let Some(tx) = WORKER_TX.get() { let _ = tx.send(WorkerCmd::PhoneHistory(super::PhoneAction::Wakeup(self.phone_history_generation))); }
+                                                    }
+                                                    if ui.button("Dừng đồng bộ điện thoại").clicked() {
+                                                        let generation = self.phone_history_generation;
+                                                        // Invalidate queued old-run deltas immediately, before worker cancellation is delivered.
+                                                        self.phone_history_generation = generation.wrapping_add(1);
+                                                        self.phone_history_active = false;
+                                                        self.phone_history_status = "Đã yêu cầu dừng; lịch sử đã nhận vẫn được giữ".into();
+                                                        if let Some(tx) = WORKER_TX.get() { let _ = tx.send(WorkerCmd::PhoneHistory(super::PhoneAction::Cancel(generation))); }
+                                                    }
+                                                } else if ui.button("Đồng bộ từ điện thoại").clicked() {
+                                                    self.phone_history_generation = self.phone_history_generation.wrapping_add(1);
+                                                    if let Some(tx) = WORKER_TX.get() {
+                                                        if tx.send(WorkerCmd::PhoneHistory(super::PhoneAction::Start(self.phone_history_generation))).is_ok() {
+                                                            self.phone_history_active = true;
+                                                            self.phone_history_status = "Đang yêu cầu đồng bộ; mở Zalo trên điện thoại để xác nhận".into();
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                            ui.label(&self.group_history_status);
+                                            if ui.button("Tải thêm lịch sử nhóm qua kết nối hiện tại").clicked() {
+                                                if let Some(tx) = WORKER_TX.get() { let _ = tx.send(WorkerCmd::LoadGroupHistoryStream); }
+                                            }
+                                            ui.add_space(16.0);
                                             ui.label(RichText::new("Di chuyển / Nhập lịch sử tin nhắn có sẵn (Migrate)").color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(6.0);
                                             egui::Frame::none()

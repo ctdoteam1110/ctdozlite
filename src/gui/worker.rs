@@ -63,6 +63,10 @@ pub enum WorkerCmd {
         /// "Tải thêm" reaches further back instead of re-reading the same newest 500.
         have: usize,
     },
+    /// Explicit bounded group history request over the existing shared socket.
+    LoadGroupHistoryStream,
+    /// Phone transfer controls preserve user intent order through the shared worker.
+    PhoneHistory(super::phone_history::PhoneAction),
     /// Page group / Cloud history back from the server into SQLite: (id, name, is_group).
     SyncHistory {
         threads: Vec<(String, String, bool)>,
@@ -269,6 +273,31 @@ async fn dispatch_delivery_receipts(
     if result.is_err() {
         crate::logger::log_error("gui::delivery_receipts", "UI event receiver closed");
     }
+}
+
+fn dispatch_group_history_request(
+    sync: &mut super::group_history::GroupHistorySync,
+    commands: Option<&tokio::sync::mpsc::UnboundedSender<crate::socket::WsCommand>>,
+    request: Option<super::group_history::GroupHistoryRequest>,
+    gui_tx: &GuiTx,
+) {
+    if let Some(request) = request {
+        let sent = commands.is_some_and(|commands| {
+            commands
+                .send(crate::socket::WsCommand::RequestGroupHistory {
+                    last_id: request.last_id,
+                })
+                .is_ok()
+        });
+        if !sent {
+            sync.fail();
+            let _ = gui_tx.send(GuiEvent::GroupHistoryStatus(
+                "Lịch sử nhóm: chưa có kết nối; bấm tải thêm để thử lại".into(),
+            ));
+            return;
+        }
+    }
+    let _ = gui_tx.send(GuiEvent::GroupHistoryStatus(sync.status()));
 }
 
 async fn process_original_reaction_import(
@@ -578,6 +607,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
         ui_generation: std::sync::atomic::AtomicU64::new(crate::runtime_scope::registry().generation()),
     });
 
+    let (phone_tx, mut phone_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (group_tx, mut group_rx) = tokio::sync::mpsc::unbounded_channel();
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
     let poll_state =
         std::sync::Arc::new(tokio::sync::Mutex::new(crate::chat::PollState::default()));
@@ -759,9 +790,17 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         > = None;
                         let mut ws_sek = String::new();
                         let mut ws_generation = 0;
+                        let mut ws_account = String::new();
+                        let mut ws_commands = None;
+                        let mut phone = super::phone_history::PhoneCoordinator::default();
+                        let mut group = super::group_history::GroupHistorySync::default();
                         loop {
                             let scope = crate::runtime_scope::registry().current();
                             if ws_generation != scope.generation {
+                                phone.reset();
+                                group = super::group_history::GroupHistorySync::default();
+                                ws_commands = None;
+                                ws_account.clear();
                                 ws_rx = None;
                                 ws_sek.clear();
                                 ws_generation = scope.generation;
@@ -771,9 +810,34 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let s_snap = s_ws.lock().await.clone();
                             if s_snap.login.is_some() {
                                 let cur_sek = s_snap.zpw_sek.clone().unwrap_or_default();
-                                if !cur_sek.is_empty() && (ws_rx.is_none() || ws_sek != cur_sek) {
+                                let account = s_snap
+                                    .login
+                                    .as_ref()
+                                    .map(|login| login.uin.clone())
+                                    .unwrap_or_default();
+                                if !cur_sek.is_empty() && (ws_rx.is_none() || ws_sek != cur_sek || ws_account != account) {
+                                    phone.reset_for_session(&gui_tx_ws, &ctx_ws, &ws_account);
+                                    group = super::group_history::GroupHistorySync::default();
                                     ws_sek = cur_sek;
-                                    ws_rx = Some(crate::socket::spawn(s_snap.clone()));
+                                    ws_account = account;
+                                    let (events, commands) = crate::socket::spawn_with_history(s_snap.clone());
+                                    ws_rx = Some(events);
+                                    ws_commands = Some(commands);
+                                }
+                                while let Ok((ticket, action)) = phone_rx.try_recv() {
+                                    if !crate::runtime_scope::registry().accepts(&ticket) || ticket.account != ws_account { continue; }
+                                    phone.control(ticket, s_ws.clone(), action, &s_snap, ws_commands.as_ref(), &gui_tx_ws, &ctx_ws);
+                                }
+                                let mut requested = false;
+                                while let Ok(ticket) = group_rx.try_recv() {
+                                    if crate::runtime_scope::registry().accepts(&ticket) && ticket.account == ws_account { requested = true; }
+                                }
+                                if let Some(status) = group.check_timeout(std::time::Instant::now()) {
+                                    let _ = gui_tx_ws.send(GuiEvent::GroupHistoryStatus(status));
+                                }
+                                if requested {
+                                    let request = group.request_batch(std::time::Instant::now());
+                                    dispatch_group_history_request(&mut group, ws_commands.as_ref(), request, &gui_tx_ws);
                                 }
                                 if let Some(rx) = ws_rx.as_mut() {
                                     match tokio::time::timeout(
@@ -783,6 +847,48 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     .await
                                     {
                                         Ok(Some(ev)) => {
+                                            let current = s_ws.lock().await;
+                                            if current.login.as_ref().map(|login| login.uin.as_str()) != Some(ws_account.as_str())
+                                                || current.zpw_sek.as_deref() != Some(ws_sek.as_str())
+                                            {
+                                                return;
+                                            }
+                                            drop(current);
+                                            phone.forward(&ev);
+                                            let group_page = ev.cmd == crate::socket::CMD_PULL_MSG_GROUP && ev.sub_cmd == 1;
+                                            if group_page {
+                                                match super::group_history::GroupHistoryPage::parse(&ev.payload) {
+                                                    Ok(page) => {
+                                                        let account = s_snap
+                                                            .login
+                                                            .as_ref()
+                                                            .map(|login| login.uin.as_str())
+                                                            .unwrap_or_default();
+                                                        let mut threads = Vec::new();
+                                                        crate::chat::merge_previews(&mut threads, &page.normalized_payload(account));
+                                                        if !threads.is_empty() {
+                                                            let _ = gui_tx_ws.send(GuiEvent::GroupHistoryThreads {
+                                                                account: account.into(),
+                                                                threads,
+                                                            });
+                                                        }
+                                                        let update = group.accept_page(&page, std::time::Instant::now());
+                                                        let _ = gui_tx_ws.send(GuiEvent::GroupHistoryStatus(update.status));
+                                                        dispatch_group_history_request(
+                                                            &mut group,
+                                                            ws_commands.as_ref(),
+                                                            update.next_request,
+                                                            &gui_tx_ws,
+                                                        );
+                                                    }
+                                                    Err(_) => {
+                                                        group.fail();
+                                                        let _ = gui_tx_ws.send(GuiEvent::GroupHistoryStatus(
+                                                            "Lịch sử nhóm trả phản hồi không hợp lệ".into(),
+                                                        ));
+                                                    }
+                                                }
+                                            }
                                             let data_node = ev
                                                 .payload
                                                 .get("data")
@@ -798,7 +904,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 process_reaction_journal(s_ws.clone(), s_snap.clone(), gui_tx_ws.clone(), reactions, Vec::new()).await;
                                             }
                                             dispatch_delivery_receipts(&s_ws, &s_snap, &gui_tx_ws, ev.cmd, ev.sub_cmd, &ev.payload).await;
-                                            if ev.is_chat_ish() {
+                                            if ev.is_chat_ish() && !group_page {
                                                 let mut ws_threads = Vec::new();
                                                 if let Some(li) = s_snap.login.as_ref() {
                                                     if !li.send2me_id.is_empty() {
@@ -842,6 +948,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                 }
                             } else {
+                                phone.reset_for_session(&gui_tx_ws, &ctx_ws, &ws_account);
+                                ws_commands = None;
+                                ws_account.clear();
                                 ws_rx = None;
                                 ws_sek.clear();
                                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1685,6 +1794,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 }
                             });
                         }
+                        WorkerCmd::PhoneHistory(action) => { let _ = phone_tx.send((command_scope.clone(), action)); }
+                        WorkerCmd::LoadGroupHistoryStream => { let _ = group_tx.send(command_scope.clone()); }
                         WorkerCmd::SyncHistory { threads } => {
                             use std::sync::atomic::Ordering;
                             if crate::history_sync::RUNNING.swap(true, Ordering::SeqCst) {

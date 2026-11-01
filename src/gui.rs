@@ -22,6 +22,8 @@ use crate::qr::QrLogin;
 use crate::session::Session;
 
 mod history;
+mod group_history;
+mod phone_history;
 mod media_preview;
 mod native_photo_viewer;
 mod messages;
@@ -38,6 +40,7 @@ use stickers::*;
 use theme::*;
 pub use theme::{emoji_to_tex_key, load_app_icon, lucide, REACTION_LIST};
 pub use worker::WorkerCmd;
+pub use phone_history::PhoneAction;
 use worker::*;
 
 fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
@@ -129,6 +132,26 @@ pub enum GuiEvent {
     },
     LoginFailed(String),
     ThreadsUpdated(Vec<Thread>),
+    /// Historical arrivals never drive live unread or notification accounting.
+    PhoneHistoryThreads {
+        generation: u64,
+        account: String,
+        threads: Vec<Thread>,
+    },
+    /// Terminal or progress status for an explicit phone transfer run.
+    PhoneHistoryStatus {
+        generation: u64,
+        account: String,
+        message: String,
+        active: bool,
+    },
+    /// Progress from the shared-socket bounded group history cursor.
+    GroupHistoryStatus(String),
+    /// Old group pages, separate from live arrivals.
+    GroupHistoryThreads {
+        account: String,
+        threads: Vec<Thread>,
+    },
     /// Exact remote progress, applied only to current outgoing message identities.
     DeliveryEvents {
         account: String,
@@ -587,6 +610,10 @@ pub struct ZaloGuiApp {
 
     // Session state
     is_logged_in: bool,
+    phone_history_generation: u64,
+    phone_history_active: bool,
+    phone_history_status: String,
+    group_history_status: String,
     original_reaction_import_pending: bool,
     user_name: String,
     user_uin: String,
@@ -803,6 +830,10 @@ impl ZaloGuiApp {
         let app = Self {
             dark_mode,
             theme_dirty: false,
+            phone_history_generation: 0,
+            phone_history_active: false,
+            phone_history_status: "Lịch sử trên điện thoại cần xác nhận đồng bộ riêng".into(),
+            group_history_status: "Lịch sử nhóm: chờ yêu cầu".into(),
             is_logged_in,
             original_reaction_import_pending: false,
             user_name,
@@ -1017,6 +1048,10 @@ impl ZaloGuiApp {
     }
 
     fn reset_epoch_inflight(&mut self, ctx: &egui::Context) {
+        self.phone_history_generation = self.phone_history_generation.wrapping_add(1);
+        self.phone_history_active = false;
+        self.phone_history_status = "Phiên đồng bộ đã thay đổi; hãy yêu cầu lại".into();
+        self.group_history_status = "Lịch sử nhóm: chờ yêu cầu của phiên hiện tại".into();
         emoji_text::reset_pending(ctx);
         self.native_photo_pending = false;
         self.original_reaction_import_pending = false;
@@ -1312,6 +1347,49 @@ impl ZaloGuiApp {
                         self.persist_threads_async();
                     }
                 }
+                GuiEvent::PhoneHistoryStatus {
+                    generation,
+                    account,
+                    message,
+                    active,
+                } => {
+                    if phone_history::accepts_event(
+                        self.is_logged_in,
+                        self.phone_history_generation,
+                        &self.user_uin,
+                        generation,
+                        &account,
+                    ) {
+                        self.phone_history_status = message;
+                        self.phone_history_active = active;
+                    }
+                }
+                GuiEvent::PhoneHistoryThreads {
+                    generation,
+                    account,
+                    threads,
+                } => {
+                    if phone_history::accepts_event(
+                        self.is_logged_in,
+                        self.phone_history_generation,
+                        &self.user_uin,
+                        generation,
+                        &account,
+                    ) {
+                        apply_import_delta(&mut self.threads, threads);
+                        self.persist_threads_async();
+                        self.replay_reactions_async();
+                    }
+                }
+                GuiEvent::GroupHistoryStatus(status) => self.group_history_status = status,
+                GuiEvent::GroupHistoryThreads { account, threads } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        apply_import_delta(&mut self.threads, threads);
+                        self.persist_threads_async();
+                        self.replay_reactions_async();
+                    }
+                }
+
                 GuiEvent::ReactionEvents { account } => {
                     if self.is_logged_in && self.user_uin == account {
                         self.replay_reactions_async();
@@ -1412,6 +1490,8 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::SessionExpired(reason) => {
                     self.original_reaction_import_pending = false;
+                    self.phone_history_generation = self.phone_history_generation.wrapping_add(1);
+                    self.phone_history_active = false;
                     self.is_logged_in = false;
                     self.qr_texture = None;
                     self.qr_status = format!(
@@ -1439,6 +1519,8 @@ impl ZaloGuiApp {
                     self.local_history_tombstones.clear();
                     self.history_revisions.clear();
                     self.original_reaction_import_pending = false;
+                    self.phone_history_generation = self.phone_history_generation.wrapping_add(1);
+                    self.phone_history_active = false;
                     self.is_logged_in = false;
                     self.user_name.clear();
                     self.user_uin.clear();
