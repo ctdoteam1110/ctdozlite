@@ -68,9 +68,9 @@ pub async fn decode_image(bytes: &[u8], quality: ImageQuality) -> Result<RgbaIma
         bail!("Image input exceeds preview limits");
     }
     let owned = bytes.to_vec();
-    let raster = tokio::task::spawn_blocking(move || decode_raster(&owned, quality))
+    let raster = crate::runtime_scope::spawn_blocking(move || decode_raster(&owned, quality))
         .await
-        .context("Image decode task failed")?;
+        .context("Image decode task failed")??;
     match raster {
         Ok(image) => Ok(image),
         Err(_) => decode_native(bytes, quality).await,
@@ -89,13 +89,16 @@ async fn decode_native(bytes: &[u8], quality: ImageQuality) -> Result<RgbaImage>
     let helper = packaged.filter(|path| path.is_file()).unwrap_or_else(|| {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("native/macos/build/MediaPreview")
     });
-    let mut child = tokio::process::Command::new(helper)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .context("Media preview helper unavailable")?;
+    let mut child = {
+        let _guard = crate::runtime_scope::mutation()?;
+        tokio::process::Command::new(helper)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Media preview helper unavailable")?
+    };
     let mut stdin = child
         .stdin
         .take()
@@ -132,9 +135,9 @@ async fn decode_native(bytes: &[u8], quality: ImageQuality) -> Result<RgbaImage>
     let output = tokio::time::timeout(std::time::Duration::from_secs(10), operation)
         .await
         .context("Media preview helper timed out")??;
-    tokio::task::spawn_blocking(move || decode_raster(&output, quality))
+    crate::runtime_scope::spawn_blocking(move || decode_raster(&output, quality))
         .await
-        .context("Preview decode task failed")?
+        .context("Preview decode task failed")??
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -300,7 +303,7 @@ async fn load_one(
     let disk_key = key.clone();
     let read_root = root.to_owned();
     let write_root = root.to_owned();
-    let cached = tokio::task::spawn_blocking(move || {
+    let cached = crate::runtime_scope::spawn_blocking(move || {
         use std::io::Read;
         let cache = PrivateMediaCache::new(&read_root, &disk_key.account).ok()?;
         let path = cache.path_for(&disk_key).ok()?;
@@ -312,7 +315,8 @@ async fn load_one(
         (bytes.len() <= PREVIEW_LIMIT).then_some(bytes)
     })
     .await
-    .map_err(|_| MediaError::Io)?;
+    .map_err(|_| MediaError::Io)?
+    .map_err(|_| MediaError::Cancelled)?;
     if let Some(bytes) = cached {
         if let Ok(image) = decode_image(&bytes, quality).await {
             generation.check(ticket)?;
@@ -325,7 +329,7 @@ async fn load_one(
         .map_err(|_| MediaError::Decoder)?;
     generation.check(ticket)?;
     let generation_copy = generation.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::runtime_scope::spawn_blocking(move || {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let Ok(cache) = PrivateMediaCache::new(&write_root, &key.account) else {
             return;
@@ -346,7 +350,8 @@ async fn load_one(
         let _ = cache.prune();
     })
     .await
-    .map_err(|_| MediaError::Io)?;
+    .map_err(|_| MediaError::Io)?
+    .map_err(|_| MediaError::Cancelled)?;
     generation.check(ticket)?;
     Ok(image)
 }
@@ -523,7 +528,7 @@ pub(super) async fn prepare_native_photo(client: &reqwest::Client, key: crate::m
     generation.check(ticket)?;
     let root = root.to_owned();
     let generation = generation.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::runtime_scope::spawn_blocking(move || {
         use std::io::Read;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let cache = PrivateMediaCache::new(&root, &key.account)?;
@@ -543,5 +548,5 @@ pub(super) async fn prepare_native_photo(client: &reqwest::Client, key: crate::m
         generation.check(ticket)?;
         file.commit()?;
         Ok(NativePhotoLease(lease))
-    }).await.map_err(|_| MediaError::Io)?
+    }).await.map_err(|_| MediaError::Io)?.map_err(|_| MediaError::Cancelled)?
 }

@@ -36,9 +36,10 @@ pub(super) async fn open(
     if !cfg!(target_os = "macos") {
         return Err(MediaError::Io);
     }
-    let helper = tokio::task::spawn_blocking(helper_path)
+    let helper = crate::runtime_scope::spawn_blocking(helper_path)
         .await
-        .map_err(|_| MediaError::Io)?;
+        .map_err(|_| MediaError::Io)?
+        .map_err(|_| MediaError::Cancelled)?;
     open_at(
         client,
         current_account,
@@ -78,17 +79,20 @@ async fn open_at(
     )
     .await?;
     // No shell and no remote URL reaches the helper. The lease is held until child exit/drop.
-    let mut child = tokio::process::Command::new(helper)
-        .arg("--file")
-        .arg(file.path())
-        .arg("--mime")
-        .arg("image/*")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| MediaError::Io)?;
+    let mut child = {
+        let _guard = crate::runtime_scope::mutation().map_err(|_| MediaError::Cancelled)?;
+        tokio::process::Command::new(helper)
+            .arg("--file")
+            .arg(file.path())
+            .arg("--mime")
+            .arg("image/*")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| MediaError::Io)?
+    };
     let result = child.wait().await.map_err(|_| MediaError::Io)?;
     if result.success() {
         Ok(())

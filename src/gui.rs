@@ -995,7 +995,10 @@ impl ZaloGuiApp {
         }
     }
 
-    fn reset_epoch_inflight(&mut self) {
+    fn reset_epoch_inflight(&mut self, ctx: &egui::Context) {
+        emoji_text::reset_pending(ctx);
+        self.native_photo_pending = false;
+        self.original_reaction_import_pending = false;
         reset_epoch_loading(
             &mut [&mut self.loading_stickers, &mut self.composer_sticker_loading,
                 &mut self.loading_link_previews, &mut self.checking_friend_status],
@@ -1057,7 +1060,7 @@ impl ZaloGuiApp {
                     let transition = is_epoch_transition(&event);
                     if let Some(tx) = WORKER_TX.get() {
                         if transition {
-                            if tx.ui_generation() != scope.generation { self.reset_epoch_inflight(); }
+                            if tx.ui_generation() != scope.generation { self.reset_epoch_inflight(ctx); }
                             tx.acknowledge_ui_generation(scope.generation);
                         }
                         else if !epoch_event_allowed(tx.ui_generation(), scope.generation, &event) { continue; }

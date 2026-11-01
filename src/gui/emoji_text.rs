@@ -246,6 +246,13 @@ fn cache(ctx: &egui::Context) -> SharedCache {
     })
 }
 
+/// Release cancelled jobs while retaining completed images and font-independent caches.
+pub(super) fn reset_pending(ctx: &egui::Context) {
+    if let Ok(mut cache) = cache(ctx).lock() {
+        cache.pending.clear();
+    }
+}
+
 /// Share the six already-loaded reaction textures without decoding again during layout.
 pub(super) fn register_reactions(ctx: &egui::Context, reactions: &HashMap<String, TextureHandle>) {
     if let Ok(mut cache) = cache(ctx).lock() {
@@ -388,12 +395,15 @@ fn native_preview(cluster: &str) -> Option<Vec<u8>> {
     } else {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("native/macos/build/EmojiPreview")
     };
-    let mut child = Command::new(helper)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let mut child = {
+        let _guard = crate::runtime_scope::mutation().ok()?;
+        Command::new(helper)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?
+    };
     if child.stdin.take()?.write_all(cluster.as_bytes()).is_err() {
         let _ = child.kill();
         let _ = child.wait();
@@ -1031,3 +1041,27 @@ pub(super) fn seed_worker_results(
 #[cfg(test)]
 #[path = "emoji_text/visual_tests.rs"]
 mod visual_tests;
+
+#[cfg(test)]
+mod scope_hook_tests {
+    use super::*;
+
+    #[test]
+    fn emoji_epoch_reset_releases_pending_but_retains_completed_cache() {
+        let ctx = egui::Context::default();
+        let shared = cache(&ctx);
+        let pending = ImageKey::Native("pending".to_owned());
+        let completed = ImageKey::Native("completed".to_owned());
+        {
+            let mut cache = shared.lock().unwrap();
+            cache.pending.insert(pending.clone());
+            cache.insert(completed.clone(), Cached::Failed);
+        }
+        reset_pending(&ctx);
+        let mut cache = shared.lock().unwrap();
+        assert!(cache.pending.is_empty());
+        assert!(cache.entries.contains_key(&completed));
+        assert_eq!(cache.order.len(), 1);
+        assert!(cache.pending.insert(pending));
+    }
+}

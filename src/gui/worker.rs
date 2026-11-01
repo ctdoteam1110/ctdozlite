@@ -279,9 +279,10 @@ async fn process_original_reaction_import(
     } else {
         // No session or journal locks are held while an explicit native picker is open.
         let selected = if pick_file {
-            tokio::task::spawn_blocking(|| pick_native_file_dialog(false))
+            crate::runtime_scope::spawn_blocking(|| pick_native_file_dialog(false))
                 .await
                 .map_err(|_| ImportError::Worker)
+                .and_then(|result| result.map_err(|_| ImportError::StaleAccount))
         } else {
             Ok(selected)
         };
@@ -291,8 +292,12 @@ async fn process_original_reaction_import(
             Ok(Some(selected)) => {
                 let _lane = REACTION_JOURNAL_LANE.lock().await;
                 let import_account = account.clone();
-                match tokio::task::spawn_blocking(move || {
+                match crate::runtime_scope::spawn_blocking(move || {
                     let current = session.blocking_lock();
+                    let _guard = match crate::runtime_scope::mutation() {
+                        Ok(guard) => guard,
+                        Err(_) => return Err(ImportError::StaleAccount),
+                    };
                     if current.login.as_ref().map(|l| l.uin.as_str())
                         != Some(import_account.as_str())
                         || current.zpw_sek != captured.zpw_sek
@@ -308,7 +313,8 @@ async fn process_original_reaction_import(
                 })
                 .await
                 {
-                    Ok(result) => result,
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) => Err(ImportError::StaleAccount),
                     Err(_) => Err(ImportError::Worker),
                 }
             }
@@ -358,10 +364,11 @@ async fn process_reaction_journal_at(
     }
     let _lane = REACTION_JOURNAL_LANE.lock().await;
     let result =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<(String, Vec<Thread>)>> {
+        crate::runtime_scope::spawn_blocking(move || -> anyhow::Result<Option<(String, Vec<Thread>)>> {
             // Keep the account stable through all journal side effects. The runtime epoch fence
             // additionally rejects same-account reauthentication and queued stale UI results.
             let current = session.blocking_lock();
+            let _guard = crate::runtime_scope::mutation()?;
             if current.login.as_ref().map(|l| &l.uin) != Some(&account)
                 || current.zpw_sek != captured.zpw_sek
             {
@@ -379,7 +386,7 @@ async fn process_reaction_journal_at(
         })
         .await;
     match result {
-        Ok(Ok(Some((account, threads)))) => {
+        Ok(Ok(Ok(Some((account, threads))))) => {
             let event = if threads.is_empty() {
                 GuiEvent::ReactionEvents { account }
             } else {
@@ -387,7 +394,8 @@ async fn process_reaction_journal_at(
             };
             let _ = sender.send(event);
         }
-        Ok(Ok(None)) => {}
+        Ok(Ok(Ok(None))) => {}
+        Ok(Err(_)) => {}
         _ => {
             let _ = sender.send(GuiEvent::StatusUpdate(
                 "Chưa lưu hoặc khôi phục được sự kiện thả cảm xúc; vui lòng thử đồng bộ lại".into(),
@@ -892,7 +900,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let captured = session.lock().await.clone();
                             let session = session.clone();
                             let sender = gui_tx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let pick_file = path.is_none();
                                 process_original_reaction_import(std::path::PathBuf::from("."), session, captured, sender, account, path, pick_file).await;
                             });
@@ -900,14 +908,18 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         WorkerCmd::ReplayReactions { account, threads } => {
                             let captured = session.lock().await.clone();
                             if captured.login.as_ref().map(|l| l.uin.as_str()) == Some(account.as_str()) {
-                                process_reaction_journal(session.clone(), captured, gui_tx.clone(), Vec::new(), threads).await;
+                                let session = session.clone();
+                                let sender = gui_tx.clone();
+                                crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
+                                    process_reaction_journal(session, captured, sender, Vec::new(), threads).await;
+                                });
                             }
                         }
                         WorkerCmd::ImportHistory { account, path } => {
                             let tx = gui_tx.clone();
                             let ctx = egui_ctx.clone();
                             let current = session.lock().await.login.as_ref().map(|info| info.uin.clone()).unwrap_or_default();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let result = if current != account || account.is_empty() {
                                     Err("Account mismatch".to_owned())
                                 } else {
@@ -926,7 +938,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 continue;
                             };
                             let snapshot = session.lock().await.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let _permit = permit;
                                 let account = snapshot.login.as_ref().map(|info| info.uin.as_str()).unwrap_or_default();
                                 let result = super::native_photo_viewer::open(&snapshot.http, account, key.clone(), &url).await;
@@ -944,7 +956,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 let _ = tx.send(GuiEvent::PhotoPreviewReady { account: key.account, key: texture, result: Err(crate::media_resources::MediaError::Cancelled) });
                                 continue;
                             };
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let permit = admission.start().await;
                                 let result = if snapshot.login.as_ref().map(|info| info.uin.as_str()) != Some(key.account.as_str()) { Err(crate::media_resources::MediaError::AccountMismatch) }
                                 else if let Some(_permit) = permit {
@@ -962,7 +974,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let tx = gui_tx.clone();
                             let ctx = egui_ctx.clone();
                             if session.lock().await.login.as_ref().map(|info| info.uin.as_str()) == Some(account.as_str()) {
-                                tokio::spawn(async move {
+                                crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                     let result = crate::native_notifications::deliver(&account, &thread, &message, sound).await;
                                     let _ = tx.send(GuiEvent::IncomingNotificationFinished { result });
                                     ctx.request_repaint();
@@ -1981,7 +1993,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         WorkerCmd::SendWithMentions { to_id, text, mentions, quoted } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), async move {
                                 let s = session_clone.lock().await.clone();
                                 let client_id = crate::chat::next_client_message_id();
                                 // Keep raw text/offsets intact instead of rewriting a URL into link-card params.
@@ -2325,7 +2337,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::RenderInlineEmoji { cluster, sprite_id } => {
-                            tokio::spawn(render_inline_emoji(cluster, sprite_id, gui_tx.clone()));
+                            crate::runtime_scope::spawn_scoped(command_scope.clone(), render_inline_emoji(cluster, sprite_id, gui_tx.clone()));
                         }
                         WorkerCmd::FetchStickerImage { key, url } => {
                             let session_clone = session.clone();
@@ -3314,7 +3326,7 @@ mod reaction_consumer_tests {
         let captured = session_fixture("account-a");
         let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
         let (tx, rx) = channel();
-        let sender = GuiTx { tx, ctx: egui::Context::default() };
+        let sender = GuiTx { scope: None, tx, ctx: egui::Context::default() };
         process_reaction_journal_at(root.clone(), session, captured, sender, Vec::new(), Vec::new()).await;
         assert!(!root.exists());
         assert!(rx.try_recv().is_err());
@@ -3327,6 +3339,7 @@ mod reaction_consumer_tests {
         let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
         let (tx, rx) = channel();
         let sender = GuiTx {
+            scope: None,
             tx,
             ctx: egui::Context::default(),
         };
@@ -3383,6 +3396,7 @@ mod reaction_consumer_tests {
         let session = std::sync::Arc::new(tokio::sync::Mutex::new(session_fixture("account-b")));
         let (tx, rx) = channel();
         let sender = GuiTx {
+            scope: None,
             tx,
             ctx: egui::Context::default(),
         };
@@ -3407,6 +3421,7 @@ mod reaction_consumer_tests {
         let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
         let (tx, rx) = channel();
         let sender = GuiTx {
+            scope: None,
             tx,
             ctx: egui::Context::default(),
         };
@@ -3427,8 +3442,9 @@ mod reaction_consumer_tests {
 
 
 async fn import_history_async(path: std::path::PathBuf, database: String) -> Result<(crate::store::ImportReport, Vec<Thread>), String> {
-    tokio::task::spawn_blocking(move || crate::store::import_history_delta_from_path(&path, &database).map_err(|_| "History import failed".to_owned()))
-        .await.map_err(|_| "Import task failed".to_owned()).and_then(|result| result)
+    crate::runtime_scope::spawn_blocking(move || crate::store::import_history_delta_from_path(&path, &database).map_err(|_| "History import failed".to_owned()))
+        .await.map_err(|_| "Import task failed".to_owned())?
+        .map_err(|_| "Import session expired".to_owned())?
 }
 
 #[cfg(test)]
@@ -3518,7 +3534,7 @@ async fn render_inline_emoji(cluster: String, sprite_id: Option<u16>, gui_tx: Gu
         .clone();
     let key = cluster.clone();
     let image = match slots.acquire_owned().await {
-        Ok(permit) => tokio::task::spawn_blocking(move || {
+        Ok(permit) => crate::runtime_scope::spawn_blocking(move || {
             let _permit = permit;
             match sprite_id {
                 Some(sprite) => super::emoji_text::render_original(sprite),
@@ -3527,6 +3543,7 @@ async fn render_inline_emoji(cluster: String, sprite_id: Option<u16>, gui_tx: Gu
         })
         .await
         .ok()
+        .and_then(Result::ok)
         .flatten(),
         Err(_) => None,
     };
@@ -3554,6 +3571,7 @@ mod inline_emoji_native_tests {
                 cluster.into(),
                 None,
                 GuiTx {
+            scope: None,
                     tx: tx.clone(),
                     ctx: ctx.clone(),
                 },
@@ -3647,6 +3665,7 @@ mod original_reaction_import_consumer_tests {
         let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
         let (tx, rx) = channel();
         let sender = GuiTx {
+            scope: None,
             tx,
             ctx: egui::Context::default(),
         };
@@ -3697,6 +3716,7 @@ mod original_reaction_import_consumer_tests {
         let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
         let (tx, rx) = channel();
         let sender = GuiTx {
+            scope: None,
             tx,
             ctx: egui::Context::default(),
         };
@@ -3767,6 +3787,7 @@ mod original_reaction_import_consumer_tests {
         let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
         let (tx, rx) = channel();
         let sender = GuiTx {
+            scope: None,
             tx,
             ctx: egui::Context::default(),
         };
@@ -3841,6 +3862,7 @@ mod delivery_consumer_tests {
         let current = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
         let (tx, rx) = std::sync::mpsc::channel();
         let sender = GuiTx {
+            scope: None,
             tx,
             ctx: egui::Context::default(),
         };
@@ -3870,6 +3892,7 @@ mod delivery_consumer_tests {
         )));
         let (tx, rx) = std::sync::mpsc::channel();
         let sender = GuiTx {
+            scope: None,
             tx,
             ctx: egui::Context::default(),
         };
@@ -3927,5 +3950,69 @@ mod runtime_tests {
         assert_eq!(receiver.try_recv().unwrap().0, 9);
         bridge.send_at(7, WorkerCmd::PollMessages { known_threads: Vec::new() }).unwrap();
         assert_eq!(receiver.try_recv().unwrap().0, 7);
+    }
+}
+
+#[cfg(test)]
+mod integrated_epoch_tests {
+    use super::*;
+    fn session_fixture() -> Session {
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo { uin: "account-a".into(), ..Default::default() });
+        session.zpw_sek = Some("fixture-session".into());
+        session
+    }
+    #[tokio::test]
+    async fn runtime_new_receipt_consumer_rejects_same_account_aba_with_identical_credentials() {
+        let _serial = crate::runtime_scope::tests::TEST_LOCK.lock().await;
+        let old = crate::runtime_scope::transition("account-a").unwrap();
+        crate::runtime_scope::transition("account-b").unwrap();
+        let current = crate::runtime_scope::transition("account-a").unwrap();
+        let captured = session_fixture();
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let (tx, rx) = channel();
+        let sender = GuiTx::for_test(tx);
+        let payload = serde_json::json!({"delivereds":[{"threadId":"peer-fixture","msgId":"message-fixture"}]});
+        crate::runtime_scope::run_stale_for_test(old, async {
+            dispatch_delivery_receipts(&session, &captured, &sender, 502, 0, &payload).await;
+        }).await;
+        assert!(rx.try_recv().is_err());
+        crate::runtime_scope::run(current.clone(), async {
+            dispatch_delivery_receipts(&session, &captured, &sender, 502, 0, &payload).await;
+        }).await.unwrap();
+        let GuiEvent::Scoped { scope, event } = rx.try_recv().unwrap() else { panic!("receipt lost its epoch"); };
+        assert_eq!(scope, current);
+        assert!(matches!(*event, GuiEvent::DeliveryEvents { .. }));
+    }
+    #[tokio::test]
+    async fn runtime_new_journal_and_import_consumers_never_write_after_same_account_aba() {
+        let _serial = crate::runtime_scope::tests::TEST_LOCK.lock().await;
+        let old = crate::runtime_scope::transition("account-a").unwrap();
+        crate::runtime_scope::transition("account-b").unwrap();
+        crate::runtime_scope::transition("account-a").unwrap();
+        let root = std::env::temp_dir().join(format!("zl-integrated-epoch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("explicit.json");
+        let bytes = serde_json::to_vec(&serde_json::json!({"schema":1,"account_id":"account-a","source":"zalo-macos-local-cache","captured_at_ms":1700000000000_i64,"snapshots":[]})).unwrap();
+        std::fs::write(&source, &bytes).unwrap();
+        let captured = session_fixture();
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let (tx, rx) = channel();
+        let sender = GuiTx::for_test(tx);
+        let events = crate::reaction_journal::account_events(&serde_json::json!({"reacts":[{
+            "idTo":"account-a","uidFrom":"peer-fixture","msgId":"event-fixture","ts":1700000000000_i64,
+            "content":{"rType":5,"rMsg":[{"gMsgID":"message-fixture"}]}
+        }]}), "account-a");
+        assert!(!events.is_empty());
+        crate::runtime_scope::run_stale_for_test(old, async {
+            process_reaction_journal_at(root.join("journal"), session.clone(), captured.clone(), sender.clone(), events, Vec::new()).await;
+            process_original_reaction_import(root.join("managed"), session, captured, sender, "account-a".into(), Some(source.clone()), false).await;
+        }).await;
+        assert!(!root.join("journal").exists());
+        assert!(!root.join("managed").exists());
+        assert_eq!(std::fs::read(source).unwrap(), bytes);
+        assert!(rx.try_recv().is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

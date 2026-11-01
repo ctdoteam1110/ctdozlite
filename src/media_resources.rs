@@ -151,6 +151,7 @@ pub struct AtomicPrivateFile {
 }
 impl AtomicPrivateFile {
     pub fn create(destination: &Path, suffix: &str) -> Result<Self, MediaError> {
+        let _guard = crate::runtime_scope::mutation().map_err(|_| MediaError::Cancelled)?;
         if suffix.is_empty()
             || suffix.len() > 96
             || !suffix
@@ -176,6 +177,7 @@ impl AtomicPrivateFile {
         })
     }
     pub fn write_all(&mut self, bytes: &[u8]) -> Result<(), MediaError> {
+        let _guard = crate::runtime_scope::mutation().map_err(|_| MediaError::Cancelled)?;
         self.file
             .as_mut()
             .ok_or(MediaError::Io)?
@@ -183,6 +185,7 @@ impl AtomicPrivateFile {
             .map_err(|_| MediaError::Io)
     }
     pub fn commit(mut self) -> Result<(), MediaError> {
+        let _guard = crate::runtime_scope::mutation().map_err(|_| MediaError::Cancelled)?;
         self.file
             .as_ref()
             .ok_or(MediaError::Io)?
@@ -252,6 +255,7 @@ pub struct PrivateMediaCache {
 }
 impl PrivateMediaCache {
     pub fn new(root: &Path, account: &str) -> Result<Self, MediaError> {
+        let _guard = crate::runtime_scope::mutation().map_err(|_| MediaError::Cancelled)?;
         if account.is_empty() {
             return Err(MediaError::AccountMismatch);
         }
@@ -275,6 +279,7 @@ impl PrivateMediaCache {
         Ok(self.directory.join(format!("{}.media", key.cache_id())))
     }
     pub fn touch(&self, key: &MediaKey) -> Result<(), MediaError> {
+        let _guard = crate::runtime_scope::mutation().map_err(|_| MediaError::Cancelled)?;
         let path = self.path_for(key)?;
         let file = std::fs::File::open(path).map_err(|_| MediaError::Io)?;
         file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
@@ -282,6 +287,7 @@ impl PrivateMediaCache {
     }
     /// Only cache-owned regular .media files are candidates; saved originals are not tracked.
     pub fn prune(&self) -> Result<u64, MediaError> {
+        let _guard = crate::runtime_scope::mutation().map_err(|_| MediaError::Cancelled)?;
         let mut entries = Vec::new();
         let mut total = 0u64;
         for entry in std::fs::read_dir(&self.directory).map_err(|_| MediaError::Io)? {
@@ -449,5 +455,50 @@ mod admission_and_drop_tests {
         assert!(!partial.exists());
         assert!(!destination.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod scope_hook_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn media_scope_delayed_blocking_keeps_ticket_after_invalidation() {
+        let _serial = crate::runtime_scope::tests::TEST_LOCK.lock().await;
+        let scope = crate::runtime_scope::transition("media-delayed-fixture").unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = crate::runtime_scope::run_stale_for_test(scope, async {
+            crate::runtime_scope::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                crate::runtime_scope::mutation().is_err()
+            })
+        }).await;
+        started_rx.await.unwrap();
+        crate::runtime_scope::registry().invalidate_now();
+        release_tx.send(()).unwrap();
+        assert!(task.await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn media_scope_stale_blocking_cannot_publish_or_create_cache() {
+        let _serial = crate::runtime_scope::tests::TEST_LOCK.lock().await;
+        let scope = crate::runtime_scope::transition("media-scope-fixture").unwrap();
+        let root = std::env::temp_dir().join(format!("media-scope-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let destination = root.join("saved.media");
+        let mut file = AtomicPrivateFile::create(&destination, "stale-test").unwrap();
+        file.write_all(b"private").unwrap();
+        crate::runtime_scope::registry().invalidate_now();
+        let result = crate::runtime_scope::run_stale_for_test(scope, async {
+            assert_eq!(file.commit(), Err(MediaError::Cancelled));
+            assert!(matches!(PrivateMediaCache::new(&root, "a"), Err(MediaError::Cancelled)));
+            crate::runtime_scope::spawn_blocking(|| panic!("stale operation executed")).await.unwrap()
+        }).await;
+        assert!(result.is_err());
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir(&root).unwrap();
     }
 }

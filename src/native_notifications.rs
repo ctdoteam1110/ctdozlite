@@ -84,14 +84,17 @@ async fn invoke(
     command: &str,
     deadline: Duration,
 ) -> Result<AuthorizationStatus, NotificationError> {
-    let mut child = tokio::process::Command::new(path)
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| NotificationError::HelperUnavailable)?;
+    let mut child = {
+        let _guard = crate::runtime_scope::mutation().map_err(|_| NotificationError::Io)?;
+        tokio::process::Command::new(path)
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| NotificationError::HelperUnavailable)?
+    };
     let operation = async {
         let mut output = Vec::new();
         child
@@ -534,14 +537,17 @@ async fn deliver_at_with_deadline(
         "id": delivery_id(account, thread, message), "sound": sound,
     }))
     .map_err(|_| NotificationError::InvalidResponse)?;
-    let mut child = tokio::process::Command::new(path)
-        .arg("--notify")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| NotificationError::HelperUnavailable)?;
+    let mut child = {
+        let _guard = crate::runtime_scope::mutation().map_err(|_| NotificationError::Io)?;
+        tokio::process::Command::new(path)
+            .arg("--notify")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| NotificationError::HelperUnavailable)?
+    };
     let operation = async {
         let mut stdin = child.stdin.take().ok_or(NotificationError::Io)?;
         stdin
@@ -592,4 +598,21 @@ pub async fn deliver(
         return Err(NotificationError::HelperUnavailable);
     }
     deliver_at(&helper_path(), account, thread, message, sound).await
+}
+
+#[cfg(all(test, unix))]
+mod scope_hook_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_scope_stale_delivery_never_spawns_helper() {
+        let _serial = crate::runtime_scope::tests::TEST_LOCK.lock().await;
+        let scope = crate::runtime_scope::transition("native-scope-fixture").unwrap();
+        crate::runtime_scope::registry().invalidate_now();
+        // An absent executable distinguishes rejection at the scope gate from spawn failure.
+        let result = crate::runtime_scope::run_stale_for_test(scope, async {
+            deliver_at(Path::new("/missing-scope-fixture/helper"), "a", "t", "m", false).await
+        }).await;
+        assert_eq!(result, Err(NotificationError::Io));
+    }
 }
