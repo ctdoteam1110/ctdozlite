@@ -291,12 +291,15 @@ jobs:
           cargo build --release --locked --bin ctdozlite
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target\release\ctdozlite.exe "dist\ctdozlite-$($env:VERSION)-portable-windows-x86_64.exe"
+          Compress-Archive -Path "dist\ctdozlite-$($env:VERSION)-portable-windows-x86_64.exe","README.md","LICENSE-MIT","LICENSE-APACHE" -DestinationPath "dist\ctdozlite-$($env:VERSION)-portable-windows-x86_64.zip" -Force
           iscc "/DMyAppVersion=$($env:VERSION)" packaging\windows\installer.iss
           Move-Item dist\ctdozlite-setup-windows-x86_64.exe "dist\ctdozlite-$($env:VERSION)-setup-windows-x86_64.exe" -Force
       - uses: actions/upload-artifact@v4
         with:
           name: ctdozlite-windows-exe
-          path: dist/*.exe
+          path: |
+            dist/*.exe
+            dist/*.zip
 
   macos-dmg:
     name: macOS (Apple Silicon arm64 + Intel x86_64 + Universal .dmg)

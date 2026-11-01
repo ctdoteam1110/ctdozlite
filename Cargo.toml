@@ -82,4 +82,7 @@ assets = [
 ]
 
 [profile.release]
-strip = true
+# Preserve PE debug/symbol metadata on Windows MSVC builds so unsigned binaries and
+# Inno Setup installers do not trigger Microsoft Defender's stripped-PE ML heuristics (#58).
+# Linux release jobs run `strip` explicitly in CI.
+strip = "none"

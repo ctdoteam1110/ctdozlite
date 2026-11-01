@@ -25,8 +25,19 @@ PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=..\..\dist
 OutputBaseFilename=ctdozlite-setup-windows-x86_64
 SetupIconFile=..\..\src\assets\app_icon.ico
-Compression=lzma2
-SolidCompression=yes
+; Use standard ZIP/DEFLATE non-solid packaging instead of solid LZMA2 streams and
+; embed complete PE VersionInfo metadata so unsigned Inno Setup installers do not
+; trigger Microsoft Defender ML Trojan false positives (#58).
+Compression=zip/9
+SolidCompression=no
+SignedUninstaller=no
+VersionInfoVersion={#MyAppVersion}.0
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription=ctdozlite Native Desktop Client Installer
+VersionInfoTextVersion={#MyAppVersion}
+VersionInfoProductName={#MyAppName}
+VersionInfoProductVersion={#MyAppVersion}.0
+VersionInfoCopyright=Copyright (C) 2026 ctdoteam1110 (MIT OR Apache-2.0)
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible

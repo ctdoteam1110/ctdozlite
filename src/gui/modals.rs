@@ -2334,6 +2334,276 @@ impl ZaloGuiApp {
         }
     }
 
+    pub(super) fn render_update_notification_modal(
+        &mut self,
+        ctx: &egui::Context,
+        pal: &ThemePalette,
+    ) {
+        if !self.update_modal_open {
+            return;
+        }
+        let Some(info) = self.update_info.clone().filter(|u| u.has_update) else {
+            self.update_modal_open = false;
+            return;
+        };
+        if ctx.input(|i| i.key_pressed(Key::Escape)) && !self.update_downloading {
+            self.update_modal_open = false;
+            return;
+        }
+
+        let mut open = true;
+        let mut trigger_download = false;
+        let mut skip_this_version = false;
+        let mut remind_later = false;
+
+        egui::Window::new("🚀 Có bản cập nhật mới từ GitHub Releases")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(480.0)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(pal.bg_elevated)
+                    .rounding(Rounding::same(12.0))
+                    .stroke(Stroke::new(1.4_f32, pal.accent_online))
+                    .inner_margin(Margin::symmetric(20.0, 16.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let (icon_r, _) = ui.allocate_exact_size(Vec2::splat(42.0), Sense::hover());
+                    if let Some(ref logo) = self.app_logo_texture {
+                        ui.painter().image(
+                            logo.id(),
+                            icon_r,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    } else {
+                        ui.painter().rect_filled(
+                            icon_r,
+                            Rounding::same(10.0),
+                            pal.accent_online.linear_multiply(0.20),
+                        );
+                    }
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} (v{} ➔ v{})",
+                                info.release_title, info.current_version, info.latest_version
+                            ))
+                            .size(14.5)
+                            .color(pal.text_primary)
+                            .strong(),
+                        );
+                        let mut meta_parts = Vec::new();
+                        if !info.published_at.is_empty() {
+                            meta_parts.push(format!("Phát hành: {}", info.published_at));
+                        }
+                        if info.asset_size > 0 {
+                            let mb = (info.asset_size as f64) / (1024.0 * 1024.0);
+                            meta_parts.push(format!("Dung lượng: {mb:.1} MB"));
+                        }
+                        if info.expected_sha256.is_some() {
+                            meta_parts.push("🔒 Đã xác thực SHA-256".to_string());
+                        }
+                        if !meta_parts.is_empty() {
+                            ui.label(
+                                RichText::new(meta_parts.join("  ·  "))
+                                    .size(11.5)
+                                    .color(pal.text_secondary),
+                            );
+                        }
+                    });
+                });
+
+                let bullets = extract_concise_changelog(&info.release_notes);
+                if !bullets.is_empty() {
+                    ui.add_space(10.0);
+                    egui::Frame::none()
+                        .fill(pal.bg_input)
+                        .stroke(Stroke::new(1.0_f32, pal.border))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::symmetric(12.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Điểm mới trong phiên bản v{}:",
+                                    info.latest_version
+                                ))
+                                .size(12.0)
+                                .color(pal.text_primary)
+                                .strong(),
+                            );
+                            ui.add_space(4.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(150.0)
+                                .show(ui, |ui| {
+                                    for b in bullets.iter().take(8) {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(
+                                                RichText::new("•")
+                                                    .size(12.0)
+                                                    .color(pal.accent_online)
+                                                    .strong(),
+                                            );
+                                            ui.label(
+                                                RichText::new(b)
+                                                    .size(12.0)
+                                                    .color(pal.text_secondary),
+                                            );
+                                        });
+                                        ui.add_space(2.0);
+                                    }
+                                });
+                        });
+                }
+
+                if self.update_downloading {
+                    ui.add_space(10.0);
+                    let (dl_bytes, tot_bytes) = self.update_progress.unwrap_or((0, 0));
+                    let frac = if tot_bytes > 0 {
+                        (dl_bytes as f32 / tot_bytes as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.35
+                    };
+                    let dl_mb = dl_bytes as f64 / (1024.0 * 1024.0);
+                    let tot_mb = tot_bytes as f64 / (1024.0 * 1024.0);
+                    let p_txt = if tot_bytes > 0 {
+                        format!(
+                            "Đang tải bản cập nhật: {dl_mb:.1} / {tot_mb:.1} MB ({:.0}%)",
+                            frac * 100.0
+                        )
+                    } else {
+                        format!("Đang tải bản cập nhật: {dl_mb:.1} MB…")
+                    };
+                    ui.add(egui::ProgressBar::new(frac).text(p_txt).animate(true));
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Ứng dụng sẽ tự động xác thực SHA-256 và khởi động lại ngay khi tải xong.",
+                        )
+                        .size(11.2)
+                        .color(pal.text_muted),
+                    );
+                } else if self.update_status.starts_with("Lỗi")
+                    || self.update_status.starts_with("⚠️")
+                {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(&self.update_status)
+                            .size(12.0)
+                            .color(pal.danger),
+                    );
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if info.download_url.is_some() && info.asset_name.is_some() {
+                        let btn_lbl = if self.update_downloading {
+                            "⏳ Đang cập nhật…".to_string()
+                        } else {
+                            format!("⬇ Cập nhật ngay (v{})", info.latest_version)
+                        };
+                        let upd_btn = egui::Button::new(
+                            RichText::new(btn_lbl)
+                                .size(12.5)
+                                .color(Color32::WHITE)
+                                .strong(),
+                        )
+                        .fill(pal.accent_online)
+                        .rounding(Rounding::same(8.0))
+                        .min_size(Vec2::new(165.0, 34.0));
+                        if ui
+                            .add_enabled(!self.update_downloading, upd_btn)
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            trigger_download = true;
+                        }
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("🌐 Xem trên GitHub")
+                                    .size(12.0)
+                                    .color(pal.text_primary),
+                            )
+                            .fill(pal.bg_input)
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .rounding(Rounding::same(8.0))
+                            .min_size(Vec2::new(124.0, 34.0)),
+                        )
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        open_external_url(&info.html_url);
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                !self.update_downloading,
+                                egui::Button::new(
+                                    RichText::new("Để sau")
+                                        .size(12.0)
+                                        .color(pal.text_secondary),
+                                )
+                                .fill(Color32::TRANSPARENT),
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            remind_later = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.update_downloading,
+                                egui::Button::new(
+                                    RichText::new("Bỏ qua bản này")
+                                        .size(11.5)
+                                        .color(pal.text_muted),
+                                )
+                                .fill(Color32::TRANSPARENT),
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            skip_this_version = true;
+                        }
+                    });
+                });
+            });
+
+        if trigger_download {
+            if let (Some(dl_url), Some(asset_name)) =
+                (info.download_url.clone(), info.asset_name.clone())
+            {
+                self.update_downloading = true;
+                self.update_progress = Some((0, info.asset_size));
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::DownloadAndApplyUpdate {
+                        download_url: dl_url,
+                        asset_name,
+                        target_version: info.latest_version.clone(),
+                        expected_sha256: info.expected_sha256.clone(),
+                    });
+                }
+            }
+        }
+        if skip_this_version {
+            self.settings.skipped_update_version = info.latest_version;
+            self.settings.save();
+            self.update_modal_open = false;
+            self.update_banner_dismissed = true;
+        }
+        if remind_later || !open {
+            self.update_modal_open = false;
+        }
+    }
+
     pub(super) fn render_schedule_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.schedule_modal_open {
             return;

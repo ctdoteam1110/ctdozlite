@@ -72,9 +72,22 @@ Gói `.tar.gz` kèm sẵn `install.sh` và `uninstall.sh`.
 ## Windows (x64)
 
 - **Bộ cài đặt:** `ctdozlite-<version>-setup-windows-x86_64.exe` — chạy và làm theo hướng dẫn.
-- **Bản chạy ngay (Portable):** `ctdozlite-<version>-portable-windows-x86_64.exe` — không cần cài đặt.
+- **Bản chạy ngay (Portable):** `ctdozlite-<version>-portable-windows-x86_64.exe` hoặc gói nén `ctdozlite-<version>-portable-windows-x86_64.zip` — không cần cài đặt.
 
-Nếu Windows SmartScreen cảnh báo ứng dụng chưa ký, chọn **More info → Run anyway**.
+Nếu Windows SmartScreen hoặc Microsoft Defender cảnh báo ứng dụng mã nguồn mở chưa mua chứng chỉ EV Code Signing thương mại:
+1. Đối chiếu mã băm SHA-256 của file tải về với `SHA256SUMS.txt` trên trang GitHub Releases (`Get-FileHash .\ctdozlite-<version>-setup-windows-x86_64.exe -Algorithm SHA256`).
+2. Chọn **More info → Run anyway** (hoặc dùng bản `portable-windows-x86_64.exe` / `.zip`). Từ bản `v0.0.4`, bộ cài Inno Setup đã chuyển sang chuẩn nén `zip/9` không đóng khối đặc (`SolidCompression=no`), nhúng đầy đủ `VS_VERSIONINFO` + `RT_MANIFEST` (`asInvoker`) và giữ bảng ký hiệu PE để tránh cảnh báo nhầm (false positive) của bộ máy học Microsoft Defender (#58).
+
+## Tự động thông báo & cập nhật qua GitHub Releases API
+
+`ctdozlite` tích hợp sẵn bộ kiểm tra và cập nhật tự động qua REST API chính thức của GitHub (`https://api.github.com/repos/ctdoteam1110/ctdozlite/releases/latest`, kèm fallback sang `latest.json`):
+- **Khi khởi động & định kỳ mỗi 30 phút:** Ứng dụng tự động truy vấn GitHub Releases API ở luồng nền.
+- **Thông báo tức thì:** Khi phát hiện phiên bản mới (`vLatest > vCurrent`), ứng dụng tự động bắn thông báo hệ thống (OS Notification trên macOS / Windows / Linux), hiển thị huy hiệu **🚀 Cập nhật mới** trên thanh tiêu đề, thanh thông báo ở đầu khung chat và mở hộp thoại **Có bản cập nhật mới** kèm tóm tắt Changelog & nút **⬇ Cập nhật ngay**.
+- **Xác thực SHA-256 & Hoàn tác nguyên tử:** Gói tải về được kiểm tra kích thước, chữ ký thực thi (`MZ` / `ELF`) và mã băm `SHA-256` trước khi thay thế thực thi hoặc mở bộ cài đặt.
+- **Kiểm tra từ dòng lệnh (CLI):**
+  ```bash
+  ctdozlite --check-update
+  ```
 
 ## macOS (Apple Silicon M1/M2/M3/M4 & Intel)
 

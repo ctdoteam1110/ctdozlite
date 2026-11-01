@@ -44,6 +44,38 @@ async fn main() -> Result<()> {
         println!("ctdozlite v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if args.iter().any(|a| a == "--check-update") {
+        match gui::check_github_release_cli().await {
+            Ok(info) => {
+                if info.has_update {
+                    println!(
+                        "🚀 Có bản cập nhật mới v{} trên GitHub (hiện tại: v{})",
+                        info.latest_version, info.current_version
+                    );
+                    println!("   Tiêu đề: {}", info.release_title);
+                    println!("   Trang phát hành: {}", info.html_url);
+                    if let Some(ref dl) = info.download_url {
+                        println!("   Tải xuống: {dl}");
+                    }
+                    updater::notify_os_new_update(
+                        &info.latest_version,
+                        &info.current_version,
+                        &info.release_title,
+                    );
+                } else {
+                    println!(
+                        "✅ Bạn đang sử dụng phiên bản mới nhất (v{})",
+                        info.current_version
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("⚠️ Không kiểm tra được bản cập nhật từ GitHub API: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let data_path = data_dir::initialize(&args)?;
     if args.iter().any(|a| a == "--print-data-dir") {
         println!("{}", data_path.display());

@@ -184,21 +184,12 @@ pub struct UpdateCheckResult {
 
 /// Compare semantic versions (`"v0.0.2"` > `"0.0.1"`).
 pub fn is_newer_semver(remote: &str, current: &str) -> bool {
-    let parse = |s: &str| -> (u64, u64, u64) {
-        let clean = s
-            .trim()
-            .trim_start_matches(['v', 'V'])
-            .split(['-', '+'])
-            .next()
-            .unwrap_or("");
-        let mut parts = clean.split('.').filter_map(|p| p.trim().parse::<u64>().ok());
-        (
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-        )
-    };
-    parse(remote) > parse(current)
+    crate::updater::is_newer_semver(remote, current)
+}
+
+/// Query GitHub Releases API (`/repos/ctdoteam1110/ctdozlite/releases/latest`) for updates.
+pub async fn check_github_release_cli() -> Result<UpdateCheckResult, String> {
+    worker::fetch_github_latest_release().await
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +270,9 @@ struct AppSettings {
     // 7. Thiết bị cuộc gọi (Mic & Camera)
     selected_mic_device: String,
     selected_camera_device: String,
+    // 8. Cập nhật tự động qua GitHub Releases API
+    auto_check_updates: bool,
+    skipped_update_version: String,
 }
 
 impl Default for AppSettings {
@@ -323,6 +317,8 @@ impl Default for AppSettings {
             enable_sticker_keyword_search: true,
             selected_mic_device: String::new(),
             selected_camera_device: String::new(),
+            auto_check_updates: true,
+            skipped_update_version: String::new(),
         }
     }
 }
@@ -460,6 +456,9 @@ pub struct ZaloGuiApp {
     update_progress: Option<(u64, u64)>,
     update_status: String,
     update_info: Option<UpdateCheckResult>,
+    update_modal_open: bool,
+    update_banner_dismissed: bool,
+    last_notified_update_version: Option<String>,
     dev_mode: bool,
     dev_panel_open: bool,
     dev_tab: DevTab,
@@ -642,6 +641,9 @@ impl ZaloGuiApp {
             update_progress: None,
             update_status: String::new(),
             update_info: None,
+            update_modal_open: false,
+            update_banner_dismissed: false,
+            last_notified_update_version: None,
             dev_mode,
             dev_panel_open: false,
             dev_tab: DevTab::Logs,
@@ -1322,7 +1324,27 @@ impl ZaloGuiApp {
                                     info.latest_version, info.current_version
                                 );
                                 self.update_status = msg.clone();
-                                self.show_toast(msg);
+                                let is_skipped = silent
+                                    && !self.settings.skipped_update_version.is_empty()
+                                    && self.settings.skipped_update_version == info.latest_version;
+                                let already_notified = self.last_notified_update_version.as_deref()
+                                    == Some(info.latest_version.as_str());
+                                if !is_skipped {
+                                    self.show_toast(msg);
+                                    if !already_notified || !silent {
+                                        self.last_notified_update_version =
+                                            Some(info.latest_version.clone());
+                                        self.update_modal_open = true;
+                                        self.update_banner_dismissed = false;
+                                        if self.settings.enable_notifications {
+                                            crate::updater::notify_os_new_update(
+                                                &info.latest_version,
+                                                &info.current_version,
+                                                &info.release_title,
+                                            );
+                                        }
+                                    }
+                                }
                             } else {
                                 self.update_status = format!(
                                     "✅ Bạn đang sử dụng phiên bản mới nhất (v{})",
@@ -1458,6 +1480,9 @@ impl eframe::App for ZaloGuiApp {
         } else {
             self.render_chat_workspace(ctx, &pal);
         }
+
+        // Auto-notification modal for new GitHub Releases (works on both Login & Chat screens)
+        self.render_update_notification_modal(ctx, &pal);
 
         if !ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
             let screen = ctx.screen_rect();
@@ -1757,6 +1782,43 @@ impl ZaloGuiApp {
                         }
 
                         buttons_left_x = th_rect.left();
+
+                        if let Some(ref upd) = self.update_info {
+                            if upd.has_update {
+                                ui.add_space(6.0);
+                                let badge_txt = if self.update_downloading {
+                                    let (dl, tot) = self.update_progress.unwrap_or((0, 0));
+                                    if tot > 0 {
+                                        let pct = ((dl as f64 / tot as f64) * 100.0).clamp(0.0, 100.0);
+                                        format!("⏳ Đang cập nhật {pct:.0}%")
+                                    } else {
+                                        "⏳ Đang tải cập nhật…".to_string()
+                                    }
+                                } else {
+                                    format!("🚀 Cập nhật mới v{}", upd.latest_version)
+                                };
+                                let upd_pill = egui::Button::new(
+                                    RichText::new(badge_txt)
+                                        .size(11.2)
+                                        .color(Color32::WHITE)
+                                        .strong(),
+                                )
+                                .fill(pal.accent_online)
+                                .rounding(Rounding::same(5.0));
+                                let r = ui
+                                    .add(upd_pill)
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text(format!(
+                                        "Đã có phiên bản v{} trên GitHub Releases — Bấm để xem chi tiết & cập nhật tự động",
+                                        upd.latest_version
+                                    ));
+                                buttons_left_x = r.rect.left() - 8.0;
+                                if r.clicked() {
+                                    self.update_modal_open = true;
+                                    self.update_banner_dismissed = false;
+                                }
+                            }
+                        }
 
                         if !self.is_logged_in && !self.threads.is_empty() {
                             ui.add_space(8.0);

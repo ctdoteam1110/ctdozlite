@@ -2411,6 +2411,114 @@ impl ZaloGuiApp {
                         self.status_msg = "Đã bỏ ghim tin nhắn".into();
                     }
 
+                    // 1c-0. GitHub Release Update Available Notification Banner
+                    if let Some(upd) = self.update_info.clone() {
+                        if upd.has_update
+                            && !self.update_banner_dismissed
+                            && self.settings.skipped_update_version != upd.latest_version
+                        {
+                            egui::Frame::none()
+                                .fill(pal.accent_online.linear_multiply(0.14))
+                                .stroke(Stroke::new(1.0_f32, pal.accent_online))
+                                .inner_margin(Margin::symmetric(14.0, 6.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let msg_txt = if self.update_downloading {
+                                            let (dl, tot) = self.update_progress.unwrap_or((0, 0));
+                                            if tot > 0 {
+                                                let pct = ((dl as f64 / tot as f64) * 100.0)
+                                                    .clamp(0.0, 100.0);
+                                                format!(
+                                                    "⏳ Đang tải bản cập nhật v{} từ GitHub ({pct:.0}%)…",
+                                                    upd.latest_version
+                                                )
+                                            } else {
+                                                format!(
+                                                    "⏳ Đang tải bản cập nhật v{} từ GitHub…",
+                                                    upd.latest_version
+                                                )
+                                            }
+                                        } else {
+                                            format!(
+                                                "🚀 Đã có bản cập nhật mới ctdozlite v{} trên GitHub Releases!",
+                                                upd.latest_version
+                                            )
+                                        };
+                                        ui.label(
+                                            RichText::new(msg_txt)
+                                                .size(12.0)
+                                                .color(pal.accent_online)
+                                                .strong(),
+                                        );
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .small_button(lucide::X)
+                                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                                    .on_hover_text("Ẩn thanh thông báo cập nhật")
+                                                    .clicked()
+                                                {
+                                                    self.update_banner_dismissed = true;
+                                                }
+                                                if ui
+                                                    .small_button("Chi tiết")
+                                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                                    .clicked()
+                                                {
+                                                    self.update_modal_open = true;
+                                                }
+                                                if !self.update_downloading {
+                                                    if let (Some(dl_url), Some(asset_name)) =
+                                                        (upd.download_url.clone(), upd.asset_name.clone())
+                                                    {
+                                                        if ui
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    RichText::new(format!(
+                                                                        "⬇ Cập nhật v{}",
+                                                                        upd.latest_version
+                                                                    ))
+                                                                    .size(11.5)
+                                                                    .color(Color32::WHITE)
+                                                                    .strong(),
+                                                                )
+                                                                .fill(pal.accent_online)
+                                                                .rounding(Rounding::same(5.0)),
+                                                            )
+                                                            .on_hover_cursor(
+                                                                CursorIcon::PointingHand,
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            self.update_downloading = true;
+                                                            self.update_progress =
+                                                                Some((0, upd.asset_size));
+                                                            self.update_modal_open = true;
+                                                            if let Some(tx) = WORKER_TX.get() {
+                                                                let _ = tx.send(
+                                                                    WorkerCmd::DownloadAndApplyUpdate {
+                                                                        download_url: dl_url,
+                                                                        asset_name,
+                                                                        target_version: upd
+                                                                            .latest_version
+                                                                            .clone(),
+                                                                        expected_sha256: upd
+                                                                            .expected_sha256
+                                                                            .clone(),
+                                                                    },
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+                        }
+                    }
+
                     // 1c. Starred filter active banner
                     if self.filter_starred_only {
                         egui::Frame::none()
