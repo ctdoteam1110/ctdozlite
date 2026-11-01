@@ -18,8 +18,10 @@
     <string>ctdozlite</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <!-- Sentinel default: CI overwrites this from Cargo.toml before packaging:
+         plutil -replace CFBundleShortVersionString -string "<version>" .../Info.plist -->
     <key>CFBundleShortVersionString</key>
-    <string>0.0.1</string>
+    <string>0.0.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>

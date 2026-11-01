@@ -6,10 +6,11 @@ Thư mục này chứa tài liệu chi tiết về cách sử dụng, cấu trú
 
 | Tài liệu | Nội dung |
 |---|---|
-| [1. Hướng dẫn sử dụng](HUONG_DAN_SU_DUNG.md) | Các tham số CLI, thao tác trên GUI (`egui`), phím tắt TUI (`ratatui`) và công cụ kiểm thử. |
-| [2. Kiến trúc hệ thống](KIEN_TRUC_HE_THONG.md) | Mô hình phân tách UI thread / Tokio worker, đồng bộ WebSocket + HTTP polling và lưu trữ SQLite. |
-| [3. Đặc tả giao thức Zalo](GIAO_THUC_ZALO.md) | Cấu trúc tham số `zpw_ver=694`, `ParamCipher v2`, `PasswordCipher`, `signkey` và cơ chế mã hóa AES. |
-| [4. Xử lý sự cố](KHAC_PHUC_SU_CO.md) | Bảng mã lỗi máy chủ Zalo (`18012`, `18060`, `18022`, `600`, `102`, `114`, `429`) và cách khắc phục. |
+| [1. Cài đặt](CAI_DAT.md) | Tải và cài đặt trên Linux, Windows, macOS; kiểm tra SHA-256 và gỡ cài đặt. |
+| [2. Hướng dẫn sử dụng](HUONG_DAN_SU_DUNG.md) | Các tham số CLI, thao tác trên GUI (`egui`), phím tắt TUI (`ratatui`) và công cụ kiểm thử. |
+| [3. Kiến trúc hệ thống](KIEN_TRUC_HE_THONG.md) | Mô hình phân tách UI thread / Tokio worker, đồng bộ WebSocket + HTTP polling và lưu trữ SQLite. |
+| [4. Đặc tả giao thức Zalo](GIAO_THUC_ZALO.md) | Cấu trúc tham số `zpw_ver=694`, `ParamCipher v2`, `PasswordCipher`, `signkey` và cơ chế mã hóa AES. |
+| [5. Xử lý sự cố](KHAC_PHUC_SU_CO.md) | Bảng mã lỗi máy chủ Zalo (`18012`, `18060`, `18022`, `600`, `102`, `114`, `429`) và cách khắc phục. |
 
 ## Tiêu chuẩn kỹ thuật (Engineering Standards)
 

@@ -1342,7 +1342,7 @@ impl ZaloGuiApp {
                             .strong(),
                     );
 
-                    // Subtle "Native v0.0.1" pill badge
+                    // Subtle "Native v<version>" pill badge
                     egui::Frame::none()
                         .fill(pal.primary.linear_multiply(0.14))
                         .rounding(Rounding::same(4.0))
