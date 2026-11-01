@@ -967,13 +967,8 @@ impl<'a> TuiApp<'a> {
                 self.status = "Đã đăng xuất. Bấm 'q' để thoát.".into();
             }
             ConfirmKind::WipeLocalData => {
-                // History only: the session and the thread list stay usable (#21).
-                let _ = std::fs::remove_file("zalo_history.db");
-                let _ = std::fs::remove_file("threads_cache.json");
-                for t in self.threads.iter_mut() {
-                    t.messages.clear();
-                }
-                self.status = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên).".into();
+                // The custom channel keeps account-scoped history until an atomic wipe is available.
+                self.status = "Chức năng xóa dữ liệu chưa hỗ trợ kho lịch sử cá nhân".into();
             }
             ConfirmKind::DeleteMessage => {
                 let thread_id = action.thread_id;
@@ -2613,7 +2608,7 @@ mod tests {
     fn draws_thread_and_messages_without_panicking() {
         let mut session = crate::session::Session::new(false, false, false).unwrap();
         let (tx, rx) = channel();
-        let thread = Thread {
+        let thread = Thread { presentation: Default::default(), unread: Default::default(),
             id: "u1".into(),
             name: "Test".into(),
             preview: "xin chao".into(),

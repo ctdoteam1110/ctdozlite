@@ -48,13 +48,7 @@ pub fn prompt_password(label: &str) -> Result<String> {
 }
 
 pub fn clock() -> String {
-    let secs = crate::login::unix_now();
-    format!(
-        "{:02}:{:02}:{:02}",
-        (secs / 3600) % 24,
-        (secs / 60) % 60,
-        secs % 60
-    )
+    crate::clock::now_clock()
 }
 
 /// Repaint the thread list and wait for one key.

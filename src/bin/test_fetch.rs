@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
             println!("! getfriends lỗi ({e}) -> Khởi tạo danh sách mặc định từ session để test tiếp...");
             let mut list = Vec::new();
             if !li.send2me_id.is_empty() {
-                list.push(zalo_rust::chat::Thread {
+                list.push(zalo_rust::chat::Thread { presentation: Default::default(), unread: Default::default(),
                     id: li.send2me_id.clone(),
                     name: "Cloud của tôi (Lưu trữ)".into(),
                     preview: String::new(),
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
                     messages: Vec::new(),
                 });
             }
-            list.push(zalo_rust::chat::Thread {
+            list.push(zalo_rust::chat::Thread { presentation: Default::default(), unread: Default::default(),
                 id: "1000000000000000001".into(),
                 name: "Zalo".into(),
                 preview: String::new(),

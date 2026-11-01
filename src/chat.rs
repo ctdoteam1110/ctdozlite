@@ -9,6 +9,14 @@ use crate::session::{obj, Session};
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
+    #[serde(default)]
+    pub kind: crate::message_model::MessageKind,
+    #[serde(default)]
+    pub wire_ref: crate::message_model::WireMessageRef,
+    #[serde(default)]
+    pub unread_policy: crate::message_model::UnreadPolicy,
+    #[serde(default)]
+    pub delivery: crate::message_model::DeliveryState,
     pub id: String,
     pub sender: String,
     pub text: String,
@@ -29,6 +37,20 @@ pub struct ChatMessage {
     pub reply_to_text: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reaction_summaries: Vec<crate::reactions::ReactionSummary>,
+    #[serde(default)]
+    pub reaction_snapshot: bool,
+    #[serde(default)]
+    pub reaction_authoritative_snapshot: bool,
+    #[serde(skip)]
+    pub reaction_snapshot_fresh: bool,
+    #[serde(default)]
+    pub reaction_snapshot_provenance: crate::reactions::ReactionSnapshotProvenance,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub reaction_versions: std::collections::BTreeMap<String, crate::reactions::ReactionVersion>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_message_id: String,
     #[serde(default)]
     pub is_pinned: bool,
     #[serde(default)]
@@ -43,9 +65,165 @@ pub struct ChatMessage {
     pub link_thumb: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_src: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_source: Option<Value>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub resolved_mention_uids: std::collections::BTreeMap<String,String>,
 }
 
 impl ChatMessage {
+    pub fn merge_message_metadata(&mut self, incoming: &Self) -> bool {
+        let previous_mentions=self.resolved_mention_uids.clone();
+        self.resolved_mention_uids.extend(incoming.resolved_mention_uids.clone());
+        let before = (self.kind, self.wire_ref.clone(), self.unread_policy.clone(), self.delivery, self.history_source.clone());
+        if incoming.kind != crate::message_model::MessageKind::Unknown { self.kind = incoming.kind; }
+        if !incoming.wire_ref.fields.is_empty() {
+            let mut fields = self.wire_ref.fields.clone();
+            fields.extend(incoming.wire_ref.fields.clone());
+            self.wire_ref = crate::message_model::WireMessageRef::from_raw(&Value::Object(fields.into_iter().collect()));
+            if incoming.unread_policy.params_ext_present { self.unread_policy = incoming.unread_policy.clone(); }
+        }
+        if incoming.history_source.is_some() { self.history_source = incoming.history_source.clone(); }
+        self.delivery = self.delivery.merge(incoming.delivery);
+        previous_mentions!=self.resolved_mention_uids || before != (self.kind, self.wire_ref.clone(), self.unread_policy.clone(), self.delivery, self.history_source.clone())
+    }
+
+    /// Keep aggregate counts and event replay cursors across cache/network merges.
+    pub fn merge_reaction_metadata(&mut self, incoming: &Self) -> bool {
+        let model_changed = self.merge_message_metadata(incoming);
+        let previous_provenance = self.reaction_snapshot_provenance.clone();
+        let before = (self.reaction_summaries.clone(), self.reactions.clone(), self.client_message_id.clone(), self.reaction_snapshot, self.reaction_authoritative_snapshot, self.reaction_versions.clone());
+        if self.client_message_id.is_empty() { self.client_message_id = incoming.client_message_id.clone(); }
+        let accept_snapshot = incoming.reaction_authoritative_snapshot
+            && (incoming.reaction_snapshot_fresh || !self.reaction_authoritative_snapshot)
+            && self.reaction_snapshot_provenance.accepts_snapshot(
+                &incoming.reaction_snapshot_provenance, &self.reaction_versions,
+                incoming.reaction_snapshot_fresh);
+
+        if accept_snapshot {
+            self.reaction_snapshot_provenance = incoming.reaction_snapshot_provenance.clone();
+            self.reaction_summaries = incoming.reaction_summaries.clone();
+            self.reaction_authoritative_snapshot = true;
+            self.reaction_snapshot = true;
+            for (user, version) in &mut self.reaction_versions {
+                version.covered_events.append(&mut version.events);
+                version.baseline = incoming.reaction_summaries.iter().filter_map(|s|
+                    Some((s.r_type?, *s.reactor_counts.get(user)?))).collect();
+                version.ledger_initialized = true;
+                version.snapshot_baseline = true;
+            }
+            for (user, incoming_version) in &incoming.reaction_versions {
+                let covered = self.reaction_versions.get(user)
+                    .map(|v| v.covered_events.clone()).unwrap_or_default();
+                let mut version = incoming_version.clone();
+                version.covered_events.extend(covered);
+                if incoming.reaction_snapshot_fresh {
+                    version.covered_events.append(&mut version.events);
+                    version.baseline = incoming.reaction_summaries.iter().filter_map(|s|
+                        Some((s.r_type?, *s.reactor_counts.get(user)?))).collect();
+                    version.ledger_initialized = true;
+                    version.snapshot_baseline = true;
+                }
+                self.reaction_versions.insert(user.clone(), version);
+            }
+        }
+        if !self.reaction_authoritative_snapshot && !incoming.reaction_authoritative_snapshot
+            && (incoming.reaction_snapshot || !incoming.reaction_summaries.is_empty())
+            && self.reaction_versions.is_empty() {
+            self.reaction_summaries = incoming.reaction_summaries.clone();
+            self.reactions = crate::reactions::legacy_emojis(&self.reaction_summaries);
+            self.reaction_snapshot = incoming.reaction_snapshot;
+        }
+        if !self.reaction_authoritative_snapshot && !incoming.reaction_authoritative_snapshot && !self.reaction_versions.is_empty()
+            && (incoming.reaction_snapshot || !incoming.reaction_summaries.is_empty()) {
+            crate::reactions::merge_untracked_snapshot(&mut self.reaction_summaries,
+                &incoming.reaction_summaries, &self.reaction_versions,
+                incoming.reaction_snapshot && incoming.reaction_versions.is_empty());
+        }
+        for (user, version) in &incoming.reaction_versions {
+            if accept_snapshot { continue; }
+            if !self.reaction_versions.contains_key(user) {
+                if self.reaction_authoritative_snapshot {
+                    for event in &version.events {
+                        if event.r_type >= -1 { self.apply_reaction(event); }
+                    }
+                    continue;
+                }
+                self.reaction_versions.insert(user.clone(), version.clone());
+                if version.ledger_initialized {
+                    version.rebuild(&mut self.reaction_summaries, user);
+                }
+            } else {
+                for event in &version.events {
+                    if event.r_type >= -1 { self.apply_reaction(event); }
+                }
+            }
+        }
+        if !self.reaction_summaries.is_empty() || incoming.reaction_snapshot
+            || !incoming.reaction_versions.is_empty() {
+            self.reactions = crate::reactions::legacy_emojis(&self.reaction_summaries);
+        } else if self.reactions.is_empty() && self.reaction_versions.is_empty() && !self.reaction_snapshot {
+            self.reactions = incoming.reactions.clone();
+        }
+        model_changed || previous_provenance != self.reaction_snapshot_provenance || before != (self.reaction_summaries.clone(), self.reactions.clone(), self.client_message_id.clone(), self.reaction_snapshot, self.reaction_authoritative_snapshot, self.reaction_versions.clone())
+    }
+
+    pub fn apply_reaction(&mut self, event: &crate::reactions::ReactionEvent) -> bool {
+        if event.sender_id.is_empty() || event.r_type < -1 { return false; }
+        if self.reaction_summaries.is_empty() && !self.reactions.is_empty() {
+            self.reaction_summaries = crate::reactions::parse_reactions(&json!({"reactions":self.reactions}));
+        }
+        let changed = self.reaction_versions.entry(event.sender_id.clone()).or_default()
+            .record(&mut self.reaction_summaries, event, self.reaction_authoritative_snapshot);
+        self.reactions = crate::reactions::legacy_emojis(&self.reaction_summaries);
+        self.reaction_snapshot = true;
+        changed
+    }
+
+    /// Repair cached media metadata without changing captions or signed URL bytes.
+    pub fn hydrate_media_metadata(&mut self) -> bool {
+        if self.text == "[Tin nhắn đã thu hồi]" { return false; }
+        let before = (self.link_url.clone(), self.link_thumb.clone(), self.link_src.clone());
+        let source_kind = self.history_source.as_ref().and_then(|source| {
+            let kind = source.get("msgType").and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()));
+            match kind { Some(2 | 3 | 4) => Some("Hình ảnh Zalo"), Some(19) => Some("Video Zalo"), _ => None }
+        });
+        if let Some(source) = &self.history_source {
+            if let Some(attachment) = source.get("meta").and_then(|m| m.get("attachsList"))
+                .and_then(Value::as_array).and_then(|a| a.first()) {
+                let (url, _, _, thumb, _) = extract_link_info(attachment);
+                if self.link_url.is_none() { self.link_url = url; }
+                if self.link_thumb.is_none() { self.link_thumb = thumb; }
+            }
+        }
+        let label_kind = match self.text.trim() {
+            "[Photo]" | "[Hình ảnh]" => Some("Hình ảnh Zalo"),
+            "[Video]" => Some("Video Zalo"),
+            _ => None,
+        };
+        if let Some(kind) = source_kind.or(label_kind) {
+            self.link_src = Some(kind.into());
+            if kind == "Hình ảnh Zalo" && self.link_thumb.is_none() {
+                self.link_thumb = self.link_url.clone();
+            }
+        }
+        before != (self.link_url.clone(), self.link_thumb.clone(), self.link_src.clone())
+    }
+
+    /// Fill independently missing card fields when an existing URL already exists.
+    fn merge_media_metadata(&mut self, incoming: &Self) -> bool {
+        if self.text == "[Tin nhắn đã thu hồi]" { return false; }
+        let before = (self.link_url.clone(), self.link_title.clone(), self.link_desc.clone(), self.link_thumb.clone(), self.link_src.clone());
+        if self.link_title.is_none() { self.link_title = incoming.link_title.clone(); }
+        if self.link_desc.is_none() { self.link_desc = incoming.link_desc.clone(); }
+        if self.link_thumb.is_none() { self.link_thumb = incoming.link_thumb.clone(); }
+        if self.link_src.is_none() || matches!(incoming.link_src.as_deref(), Some("Hình ảnh Zalo" | "Video Zalo")) {
+            self.link_src = incoming.link_src.clone().or_else(|| self.link_src.clone());
+        }
+        self.hydrate_media_metadata();
+        before != (self.link_url.clone(), self.link_title.clone(), self.link_desc.clone(), self.link_thumb.clone(), self.link_src.clone())
+    }
+
     /// Compute the static PNG URL for a Zalo sticker (`compact-app-pc.b7bec208c4c8f73e09f8.js:7739583` & `18589292`).
     pub fn sticker_image_url(&self) -> Option<String> {
         let sid = self.sticker_id?;
@@ -75,6 +253,8 @@ impl ChatMessage {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Thread {
+    #[serde(default)]
+    pub presentation: SidebarPresentation,
     pub id: String,
     pub name: String,
     pub preview: String,
@@ -82,6 +262,138 @@ pub struct Thread {
     pub avatar: Option<String>,
     pub is_group: bool,
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub unread: crate::unread::UnreadState,
+}
+
+/// Durable sidebar metadata, including metadata-only startup snapshots.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SidebarPresentation {
+    pub members: Vec<SidebarMember>,
+    /// Server totalMember only; never inferred from message senders or avatar samples.
+    pub member_count: Option<u64>,
+    pub last_message_ts: i64,
+    pub last_message_id: String,
+    pub last_sender: String,
+    pub last_sender_id: String,
+    pub last_outgoing: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SidebarMember {
+    pub id: String,
+    pub name: String,
+    pub avatar: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarFontStyle { Regular, Semibold }
+
+impl Thread {
+    pub fn sidebar_font_style(&self) -> SidebarFontStyle {
+        if self.unread.has_badge() { SidebarFontStyle::Semibold } else { SidebarFontStyle::Regular }
+    }
+
+    pub fn refresh_sidebar_presentation(&mut self) {
+        if let Some(message)=self.messages.iter().max_by_key(|m|crate::clock::normalize_ts_ms(m.ts)) {
+            let ts=crate::clock::normalize_ts_ms(message.ts);
+            if ts>=crate::clock::normalize_ts_ms(self.presentation.last_message_ts) {
+                let sender_id=sidebar_sender_id(message).or_else(||(message.id==self.presentation.last_message_id && ts==crate::clock::normalize_ts_ms(self.presentation.last_message_ts)).then(||self.presentation.last_sender_id.clone())).unwrap_or_default();
+                let keep_resolved=message.id==self.presentation.last_message_id && ts==crate::clock::normalize_ts_ms(self.presentation.last_message_ts)
+                    && sender_id==self.presentation.last_sender_id && !self.presentation.last_sender.is_empty()
+                    && !self.presentation.last_sender.bytes().all(|b|b.is_ascii_digit())
+                    && message.sender.bytes().all(|b|b.is_ascii_digit());
+                self.presentation.last_message_ts=message.ts;
+                self.presentation.last_message_id=message.id.clone();
+                if !keep_resolved {self.presentation.last_sender=message.sender.clone();}
+                self.presentation.last_sender_id=sender_id;
+                self.presentation.last_outgoing=message.is_outgoing;
+            }
+        }
+    }
+
+    pub fn sidebar_preview(&self) -> String {
+        let latest = self.messages.iter().max_by_key(|m| crate::clock::normalize_ts_ms(m.ts))
+            .filter(|m| crate::clock::normalize_ts_ms(m.ts) > crate::clock::normalize_ts_ms(self.presentation.last_message_ts) || self.presentation.last_sender.is_empty());
+        let (sender, outgoing) = latest.map(|m| (m.sender.as_str(), m.is_outgoing))
+            .unwrap_or((&self.presentation.last_sender, self.presentation.last_outgoing));
+        let sender = self.presentation.members.iter().find(|member| member.id == sender && !member.name.trim().is_empty())
+            .map(|member| member.name.as_str()).unwrap_or(sender);
+        let text = self.preview.replace('\n', " ");
+        if text.is_empty() { return text; }
+        if outgoing {
+            if text.starts_with("Bạn: ") { text } else { format!("Bạn: {text}") }
+        }
+        else if self.is_group && !sender.trim().is_empty() && !sender.trim().chars().all(|c| c.is_ascii_digit()) {
+            let prefix = format!("{}: ", sender.trim());
+            if text.starts_with(&prefix) { text } else { format!("{prefix}{text}") }
+        }
+        else { text }
+    }
+
+    pub fn sidebar_activity_ts(&self) -> i64 {
+        self.messages.iter().map(|m| crate::clock::normalize_ts_ms(m.ts))
+            .chain(std::iter::once(crate::clock::normalize_ts_ms(self.presentation.last_message_ts))).max().unwrap_or(0)
+    }
+
+    pub fn sidebar_timestamp(&self, now_ms: i64) -> String {
+        let ts = self.sidebar_activity_ts();
+        if ts > 0 { crate::clock::sidebar_time_at(ts, now_ms) } else { self.time.clone() }
+    }
+
+    /// Parse only group roster metadata observed in the original getmg-v2 consumer.
+    pub fn apply_group_sidebar_metadata(&mut self, info: &Value) {
+        if let Some(count) = info.get("totalMember").and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok())) {
+            self.presentation.member_count = Some(count);
+        }
+        let mut ids = Vec::new();
+        if let Some(list) = info.get("memVerList").and_then(Value::as_array) {
+            for item in list.iter().filter_map(Value::as_str) {
+                let id = item.split('_').next().unwrap_or_default();
+                if !id.is_empty() && !ids.iter().any(|s| s == id) { ids.push(id.to_owned()); }
+            }
+        } else if let Some(map) = info.get("memberVerMap").and_then(Value::as_object) {
+            ids.extend(map.keys().cloned());
+        }
+        let mut leaders = Vec::new();
+        if let Some(creator) = pick_str(info, &["creatorId"]) { leaders.push(creator); }
+        if let Some(admins) = info.get("adminIds").and_then(Value::as_array) {
+            leaders.extend(admins.iter().filter_map(Value::as_str).map(str::to_owned));
+        }
+        let mut ordered = Vec::new();
+        for id in leaders.into_iter().chain(ids.iter().cloned()) {
+            if ids.contains(&id) && !ordered.contains(&id) { ordered.push(id); }
+        }
+        ids = ordered;
+        let top = info.get("topMember").and_then(Value::as_array);
+        if let Some(top) = top {
+            for profile in top {
+                if let Some(id) = pick_str(profile, &["id", "userId", "uid"]) {
+                    if !ids.contains(&id) { ids.push(id); }
+                }
+            }
+        }
+        if !ids.is_empty() {
+            let previous = std::mem::take(&mut self.presentation.members);
+            self.presentation.members = ids.into_iter().map(|id| {
+                let profile = top.and_then(|list| list.iter().find(|p| pick_str(p, &["id", "userId", "uid"]).as_ref() == Some(&id)));
+                let mut member = previous.iter().find(|m| m.id == id).cloned().unwrap_or(SidebarMember { id, ..Default::default() });
+                if let Some(profile) = profile {
+                    if let Some(name) = pick_str(profile, &["displayName", "zaloName", "name"]) { member.name = name; }
+                    if let Some(avatar) = pick_str(profile, &["avatar", "avt"]) { member.avatar = Some(avatar); }
+                }
+                member
+            }).collect();
+        }
+    }
+}
+
+pub fn sidebar_sender_id(message:&ChatMessage)->Option<String> {
+    let raw=message.wire_ref.sender.as_ref().or_else(||message.history_source.as_ref().and_then(|v|v.get("senderId")))?;
+    let id=match raw {Value::String(v)=>v.clone(),Value::Number(v) if v.is_u64()=>v.to_string(),_=>return None};
+    (!id.is_empty() && id!="0" && id.bytes().all(|b|b.is_ascii_digit())).then_some(id)
 }
 
 /// Return `true` if a thread name is empty or a generic placeholder (`"Người dùng ..."`, `"Nhóm ..."`).
@@ -126,131 +438,184 @@ pub fn avatar_url_time(avatar: Option<&str>) -> i64 {
     0
 }
 
-/// Return `true` if two `Thread` entries represent the same underlying contact or group,
-/// even if Zalo issued a new session-scoped `userId` after a QR re-login.
+/// Identity requires an exact nonempty ID. Names and avatar URLs are presentation only.
 pub fn threads_represent_same_contact(a: &Thread, b: &Thread) -> bool {
-    if !a.id.is_empty() && a.id == b.id {
-        return true;
+    !a.id.is_empty() && a.id != "0" && a.id == b.id && a.is_group == b.is_group
+}
+
+/// Find an exact message, or a uniquely identified pending client echo.
+pub fn matching_message_index(messages: &[ChatMessage], incoming: &ChatMessage) -> Option<usize> {
+    if !incoming.id.is_empty() {
+        if let Some(index) = messages.iter().position(|m| m.id == incoming.id) { return Some(index); }
     }
-    if a.is_group != b.is_group {
-        return false;
-    }
-    if let (Some(ka), Some(kb)) = (
-        avatar_file_key(a.avatar.as_deref()),
-        avatar_file_key(b.avatar.as_deref()),
-    ) {
-        return ka == kb;
-    }
-    if !is_generic_thread_name(&a.name)
-        && !is_generic_thread_name(&b.name)
-        && a.name.trim() == b.name.trim()
-    {
-        return true;
-    }
-    false
+    if incoming.client_message_id.is_empty() { return None; }
+    let mut candidates = messages.iter().enumerate().filter(|(_, m)| {
+        m.client_message_id == incoming.client_message_id
+    });
+    let (index, candidate) = candidates.next()?;
+    if candidates.next().is_some() { return None; }
+    let pending = !candidate.id.is_empty() && !incoming.id.is_empty()
+        && candidate.id.starts_with("out_") != incoming.id.starts_with("out_");
+    (pending && candidate.is_outgoing && incoming.is_outgoing).then_some(index)
 }
 
 /// Merge `incoming` thread into `target`. When `incoming_id_is_authoritative` is `true`,
 /// `target.id` is migrated to `incoming.id` so actions (chat/VoIP call) always target the active session's `userId`.
 pub fn merge_thread_into(
     target: &mut Thread,
-    incoming: Thread,
+    mut incoming: Thread,
     incoming_id_is_authoritative: bool,
-) {
+) -> bool {
+    let previous_presentation = target.presentation.clone();
+    target.refresh_sidebar_presentation();
+    incoming.refresh_sidebar_presentation();
+    let previous_latest_ts = crate::clock::normalize_ts_ms(target.presentation.last_message_ts);
+    let incoming_latest_ts = crate::clock::normalize_ts_ms(incoming.presentation.last_message_ts);
+    let mut changed = previous_presentation != target.presentation;
+    macro_rules! set {
+        ($field:expr, $value:expr) => {{
+            let value = $value;
+            if $field != value { $field = value; changed = true; }
+        }};
+    }
     if incoming_id_is_authoritative && !incoming.id.is_empty() && incoming.id != "0" {
-        target.id = incoming.id;
+        set!(target.id, incoming.id);
     }
     if !incoming.name.is_empty()
         && (!is_generic_thread_name(&incoming.name) || is_generic_thread_name(&target.name))
     {
-        target.name = incoming.name;
+        set!(target.name, incoming.name);
     }
     if incoming.avatar.is_some()
         && (target.avatar.is_none()
             || incoming_id_is_authoritative
             || avatar_url_time(incoming.avatar.as_deref()) >= avatar_url_time(target.avatar.as_deref()))
     {
-        target.avatar = incoming.avatar;
+        set!(target.avatar, incoming.avatar);
     }
-    target.is_group = target.is_group || incoming.is_group;
+    set!(target.is_group, target.is_group || incoming.is_group);
+    changed |= target.unread.merge_metadata(&incoming.unread);
+    if incoming.presentation.member_count.is_some() { set!(target.presentation.member_count, incoming.presentation.member_count); }
+    if !incoming.presentation.members.is_empty() { set!(target.presentation.members, incoming.presentation.members); }
+    if crate::clock::normalize_ts_ms(incoming.presentation.last_message_ts) > crate::clock::normalize_ts_ms(target.presentation.last_message_ts) {
+        set!(target.presentation.last_message_ts, incoming.presentation.last_message_ts);
+        set!(target.presentation.last_message_id, incoming.presentation.last_message_id.clone());
+        set!(target.presentation.last_sender, incoming.presentation.last_sender.clone());
+        set!(target.presentation.last_sender_id, incoming.presentation.last_sender_id.clone());
+        set!(target.presentation.last_outgoing, incoming.presentation.last_outgoing);
+    }
 
+    if incoming_latest_ts==previous_latest_ts && incoming_latest_ts>0
+        && (target.presentation.last_message_id.is_empty() || target.presentation.last_message_id==incoming.presentation.last_message_id)
+        && (target.presentation.last_sender.is_empty() || target.presentation.last_sender.bytes().all(|b|b.is_ascii_digit()))
+        && !incoming.presentation.last_sender.is_empty() && !incoming.presentation.last_sender.bytes().all(|b|b.is_ascii_digit())
+        && (target.presentation.last_sender_id.is_empty() || target.presentation.last_sender_id==incoming.presentation.last_sender_id) {
+        set!(target.presentation.last_sender,incoming.presentation.last_sender);
+        set!(target.presentation.last_sender_id,incoming.presentation.last_sender_id);
+    }
+    let mut ids = std::collections::HashMap::new();
+    let mut clients: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    for (index, message) in target.messages.iter().enumerate() {
+        if !message.id.is_empty() { ids.entry(message.id.clone()).or_insert(index); }
+        if !message.client_message_id.is_empty() { clients.entry(message.client_message_id.clone()).or_default().push(index); }
+    }
     for msg in incoming.messages {
         if msg.text == "sendBubbleMessage" {
             continue;
         }
-        if let Some(existing_msg) = target.messages.iter_mut().find(|m| {
-            (!m.id.is_empty() && !msg.id.is_empty() && m.id == msg.id)
-                || (m.text == msg.text
-                    && m.is_outgoing == msg.is_outgoing
-                    && (m.time == msg.time
-                        || (m.ts != 0 && msg.ts != 0 && (m.ts - msg.ts).abs() < 5000)))
-        }) {
+        let exact = ids.get(&msg.id).copied().filter(|_| !msg.id.is_empty());
+        let echo = clients.get(&msg.client_message_id).filter(|indices| indices.len() == 1)
+            .and_then(|indices| {
+                let index = indices[0];
+                let existing = &target.messages[index];
+                (!existing.id.is_empty() && !msg.id.is_empty() && existing.is_outgoing && msg.is_outgoing &&
+                    (existing.id.starts_with("out_") != msg.id.starts_with("out_"))).then_some(index)
+            });
+        if let Some(index) = exact.or(echo) {
+            let existing_msg = &mut target.messages[index];
+            changed |= existing_msg.merge_reaction_metadata(&msg);
+            changed |= existing_msg.merge_media_metadata(&msg);
+            if msg.history_source.is_some() { set!(existing_msg.history_source, msg.history_source); }
             if existing_msg.id.starts_with("out_")
                 && !msg.id.is_empty()
                 && !msg.id.starts_with("out_")
             {
-                existing_msg.id = msg.id;
+                set!(existing_msg.id, msg.id.clone());
+                ids.entry(msg.id.clone()).or_insert(index);
             }
             if msg.ts > 0 && existing_msg.ts != msg.ts {
-                existing_msg.ts = msg.ts;
-                existing_msg.time = msg.time;
+                set!(existing_msg.ts, msg.ts);
+                set!(existing_msg.time, msg.time);
             }
             if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
-                existing_msg.text = "[Tin nhắn đã thu hồi]".to_string();
-                existing_msg.sticker_id = None;
-                existing_msg.link_url = None;
-                existing_msg.link_thumb = None;
+                set!(existing_msg.text, "[Tin nhắn đã thu hồi]".to_string());
+                set!(existing_msg.sticker_id, None);
+                set!(existing_msg.link_url, None);
+                set!(existing_msg.link_thumb, None);
             }
             if existing_msg.sticker_id.is_none() && msg.sticker_id.is_some() {
-                existing_msg.sticker_id = msg.sticker_id;
-                existing_msg.sticker_cate_id = msg.sticker_cate_id;
-                existing_msg.sticker_type = msg.sticker_type;
+                set!(existing_msg.sticker_id, msg.sticker_id);
+                set!(existing_msg.sticker_cate_id, msg.sticker_cate_id);
+                set!(existing_msg.sticker_type, msg.sticker_type);
             }
             if existing_msg.reply_to_text.is_none() && msg.reply_to_text.is_some() {
-                existing_msg.reply_to_id = msg.reply_to_id;
-                existing_msg.reply_to_sender = msg.reply_to_sender;
-                existing_msg.reply_to_text = msg.reply_to_text;
+                set!(existing_msg.reply_to_id, msg.reply_to_id);
+                set!(existing_msg.reply_to_sender, msg.reply_to_sender);
+                set!(existing_msg.reply_to_text, msg.reply_to_text);
             }
             if existing_msg.link_url.is_none() && msg.link_url.is_some() {
-                existing_msg.link_url = msg.link_url;
-                existing_msg.link_title = msg.link_title;
-                existing_msg.link_desc = msg.link_desc;
-                existing_msg.link_thumb = msg.link_thumb;
-                existing_msg.link_src = msg.link_src;
+                set!(existing_msg.link_url, msg.link_url);
+                set!(existing_msg.link_title, msg.link_title);
+                set!(existing_msg.link_desc, msg.link_desc);
+                set!(existing_msg.link_thumb, msg.link_thumb);
+                set!(existing_msg.link_src, msg.link_src);
                 if !msg.text.is_empty() {
-                    existing_msg.text = msg.text;
+                    set!(existing_msg.text, msg.text);
                 }
             }
             if existing_msg.reactions.is_empty() && !msg.reactions.is_empty() {
-                existing_msg.reactions = msg.reactions;
+                set!(existing_msg.reactions, msg.reactions);
             }
-            existing_msg.is_pinned = existing_msg.is_pinned || msg.is_pinned;
-            existing_msg.is_starred = existing_msg.is_starred || msg.is_starred;
+            set!(existing_msg.is_pinned, existing_msg.is_pinned || msg.is_pinned);
+            set!(existing_msg.is_starred, existing_msg.is_starred || msg.is_starred);
         } else {
+            let index = target.messages.len();
+            if !msg.id.is_empty() { ids.entry(msg.id.clone()).or_insert(index); }
+            if !msg.client_message_id.is_empty() { clients.entry(msg.client_message_id.clone()).or_default().push(index); }
             target.messages.push(msg);
+            changed = true;
         }
     }
 
+    let previous_len = target.messages.len();
     target.messages.retain(|m| m.text != "sendBubbleMessage");
+    changed |= target.messages.len() != previous_len;
+    changed |= target.messages.windows(2).any(|pair| pair[0].ts > pair[1].ts);
     target.messages.sort_by_key(|m| m.ts);
 
-    if let Some(newest) = target.messages.last() {
+    let newest_known_ts = previous_latest_ts.max(incoming_latest_ts);
+    if let Some(newest) = target.messages.last().filter(|m| crate::clock::normalize_ts_ms(m.ts) >= newest_known_ts) {
         if !newest.text.is_empty() {
-            target.preview = newest.text.replace('\n', " ");
-            target.time = newest.time.clone();
+            set!(target.preview, newest.text.replace('\n', " "));
+            set!(target.time, newest.time.clone());
         }
-    } else if !incoming.preview.is_empty() && target.preview.is_empty() {
-        target.preview = incoming.preview;
-        if !incoming.time.is_empty() {
-            target.time = incoming.time;
-        }
-    } else if target.time.is_empty() && !incoming.time.is_empty() {
-        target.time = incoming.time;
+    } else if incoming_latest_ts > previous_latest_ts && !incoming.preview.is_empty() {
+        set!(target.preview, incoming.preview);
+        if !incoming.time.is_empty() { set!(target.time, incoming.time); }
+    } else if target.preview.is_empty() && incoming_latest_ts >= previous_latest_ts && !incoming.preview.is_empty() {
+        set!(target.preview, incoming.preview);
+        if !incoming.time.is_empty() { set!(target.time, incoming.time); }
+    } else if target.time.is_empty() && incoming_latest_ts >= previous_latest_ts && !incoming.time.is_empty() {
+        set!(target.time, incoming.time);
     }
+    let before = target.presentation.clone();
+    target.refresh_sidebar_presentation();
+    changed |= before != target.presentation;
+    changed
 }
 
 /// Deduplicate `threads` in-place, merging entries that represent the same contact/group
-/// (by `id`, avatar hash, or non-generic display name) and preserving the authoritative/newer `id`.
+/// by exact ID. Display names and avatars never establish identity.
 pub fn deduplicate_threads(
     threads: &mut Vec<Thread>,
     authoritative_ids: Option<&std::collections::HashSet<String>>,
@@ -295,35 +660,6 @@ pub fn deduplicate_threads(
             merged.push(t);
         }
     }
-    let cloud_msg_ids: std::collections::HashSet<String> = merged
-        .iter()
-        .filter(|t| t.name.contains("Cloud của tôi"))
-        .flat_map(|t| t.messages.iter())
-        .filter_map(|m| {
-            if !m.id.is_empty() && !m.id.starts_with("out_") && !m.id.starts_with("local_") {
-                Some(m.id.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-    if !cloud_msg_ids.is_empty() {
-        for t in merged.iter_mut() {
-            if !t.name.contains("Cloud của tôi") {
-                let before = t.messages.len();
-                t.messages.retain(|m| !cloud_msg_ids.contains(&m.id));
-                if t.messages.len() != before {
-                    if let Some(newest) = t.messages.last() {
-                        t.preview = newest.text.replace('\n', " ");
-                        t.time = newest.time.clone();
-                    } else {
-                        t.preview.clear();
-                        t.time.clear();
-                    }
-                }
-            }
-        }
-    }
     *threads = merged;
 }
 
@@ -331,6 +667,14 @@ pub fn deduplicate_threads(
 pub fn load_threads_cache() -> Vec<Thread> {
     if let Ok(text) = std::fs::read_to_string("threads_cache.json") {
         if let Ok(mut threads) = serde_json::from_str::<Vec<Thread>>(&text) {
+            for thread in &mut threads {
+                for message in &mut thread.messages {
+                    if message.ts > 0 { message.time = crate::clock::message_time(message.ts); }
+                }
+                if let Some(last) = thread.messages.iter().max_by_key(|m| m.ts) {
+                    thread.time = last.time.clone();
+                }
+            }
             deduplicate_threads(&mut threads, None);
             return threads;
         }
@@ -340,9 +684,40 @@ pub fn load_threads_cache() -> Vec<Thread> {
 
 /// Persist conversations and message history locally so they survive app restarts.
 pub fn save_threads_cache(threads: &[Thread]) {
-    if let Ok(text) = serde_json::to_string_pretty(threads) {
-        let _ = std::fs::write("threads_cache.json", text);
+    if let Err(error) = try_save_threads_cache(threads) {
+        crate::logger::log_error("chat::save_threads_cache", &error.to_string());
     }
+}
+
+/// Checked atomic persistence for UI callers that must surface storage failures.
+pub fn try_save_threads_cache(threads: &[Thread]) -> Result<()> {
+    let text = serde_json::to_vec_pretty(threads)?;
+    crate::data_dir::write_private_atomic(std::path::Path::new("threads_cache.json"), &text)
+}
+
+/// Preserve application errors after decrypting an HTTP sync envelope.
+fn checked_sync_response(mut response: Value) -> Result<Value> {
+    fn check(value: &Value) -> Result<()> {
+        let code = value.get("error_code").and_then(|v| {
+            v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        }).unwrap_or(0);
+        if code != 0 {
+            // Do not include request URLs, credentials, or response bodies in UI errors.
+            return Err(crate::session::SessionError::new(code, "sync request rejected").into());
+        }
+        Ok(())
+    }
+    check(&response)?;
+    if let Some(text) = response.get("data").and_then(Value::as_str) {
+        let parsed: Value = serde_json::from_str(text)
+            .map_err(|_| anyhow::anyhow!("sync response could not be decrypted"))?;
+        check(&parsed)?;
+        response["data"] = parsed;
+    }
+    if let Some(data) = response.get("data") {
+        check(data)?;
+    }
+    Ok(response)
 }
 
 /// `/api/social/friend/getfriends` — the friend list.
@@ -350,6 +725,15 @@ pub fn save_threads_cache(threads: &[Thread]) {
 /// Uses `s.domains.friend` (defaulting to `tt-friend-wpa.chat.zalo.me`), falling back
 /// to `s.domains.profile` only if `domains.friend` is empty.
 pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
+    get_friends_impl(s, true).await
+}
+
+/// Fetch remote metadata only. Account-owned GUI storage is handled by its caller.
+pub async fn get_friends_remote(s: &Session) -> Result<Vec<Thread>> {
+    get_friends_impl(s, false).await
+}
+
+async fn get_friends_impl(s: &Session, legacy_storage: bool) -> Result<Vec<Thread>> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -405,6 +789,7 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
             return Err(err.context("không tải được danh sách bạn bè"));
         }
     };
+    let resp = checked_sync_response(resp)?;
     let data_root = resp.get("data").unwrap_or(&resp);
     let mut threads: Vec<Thread> = match data_root {
         Value::Array(items) => items.iter().filter_map(parse_thread).collect(),
@@ -424,7 +809,7 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
         if !li.send2me_id.is_empty() && !threads.iter().any(|t| t.id == li.send2me_id) {
             threads.insert(
                 0,
-                Thread {
+                Thread { presentation: Default::default(), unread: Default::default(),
                     id: li.send2me_id.clone(),
                     name: "Cloud của tôi (Lưu trữ)".into(),
                     preview: "".into(),
@@ -437,8 +822,6 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
         }
     }
 
-    // Hydrate with locally persisted history from SQLite (`zalo_history.db`)
-    crate::store::load_history_into_threads("zalo_history.db", &mut threads, 200);
 
     // Merge user groups (`getlg/v4` + `getmg-v2`) into threads list, upgrading any placeholder group names
     if let Ok(mut groups) = get_groups(s).await {
@@ -451,6 +834,10 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
         }
     }
 
+    // Hydrate with locally persisted history from SQLite (`zalo_history.db`)
+    if legacy_storage {
+        crate::store::load_history_into_threads("zalo_history.db", &mut threads, 200);
+    }
     resolve_thread_names(s, &mut threads).await;
 
     Ok(threads)
@@ -468,19 +855,9 @@ fn parse_thread(v: &Value) -> Option<Thread> {
         .unwrap_or_else(|| id.clone());
     let avatar = pick_str(v, &["avatar", "avt", "profile_avatar"]);
     let is_group = is_group_flag(v);
-    let time = v.get("lastActionTime")
-        .and_then(|val| match val {
-            Value::Number(n) => n.as_i64(),
-            Value::String(s) => s.parse::<i64>().ok(),
-            _ => None,
-        })
-        .map(|ts| {
-            let s = ts / 1000;
-            format!("{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60)
-        })
-        .unwrap_or_default();
-
-    Some(Thread {
+    // lastActionTime belongs to contact activity, not conversation history.
+    let time=String::new();
+    Some(Thread { presentation: Default::default(), unread: Default::default(),
         id,
         name,
         preview: String::new(),
@@ -502,19 +879,32 @@ fn pick_str(v: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
+/// Preserve the protocol's integer clientId without rounding through a float.
+pub fn client_id_wire_value(client_id: &str) -> Result<Value> {
+    anyhow::ensure!(!client_id.is_empty() && client_id.bytes().all(|b| b.is_ascii_digit()), "clientId must contain decimal digits");
+    let value: u64 = client_id.parse().map_err(|_| anyhow::anyhow!("clientId exceeds the unsigned 64-bit wire range"))?;
+    anyhow::ensure!(value.to_string() == client_id, "clientId must use canonical decimal digits");
+    Ok(json!(value))
+}
+fn generated_client_id() -> String {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string()).unwrap_or_else(|_| "0".into())
+}
+
 /// Send a 1-1 text message: `POST {domains.chat}/api/message/sms?{common}`
 pub async fn send_message(s: &Session, to_id: &str, text: &str) -> Result<Value> {
+    send_message_with_client_id(s, to_id, text, &generated_client_id()).await
+}
+
+pub async fn send_message_with_client_id(s: &Session, to_id: &str, text: &str, client_id: &str) -> Result<Value> {
+    let client_id = client_id_wire_value(client_id)?;
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
     let body = obj(&[
         ("toid", json!(to_id)),
         ("message", json!(text)),
-        ("clientId", json!(now)),
+        ("clientId", client_id),
         ("imei", json!(s.imei)),
     ]);
     let params = s.encoded_params(&body)?;
@@ -549,6 +939,11 @@ pub async fn send_message(s: &Session, to_id: &str, text: &str) -> Result<Value>
 
 /// Send a group text message: `POST {domains.group}/api/group/sendmsg?{common}`
 pub async fn send_group_message(s: &Session, grid: &str, text: &str) -> Result<Value> {
+    send_group_message_with_client_id(s, grid, text, &generated_client_id()).await
+}
+
+pub async fn send_group_message_with_client_id(s: &Session, grid: &str, text: &str, client_id: &str) -> Result<Value> {
+    let client_id = client_id_wire_value(client_id)?;
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -556,14 +951,10 @@ pub async fn send_group_message(s: &Session, grid: &str, text: &str) -> Result<V
         .trim_start_matches("group_")
         .trim_start_matches('g')
         .trim_start_matches('G');
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
     let body = obj(&[
         ("grid", json!(clean_grid)),
         ("message", json!(text)),
-        ("clientId", json!(now)),
+        ("clientId", client_id),
         ("imei", json!(s.imei)),
         ("visibility", json!(0)),
     ]);
@@ -595,16 +986,119 @@ pub fn format_file_size(bytes: u64) -> String {
     }
 }
 
-fn md5_hex_bytes(bytes: &[u8]) -> String {
-    use md5::{Digest, Md5};
-    let mut h = Md5::new();
-    h.update(bytes);
-    let out = h.finalize();
-    out.iter().fold(String::with_capacity(32), |mut acc, b| {
-        use std::fmt::Write;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
+pub const UPLOAD_CHUNK_SIZE: usize = 1024 * 1024;
+pub const SINGLE_SHOT_UPLOAD_LIMIT: u64 = 16 * 1024 * 1024;
+
+struct UploadReader {
+    reader: std::io::BufReader<std::fs::File>,
+    remaining: u64,
+    digest: md5::Md5,
+    expected_digest: String,
+}
+
+/// Bounded file IO runs on the blocking pool, never on the UI executor.
+pub struct AttachmentUploadSource {
+    pub total_size: u64,
+    pub checksum: String,
+    pub dimensions: Option<(u32, u32)>,
+    path: std::path::PathBuf,
+    reader: std::sync::Arc<std::sync::Mutex<UploadReader>>,
+}
+impl AttachmentUploadSource {
+    pub async fn open(path: &std::path::Path) -> Result<Self> {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<Self> {
+            use std::io::{Read, Seek, SeekFrom};
+            use md5::{Digest, Md5};
+            let preflight = std::fs::metadata(&path)?;
+            anyhow::ensure!(preflight.is_file(), "Attachment must be a regular file");
+            let file = std::fs::File::open(&path)?;
+            let metadata = file.metadata()?;
+            anyhow::ensure!(metadata.is_file(), "Attachment must be a regular file");
+            let total_size = metadata.len();
+            anyhow::ensure!(total_size > 0, "Attachment is empty (0 bytes)");
+            let mut reader = std::io::BufReader::with_capacity(UPLOAD_CHUNK_SIZE, file);
+            let mut digest = Md5::new();
+            let mut buffer = vec![0; UPLOAD_CHUNK_SIZE];
+            let mut seen = 0u64;
+            loop {
+                let count = reader.read(&mut buffer)?;
+                if count == 0 { break; }
+                seen = seen.checked_add(count as u64).ok_or_else(|| anyhow::anyhow!("Attachment size overflow"))?;
+                anyhow::ensure!(seen <= total_size, "Attachment changed during preflight");
+                digest.update(&buffer[..count]);
+            }
+            anyhow::ensure!(seen == total_size, "Attachment changed during preflight");
+            let checksum = format!("{:x}", digest.finalize());
+            reader.seek(SeekFrom::Start(0))?;
+            let dimensions = image::ImageReader::open(&path).ok()
+                .and_then(|r| r.with_guessed_format().ok()).and_then(|r| r.into_dimensions().ok());
+            Ok(Self { total_size, checksum: checksum.clone(), dimensions, path,
+                reader: std::sync::Arc::new(std::sync::Mutex::new(UploadReader {
+                    reader, remaining: total_size, digest: Md5::new(), expected_digest: checksum,
+                })) })
+        }).await?
+    }
+
+    pub fn total_chunks(&self) -> u64 { self.total_size.div_ceil(UPLOAD_CHUNK_SIZE as u64) }
+
+    /// Existing chunk protocol headers; chunk ordinals are one-based.
+    pub fn chunk_parameters(&self, file_name: &str, client_id: u64, imei: &str,
+        target: &str, is_group: bool, is_image: bool, chunk_id: u64) -> Result<Value> {
+        anyhow::ensure!((1..=self.total_chunks()).contains(&chunk_id), "Invalid upload chunk ordinal");
+        let mut fields = serde_json::Map::new();
+        fields.insert("totalChunk".into(), json!(self.total_chunks()));
+        fields.insert("fileName".into(), json!(file_name));
+        fields.insert("clientId".into(), json!(client_id));
+        fields.insert("totalSize".into(), json!(self.total_size));
+        fields.insert("imei".into(), json!(imei));
+        fields.insert("isE2EE".into(), json!(0));
+        fields.insert("chunkId".into(), json!(chunk_id));
+        if is_image { fields.insert("jxl".into(), json!(0)); }
+        fields.insert(if is_group { "grid" } else { "toid" }.into(), json!(target));
+        Ok(Value::Object(fields))
+    }
+
+    pub async fn next_chunk(&self) -> Result<Option<Vec<u8>>> {
+        let state = self.reader.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            use std::io::Read;
+            use md5::Digest;
+            let mut state = state.lock().map_err(|_| anyhow::anyhow!("Upload reader lock failed"))?;
+            if state.remaining == 0 { return Ok(None); }
+            let length = state.remaining.min(UPLOAD_CHUNK_SIZE as u64) as usize;
+            let mut bytes = vec![0; length];
+            state.reader.read_exact(&mut bytes)?;
+            state.digest.update(&bytes);
+            state.remaining -= length as u64;
+            if state.remaining == 0 {
+                let mut extra = [0u8; 1];
+                anyhow::ensure!(state.reader.read(&mut extra)? == 0, "Attachment grew during upload");
+                anyhow::ensure!(format!("{:x}", state.digest.clone().finalize()) == state.expected_digest,
+                    "Attachment changed during upload");
+            }
+            Ok(Some(bytes))
+        }).await?
+    }
+
+    pub async fn single_shot_bytes(&self) -> Result<Vec<u8>> {
+        anyhow::ensure!(self.total_size <= SINGLE_SHOT_UPLOAD_LIMIT,
+            "Chunk upload failed; single-shot fallback exceeds the 16 MiB bound");
+        let path = self.path.clone();
+        let expected_size = self.total_size;
+        let expected_digest = self.checksum.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            use std::io::Read;
+            use md5::{Digest, Md5};
+            let mut file = std::fs::File::open(path)?;
+            let mut bytes = vec![0; expected_size as usize];
+            file.read_exact(&mut bytes)?;
+            let mut extra = [0u8; 1];
+            anyhow::ensure!(file.read(&mut extra)? == 0, "Attachment changed before fallback");
+            anyhow::ensure!(format!("{:x}", Md5::digest(&bytes)) == expected_digest, "Attachment changed before fallback");
+            Ok(bytes)
+        }).await?
+    }
 }
 
 /// Upload and send a photo, video, or general file attachment to a 1-1 or group conversation.
@@ -619,13 +1113,16 @@ pub async fn send_attachment(
     file_path: &std::path::Path,
     caption: &str,
 ) -> Result<(Value, ChatMessage)> {
+    let id=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis().to_string();
+    send_attachment_with_client_id(s,to_id,is_group,file_path,caption,&id).await
+}
+
+pub async fn send_attachment_with_client_id(s:&Session,to_id:&str,is_group:bool,file_path:&std::path::Path,caption:&str,client_id:&str)->Result<(Value,ChatMessage)>{
+    let client_id=client_id_wire_value(client_id)?.as_u64().ok_or_else(||anyhow::anyhow!("Invalid attachment client ID"))?;
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let file_bytes = std::fs::read(file_path)?;
-    if file_bytes.is_empty() {
-        anyhow::bail!("Tập tin rỗng (0 byte)");
-    }
+    let upload = AttachmentUploadSource::open(file_path).await?;
     let file_name = file_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -656,19 +1153,11 @@ pub async fn send_attachment(
     } else {
         to_id
     };
-    let client_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(1793165000000);
-    let total_size = file_bytes.len() as u64;
-    let chunk_size: usize = 1_048_576; // 1 MiB chunks
-    let total_chunks = file_bytes.len().div_ceil(chunk_size).max(1);
+    let total_size = upload.total_size;
     let target_type = if is_group { 11 } else { 2 };
 
     if is_image {
-        let (width, height) = image::load_from_memory(&file_bytes)
-            .map(|img| (img.width(), img.height()))
-            .unwrap_or((800, 600));
+        let (width, height) = upload.dimensions.unwrap_or((800, 600));
         let mime = match ext.as_str() {
             "png" => "image/png",
             "webp" => "image/webp",
@@ -683,31 +1172,19 @@ pub async fn send_attachment(
         };
 
         let mut last_up_dec = Value::Null;
-        for (idx, chunk) in file_bytes.chunks(chunk_size).enumerate() {
-            let chunk_id = idx + 1;
-            let mut m = serde_json::Map::new();
-            m.insert("totalChunk".into(), json!(total_chunks));
-            m.insert("fileName".into(), json!(file_name));
-            m.insert("clientId".into(), json!(client_id));
-            m.insert("totalSize".into(), json!(total_size));
-            m.insert("imei".into(), json!(s.imei));
-            m.insert("isE2EE".into(), json!(0));
-            m.insert("jxl".into(), json!(0));
-            m.insert("chunkId".into(), json!(chunk_id));
-            if is_group {
-                m.insert("grid".into(), json!(clean_target));
-            } else {
-                m.insert("toid".into(), json!(clean_target));
-            }
-            let params = s.encoded_params(&Value::Object(m))?;
+        let mut idx = 0u64;
+        while let Some(chunk) = upload.next_chunk().await? {
+            let body = upload.chunk_parameters(&file_name, client_id, &s.imei, clean_target, is_group, true, idx + 1)?;
+            let params = s.encoded_params(&body)?;
             let url = format!(
                 "{file_host}{upload_ep}?{}&params={params}&type={target_type}",
                 s.common_params()
             );
             let up_raw = s
-                .post_multipart(&url, "chunkContent", &file_name, mime, chunk)
+                .post_multipart(&url, "chunkContent", &file_name, mime, &chunk)
                 .await?;
             last_up_dec = s.maybe_decrypt(up_raw, s.session_key_bytes()).await;
+            idx += 1;
         }
 
         let data_node = last_up_dec.get("data").unwrap_or(&last_up_dec);
@@ -772,6 +1249,7 @@ pub async fn send_attachment(
                 "{file_host}{single_ep}?{}&params={params}&type={target_type}",
                 s.common_params()
             );
+            let file_bytes = upload.single_shot_bytes().await?;
             let r = s
                 .post_multipart(&url, "fileContent", &file_name, mime, &file_bytes)
                 .await?;
@@ -798,12 +1276,6 @@ pub async fn send_attachment(
         } else {
             file_path.display().to_string()
         };
-        // Pre-populate `stickers_cache/thumb_<md5>.png` with the local image bytes so the GUI
-        // renders the sent photo immediately without an extra network round-trip.
-        let _ = std::fs::create_dir_all("stickers_cache");
-        let cache_key = format!("thumb_{}", crate::crypto::md5_hex(&final_thumb));
-        let _ = std::fs::write(format!("stickers_cache/{cache_key}.png"), &file_bytes);
-
         let msg_id = send_resp
             .get("data")
             .and_then(|d| pick_str(d, &["msgId", "cliMsgId"]))
@@ -815,12 +1287,15 @@ pub async fn send_attachment(
             format!("[Hình ảnh] {file_name}")
         };
         let cm = ChatMessage {
+            client_message_id: client_id.to_string(),
+            kind: crate::message_model::MessageKind::Photo,
+            delivery: crate::message_model::DeliveryState::ServerAccepted,
             id: msg_id,
             sender: "Tôi".into(),
             text: display_text.clone(),
             time: now_str,
             is_outgoing: true,
-            ts: client_id as i64,
+            ts: (crate::login::unix_now()*1000)as i64,
             link_url: Some(final_url),
             link_title: Some(format!("{file_name} ({width}×{height} · {})", format_file_size(total_size))),
             link_desc: if caption.trim().is_empty() {
@@ -848,7 +1323,7 @@ pub async fn send_attachment(
         "txt" | "md" | "log" => "text/plain",
         _ => "application/octet-stream",
     };
-    let checksum = md5_hex_bytes(&file_bytes);
+    let checksum = upload.checksum.clone();
     let upload_ep = if is_group {
         "/api/group/asyncfile/upload"
     } else {
@@ -856,38 +1331,29 @@ pub async fn send_attachment(
     };
 
     let mut last_up_dec = Value::Null;
-    for (idx, chunk) in file_bytes.chunks(chunk_size).enumerate() {
-        let chunk_id = idx + 1;
-        let mut m = serde_json::Map::new();
-        m.insert("totalChunk".into(), json!(total_chunks));
-        m.insert("fileName".into(), json!(file_name));
-        m.insert("clientId".into(), json!(client_id));
-        m.insert("totalSize".into(), json!(total_size));
-        m.insert("imei".into(), json!(s.imei));
-        m.insert("isE2EE".into(), json!(0));
-        m.insert("chunkId".into(), json!(chunk_id));
-        if is_group {
-            m.insert("grid".into(), json!(clean_target));
-        } else {
-            m.insert("toid".into(), json!(clean_target));
-        }
-        let params = s.encoded_params(&Value::Object(m))?;
+    let mut idx = 0u64;
+    while let Some(chunk) = upload.next_chunk().await? {
+        let body = upload.chunk_parameters(&file_name, client_id, &s.imei, clean_target, is_group, false, idx + 1)?;
+        let params = s.encoded_params(&body)?;
         let url = format!(
             "{file_host}{upload_ep}?{}&params={params}&type={target_type}",
             s.common_params()
         );
         if let Ok(up_raw) = s
-            .post_multipart(&url, "chunkContent", &file_name, mime, chunk)
+            .post_multipart(&url, "chunkContent", &file_name, mime, &chunk)
             .await
         {
             last_up_dec = s.maybe_decrypt(up_raw, s.session_key_bytes()).await;
+            if last_up_dec.get("error_code").and_then(Value::as_i64).is_some_and(|code| code != 0) { break; }
+            idx += 1;
         } else {
             break;
         }
     }
 
     let data_node = last_up_dec.get("data").unwrap_or(&last_up_dec);
-    let file_id = pick_str(data_node, &["fileId", "clientFileId"]);
+    let file_id = pick_str(data_node, &["fileId", "clientFileId"])
+        .filter(|_| idx == upload.total_chunks());
     let file_url = pick_str(data_node, &["fileUrl", "url", "normalUrl"]).unwrap_or_default();
 
     let mut send_resp = if let Some(fid) = file_id {
@@ -942,6 +1408,7 @@ pub async fn send_attachment(
             "{file_host}{share_ep}?{}&params={params}&type={target_type}",
             s.common_params()
         );
+        let file_bytes = upload.single_shot_bytes().await?;
         let r = s
             .post_multipart(&url, "fileContent", &file_name, mime, &file_bytes)
             .await?;
@@ -977,12 +1444,15 @@ pub async fn send_attachment(
         format!("[{kind_label}] {file_name}")
     };
     let cm = ChatMessage {
+        client_message_id: client_id.to_string(),
+        kind: if is_video { crate::message_model::MessageKind::Video } else { crate::message_model::MessageKind::File },
+        delivery: crate::message_model::DeliveryState::ServerAccepted,
         id: msg_id,
         sender: "Tôi".into(),
         text: display_text,
         time: crate::ui::clock(),
         is_outgoing: true,
-        ts: client_id as i64,
+        ts: (crate::login::unix_now()*1000)as i64,
         link_url: if final_url.is_empty() {
             None
         } else {
@@ -1077,9 +1547,8 @@ pub async fn scrape_opengraph_metadata(url: &str) -> Option<LinkMetadata> {
     if !resp.status().is_success() {
         return None;
     }
-    let bytes = resp.bytes().await.ok()?;
-    let take_len = bytes.len().min(131_072);
-    let html = String::from_utf8_lossy(&bytes[..take_len]);
+    let bytes = crate::media_resources::read_bounded_response(resp, crate::media_resources::HTML_LIMIT).await.ok()?;
+    let html = String::from_utf8_lossy(&bytes);
 
     let mut og_title = String::new();
     let mut og_desc = String::new();
@@ -2100,6 +2569,14 @@ pub async fn send_quote_message(
     quoted: &ChatMessage,
     is_group: bool,
 ) -> Result<Value> {
+    send_quote_message_with_client_id(s, to_id, text, quoted, is_group, &generated_client_id()).await
+}
+
+pub async fn send_quote_message_with_client_id(
+    s: &Session, to_id: &str, text: &str, quoted: &ChatMessage,
+    is_group: bool, client_id: &str,
+) -> Result<Value> {
+    let wire_client_id = client_id_wire_value(client_id)?;
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -2145,7 +2622,7 @@ pub async fn send_quote_message(
             let body = obj(&[
                 ("grid", json!(clean_grid)),
                 ("message", json!(text)),
-                ("clientId", json!(now)),
+                ("clientId", wire_client_id.clone()),
                 ("language", json!("vi")),
                 ("qmsgOwner", json!(qmsg_owner)),
                 ("qmsgId", json!(qmsg_id_num)),
@@ -2180,7 +2657,7 @@ pub async fn send_quote_message(
             let body = obj(&[
                 ("toid", json!(to_id)),
                 ("message", json!(text)),
-                ("clientId", json!(now)),
+                ("clientId", wire_client_id.clone()),
                 ("qmsgOwner", json!(qmsg_owner)),
                 ("qmsgId", json!(qmsg_id_num)),
                 ("qmsgCliId", json!(qmsg_cli_id)),
@@ -2209,9 +2686,9 @@ pub async fn send_quote_message(
         Ok(r) => Ok(r),
         Err(_) => {
             if is_group {
-                send_group_message(s, to_id, text).await
+                send_group_message_with_client_id(s, to_id, text, client_id).await
             } else {
-                send_message(s, to_id, text).await
+                send_message_with_client_id(s, to_id, text, client_id).await
             }
         }
     }
@@ -2522,7 +2999,83 @@ pub async fn get_last_msgs(s: &Session, thread_ids: &[String]) -> Result<Value> 
     );
     let resp = s.get(&url).await?;
     let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    Ok(resp)
+    checked_sync_response(resp)
+}
+
+/// Metadata requests deliberately bypass request/payload dumps, including developer mode.
+async fn get_private_metadata(s: &Session, url: String) -> Result<Value> {
+    anyhow::ensure!(s.login.is_some(), "Metadata requires an authenticated session");
+    let parsed = reqwest::Url::parse(&url)?;
+    anyhow::ensure!(parsed.host_str().is_some_and(|h|h=="zalo.me" || h.ends_with(".zalo.me") || h=="zaloapp.com" || h.ends_with(".zaloapp.com")), "Unexpected metadata host");
+    let mut request = s.http.get(parsed).timeout(std::time::Duration::from_secs(15));
+    if let Some(token) = s.zpw_sek.as_ref() {
+        request = request.header("Cookie",format!("zpw_sek={token}; _zlang=vi")).header("zpw_sek",token)
+            .header("Origin","https://chat.zalo.me").header("Referer","https://chat.zalo.me/");
+    }
+    let response = request.send().await.map_err(|_|anyhow::anyhow!("Metadata transport failed"))?;
+    anyhow::ensure!(response.status().is_success(), "Metadata HTTP request failed");
+    let mut value: Value = response.json().await.map_err(|_|anyhow::anyhow!("Invalid metadata response"))?;
+    if let Some(encoded) = value.get("data").and_then(Value::as_str) {
+        if !encoded.trim_start().starts_with('{') && !encoded.trim_start().starts_with('[') {
+            let plaintext = crate::crypto::decode_aes(s.session_key_bytes(),encoded).map_err(|_|anyhow::anyhow!("Metadata decryption failed"))?;
+            value = serde_json::from_str(&plaintext).map_err(|_|anyhow::anyhow!("Invalid decrypted metadata"))?;
+        }
+    }
+    checked_sync_response(value)
+}
+
+/// Read-only desktop command 12009. It fetches account read cursors, not receipts.
+pub async fn get_last_seen(s: &Session, threads: &[Thread]) -> Result<Value> {
+    let groups: Vec<_> = threads.iter().filter(|t|t.is_group).map(|t|t.id.trim_start_matches('g').to_string()).collect();
+    let peers: Vec<_> = threads.iter().filter(|t|!t.is_group).map(|t|t.id.clone()).collect();
+    let body = json!({"param": serde_json::to_string(&json!({"group":groups,"oneone":peers}))?});
+    let params = s.encoded_params(&body)?;
+    get_private_metadata(s,format!("{}/api/preloadconvers/get-last-seen?{}&params={params}",s.domains.chat,s.common_params())).await
+}
+
+/// Read-only desktop command 11280, used to render muted unread dots.
+pub async fn get_mute_metadata(s: &Session) -> Result<Value> {
+    let params = s.encoded_params(&json!({"imei":s.imei}))?;
+    get_private_metadata(s,format!("{}/api/social/profile/getmute?{}&params={params}",s.domains.profile,s.common_params())).await
+}
+
+/// Fetch read cursors without opening another socket or sending any seen mutation.
+fn unread_metadata_targets(threads: &[Thread]) -> Vec<Thread> {
+    threads.iter().filter(|thread| !thread.id.trim().is_empty() && thread.id != "0")
+        .map(|thread| Thread { presentation: Default::default(),
+            id: thread.id.clone(), is_group: thread.is_group, name: String::new(), preview: String::new(),
+            time: String::new(), avatar: None, messages: Vec::new(), unread: Default::default(),
+        }).collect()
+}
+
+pub async fn sync_unread_metadata(s: &Session, threads: &mut Vec<Thread>) -> Result<()> {
+    // Match the original batching contract and avoid URL overflow on large contact lists.
+    let known = unread_metadata_targets(threads);
+    for batch in known.chunks(100) {
+        let response = get_last_seen(s, batch).await?;
+        let mut data = response;
+        for _ in 0..4 {
+            match data.get("data") {
+                Some(Value::String(text)) => { data = serde_json::from_str(text)?; }
+                Some(value) => { data = value.clone(); }
+                None => break,
+            }
+        }
+        crate::unread::merge_read_points(threads, &data);
+    }
+    for thread in threads.iter_mut().filter(|t|t.unread.fresh) { thread.unread.observe(&thread.messages); }
+    if let Ok(response) = get_mute_metadata(s).await {
+        let mut data = response;
+        for _ in 0..4 {
+            match data.get("data") {
+                Some(Value::String(text)) => { if let Ok(value) = serde_json::from_str(text) { data = value; } else { break; } }
+                Some(value) => { data = value.clone(); }
+                None => break,
+            }
+        }
+        crate::unread::merge_mute_metadata(threads, &data);
+    }
+    Ok(())
 }
 
 /// `GET /api/pinconvers/list` (cmd 12120) — pinned threads.
@@ -2540,34 +3093,7 @@ pub async fn get_pinned(s: &Session) -> Result<Value> {
 
 /// `GET /api/group/history` (cmd 11240) — group message history.
 pub async fn get_group_history(s: &Session, group_id: &str, count: u32) -> Result<Value> {
-    if s.login.is_none() {
-        anyhow::bail!("chưa đăng nhập");
-    }
-    let grid = group_id
-        .trim_start_matches("group_")
-        .trim_start_matches('g')
-        .trim_start_matches('G');
-    let body = obj(&[
-        ("grid", json!(grid)),
-        ("count", json!(count)),
-        ("imei", json!(s.imei)),
-    ]);
-    let params = match s.encoded_params(&body) {
-        Ok(p) => format!("params={p}"),
-        Err(e) => {
-            crate::logger::log_error("chat::get_group_history::encoded_params", &e.to_string());
-            Session::plain_params(&body)
-        }
-    };
-    let url = format!(
-        "{}/api/group/history?{}&{params}",
-        s.domains.group,
-        s.common_params()
-    );
-    match s.get(&url).await {
-        Ok(resp) => Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await),
-        Err(_) => get_group_history_raw(s, grid, count).await,
-    }
+    get_group_history_raw(s, group_id, count).await
 }
 
 /// Byte-exact replica of the shipped bundle's `getHistoryMessage(e, t)`.
@@ -2771,7 +3297,7 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
     let mut groups = Vec::new();
     if let Some(map) = data_node.get("gridVerMap").and_then(Value::as_object) {
         for (grid, _ver) in map {
-            groups.push(Thread {
+            groups.push(Thread { presentation: Default::default(), unread: Default::default(),
                 id: grid.clone(),
                 name: format!("Nhóm {}", grid),
                 preview: String::new(),
@@ -2787,6 +3313,7 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
                 let mut need_mem_uids: Vec<String> = Vec::new();
                 for g in &mut groups {
                     if let Some(info) = info_map.get(&g.id) {
+                        g.apply_group_sidebar_metadata(info);
                         if let Some(name) = pick_str(info, &["name", "groupName", "displayName"]) {
                             g.name = name;
                         }
@@ -2835,6 +3362,7 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
             }
         }
     }
+    resolve_thread_names(s, &mut groups).await;
     Ok(groups)
 }
 
@@ -2873,6 +3401,38 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
         })
         .map(|t| t.id.clone())
         .collect();
+
+    let member_ids: std::collections::BTreeSet<String> = threads.iter().filter(|t| t.is_group)
+        .flat_map(|t| t.presentation.members.iter().take(4))
+        .filter(|member| member.avatar.is_none() || member.name.is_empty())
+        .map(|member| member.id.clone()).collect();
+    let mut member_ids=member_ids;
+    for thread in threads.iter_mut().filter(|t|t.is_group) {thread.refresh_sidebar_presentation();
+        if !thread.presentation.last_outgoing && !thread.presentation.last_sender_id.is_empty()
+            && (thread.presentation.last_sender.is_empty() || thread.presentation.last_sender.bytes().all(|b|b.is_ascii_digit())) {
+            member_ids.insert(thread.presentation.last_sender_id.clone());
+        }
+    }
+    let member_ids: Vec<_> = member_ids.into_iter().collect();
+    for chunk in member_ids.chunks(50) {
+        if let Ok(profiles) = get_mini_profiles(s, chunk).await {
+            for thread in threads.iter_mut().filter(|t| t.is_group) {
+                if let Some(profile)=profiles.get(&thread.presentation.last_sender_id) {
+                    if let Some(name)=pick_str(profile,&["zaloName","displayName","name"]) {
+                        thread.presentation.last_sender=name.clone();
+                        for message in &mut thread.messages {if sidebar_sender_id(message).as_deref()==Some(&thread.presentation.last_sender_id){message.sender=name.clone();}}
+                    }
+                }
+
+                for member in &mut thread.presentation.members {
+                    if let Some(profile) = profiles.get(&member.id) {
+                        if let Some(name) = pick_str(profile, &["zaloName", "displayName", "name"]) { member.name = name; }
+                        if let Some(avatar) = pick_str(profile, &["avatar", "avt"]) { member.avatar = Some(avatar); }
+                    }
+                }
+            }
+        }
+    }
 
     if !unknown_ids.is_empty() {
         for chunk in unknown_ids.chunks(50) {
@@ -2921,6 +3481,7 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
                         .trim_start_matches('g')
                         .trim_start_matches('G');
                     if let Some(info) = info_map.get(&t.id).or_else(|| info_map.get(clean_id)) {
+                        t.apply_group_sidebar_metadata(info);
                         if let Some(name) = pick_str(info, &["name", "groupName", "displayName"]) {
                             if !name.is_empty() {
                                 t.name = name;
@@ -3288,6 +3849,24 @@ pub async fn poll_new_messages(
     state: &mut PollState,
     threads: &mut Vec<Thread>,
 ) -> Result<()> {
+    poll_new_messages_impl(s, state, threads, true).await
+}
+
+/// Merge remote updates without reading or writing global legacy history/cache.
+pub async fn poll_new_messages_remote(
+    s: &Session,
+    state: &mut PollState,
+    threads: &mut Vec<Thread>,
+) -> Result<()> {
+    poll_new_messages_impl(s, state, threads, false).await
+}
+
+async fn poll_new_messages_impl(
+    s: &Session,
+    state: &mut PollState,
+    threads: &mut Vec<Thread>,
+    legacy_storage: bool,
+) -> Result<()> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -3353,14 +3932,17 @@ pub async fn poll_new_messages(
             }
         }
     }
+    let _ = sync_unread_metadata(s, threads).await;
     // 3. Resolve display names for any newly discovered threads
     resolve_thread_names(s, threads).await;
     threads.retain(|t| !t.messages.is_empty() || !t.name.starts_with("Người dùng "));
     deduplicate_threads(threads, None);
-    if let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") {
-        let _ = crate::store::persist_threads(&mut store, threads);
+    if legacy_storage {
+        if let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") {
+            let _ = crate::store::persist_threads(&mut store, threads);
+        }
+        save_threads_cache(threads);
     }
-    save_threads_cache(threads);
     Ok(())
 }
 
@@ -3419,6 +4001,9 @@ fn normalize_msg_type(it: &Value) -> String {
         .or_else(|| it.get("messageType"))
         .or_else(|| it.get("type"));
     match raw {
+        Some(Value::String(s)) if s.parse::<i64>().is_ok() => {
+            normalize_msg_type(&json!({"msgType": s.parse::<i64>().unwrap()}))
+        }
         Some(Value::String(s)) => s.to_ascii_lowercase(),
         Some(Value::Number(n)) => {
             match n.as_i64() {
@@ -3506,18 +4091,13 @@ fn extract_link_info(
             let href = o
                 .get("href")
                 .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|h| !h.is_empty() && (h.starts_with("http://") || h.starts_with("https://")))
+                .filter(|h| h.starts_with("http://") || h.starts_with("https://"))
                 .map(str::to_string);
             let Some(url) = href else {
                 return (None, None, None, None, None);
             };
-            let thumb = o
-                .get("thumb")
-                .or_else(|| o.get("hd"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|t| !t.is_empty() && (t.starts_with("http://") || t.starts_with("https://")))
+            let thumb = ["thumb", "hd"].iter().filter_map(|key| o.get(*key).and_then(Value::as_str))
+                .find(|t| t.starts_with("http://") || t.starts_with("https://"))
                 .map(str::to_string);
             let mut title = o
                 .get("title")
@@ -3564,8 +4144,9 @@ fn extract_link_info(
         _ => (None, None, None, None, None),
     }
 }
-fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
+pub fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     let msg_type = normalize_msg_type(it);
+    if msg_type == "chat.reaction" { return None; }
 
     let raw_content_val = it
         .get("content")
@@ -3576,9 +4157,18 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     if sticker_meta.is_none() && (msg_type == "chat.sticker" || msg_type == "sticker" || msg_type == "5") {
         sticker_meta = extract_sticker_info(it);
     }
-    let (link_url, link_title, link_desc, link_thumb, link_src) = raw_content_val
+    let (link_url, link_title, link_desc, mut link_thumb, mut link_src) = raw_content_val
         .map(extract_link_info)
         .unwrap_or((None, None, None, None, None));
+
+    match msg_type.as_str() {
+        "chat.photo" | "photo" | "2" => {
+            link_src = Some("Hình ảnh Zalo".into());
+            if link_thumb.is_none() { link_thumb = link_url.clone(); }
+        }
+        "chat.video" | "video" | "4" => link_src = Some("Video Zalo".into()),
+        _ => {}
+    }
 
     let mut content = raw_content_val
         .and_then(extract_content_text)
@@ -3682,7 +4272,6 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
 
     let ts = it
         .get("ts")
-        .or_else(|| it.get("cliMsgId"))
         .or_else(|| it.get("sendTime"))
         .or_else(|| it.get("serverTime"))
         .or_else(|| it.get("time"))
@@ -3693,15 +4282,11 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         })
         .unwrap_or(0);
 
-    let time = if ts > 0 {
-        let s = ts / 1000;
-        format!("{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60)
-    } else {
-        crate::ui::clock()
-    };
+    let ts = crate::clock::normalize_ts_ms(ts);
+    let time = crate::clock::message_time(ts);
 
     let (reply_to_id, reply_to_sender, reply_to_text) = if let Some(q) = it.get("quote").filter(|v| v.is_object()) {
-        let q_id = pick_str(q, &["cliMsgId", "globalMsgId", "msgId"]);
+        let q_id = crate::message_navigation::reply_reference(q);
         let q_sender = pick_str(q, &["fromD", "dName", "ownerId", "fromUid", "uidFrom"]);
         let q_text = pick_str(q, &["msg", "message", "content"]).or_else(|| {
             q.get("msg").or_else(|| q.get("content")).and_then(extract_content_text)
@@ -3712,6 +4297,11 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     };
 
     Some(ChatMessage {
+        resolved_mention_uids: Default::default(),
+        kind: crate::message_model::MessageKind::from_wire_name(&msg_type),
+        wire_ref: crate::message_model::WireMessageRef::from_raw(it),
+        unread_policy: crate::message_model::UnreadPolicy::from_raw(it),
+        delivery: crate::message_model::DeliveryState::Unknown,
         id: msg_id,
         sender: display_sender,
         text: content,
@@ -3724,7 +4314,17 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         reply_to_id,
         reply_to_sender,
         reply_to_text,
-        reactions: extract_reactions(it),
+        reactions: crate::reactions::legacy_emojis(&crate::reactions::parse_reactions(it)),
+        reaction_summaries: crate::reactions::parse_reactions(it),
+        reaction_snapshot: it.get("reacts").is_some_and(|v| !v.is_null()) || it.get("reactions").is_some_and(|v| !v.is_null()),
+        reaction_authoritative_snapshot: it.get("reacts").and_then(|v| v.get("reactions"))
+            .or_else(|| it.get("reactions")).is_some_and(Value::is_object),
+        reaction_snapshot_fresh: it.get("reacts").and_then(|v| v.get("reactions"))
+            .or_else(|| it.get("reactions")).is_some_and(Value::is_object),
+        reaction_snapshot_provenance: it.get("reaction_snapshot_provenance")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()).unwrap_or_default(),
+        reaction_versions: Default::default(),
+        client_message_id: pick_str(it, &["cliMsgId", "clientId", "client_message_id"]).unwrap_or_default(),
         is_pinned: false,
         is_starred: false,
         link_url,
@@ -3732,6 +4332,7 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         link_desc,
         link_thumb,
         link_src,
+        history_source: it.get("historySource").cloned(),
     })
 }
 
@@ -3835,6 +4436,7 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
     if let Some(inner_data) = data_node.get("data").filter(|v| v.is_object() || v.is_array()) {
         data_node = inner_data;
     }
+    crate::unread::merge_read_points(threads, data_node);
     let cloud_tid: Option<String> = threads
         .iter()
         .find(|t| t.name.contains("Cloud của tôi"))
@@ -3873,7 +4475,7 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 // Only auto-create 1-1 conversation threads from `clearUnreads`; disbanded groups
                 // may linger in `clearUnreads` after removal, whereas active groups come from `get_groups`.
                 if !is_grp && !threads.iter().any(|t| t.id == tid) {
-                    threads.push(Thread {
+                    threads.push(Thread { presentation: Default::default(), unread: Default::default(),
                         id: tid.clone(),
                         name: format!("Người dùng {tid}"),
                         preview: String::new(),
@@ -3939,13 +4541,11 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 if thread_is_group {
                     t.is_group = true;
                 }
-                if let Some(existing) = t.messages.iter_mut().find(|existing| {
-                    (!existing.id.is_empty() && !parsed.id.is_empty() && existing.id == parsed.id)
-                        || (existing.text == parsed.text
-                            && existing.is_outgoing == parsed.is_outgoing
-                            && (existing.time == parsed.time
-                                || (existing.ts != 0 && parsed.ts != 0 && (existing.ts - parsed.ts).abs() < 5000)))
-                }) {
+                if let Some(index) = matching_message_index(&t.messages, &parsed) {
+                    let existing = &mut t.messages[index];
+                    existing.merge_reaction_metadata(&parsed);
+                    existing.merge_media_metadata(&parsed);
+                    if parsed.history_source.is_some() { existing.history_source = parsed.history_source.clone(); }
                     if existing.id.starts_with("out_") && !parsed.id.is_empty() && !parsed.id.starts_with("out_") {
                         existing.id = parsed.id;
                     }
@@ -3994,7 +4594,7 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 } else {
                     format!("Người dùng {}", tid)
                 };
-                threads.push(Thread {
+                threads.push(Thread { presentation: Default::default(), unread: Default::default(),
                     id: tid,
                     name: default_name,
                     preview: parsed.text.clone(),
@@ -4008,9 +4608,10 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
     }
 
     for t in threads.iter_mut() {
+        t.refresh_sidebar_presentation();
         if !t.messages.is_empty() {
             t.messages.sort_by_key(|m| m.ts);
-            if let Some(newest) = t.messages.last() {
+            if let Some(newest) = t.messages.last().filter(|m| crate::clock::normalize_ts_ms(m.ts) >= crate::clock::normalize_ts_ms(t.presentation.last_message_ts)) {
                 if !newest.text.is_empty() {
                     t.preview = newest.text.replace('\n', " ");
                     t.time = newest.time.clone();
@@ -4064,10 +4665,11 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
             }
         }
         if let Some(m) = parse_chat_message(it) {
-            if let Some(existing) = thread.messages.iter_mut().find(|existing| {
-                (!existing.id.is_empty() && !m.id.is_empty() && existing.id == m.id)
-                    || (existing.text == m.text && existing.ts != 0 && existing.ts == m.ts)
-            }) {
+            if let Some(index) = matching_message_index(&thread.messages, &m) {
+                let existing = &mut thread.messages[index];
+                if existing.id.starts_with("out_") && !m.id.starts_with("out_") { existing.id = m.id.clone(); }
+                existing.merge_reaction_metadata(&m);
+                existing.merge_media_metadata(&m);
                 if existing.link_url.is_none() && m.link_url.is_some() {
                     existing.link_url = m.link_url;
                     existing.link_title = m.link_title;
@@ -4084,9 +4686,10 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
         }
     }
 
+    thread.refresh_sidebar_presentation();
     thread.messages.sort_by_key(|m| m.ts);
 
-    if let Some(newest) = thread.messages.last() {
+    if let Some(newest) = thread.messages.last().filter(|m| crate::clock::normalize_ts_ms(m.ts) >= crate::clock::normalize_ts_ms(thread.presentation.last_message_ts)) {
         if !newest.text.is_empty() {
             thread.preview = newest.text.replace('\n', " ");
             thread.time = newest.time.clone();
@@ -4180,11 +4783,8 @@ pub async fn get_user_online_status(s: &Session, uid: &str) -> Result<(bool, Str
         ("imei", json!(s.imei)),
     ]);
     let enc = s.encoded_params(&body)?;
-    let host = if s.domains.profile.is_empty() {
-        "https://tt-profile-wpa.chat.zalo.me"
-    } else {
-        &s.domains.profile
-    };
+    // Session domain defaults provide the canonical profile host.
+    let host = &s.domains.profile;
     let url = format!(
         "{}/api/social/profile/lastOnline?{}&params={enc}",
         host.trim_end_matches('/'),
@@ -4452,6 +5052,40 @@ pub async fn find_user_by_phone(s: &Session, raw_phone: &str) -> Result<PhoneLoo
 mod tests {
     use super::*;
 
+    #[test]
+    fn unread_sync_targets_metadata_only_threads_in_bounded_batches() {
+        let mut threads: Vec<_> = (1..=201).map(|id| Thread { presentation: Default::default(),
+            id: id.to_string(), name: String::new(), preview: String::new(), time: String::new(),
+            avatar: None, is_group: id % 2 == 0, messages: Vec::new(), unread: Default::default(),
+        }).collect();
+        for id in ["", "0"] { let mut invalid = threads[0].clone(); invalid.id = id.into(); threads.push(invalid); }
+        let targets = unread_metadata_targets(&threads);
+        assert_eq!(targets.len(), 201);
+        assert_eq!(targets.chunks(100).map(|batch| batch.len()).collect::<Vec<_>>(), vec![100, 100, 1]);
+        assert!(targets.iter().all(|thread| thread.messages.is_empty()));
+    }
+
+    #[test]
+    fn sync_errors_after_decryption_are_not_successful_empty_lists() {
+        assert!(checked_sync_response(json!({"error_code": 0, "data": {"error_code": 600}})).is_err());
+        assert!(checked_sync_response(json!({"error_code": "600", "data": []})).is_err());
+        assert!(checked_sync_response(json!({"error_code": 0, "data": "encrypted-fixture"})).is_err());
+        let good = checked_sync_response(json!({"error_code": 0, "data": "{\"friends\":[]}"})).unwrap();
+        assert_eq!(good["data"]["friends"], json!([]));
+    }
+
+    #[test]
+    fn sync_errors_preserve_typed_auth_and_transient_status() {
+        for code in [600, -102] {
+            let error = checked_sync_response(json!({"error_code": 0, "data": {"error_code": code}})).unwrap_err();
+            assert_eq!(crate::session::SessionStatus::from_error(&error), crate::session::SessionStatus::Expired);
+        }
+        for code in [429, 500, 18022] {
+            let error = checked_sync_response(json!({"error_code": code})).unwrap_err();
+            assert_eq!(crate::session::SessionStatus::from_error(&error), crate::session::SessionStatus::Unreachable);
+        }
+    }
+
     #[tokio::test]
     async fn unauthenticated_calls_fail_cleanly() {
         let s = Session::new(false, false, false).unwrap();
@@ -4472,7 +5106,7 @@ mod tests {
     }
 
     fn sample_thread(id: &str) -> Thread {
-        Thread {
+        Thread { presentation: Default::default(), unread: Default::default(),
             id: id.into(),
             name: format!("Name {id}"),
             preview: String::new(),
@@ -4818,7 +5452,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_thread_boolean_is_group_and_string_time() {
+    fn test_parse_thread_group_metadata_does_not_use_contact_activity_time() {
         let val = json!({
             "userId": "grp_test",
             "displayName": "Nhom Chem Gio",
@@ -4828,12 +5462,13 @@ mod tests {
         let thread = parse_thread(&val).unwrap();
         assert!(thread.is_group);
         assert_eq!(thread.name, "Nhom Chem Gio");
-        assert!(!thread.time.is_empty());
+        assert!(thread.time.is_empty());
+        assert_eq!(thread.sidebar_activity_ts(),0);
     }
 
     #[test]
-    fn test_deduplicate_threads_migrates_session_scoped_ids() {
-        let old_dtc = Thread {
+    fn test_deduplicate_threads_preserves_distinct_ids() {
+        let old_dtc = Thread { presentation: Default::default(), unread: Default::default(),
             id: "1000000000000000005".into(),
             name: "Đtc".into(),
             preview: "Hi".into(),
@@ -4850,7 +5485,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let new_dtc = Thread {
+        let new_dtc = Thread { presentation: Default::default(), unread: Default::default(),
             id: "1000000000000000006".into(),
             name: "Đtc".into(),
             preview: "".into(),
@@ -4861,15 +5496,15 @@ mod tests {
         };
         let mut threads = vec![old_dtc, new_dtc];
         deduplicate_threads(&mut threads, None);
-        assert_eq!(threads.len(), 1);
-        assert_eq!(threads[0].id, "1000000000000000006");
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].id, "1000000000000000005");
         assert_eq!(threads[0].messages.len(), 1);
         assert_eq!(threads[0].preview, "Hi");
     }
 
     #[test]
     fn test_merge_group_history_parses_stringified_cloud_data() {
-        let mut cloud_thread = Thread {
+        let mut cloud_thread = Thread { presentation: Default::default(), unread: Default::default(),
             id: "9000000000000000002".into(),
             name: "Cloud của tôi (Lưu trữ)".into(),
             preview: String::new(),
@@ -4925,7 +5560,7 @@ mod tests {
 
     #[test]
     fn test_prevent_cloud_message_pollution_across_threads() {
-        let mut contact = Thread {
+        let mut contact = Thread { presentation: Default::default(), unread: Default::default(),
             id: "1000000000000000009".into(),
             name: "Người dùng Test".into(),
             preview: String::new(),
@@ -4951,7 +5586,7 @@ mod tests {
         merge_group_history(&mut contact, &raw_cloud_resp);
         assert!(contact.messages.is_empty());
 
-        let cloud = Thread {
+        let cloud = Thread { presentation: Default::default(), unread: Default::default(),
             id: "9000000000000000001".into(),
             name: "Cloud của tôi (Lưu trữ)".into(),
             preview: "Ghi chú Cloud của tôi".into(),
@@ -4968,7 +5603,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let polluted_contact = Thread {
+        let polluted_contact = Thread { presentation: Default::default(), unread: Default::default(),
             id: "1000000000000000009".into(),
             name: "Người dùng Test".into(),
             preview: "Ghi chú Cloud của tôi".into(),
@@ -4988,7 +5623,559 @@ mod tests {
         let mut list = vec![cloud, polluted_contact];
         deduplicate_threads(&mut list, None);
         assert_eq!(list[0].messages.len(), 1);
-        assert!(list[1].messages.is_empty());
-        assert!(list[1].preview.is_empty());
+        assert_eq!(list[1].messages.len(), 1);
+        assert_eq!(list[1].preview, "Ghi chú Cloud của tôi");
+    }
+}
+
+#[cfg(test)]
+mod heavy_merge_regression_tests {
+    use super::*;
+
+    fn fixture(count: usize) -> Thread {
+        Thread { presentation: Default::default(), unread: Default::default(),
+            id: "fixture-thread".into(), name: "Fixture".into(), preview: String::new(),
+            time: String::new(), avatar: None, is_group: false,
+            messages: (0..count).map(|index| ChatMessage {
+                id: format!("fixture-{index}"), text: format!("message-{index}"),
+                ts: index as i64 + 1,
+                history_source: Some(json!({"body": "fixture"})),
+                ..Default::default()
+            }).collect(),
+        }
+    }
+
+    #[test]
+    fn repeated_11800_message_merge_is_unchanged_and_preserves_metadata_enrichment() {
+        let incoming = fixture(11_800);
+        let mut target = fixture(0);
+        assert!(merge_thread_into(&mut target, incoming.clone(), true));
+        for _ in 0..3 {
+            assert!(!merge_thread_into(&mut target, incoming.clone(), true));
+            assert_eq!(target.messages.len(), 11_800);
+        }
+        let mut enriched = incoming.clone();
+        enriched.messages[6000].link_url = Some("https://example.invalid/fixture".into());
+        enriched.messages[6000].link_title = Some("Fixture title".into());
+        enriched.messages[6000].history_source = Some(json!({"body": "enriched"}));
+        assert!(merge_thread_into(&mut target, enriched.clone(), true));
+        assert_eq!(target.messages[6000].link_title.as_deref(), Some("Fixture title"));
+        assert_eq!(target.messages[6000].history_source, enriched.messages[6000].history_source);
+        assert!(!merge_thread_into(&mut target, enriched, true));
+        assert_eq!(target.messages.len(), 11_800);
+    }
+
+    #[test]
+    fn exact_id_precedes_unverified_pending_text_match() {
+        let mut target = fixture(2);
+        target.messages[0].id = "out_pending".into();
+        target.messages[0].text = "same".into();
+        target.messages[0].time = "12:00".into();
+        target.messages[1].id = "server-id".into();
+        target.messages[1].text = "different".into();
+        let mut incoming = fixture(1);
+        incoming.messages[0].id = "server-id".into();
+        incoming.messages[0].text = "same".into();
+        incoming.messages[0].time = "12:00".into();
+        incoming.messages[0].link_title = Some("Enriched earlier pending".into());
+        incoming.messages[0].link_url = Some("https://example.invalid/fixture".into());
+        merge_thread_into(&mut target, incoming, true);
+        assert_eq!(target.messages.len(), 2);
+        assert_eq!(target.messages[0].id, "out_pending");
+        assert_eq!(target.messages[1].link_title.as_deref(), Some("Enriched earlier pending"));
+        assert_eq!(target.messages[1].text, "same");
+    }
+}
+
+#[cfg(test)]
+mod media_metadata_regressions {
+    use super::*;
+
+    #[test]
+    fn explicit_photo_and_video_types_set_media_source_without_url_changes() {
+        for (kind, source) in [(json!(2), "Hình ảnh Zalo"), (json!("2"), "Hình ảnh Zalo"), (json!("chat.photo"), "Hình ảnh Zalo"), (json!(4), "Video Zalo")] {
+            let url = "https://example.invalid/media.jxl?token=synthetic%2Bvalue&v=1";
+            let message = parse_chat_message(&json!({"msgId":"fixture", "msgType":kind,
+                "content":{"href":url,"description":"Tiếng Việt 🧵","thumb":"https://example.invalid/thumb.jpg?q=synthetic%2Fvalue"}})).unwrap();
+            assert_eq!(message.link_src.as_deref(), Some(source));
+            assert_eq!(message.link_url.as_deref(), Some(url));
+            assert_eq!(message.text, "Tiếng Việt 🧵");
+            assert_eq!(message.link_thumb.as_deref(), Some("https://example.invalid/thumb.jpg?q=synthetic%2Fvalue"));
+        }
+    }
+
+    #[test]
+    fn cached_phone_types_repair_media_without_changing_source_or_caption() {
+        for (kind, expected) in [(3, "Hình ảnh Zalo"), (4, "Hình ảnh Zalo"), (19, "Video Zalo")] {
+            let source = json!({"msgType":kind,"meta":{"attachsList":[{"href":"https://example.invalid/media?x=1%2F2", "thumb":"https://example.invalid/thumb?x=2%2B3"}]}});
+            let mut message = ChatMessage { text:"[Photo]".into(), link_src:Some("example.invalid".into()), history_source:Some(source.clone()), ..Default::default() };
+            assert!(message.hydrate_media_metadata());
+            assert_eq!(message.link_src.as_deref(), Some(expected));
+            assert_eq!(message.link_url.as_deref(), Some("https://example.invalid/media?x=1%2F2"));
+            assert_eq!(message.link_thumb.as_deref(), Some("https://example.invalid/thumb?x=2%2B3"));
+            assert_eq!(message.text, "[Photo]");
+            assert_eq!(message.history_source, Some(source));
+            assert!(!message.hydrate_media_metadata());
+        }
+    }
+
+    #[test]
+    fn generic_link_is_not_media_and_empty_thumb_uses_valid_hd() {
+        let message = parse_chat_message(&json!({"msgId":"fixture", "msgType":"chat.recommended",
+            "content":{"href":"https://example.invalid/article", "thumb":"", "hd":"https://example.invalid/cover.jpg?q=1"}})).unwrap();
+        assert_eq!(message.link_src.as_deref(), Some("example.invalid"));
+        assert_eq!(message.link_thumb.as_deref(), Some("https://example.invalid/cover.jpg?q=1"));
+    }
+
+    #[test]
+    fn duplicate_with_existing_url_receives_media_thumb_and_source() {
+        let url = "https://example.invalid/media.mp4?token=synthetic";
+        let mut thread = Thread { presentation: Default::default(), unread: Default::default(), id:"fixture-peer".into(), name:"Fixture".into(), preview:String::new(), time:String::new(), avatar:None, is_group:false,
+            messages:vec![ChatMessage {id:"fixture-id".into(), text:"[Video]".into(), link_url:Some(url.into()), link_src:Some("example.invalid".into()), ..Default::default()}] };
+        let mut incoming = thread.clone();
+        incoming.messages[0].link_thumb = Some("https://example.invalid/thumb.jpg".into());
+        incoming.messages[0].link_src = Some("Video Zalo".into());
+        assert!(merge_thread_into(&mut thread, incoming, true));
+        assert_eq!(thread.messages.len(), 1);
+        assert_eq!(thread.messages[0].link_src.as_deref(), Some("Video Zalo"));
+        assert_eq!(thread.messages[0].link_thumb.as_deref(), Some("https://example.invalid/thumb.jpg"));
+    }
+
+    #[test]
+    fn recalled_message_does_not_regain_media_from_history() {
+        let mut message = ChatMessage { text:"[Tin nhắn đã thu hồi]".into(), history_source:Some(json!({"msgType":3,"meta":{"attachsList":[{"href":"https://example.invalid/photo.jpg"}]}})), ..Default::default() };
+        assert!(!message.hydrate_media_metadata());
+        assert!(message.link_url.is_none());
+    }
+}
+
+/// Result of a preview-only renewal request. Async control delivery stays explicit.
+#[derive(Debug, Clone, Default)]
+pub struct RenewMediaPreview {
+    pub thumbnail_url: Option<String>,
+    pub media_url: Option<String>,
+    pub pending: bool,
+}
+
+fn build_media_preview_renewal(msg: &ChatMessage, to_id: &str, is_group: bool, imei: &str) -> Result<Value> {
+    let source = msg.history_source.as_ref().ok_or_else(|| anyhow::anyhow!("Media renewal requires phone history metadata"))?;
+    let kind = source.get("msgType").and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()));
+    anyhow::ensure!(kind == Some(19), "Preview renewal currently supports phone-history video only");
+    anyhow::ensure!(msg.text != "[Tin nhắn đã thu hồi]", "Recalled media is not renewable");
+    let client_id = source.get("clientId").filter(|v| v.as_str().is_some_and(|s| !s.is_empty() && s != "0") || v.as_u64().is_some_and(|n| n > 0))
+        .ok_or_else(|| anyhow::anyhow!("Media renewal requires original clientId"))?;
+    let attachment = source.pointer("/meta/attachsList").and_then(Value::as_array).and_then(|a| a.first()).filter(|a| a.is_object())
+        .ok_or_else(|| anyhow::anyhow!("Media renewal requires original attachment"))?;
+    let web_url = |v: Option<&Value>| v.and_then(Value::as_str).filter(|s| s.starts_with("https://") || s.starts_with("http://")).map(str::to_owned);
+    let video = web_url(attachment.get("href")).ok_or_else(|| anyhow::anyhow!("Media renewal requires original video URL"))?;
+    let thumb = web_url(attachment.get("thumb")).ok_or_else(|| anyhow::anyhow!("Media renewal requires original thumbnail URL"))?;
+    let params = match attachment.get("params") {
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s).map_err(|_| anyhow::anyhow!("Invalid attachment renewal metadata"))?,
+        Some(v) if v.is_object() => v.clone(),
+        _ => json!({}),
+    };
+    // Preserve original attachment and params while adding the proven forward-media fields.
+    let mut content = attachment.clone();
+    content["videoUrl"] = json!(video);
+    content["thumbUrl"] = json!(thumb);
+    content["duration"] = params.get("duration").cloned().unwrap_or(json!(1));
+    content["width"] = params.get("video_width").cloned().unwrap_or(Value::Null);
+    content["height"] = params.get("video_height").cloned().unwrap_or(Value::Null);
+    content["fileSize"] = params.get("fileSize").or_else(|| params.get("file_size")).cloned().unwrap_or(Value::Null);
+    content["properties"] = attachment.get("properties").cloned().unwrap_or(Value::Null);
+    content["title"] = attachment.get("title").cloned().unwrap_or(json!(""));
+    content["renewType"] = json!(0);
+    content["isE2EE"] = json!(0);
+    content["isOriginal"] = json!(1);
+    let target = if is_group { to_id.strip_prefix("group_").or_else(|| to_id.strip_prefix('g')).or_else(|| to_id.strip_prefix('G')).unwrap_or(to_id) } else { to_id };
+    anyhow::ensure!(!target.is_empty() && target.chars().all(|c| c.is_ascii_digit()), "Media renewal requires a numeric conversation ID");
+    // Original clientId reuse is an explicit integration hypothesis, not proven by static code.
+    Ok(json!({"toId":target,"msgType":5,"msgInfo":serde_json::to_string(&content)?,"clientId":client_id,"imei":imei,"isGroup":if is_group {1} else {0}}))
+}
+
+fn parse_media_preview_renewal(response: &Value) -> Result<RenewMediaPreview> {
+    let code = response.get("error_code").and_then(Value::as_i64);
+    anyhow::ensure!(code == Some(0), "Media renewal server response was not successful");
+    let data = response.get("data").ok_or_else(|| anyhow::anyhow!("Media renewal response has no data"))?;
+    let url = |key: &str| data.get(key).and_then(Value::as_str).filter(|s| s.starts_with("https://") || s.starts_with("http://")).map(str::to_owned);
+    let pending = data.get("async").is_some_and(|v| v == &json!(true) || v.as_i64().is_some_and(|n| n != 0));
+    // A renewType=0 request renews the thumbnail, including the fileUrl response branch.
+    let thumbnail_url = url("normal").or_else(|| url("thumb")).or_else(|| url("hd")).or_else(|| url("fileUrl"));
+    anyhow::ensure!(pending || thumbnail_url.is_some(), "Media renewal returned no usable thumbnail");
+    Ok(RenewMediaPreview { thumbnail_url, media_url:None, pending })
+}
+
+/// Renew only a video preview. This does not forward, send, retry, or log payloads.
+/// Caller limits attempts per viewed message and handles pending control delivery.
+pub async fn renew_media_preview(s: &Session, msg: &ChatMessage, to_id: &str, is_group: bool) -> Result<RenewMediaPreview> {
+    anyhow::ensure!(s.login.is_some(), "Media renewal requires login");
+    let body = build_media_preview_renewal(msg, to_id, is_group, &s.imei)?;
+    let params = s.encoded_params(&body).map_err(|_| anyhow::anyhow!("Media renewal request encoding failed"))?;
+    let url = format!("{}/api/message/renewlink?{}", s.domains.file.trim_end_matches('/'), s.common_params());
+    let parsed_url = reqwest::Url::parse(&url).map_err(|_| anyhow::anyhow!("Invalid media renewal service URL"))?;
+    anyhow::ensure!(parsed_url.scheme() == "https" && parsed_url.host_str().is_some_and(|host| host.ends_with(".zalo.me") || host.ends_with(".zaloapp.com")), "Invalid media renewal service host");
+    let operation = async {
+        // Dedicated no-redirect client keeps session credentials on the selected service.
+        let client = reqwest::Client::builder()
+            .cookie_provider(std::sync::Arc::clone(&s.jar))
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ZaloPC/26.10.11 Chrome/122.0.0.0 Electron/29.0.0 Safari/537.36")
+            .build().map_err(|_| anyhow::anyhow!("Media renewal HTTP client initialization failed"))?;
+        let mut request = client.post(parsed_url)
+            .header("Origin", "https://chat.zalo.me")
+            .header("Referer", "https://chat.zalo.me/")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(format!("params={params}"));
+        if let Some(sek) = s.zpw_sek.as_ref().filter(|sek| !sek.is_empty()) {
+            request = request.header("Cookie",format!("zpw_sek={sek}; _zlang=vi")).header("zpw_sek",sek);
+        }
+        let mut response = request.send().await.map_err(|_| anyhow::anyhow!("Media renewal transport failed"))?;
+        anyhow::ensure!(response.status().is_success(), "Media renewal HTTP request failed");
+        const RESPONSE_LIMIT: usize = 1024 * 1024;
+        anyhow::ensure!(response.content_length().is_none_or(|length| length <= RESPONSE_LIMIT as u64), "Media renewal response exceeded size limit");
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| anyhow::anyhow!("Media renewal response read failed"))? {
+            anyhow::ensure!(chunk.len() <= RESPONSE_LIMIT.saturating_sub(bytes.len()), "Media renewal response exceeded size limit");
+            bytes.extend_from_slice(&chunk);
+        }
+        let mut response: Value = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("Invalid media renewal response JSON"))?;
+        anyhow::ensure!(response.get("error_code").and_then(Value::as_i64) == Some(0), "Media renewal outer response was not successful (code {})", response.get("error_code").and_then(Value::as_i64).unwrap_or(-1));
+        if let Some(encoded) = response.get("data").and_then(Value::as_str) {
+            let decoded = crate::crypto::decode_aes(s.session_key_bytes(), encoded).map_err(|_| anyhow::anyhow!("Media renewal response decryption failed"))?;
+            response = serde_json::from_str(&decoded).map_err(|_| anyhow::anyhow!("Invalid decrypted media renewal response"))?;
+        }
+        parse_media_preview_renewal(&response)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), operation).await.map_err(|_| anyhow::anyhow!("Media renewal timed out"))?
+}
+
+/// Match only a proven renew_link control event for the exact requested thumbnail.
+/// Traversal has a depth and aggregate child budget; unrelated payload URLs are ignored.
+pub fn media_preview_renewal_control(payload: &Value, original_thumb: &str) -> Option<Result<RenewMediaPreview>> {
+    fn match_entry(entry: &Value, original: &str) -> Option<Result<RenewMediaPreview>> {
+        let file_match = entry.get("originalUrl").and_then(Value::as_str) == Some(original);
+        let photo_match = entry.get("img").and_then(Value::as_str) == Some(original);
+        if !file_match && !photo_match { return None; }
+        let code_key = if file_match { "error" } else { "errorCode" };
+        if entry.get(code_key).and_then(Value::as_i64) != Some(0) {
+            return Some(Err(anyhow::anyhow!("Media renewal control reported failure")));
+        }
+        let keys: &[&str] = if file_match { &["renewUrl"] } else { &["normal", "hd", "thumb"] };
+        let thumbnail_url = keys.iter().filter_map(|key| entry.get(*key).and_then(Value::as_str))
+            .find(|url| url.starts_with("https://") || url.starts_with("http://")).map(str::to_owned);
+        Some(thumbnail_url.map(|url| RenewMediaPreview { thumbnail_url:Some(url), media_url:None, pending:false })
+            .ok_or_else(|| anyhow::anyhow!("Media renewal control returned no usable thumbnail")))
+    }
+    fn visit(value: &Value, original: &str, depth: usize, budget: &mut usize) -> Option<Result<RenewMediaPreview>> {
+        if depth > 12 || *budget == 0 { return None; }
+        *budget -= 1;
+        if value.get("act").and_then(Value::as_str) == Some("renew_link") {
+            let decoded;
+            let data = match value.get("data") {
+                Some(Value::String(text)) if text.len() <= 1024 * 1024 => {
+                    decoded = serde_json::from_str::<Value>(text).ok()?;
+                    &decoded
+                }
+                Some(data) => data,
+                None => return None,
+            };
+            if let Some(entries) = data.as_array() {
+                for entry in entries {
+                    if *budget == 0 { return None; }
+                    *budget -= 1;
+                    if let Some(result) = match_entry(entry, original) { return Some(result); }
+                }
+            }
+            return None;
+        }
+        match value {
+            Value::Object(object) => {
+                for child in object.values() {
+                    if *budget == 0 { break; }
+                    if let Some(result) = visit(child, original, depth + 1, budget) { return Some(result); }
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    if *budget == 0 { break; }
+                    if let Some(result) = visit(child, original, depth + 1, budget) { return Some(result); }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+    if original_thumb.is_empty() { return None; }
+    visit(payload, original_thumb, 0, &mut 2048)
+}
+
+#[cfg(test)]
+mod media_preview_renewal_tests {
+    use super::*;
+    fn fixture() -> ChatMessage {
+        ChatMessage {history_source:Some(json!({"clientId":"123456","msgType":19,"meta":{"attachsList":[{"href":"https://example.invalid/video.mp4?sig=a%2Bb","thumb":"https://example.invalid/poster.jpg?sig=c%2Fd","params":"{\"duration\":7,\"video_width\":640,\"video_height\":360,\"fileSize\":1234,\"video_url_to_renew\":\"synthetic-preserved\"}"}]}})),..Default::default()}
+    }
+    #[test]
+    fn preview_renewal_builder_preserves_metadata_and_uses_proven_video_shape() {
+        let request = build_media_preview_renewal(&fixture(), "g987", true, "synthetic-imei").unwrap();
+        assert_eq!(request["toId"], "987");assert_eq!(request["clientId"], "123456");assert_eq!(request["msgType"],5);assert_eq!(request["isGroup"],1);
+        let content:Value=serde_json::from_str(request["msgInfo"].as_str().unwrap()).unwrap();
+        assert_eq!(content["videoUrl"],"https://example.invalid/video.mp4?sig=a%2Bb");assert_eq!(content["thumbUrl"],"https://example.invalid/poster.jpg?sig=c%2Fd");
+        assert_eq!(content["renewType"],0);assert_eq!(content["isOriginal"],1);assert_eq!(content["isE2EE"],0);assert_eq!(content["duration"],7);assert_eq!(content["width"],640);
+        assert!(content["params"].as_str().unwrap().contains("synthetic-preserved"));
+    }
+    #[test]
+    fn preview_renewal_requires_original_client_id_and_video_source() {
+        let mut message=fixture();message.history_source.as_mut().unwrap().as_object_mut().unwrap().remove("clientId");
+        assert!(build_media_preview_renewal(&message,"987",false,"synthetic").is_err());
+        let mut message=fixture();message.history_source.as_mut().unwrap()["msgType"]=json!(4);
+        assert!(build_media_preview_renewal(&message,"987",false,"synthetic").is_err());
+    }
+    #[test]
+    fn preview_renewal_distinguishes_sync_pending_and_failure() {
+        let sync=parse_media_preview_renewal(&json!({"error_code":0,"data":{"normal":"https://example.invalid/new.jpg?sig=x%2By"}})).unwrap();
+        assert_eq!(sync.thumbnail_url.as_deref(),Some("https://example.invalid/new.jpg?sig=x%2By"));assert!(!sync.pending);assert!(sync.media_url.is_none());
+        let pending=parse_media_preview_renewal(&json!({"error_code":0,"data":{"async":1}})).unwrap();assert!(pending.pending);assert!(pending.thumbnail_url.is_none());
+        assert!(parse_media_preview_renewal(&json!({"error_code":1,"data":{"normal":"https://example.invalid/new.jpg"}})).is_err());
+        assert!(parse_media_preview_renewal(&json!({"error_code":0,"data":{}})).is_err());
+    }
+    #[test]
+    fn renewal_control_ignores_wrong_original_and_untyped_payloads() {
+        let payload=json!({"events":[{"act":"renew_link","data":[{"originalUrl":"https://example.invalid/other.jpg","renewUrl":"https://example.invalid/new.jpg","error":0}]}]});
+        assert!(media_preview_renewal_control(&payload,"https://example.invalid/old.jpg").is_none());
+        assert!(media_preview_renewal_control(&json!({"data":[{"img":"https://example.invalid/old.jpg","normal":"https://example.invalid/new.jpg","errorCode":0}]}),"https://example.invalid/old.jpg").is_none());
+        let mut nested=payload;
+        for _ in 0..14 { nested=json!({"nested":nested}); }
+        assert!(media_preview_renewal_control(&nested,"https://example.invalid/other.jpg").is_none());
+    }
+    #[test]
+    fn renewal_control_returns_matched_async_thumbnail_and_preserves_query() {
+        for entry in [json!({"originalUrl":"https://example.invalid/old.jpg","renewUrl":"https://example.invalid/new.jpg?sig=a%2Bb","error":0}),json!({"img":"https://example.invalid/old.jpg","normal":"https://example.invalid/new.jpg?sig=a%2Bb","errorCode":0})] {
+            let payload=json!({"events":[{"act":"renew_link","data":[entry]}]});
+            let result=media_preview_renewal_control(&payload,"https://example.invalid/old.jpg").unwrap().unwrap();
+            assert_eq!(result.thumbnail_url.as_deref(),Some("https://example.invalid/new.jpg?sig=a%2Bb"));assert!(!result.pending);assert!(result.media_url.is_none());
+        }
+    }
+    #[test]
+    fn renewal_control_decodes_string_data_and_surfaces_expired_asset() {
+        let data = json!([{"img":"https://example.invalid/old.jpg","org":"https://example.invalid/old.jpg","errorCode":1001,"destType":1}]);
+        let payload = json!({"act":"renew_link","act_type":1,"data":data.to_string()});
+        assert_eq!(media_preview_renewal_control(&payload,"https://example.invalid/old.jpg").unwrap().unwrap_err().to_string(),"Media renewal control reported failure");
+        let data = json!([{"img":"https://example.invalid/old.jpg","normal":"https://example.invalid/new.jpg","errorCode":0}]);
+        let payload = json!({"act":"renew_link","data":data.to_string()});
+        assert!(media_preview_renewal_control(&payload,"https://example.invalid/old.jpg").unwrap().is_ok());
+    }
+    #[test]
+    fn renewal_control_surfaces_matching_explicit_error_without_payload() {
+        let payload=json!({"act":"renew_link","data":[{"img":"https://example.invalid/old.jpg","normal":"https://example.invalid/new.jpg","errorCode":7,"private":"synthetic-private"}]});
+        let error=media_preview_renewal_control(&payload,"https://example.invalid/old.jpg").unwrap().unwrap_err().to_string();
+        assert_eq!(error,"Media renewal control reported failure");assert!(!error.contains("synthetic-private"));
+    }
+
+}
+
+#[cfg(test)]
+mod parity_regression_tests {
+    use super::*;
+
+    #[test]
+    fn parity_message_hour_matches_local_timezone() {
+        // Compare with the runtime local timezone, including UTC CI hosts.
+        let ts = 1793425680000_i64;
+        let msg = parse_chat_message(&json!({"msgId":"fixture-time","uidFrom":"peer","content":"Ok","ts":ts})).unwrap();
+        let expected = chrono::DateTime::from_timestamp_millis(ts).unwrap().with_timezone(&chrono::Local).format("%H:%M").to_string();
+        assert_eq!(msg.time, expected, "Message time must match the Mac's local time, not raw UTC");
+    }
+
+    #[test]
+    fn parity_distinct_groups_never_merge_by_name_or_avatar() {
+        let mut threads: Vec<Thread> = ["group-a", "group-b"].into_iter().map(|id| Thread { presentation: Default::default(), unread: Default::default(),
+            id:id.into(),name:"Same group name".into(),preview:String::new(),time:String::new(),avatar:Some("same-avatar".into()),is_group:true,
+            messages:vec![ChatMessage{id:format!("message-{id}"),text:id.into(),ts:1000,..Default::default()}],
+        }).collect();
+        deduplicate_threads(&mut threads,None);
+        assert_eq!(threads.len(),2,"Different group IDs are distinct even when names and avatars match");
+    }
+}
+
+
+#[cfg(test)]
+mod reaction_order_tests {
+    use super::*;
+    fn event(id: &str, ts: i64, kind: i32, user: &str) -> crate::reactions::ReactionEvent {
+        crate::reactions::ReactionEvent {event_id:id.into(), ts, r_type:kind,
+            sender_id:user.into(), emoji:crate::reactions::emoji_for_type(kind).into(), ..Default::default()}
+    }
+    fn count(m: &ChatMessage, kind: i32) -> u64 {
+        m.reaction_summaries.iter().filter(|s| s.r_type == Some(kind)).map(|s| s.count).sum()
+    }
+    #[test]
+    fn newest_then_older_taps_count_and_replay_is_idempotent() {
+        let mut m = ChatMessage::default();
+        assert!(m.apply_reaction(&event("2", 2000, 5, "a")));
+        assert!(m.apply_reaction(&event("1", 1000, 5, "a")));
+        assert_eq!(count(&m, 5), 2);
+        assert!(!m.apply_reaction(&event("1", 1000, 5, "a")));
+        assert_eq!(count(&m, 5), 2);
+    }
+    #[test]
+    fn late_clear_keeps_newer_taps_and_other_reactors() {
+        for order in [[0,1,2,3,4], [4,3,2,1,0], [3,0,4,1,2]] {
+            let events = [event("1",1000,5,"a"), event("2",2000,3,"a"),
+                event("3",3000,-1,"a"), event("4",4000,5,"a"), event("5",1000,5,"b")];
+            let mut m = ChatMessage::default();
+            for i in order { m.apply_reaction(&events[i]); }
+            assert_eq!(count(&m,5),2);
+            assert_eq!(count(&m,3),0);
+            assert_eq!(m.reaction_summaries[0].reactor_counts.get("a"),Some(&1));
+            assert_eq!(m.reaction_summaries[0].reactor_counts.get("b"),Some(&1));
+        }
+    }
+    #[test]
+    fn zero_ids_are_unknown_and_unknown_type_is_not_heart() {
+        let mut m = ChatMessage::default();
+        let mut a = event("0",1000,5,"a"); a.client_event_id = "0".into();
+        let mut b = a.clone(); b.ts = 2000;
+        assert!(m.apply_reaction(&a)); assert!(m.apply_reaction(&b));
+        assert!(!m.apply_reaction(&a));
+        m.apply_reaction(&event("3",3000,999,"a"));
+        assert_eq!(count(&m,5),2);
+        assert_eq!(count(&m,999),1);
+        assert_eq!(m.reaction_summaries.iter().find(|s|s.r_type==Some(999)).unwrap().emoji,"◦");
+    }
+    #[test]
+    fn zero_ids_without_timestamp_are_not_a_shared_identity() {
+        let mut m = ChatMessage::default();
+        let mut unknown = event("0",0,5,"a"); unknown.client_event_id = "0".into();
+        assert!(m.apply_reaction(&unknown));
+        assert!(m.apply_reaction(&unknown));
+        assert_eq!(count(&m,5),2);
+    }
+    #[test]
+    fn ledger_merges_union_events_without_snapshot_rewind() {
+        let mut a = ChatMessage::default(); a.apply_reaction(&event("2",2000,5,"a"));
+        let mut b = ChatMessage::default(); b.apply_reaction(&event("1",1000,5,"a"));
+        a.merge_reaction_metadata(&b); a.merge_reaction_metadata(&b);
+        assert_eq!(count(&a,5),2);
+        let snapshot = ChatMessage {reaction_snapshot:true,
+            reaction_summaries:crate::reactions::parse_reactions(&json!({"reactions":{"a":{"5":1},"b":{"3":2}}})),
+            ..Default::default()};
+        a.merge_reaction_metadata(&snapshot);
+        assert_eq!(count(&a,5),2); assert_eq!(count(&a,3),2);
+    }
+    #[test]
+    fn absent_metadata_preserves_legacy_reactions() {
+        let mut m = ChatMessage {reactions:vec!["❤️".into()], ..Default::default()};
+        assert!(!m.merge_reaction_metadata(&ChatMessage::default()));
+        assert_eq!(m.reactions,vec!["❤️"]);
+        let mut empty = ChatMessage::default();
+        assert!(empty.merge_reaction_metadata(&m));
+        assert_eq!(empty.reactions,vec!["❤️"]);
+        empty.merge_reaction_metadata(&ChatMessage {reaction_snapshot:true,..Default::default()});
+        assert!(empty.reactions.is_empty());
+        assert!(!empty.merge_reaction_metadata(&m));
+        assert!(empty.reactions.is_empty());
+    }
+    #[test]
+    fn authoritative_snapshot_clears_omitted_untracked_user_only() {
+        let mut m = ChatMessage {reaction_summaries:crate::reactions::parse_reactions(
+            &json!({"reactions":{"b":{"3":2}}})),..Default::default()};
+        m.apply_reaction(&event("1",1000,5,"a"));
+        assert_eq!(count(&m,3),2);
+        // A partial ledger must not clear a different reactor's aggregate.
+        let mut partial = ChatMessage::default();
+        partial.apply_reaction(&event("2",2000,5,"a"));
+        m.merge_reaction_metadata(&partial);
+        assert_eq!(count(&m,3),2); assert_eq!(count(&m,5),2);
+        // A full snapshot omitting b clears b but must not rewind tracked a.
+        let snapshot = ChatMessage {reaction_snapshot:true,
+            reaction_summaries:crate::reactions::parse_reactions(
+                &json!({"reactions":{"a":{"5":1}}})),..Default::default()};
+        m.merge_reaction_metadata(&snapshot);
+        assert_eq!(count(&m,3),0); assert_eq!(count(&m,5),2);
+        m.merge_reaction_metadata(&ChatMessage::default());
+        assert_eq!(count(&m,5),2);
+    }
+    #[test]
+    fn null_snapshot_does_not_clear_existing_aggregate() {
+        let mut m = ChatMessage {reaction_summaries:crate::reactions::parse_reactions(
+            &json!({"reactions":{"a":{"5":2}}})),..Default::default()};
+        let incoming = parse_chat_message(&json!({"msgId":"fixture","uidFrom":"peer",
+            "content":"Hello","reacts":null})).unwrap();
+        assert!(!incoming.reaction_snapshot);
+        m.merge_reaction_metadata(&incoming);
+        assert_eq!(count(&m,5),2);
+    }
+    fn actual_snapshot(count: u64) -> ChatMessage {
+        parse_chat_message(&json!({"msgId":"fixture","uidFrom":"peer","content":"Hello",
+            "reacts":{"reactions":if count == 0 { json!({}) } else { json!({"a":{"5":count}}) }}})).unwrap()
+    }
+    #[test]
+    fn authoritative_aggregate_does_not_double_count_old_history() {
+        let mut m = actual_snapshot(2);
+        assert!(m.reaction_authoritative_snapshot);
+        let old = crate::reactions::ReactionEvent {historical:true,..event("1",1000,5,"a")};
+        assert!(m.apply_reaction(&old));
+        assert_eq!(count(&m,5),2);
+        assert!(!m.apply_reaction(&old));
+        m.apply_reaction(&event("3",3000,5,"a"));
+        assert_eq!(count(&m,5),3);
+        let cached = m.clone();
+        m.merge_reaction_metadata(&cached);
+        assert_eq!(count(&m,5),3);
+        let mut historical_cache = ChatMessage::default();
+        historical_cache.apply_reaction(&crate::reactions::ReactionEvent {
+            historical:true,..event("4",500,5,"a")});
+        let mut fresh = actual_snapshot(2);
+        fresh.merge_reaction_metadata(&historical_cache);
+        assert_eq!(count(&fresh,5),2);
+        let mut empty = actual_snapshot(0);
+        empty.merge_reaction_metadata(&historical_cache);
+        assert_eq!(count(&empty,5),0);
+    }
+    #[test]
+    fn fresh_snapshot_covers_live_identity_without_replaying_it() {
+        let first = event("1",1000,5,"a");
+        let second = event("2",2000,5,"a");
+        let mut m = ChatMessage::default();
+        m.apply_reaction(&first);
+        m.merge_reaction_metadata(&actual_snapshot(1));
+        assert_eq!(count(&m,5),1);
+        assert!(!m.apply_reaction(&first));
+        assert_eq!(count(&m,5),1);
+        m.apply_reaction(&second);
+        assert_eq!(count(&m,5),2);
+        let cached: ChatMessage = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert!(!cached.reaction_snapshot_fresh);
+        m.merge_reaction_metadata(&cached);
+        assert_eq!(count(&m,5),2);
+        assert!(!m.apply_reaction(&first)); assert!(!m.apply_reaction(&second));
+        let mut restored = ChatMessage::default();
+        restored.merge_reaction_metadata(&cached);
+        assert_eq!(count(&restored,5),2);
+        assert!(!restored.apply_reaction(&first));
+        assert!(!restored.apply_reaction(&second));
+    }
+    #[test]
+    fn authoritative_empty_clears_older_history_and_prevents_resurrection() {
+        let mut m = ChatMessage::default();
+        let old = crate::reactions::ReactionEvent {historical:true,..event("1",1000,5,"a")};
+        m.apply_reaction(&old);
+        assert_eq!(count(&m,5),1);
+        m.merge_reaction_metadata(&actual_snapshot(0));
+        assert_eq!(count(&m,5),0);
+        m.apply_reaction(&crate::reactions::ReactionEvent {historical:true,..event("2",2000,5,"a")});
+        assert_eq!(count(&m,5),0);
+        m.apply_reaction(&event("3",3000,5,"a"));
+        assert_eq!(count(&m,5),1);
+    }
+    #[test]
+    fn legacy_unattributed_counts_survive_sender_clear() {
+        let mut m = ChatMessage {reactions:vec!["❤️".into()], ..Default::default()};
+        m.apply_reaction(&event("1",1000,5,"a"));
+        m.apply_reaction(&event("2",2000,-1,"a"));
+        assert_eq!(count(&m,5),1);
     }
 }

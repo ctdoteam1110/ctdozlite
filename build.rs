@@ -2,6 +2,23 @@
 //! by emitting a standard COFF/Win32 `.res` file in `OUT_DIR` without requiring external `rc.exe`.
 
 fn main() {
+    // Artwork is a local opt-in input, never downloaded or extracted by Cargo.
+    println!("cargo:rerun-if-env-changed=ZL_EMOJI_PACK");
+    let bytes = if let Some(path) = std::env::var_os("ZL_EMOJI_PACK") {
+        println!(
+            "cargo:rerun-if-changed={}",
+            std::path::Path::new(&path).display()
+        );
+        std::fs::read(path).unwrap_or_else(|error| {
+            println!("cargo:warning=Emoji pack unavailable: {error}; using Unicode fallback");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+    // Always replace the output so disabling the opt-in cannot retain stale bytes.
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    std::fs::write(output.join("emoji-sprites.bin"), bytes).expect("Write emoji pack");
     println!("cargo:rerun-if-changed=src/assets/app_icon.ico");
     println!("cargo:rerun-if-changed=src/assets/app_icon.png");
 
@@ -18,7 +35,10 @@ fn embed_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
     use std::path::PathBuf;
 
     let ico = std::fs::read("src/assets/app_icon.ico")?;
-    if ico.len() < 6 || u16::from_le_bytes([ico[0], ico[1]]) != 0 || u16::from_le_bytes([ico[2], ico[3]]) != 1 {
+    if ico.len() < 6
+        || u16::from_le_bytes([ico[0], ico[1]]) != 0
+        || u16::from_le_bytes([ico[2], ico[3]]) != 1
+    {
         return Err("Invalid ICO header".into());
     }
     let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
@@ -73,7 +93,13 @@ fn embed_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "windows")]
-fn write_res_header(buf: &mut Vec<u8>, data_size: u32, res_type: u16, res_name: u16, mem_flags: u16) {
+fn write_res_header(
+    buf: &mut Vec<u8>,
+    data_size: u32,
+    res_type: u16,
+    res_name: u16,
+    mem_flags: u16,
+) {
     buf.extend_from_slice(&data_size.to_le_bytes());
     buf.extend_from_slice(&32u32.to_le_bytes()); // HeaderSize = 32
     buf.extend_from_slice(&0xFFFFu16.to_le_bytes());

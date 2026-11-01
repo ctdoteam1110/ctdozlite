@@ -7,7 +7,14 @@
 mod audio;
 mod call;
 mod chat;
+mod clock;
+mod presence;
+mod reactions;
+mod reaction_journal;
+mod original_reactions;
+mod unread;
 mod crypto;
+mod data_dir;
 mod endpoints;
 mod gui;
 mod logger;
@@ -18,6 +25,14 @@ mod qr;
 mod session;
 mod socket;
 mod store;
+mod native_notifications;
+mod runtime_state;
+mod media_resources;
+mod read_receipts;
+mod store_v2;
+mod message_model;
+mod message_navigation;
+mod delivery_receipts;
 mod tui;
 mod ui;
 mod voip_log;
@@ -29,7 +44,16 @@ pub const POLL_SECS: u64 = 4;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    ensure_writable_working_dir();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("ctdozlite v{} (zalo-rust)", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let data_path = data_dir::initialize(&args)?;
+    if args.iter().any(|a| a == "--print-data-dir") {
+        println!("{}", data_path.display());
+        return Ok(());
+    }
     std::panic::set_hook(Box::new(|info| {
         use std::io::Write;
         let ts = std::time::SystemTime::now()
@@ -46,11 +70,6 @@ async fn main() -> Result<()> {
             let _ = f.write_all(msg.as_bytes());
         }
     }));
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("ctdozlite v{} (zalo-rust)", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
     let dev_mode = args.iter().any(|a| a == "--dev" || a == "-v" || a == "--verbose");
     let dump = args.iter().any(|a| a == "-d" || a == "--dump");
     let dump_raw = args.iter().any(|a| a == "--dump-raw");
@@ -123,17 +142,23 @@ async fn main() -> Result<()> {
             .with_decorations(false)
             .with_inner_size([1020.0, 700.0])
             .with_min_inner_size([480.0, 360.0])
-            .with_title("Zalo");
+            .with_title("Zalo")
+            .with_active(false);
         if let Some(icon) = gui::load_app_icon() {
             viewport = viewport.with_icon(std::sync::Arc::new(icon));
         }
         let native_options = eframe::NativeOptions {
             viewport,
+            #[cfg(target_os = "macos")]
+            event_loop_builder: Some(Box::new(|builder| {
+                use winit::platform::macos::EventLoopBuilderExtMacOS;
+                // Respect background launch and never override another application's focus.
+                builder.with_activate_ignoring_other_apps(false);
+            })),
             ..Default::default()
         };
 
-        let mut initial_threads = chat::load_threads_cache();
-        store::load_history_into_threads("zalo_history.db", &mut initial_threads, 200);
+        let initial_threads = Vec::new();
 
         let app_session = s;
         let res = eframe::run_native(
@@ -144,9 +169,6 @@ async fn main() -> Result<()> {
             }),
         )
         .map_err(|e| anyhow::anyhow!("Không thể khởi chạy GUI: {e}"));
-        if res.is_ok() {
-            std::process::exit(0);
-        }
         return res;
     }
 
@@ -280,64 +302,4 @@ async fn main() -> Result<()> {
     tui::run_tui(tui_app).await?;
 
     Ok(())
-}
-
-/// When launched from a macOS `.app` bundle (`/Applications/ctdozlite.app` or mounted `.dmg`),
-/// or from a read-only system directory (`/`, `/usr/bin`, `C:\Program Files`), switch the
-/// process working directory to the user's application data folder so `session.json`,
-/// `zalo_history.db`, `threads_cache.json`, `stickers_cache/`, and `crash.log` can be written.
-fn ensure_writable_working_dir() {
-    let inside_macos_app = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(|s| s.contains(".app/Contents/MacOS")))
-        .unwrap_or(false);
-    let cwd_is_root = std::env::current_dir()
-        .ok()
-        .map(|p| p.as_os_str() == "/" || p.as_os_str() == "\\")
-        .unwrap_or(true);
-    let probe_path = ".ctdozlite_write_probe";
-    let cwd_writable = if inside_macos_app || cwd_is_root {
-        false
-    } else if std::path::Path::new("session.json").exists()
-        || std::path::Path::new("zalo_history.db").exists()
-        || std::path::Path::new("Cargo.toml").exists()
-    {
-        true
-    } else if std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(probe_path)
-        .is_ok()
-    {
-        let _ = std::fs::remove_file(probe_path);
-        true
-    } else {
-        false
-    };
-
-    if !cwd_writable {
-        let data_dir = if cfg!(target_os = "macos") {
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .map(|h| h.join("Library/Application Support/ctdozlite"))
-        } else if cfg!(target_os = "windows") {
-            std::env::var_os("LOCALAPPDATA")
-                .or_else(|| std::env::var_os("APPDATA"))
-                .map(std::path::PathBuf::from)
-                .map(|p| p.join("ctdozlite"))
-        } else {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .map(std::path::PathBuf::from)
-                        .map(|h| h.join(".local/share"))
-                })
-                .map(|p| p.join("ctdozlite"))
-        };
-        if let Some(dir) = data_dir {
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::env::set_current_dir(&dir);
-        }
-    }
 }

@@ -335,6 +335,12 @@ jobs:
             mkdir -p "$stage_dir/ctdozlite.app/Contents/Resources"
             cp "$bin_path" "$stage_dir/ctdozlite.app/Contents/MacOS/zalo-rust"
             chmod +x "$stage_dir/ctdozlite.app/Contents/MacOS/zalo-rust"
+            case "$bin_path" in
+              target/aarch64-*) swift_targets="arm64-apple-macosx11.0" ;;
+              target/x86_64-*) swift_targets="x86_64-apple-macosx11.0" ;;
+              *) swift_targets="arm64-apple-macosx11.0,x86_64-apple-macosx11.0" ;;
+            esac
+            SWIFT_TARGETS="$swift_targets" bash native/macos/build-emoji-preview.sh "$stage_dir/ctdozlite.app"
             cp packaging/macos/Info.plist "$stage_dir/ctdozlite.app/Contents/Info.plist"
             plutil -replace CFBundleShortVersionString -string "$VER" "$stage_dir/ctdozlite.app/Contents/Info.plist"
             printf 'APPL????' > "$stage_dir/ctdozlite.app/Contents/PkgInfo"

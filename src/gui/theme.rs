@@ -171,30 +171,23 @@ pub(super) fn truncate_chars<'a>(s: &'a str, max_chars: usize) -> std::borrow::C
     }
 }
 
-/// Extract up to 2 uppercase alphanumeric initials from a display name (e.g. `"Nguyễn An"` -> `"NA"`, `"Hoang"` -> `"H"`).
+/// Extract up to 2 uppercase initials from a display name (e.g. `"Nguyễn An"` -> `"NA"`, `"Hoang"` -> `"H"`).
 pub(super) fn avatar_initials(name: &str) -> String {
-    let clean_words: Vec<&str> = name
-        .split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
-        .filter(|w| !w.is_empty())
-        .collect();
-    if clean_words.len() >= 2 {
-        let c1 = clean_words[0].chars().next().unwrap_or('Z').to_uppercase();
-        let c2 = clean_words[clean_words.len() - 1]
+    let words: Vec<&str> = name.split_whitespace().filter(|w| !w.is_empty()).collect();
+    if words.len() >= 2 {
+        let c1 = words[0].chars().next().unwrap_or('Z').to_uppercase();
+        let c2 = words[words.len() - 1]
             .chars()
             .next()
             .unwrap_or('U')
             .to_uppercase();
         format!("{c1}{c2}")
-    } else if let Some(first) = clean_words.first() {
-        first
-            .chars()
+    } else {
+        name.chars()
             .next()
             .unwrap_or('Z')
             .to_uppercase()
             .to_string()
-    } else {
-        "Z".to_string()
     }
 }
 
@@ -233,7 +226,10 @@ pub(super) fn matches_vn_query(haystack: &str, query_lower: &str, query_folded: 
     !query_folded.is_empty() && fold_vn_search(haystack).contains(query_folded)
 }
 
-fn paint_single_circle_avatar(
+/// Paint a circular user or group avatar: uses the real circular-masked Zalo profile image when
+/// `avatar_url` is available (fetching it asynchronously via `FetchStickerImage`), and falls back
+/// to a colored circle with initials while loading or when no URL exists.
+pub(super) fn paint_user_avatar(
     painter: &egui::Painter,
     center: Pos2,
     radius: f32,
@@ -243,11 +239,10 @@ fn paint_single_circle_avatar(
     textures: &HashMap<String, TextureHandle>,
     loading: &mut HashSet<String>,
 ) {
-    if let Some(url) = avatar_url.map(str::trim).filter(|u| {
-        !u.is_empty()
-            && !u.ends_with("/default")
-            && (u.starts_with("http://") || u.starts_with("https://"))
-    }) {
+    if let Some(url) = avatar_url
+        .map(str::trim)
+        .filter(|u| !u.is_empty() && (u.starts_with("http://") || u.starts_with("https://")))
+    {
         let key = format!("ava_{}", crate::crypto::md5_hex(url));
         if let Some(tex) = textures.get(&key) {
             let rect = Rect::from_center_size(center, Vec2::splat(radius * 2.0));
@@ -276,11 +271,10 @@ fn paint_single_circle_avatar(
 
     let av_col = avatar_color_for(name, is_group);
     painter.circle_filled(center, radius, av_col);
-    let initial = if radius >= 15.5 {
+    let initial = if radius >= 18.0 {
         avatar_initials(name)
     } else {
-        name.trim_matches(|c: char| !c.is_alphanumeric())
-            .chars()
+        name.chars()
             .next()
             .unwrap_or('Z')
             .to_uppercase()
@@ -290,186 +284,9 @@ fn paint_single_circle_avatar(
         center,
         egui::Align2::CENTER_CENTER,
         initial,
-        FontId::proportional((radius * 0.76).max(8.5)),
+        FontId::proportional((radius * 0.72).max(11.0)),
         Color32::WHITE,
     );
-}
-
-/// Paint a circular user or group avatar:
-/// - For 1-1 contacts or groups with a custom uploaded group photo (`http(s)://...`), renders the circular image.
-/// - For groups without a single custom photo (`multi:...` or `None`), renders Zalo PC's `zavatar-multi`
-///   composite layout (3-member triangle or 2x2 member grid with optional member count badge).
-pub(super) fn paint_user_avatar(
-    painter: &egui::Painter,
-    center: Pos2,
-    radius: f32,
-    name: &str,
-    is_group: bool,
-    avatar_url: Option<&str>,
-    textures: &HashMap<String, TextureHandle>,
-    loading: &mut HashSet<String>,
-) {
-    let raw_ava = avatar_url.map(str::trim).unwrap_or("");
-    let has_single_custom_photo = !raw_ava.is_empty()
-        && !raw_ava.starts_with("multi:")
-        && !raw_ava.ends_with("/default")
-        && (raw_ava.starts_with("http://") || raw_ava.starts_with("https://"));
-
-    if !is_group || has_single_custom_photo {
-        paint_single_circle_avatar(
-            painter,
-            center,
-            radius,
-            name,
-            is_group,
-            avatar_url,
-            textures,
-            loading,
-        );
-        return;
-    }
-
-    // Parse composite group member slots (`multi:<total>;<name1>|<url1>;<name2>|<url2>;...`)
-    // or derive member slots from comma-separated group name (`"Đỗ Thành, Đtc, Hoang"`).
-    let mut slots: Vec<(String, String)> = Vec::new();
-    let mut total_members: usize = 0;
-    if let Some(rest) = raw_ava.strip_prefix("multi:") {
-        for (idx, part) in rest.split(';').enumerate() {
-            if idx == 0 && !part.contains('|') {
-                total_members = part.trim().parse::<usize>().unwrap_or(0);
-                continue;
-            }
-            if let Some((m_name, m_url)) = part.split_once('|') {
-                slots.push((m_name.trim().to_string(), m_url.trim().to_string()));
-            } else if !part.trim().is_empty() {
-                slots.push((part.trim().to_string(), String::new()));
-            }
-        }
-    }
-    if slots.is_empty() {
-        let comma_parts: Vec<&str> = name
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if comma_parts.len() >= 2 {
-            for p in comma_parts.iter().take(4) {
-                slots.push(((*p).to_string(), String::new()));
-            }
-            total_members = comma_parts.len();
-        } else {
-            let words: Vec<&str> = name
-                .split_whitespace()
-                .filter(|w| !w.is_empty())
-                .collect();
-            if words.len() >= 3 {
-                for w in words.iter().take(3) {
-                    slots.push(((*w).to_string(), String::new()));
-                }
-            } else {
-                slots.push((name.to_string(), String::new()));
-                slots.push(("TV".to_string(), String::new()));
-                slots.push(("N".to_string(), String::new()));
-            }
-            total_members = slots.len();
-        }
-    }
-    if total_members < slots.len() {
-        total_members = slots.len();
-    }
-
-    let border_col = Color32::from_rgb(24, 27, 34);
-    let n_slots = slots.len();
-    if n_slots == 2 {
-        let sub_r = (radius * 0.61).max(6.0);
-        let p1 = Pos2::new(center.x + radius - sub_r, center.y - radius + sub_r);
-        let p0 = Pos2::new(center.x - radius + sub_r, center.y + radius - sub_r);
-        for &(pos, idx) in &[(p1, 1usize), (p0, 0usize)] {
-            painter.circle_filled(pos, sub_r + 1.2, border_col);
-            let (ref m_name, ref m_url) = slots[idx];
-            paint_single_circle_avatar(
-                painter,
-                pos,
-                sub_r,
-                m_name,
-                false,
-                if m_url.is_empty() { None } else { Some(m_url.as_str()) },
-                textures,
-                loading,
-            );
-        }
-    } else if n_slots == 3 && total_members <= 3 {
-        // Zalo PC `zavatar-multi.zavatar-3`: 1 top-center (z=4), 1 bottom-left (z=3), 1 bottom-right (z=2)
-        let sub_r = (radius * 0.56).max(5.5);
-        let p_top = Pos2::new(center.x, center.y - radius + sub_r);
-        let p_bl = Pos2::new(center.x - radius + sub_r + 0.5, center.y + radius - sub_r - 0.5);
-        let p_br = Pos2::new(center.x + radius - sub_r - 0.5, center.y + radius - sub_r - 0.5);
-        for &(pos, idx) in &[(p_br, 2usize), (p_bl, 1usize), (p_top, 0usize)] {
-            painter.circle_filled(pos, sub_r + 1.2, border_col);
-            let (ref m_name, ref m_url) = slots[idx];
-            paint_single_circle_avatar(
-                painter,
-                pos,
-                sub_r,
-                m_name,
-                false,
-                if m_url.is_empty() { None } else { Some(m_url.as_str()) },
-                textures,
-                loading,
-            );
-        }
-    } else {
-        // Zalo PC `zavatar-multi.zavatar-4`: 2x2 grid (with member count badge in bottom-right if total_members >= 4)
-        let sub_r = (radius * 0.52).max(5.0);
-        let p_tl = Pos2::new(center.x - radius + sub_r, center.y - radius + sub_r);
-        let p_tr = Pos2::new(center.x + radius - sub_r, center.y - radius + sub_r);
-        let p_bl = Pos2::new(center.x - radius + sub_r, center.y + radius - sub_r);
-        let p_br = Pos2::new(center.x + radius - sub_r, center.y + radius - sub_r);
-        let show_counter = total_members > 4 || n_slots < 4;
-        if show_counter {
-            painter.circle_filled(p_br, sub_r + 1.2, border_col);
-            painter.circle_filled(p_br, sub_r, Color32::from_rgb(56, 65, 82));
-            let cnt_txt = if total_members > 99 {
-                "99+".to_string()
-            } else {
-                total_members.to_string()
-            };
-            painter.text(
-                p_br,
-                egui::Align2::CENTER_CENTER,
-                cnt_txt,
-                FontId::proportional((sub_r * 0.76).max(8.0)),
-                Color32::from_rgb(218, 226, 240),
-            );
-        } else if let Some((ref m_name, ref m_url)) = slots.get(3) {
-            painter.circle_filled(p_br, sub_r + 1.2, border_col);
-            paint_single_circle_avatar(
-                painter,
-                p_br,
-                sub_r,
-                m_name,
-                false,
-                if m_url.is_empty() { None } else { Some(m_url.as_str()) },
-                textures,
-                loading,
-            );
-        }
-        for &(pos, idx) in &[(p_bl, 2usize), (p_tr, 1usize), (p_tl, 0usize)] {
-            if let Some((ref m_name, ref m_url)) = slots.get(idx) {
-                painter.circle_filled(pos, sub_r + 1.2, border_col);
-                paint_single_circle_avatar(
-                    painter,
-                    pos,
-                    sub_r,
-                    m_name,
-                    false,
-                    if m_url.is_empty() { None } else { Some(m_url.as_str()) },
-                    textures,
-                    loading,
-                );
-            }
-        }
-    }
 }
 
 pub mod lucide {
@@ -702,7 +519,7 @@ pub(super) fn render_toggle_switch(ui: &mut egui::Ui, value: &mut bool, pal: &Th
 }
 
 
-pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
+fn custom_font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
 
     // 1. Embed official Lucide Icon Font (vector glyphs for all UI icons)
@@ -712,14 +529,21 @@ pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
         egui::FontData::from_static(LUCIDE_BYTES),
     );
 
-    // 2. Bundled Vietnamese sans-serif so diacritics render identically on every OS.
-    //    System fonts below are only an optional aesthetic override, never a requirement.
-    const BUNDLED_SANS: &[u8] = include_bytes!("../assets/fonts/BeVietnamPro-Regular.ttf");
     fonts.font_data.insert(
-        "bundled_sans".to_owned(),
-        egui::FontData::from_static(BUNDLED_SANS),
+        "emoji_slot".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/emojis/zalo/slot.ttf")),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("emoji_slot".into()), vec!["emoji_slot".to_owned()],
     );
 
+    // Keep a bundled Vietnamese fallback without replacing the custom emoji families.
+    fonts.font_data.insert(
+        "bundled_sans".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/BeVietnamPro-Regular.ttf")),
+    );
+
+    // 2. Load system Vietnamese sans-serif font
     let font_candidates = [
         "C:\\Windows\\Fonts\\segoeui.ttf",
         "C:\\Windows\\Fonts\\arial.ttf",
@@ -727,8 +551,6 @@ pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/System/Library/Fonts/Supplemental/Tahoma.ttf",
         "/Library/Fonts/Arial.ttf",
-        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
-        "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -747,49 +569,141 @@ pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
         }
     }
 
-    // 3. Optional CJK (Chinese / Japanese / Korean) system font fallback (#5, #6)
-    let cjk_candidates = [
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\simsun.ttc",
-        "C:\\Windows\\Fonts\\malgun.ttf",
-        "C:\\Windows\\Fonts\\YuGothR.ttc",
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
-    ];
-    for path in cjk_candidates {
-        if let Ok(font_data) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "cjk_font".to_owned(),
-                egui::FontData::from_owned(font_data),
-            );
-            break;
-        }
+    // Lucide precedes fallback fonts so private-use UI icons keep their original glyphs.
+    // The bundled fallbacks contain TrueType outlines usable by egui/ab_glyph.
+    // Apple Color Emoji uses bitmap/color tables and is not an outline fallback.
+    for (name, bytes) in [
+        (
+            "noto_sans_math",
+            include_bytes!("../assets/fonts/NotoSansMath-Regular.ttf").as_slice(),
+        ),
+        (
+            "noto_emoji_outline",
+            include_bytes!("../assets/fonts/NotoEmoji-Variable.ttf").as_slice(),
+        ),
+    ] {
+        fonts
+            .font_data
+            .insert(name.to_owned(), egui::FontData::from_static(bytes));
     }
 
-    // Fallback order: bundled sans guarantees Vietnamese coverage, CJK supplies Han/Kana/Hangul, Lucide supplies icon glyphs
-    let prop = fonts.families.entry(egui::FontFamily::Proportional).or_default();
-    prop.insert(0, "bundled_sans".to_owned());
+    let prop = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
     if fonts.font_data.contains_key("vietnamese_font") {
-        prop.insert(1, "vietnamese_font".to_owned());
+        prop.insert(0, "vietnamese_font".to_owned());
+        prop.push("lucide_font".to_owned());
+    } else {
+        prop.insert(0, "lucide_font".to_owned());
     }
-    if fonts.font_data.contains_key("cjk_font") {
-        prop.push("cjk_font".to_owned());
-    }
-    prop.push("lucide_font".to_owned());
 
-    let mono = fonts.families.entry(egui::FontFamily::Monospace).or_default();
-    mono.push("bundled_sans".to_owned());
+    let mono = fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default();
     if fonts.font_data.contains_key("vietnamese_font") {
         mono.push("vietnamese_font".to_owned());
     }
-    if fonts.font_data.contains_key("cjk_font") {
-        mono.push("cjk_font".to_owned());
-    }
     mono.push("lucide_font".to_owned());
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let fallbacks = fonts.families.entry(family).or_default();
+        fallbacks.push("bundled_sans".to_owned());
+        fallbacks.push("noto_sans_math".to_owned());
+        fallbacks.push("noto_emoji_outline".to_owned());
+    }
+    let mut bold = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    for path in ["/System/Library/Fonts/Supplemental/Arial Bold.ttf", "C:\\Windows\\Fonts\\segoeuib.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"] {
+        if let Ok(data)=std::fs::read(path) {fonts.font_data.insert("sidebar_bold".into(),egui::FontData::from_owned(data));bold.insert(0,"sidebar_bold".into());break;}
+    }
+    fonts.families.insert(egui::FontFamily::Name("sidebar-semibold".into()),bold);
+    fonts
+}
 
-    ctx.set_fonts(fonts);
+pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(custom_font_definitions());
+}
+
+#[cfg(test)]
+mod unicode_font_tests {
+    use super::*;
+
+    // Synthetic fixture using the exact non-ASCII codepoints of the reported message.
+    const STYLED: &str = "𝗔𝗕𝗘𝗚𝗛𝗜𝗟𝗦𝗮𝗲𝗹𝗻𝗼𝘁𝘄 𝟬𝟭";
+    const VIETNAMESE: &str = "Tiếng Việt: Nguyễn, Đặng, Ắ ằ ẵ ặ ế ệ ỡ ự ỵ";
+    const SYMBOLS: &str = "🎃💥 ∑ ∫ ∞ → ≤ ≥";
+
+    fn assert_visible_glyphs(ctx: &egui::Context, font: egui::FontId, text: &str) {
+        ctx.fonts(|fonts| {
+            for c in text.chars().filter(|c| !c.is_whitespace()) {
+                assert!(
+                    fonts.has_glyph(&font, c),
+                    "missing glyph U+{:04X}",
+                    c as u32
+                );
+            }
+            let galley = fonts.layout_no_wrap(text.to_owned(), font, Color32::WHITE);
+            let actual: String = galley
+                .rows
+                .iter()
+                .flat_map(|row| row.glyphs.iter().map(|g| g.chr))
+                .collect();
+            assert_eq!(actual, text, "layout must preserve original Unicode text");
+            for glyph in galley
+                .rows
+                .iter()
+                .flat_map(|row| &row.glyphs)
+                .filter(|g| !g.chr.is_whitespace())
+            {
+                assert!(
+                    !glyph.uv_rect.is_nothing(),
+                    "no rasterized outline U+{:04X}",
+                    glyph.chr as u32
+                );
+                assert!(glyph.advance_width > 0.0);
+            }
+        });
+    }
+
+    #[test]
+    fn unicode_fallbacks_preserve_styled_text_vietnamese_and_lucide() {
+        let ctx = egui::Context::default();
+        setup_custom_fonts(&ctx);
+        ctx.begin_pass(egui::RawInput::default());
+        for font in [
+            egui::FontId::proportional(16.0),
+            egui::FontId::monospace(16.0),
+        ] {
+            for text in [STYLED, VIETNAMESE, SYMBOLS, lucide::SEARCH, lucide::SEND] {
+                assert_visible_glyphs(&ctx, font.clone(), text);
+            }
+        }
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn bundled_fonts_rasterize_real_outlines_without_system_fallbacks() {
+        let ctx = egui::Context::default();
+        let mut fonts = custom_font_definitions();
+        // An isolated family prevents a default/system font from masking a broken asset.
+        for name in ["noto_sans_math", "noto_emoji_outline", "lucide_font"] {
+            fonts
+                .families
+                .insert(egui::FontFamily::Name(name.into()), vec![name.to_owned()]);
+        }
+        ctx.set_fonts(fonts);
+        ctx.begin_pass(egui::RawInput::default());
+        for (name, text) in [
+            ("noto_sans_math", STYLED),
+            ("noto_emoji_outline", "🎃💥"),
+            ("lucide_font", "\u{e151}\u{e4f2}"),
+        ] {
+            assert_visible_glyphs(
+                &ctx,
+                egui::FontId::new(18.0, egui::FontFamily::Name(name.into())),
+                text,
+            );
+        }
+        let _ = ctx.end_pass();
+    }
 }
