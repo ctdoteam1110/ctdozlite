@@ -3429,6 +3429,9 @@ impl ZaloGuiApp {
                                                         is_latest_outgoing,
                                                         is_group,
                                                         &thread_name,
+                                                        &self.user_uin,
+                                                        &thread_id,
+                                                        &mut self.failed_photo_previews,
                                                         sender_ava_opt,
                                                         pal,
                                                         &self.sticker_textures,
@@ -3617,7 +3620,17 @@ impl ZaloGuiApp {
                                     sender,
                                     time,
                                 } => {
-                                    let hd_tex_key = self.request_hd_texture(&full_url);
+                                    let hd_tex_key = if tex_key.starts_with("photo_") {
+                                        let mut key = super::media_preview::photo_key(&self.user_uin, &thread_id, &m.id);
+                                        key.quality = crate::media_resources::MediaQuality::Original;
+                                        let texture = format!("photo_{}", key.cache_id());
+                                        if !self.sticker_textures.contains_key(&texture) && self.loading_stickers.insert(texture.clone()) {
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                let _ = tx.send(WorkerCmd::FetchPhotoPreview { key, thumbnail: full_url.clone(), source: None });
+                                            }
+                                        }
+                                        Some(texture)
+                                    } else { self.request_hd_texture(&full_url) };
                                     self.image_viewer = Some(ImageViewerModal {
                                         tex_key,
                                         hd_tex_key,

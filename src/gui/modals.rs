@@ -2322,24 +2322,10 @@ impl ZaloGuiApp {
 
         if pick_migrate_file {
             if let Some(src_path) = pick_native_file_dialog(false) {
-                match crate::store::import_history_from_path(&src_path, "zalo_history.db") {
-                    Ok(summary) => {
-                        let t_cnt = summary.threads_imported;
-                        let m_cnt = summary.messages_imported;
-                        crate::store::load_history_into_threads(
-                            "zalo_history.db",
-                            &mut self.threads,
-                            crate::store::MessageStore::PRELOAD_MSGS,
-                        );
-                        self.persist_threads_async();
-                        self.show_toast(format!(
-                            "✅ Đã nhập {m_cnt} tin nhắn từ {t_cnt} hội thoại vào zalo_history.db"
-                        ));
-                    }
-                    Err(e) => {
-                        self.show_toast(format!("⚠️ Lỗi nhập lịch sử: {e}"));
-                    }
-                }
+                let sent = WORKER_TX.get().is_some_and(|tx| tx.send(WorkerCmd::ImportHistory {
+                    account: self.user_uin.clone(), path: src_path, threads: self.threads.clone(),
+                }).is_ok());
+                self.show_toast(if sent { "Đang nhập lịch sử trong nền…" } else { "Lỗi khởi động nhập lịch sử." });
             }
         }
         if export_theme_tpl {

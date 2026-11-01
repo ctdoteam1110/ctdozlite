@@ -21,7 +21,7 @@ use crate::logger::{self, FindingLevel, LogEntry, ScanFinding};
 use crate::qr::QrLogin;
 use crate::session::Session;
 
-
+mod media_preview;
 mod messages;
 mod modals;
 mod stickers;
@@ -29,11 +29,11 @@ mod theme;
 mod worker;
 mod workspace;
 
-pub use theme::{emoji_to_tex_key, load_app_icon, lucide, REACTION_LIST};
-pub use worker::WorkerCmd;
 use messages::*;
 use stickers::*;
 use theme::*;
+pub use theme::{emoji_to_tex_key, load_app_icon, lucide, REACTION_LIST};
+pub use worker::WorkerCmd;
 use worker::*;
 
 fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
@@ -41,6 +41,24 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 }
 
 pub enum GuiEvent {
+    /// Terminal result of background history import and hydration.
+    HistoryImported {
+        account: String,
+        result: Result<(crate::store::ImportReport, Vec<Thread>), String>,
+    },
+    /// Terminal result of an account-isolated photo request.
+    PhotoPreviewReady {
+        account: String,
+        key: String,
+        result: Result<egui::ColorImage, crate::media_resources::MediaError>,
+    },
+    /// Terminal delivery result without private notification content.
+    IncomingNotificationFinished {
+        result: Result<
+            crate::native_notifications::DeliveryResult,
+            crate::native_notifications::NotificationError,
+        >,
+    },
     /// Terminal response for a Settings authorization action.
     NotificationAuthorization {
         request_id: u64,
@@ -191,7 +209,13 @@ pub enum GuiEvent {
     SocialProfileLoaded(Result<crate::feed::SocialUserProfile, String>),
     SocialAvatarsLoaded(Result<Vec<crate::feed::FeedMedia>, String>),
     SocialTimelineLoaded(
-        Result<(Vec<crate::feed::SocialUserProfile>, Vec<crate::feed::FeedItem>), String>,
+        Result<
+            (
+                Vec<crate::feed::SocialUserProfile>,
+                Vec<crate::feed::FeedItem>,
+            ),
+            String,
+        >,
     ),
     LoggedOut,
 }
@@ -511,6 +535,9 @@ pub struct ZaloGuiApp {
     settings_modal_open: bool,
     settings_tab: SettingsTab,
     notification_authorization: crate::native_notifications::AuthorizationState,
+    notification_delivery: crate::native_notifications::DeliveryGate,
+    failed_photo_previews: HashSet<String>,
+    photo_texture_budget: crate::media_resources::ResourceLru,
     settings: AppSettings,
     settings_blur_tex: Option<TextureHandle>,
     settings_blur_req_at: Option<std::time::Instant>,
@@ -717,6 +744,11 @@ impl ZaloGuiApp {
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
             notification_authorization: Default::default(),
+            notification_delivery: Default::default(),
+            failed_photo_previews: HashSet::new(),
+            photo_texture_budget: crate::media_resources::ResourceLru::new(
+                crate::media_resources::TEXTURE_BUDGET,
+            ),
             settings: loaded_settings,
             settings_blur_tex: None,
             settings_blur_req_at: None,
@@ -857,15 +889,70 @@ impl ZaloGuiApp {
     fn check_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
+                GuiEvent::HistoryImported { account, result } => {
+                    if self.is_logged_in && account == self.user_uin {
+                        match result {
+                            Ok((report, threads)) => {
+                                for imported in threads {
+                                    if let Some(existing) = self
+                                        .threads
+                                        .iter_mut()
+                                        .find(|thread| thread.id == imported.id)
+                                    {
+                                        crate::chat::merge_thread_into(existing, imported, false);
+                                    } else {
+                                        self.threads.push(imported);
+                                    }
+                                }
+                                self.persist_threads_async();
+                                self.show_toast(format!(
+                                    "Đã nhập {} tin nhắn từ {} hội thoại",
+                                    report.messages_imported, report.threads_imported
+                                ));
+                            }
+                            Err(_) => self
+                                .show_toast("Lỗi nhập lịch sử. Hãy kiểm tra tệp nguồn và thử lại."),
+                        }
+                    }
+                }
+                GuiEvent::PhotoPreviewReady {
+                    account,
+                    key,
+                    result,
+                } => {
+                    self.loading_stickers.remove(&key);
+                    if self.is_logged_in && account == self.user_uin {
+                        match result {
+                            Ok(image) => {
+                                self.failed_photo_previews.remove(&key);
+                                let bytes = image.pixels.len() as u64 * 4;
+                                let evicted = self.photo_texture_budget.insert(key.clone(), bytes);
+                                let tex = ctx.load_texture(&key, image, TextureOptions::LINEAR);
+                                self.sticker_textures.insert(key, tex);
+                                for evicted in evicted {
+                                    self.sticker_textures.remove(&evicted);
+                                }
+                            }
+                            Err(_) => {
+                                self.failed_photo_previews.insert(key);
+                            }
+                        }
+                    }
+                }
+                GuiEvent::IncomingNotificationFinished { result } => {
+                    if result.is_err() {
+                        crate::logger::log_error(
+                            "gui::notification",
+                            "Incoming notification helper failed",
+                        );
+                    }
+                }
                 GuiEvent::NotificationAuthorization { request_id, result } => {
                     self.notification_authorization.finish(request_id, result);
                 }
                 GuiEvent::QrReady { qr_image, .. } => {
-                    self.qr_texture = Some(ctx.load_texture(
-                        "qr_code_tex",
-                        qr_image,
-                        TextureOptions::NEAREST,
-                    ));
+                    self.qr_texture =
+                        Some(ctx.load_texture("qr_code_tex", qr_image, TextureOptions::NEAREST));
                     self.qr_status = "Mở ứng dụng Zalo trên điện thoại và quét mã QR".into();
                     self.login_in_progress = false;
                 }
@@ -929,6 +1016,43 @@ impl ZaloGuiApp {
                             if let Some(existing) = self.threads.iter_mut().find(|t| t.id == nt.id)
                             {
                                 let old_len = existing.messages.len();
+                                let old_ids: HashSet<_> =
+                                    existing.messages.iter().map(|m| m.id.as_str()).collect();
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs() as i64;
+                                let muted = existing.presentation.muted
+                                    || nt.presentation.muted
+                                    || self
+                                        .settings
+                                        .muted_threads
+                                        .get(&nt.id)
+                                        .is_some_and(|until| *until == -1 || *until > now);
+                                for message in &nt.messages {
+                                    if !old_ids.contains(message.id.as_str())
+                                        && self.notification_delivery.admit(
+                                            &self.user_uin,
+                                            &self.user_uin,
+                                            &nt.id,
+                                            &message.id,
+                                            self.settings.enable_notifications,
+                                            muted,
+                                            is_focused,
+                                            message.is_outgoing,
+                                        )
+                                    {
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let _ =
+                                                tx.send(WorkerCmd::DeliverIncomingNotification {
+                                                    account: self.user_uin.clone(),
+                                                    thread: nt.id.clone(),
+                                                    message: message.id.clone(),
+                                                    sound: self.settings.play_notification_sound,
+                                                });
+                                        }
+                                    }
+                                }
                                 crate::chat::merge_thread_into(existing, nt, true);
                                 let added = existing.messages.len().saturating_sub(old_len);
                                 if added > 0 {
@@ -966,11 +1090,9 @@ impl ZaloGuiApp {
                             };
                             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
                             if !is_focused {
-                                ctx.send_viewport_cmd(
-                                    egui::ViewportCommand::RequestUserAttention(
-                                        egui::UserAttentionType::Informational,
-                                    ),
-                                );
+                                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                                    egui::UserAttentionType::Informational,
+                                ));
                             }
                         }
                         crate::chat::deduplicate_threads(&mut self.threads, Some(&live_ids));
@@ -1363,7 +1485,9 @@ impl ZaloGuiApp {
                                 "calling" | "ringing" => "Đang đổ chuông…".into(),
                                 "incoming_ringing" => "Cuộc gọi đến đang đổ chuông…".into(),
                                 "connecting" => "Đang kết nối luồng âm thanh/video…".into(),
-                                "incall" | "connected" => "Đang trong cuộc gọi (Pure-Rust VoIP)".into(),
+                                "incall" | "connected" => {
+                                    "Đang trong cuộc gọi (Pure-Rust VoIP)".into()
+                                }
                                 _ => format!("Đang kết nối ({state})…"),
                             };
                         }
@@ -2291,19 +2415,40 @@ mod tests {
     #[test]
     fn delayed_local_ack_preserves_server_chronology() {
         let mut thread = crate::chat::Thread::default();
-        for (id, client, ts) in [("server-a", "client-a", 1000), ("server-b", "client-b", 2000)] {
+        for (id, client, ts) in [
+            ("server-a", "client-a", 1000),
+            ("server-b", "client-b", 2000),
+        ] {
             thread.messages.push(crate::chat::ChatMessage {
-                id: id.into(), client_message_id: client.into(), ts, time: ts.to_string(),
-                is_outgoing: true, ..Default::default()
+                id: id.into(),
+                client_message_id: client.into(),
+                ts,
+                time: ts.to_string(),
+                is_outgoing: true,
+                ..Default::default()
             });
         }
         for ack_id in ["out_client-a", "server-a"] {
-            super::merge_sent_message(&mut thread, crate::chat::ChatMessage {
-                id: ack_id.into(), client_message_id: "client-a".into(), ts: 3000, time: "3000".into(),
-                is_outgoing: true, ..Default::default()
-            });
-            let chronology: Vec<_> = thread.messages.iter().map(|message| (message.id.as_str(), message.ts, message.time.as_str())).collect();
-            assert_eq!(chronology, [("server-a", 1000, "1000"), ("server-b", 2000, "2000")]);
+            super::merge_sent_message(
+                &mut thread,
+                crate::chat::ChatMessage {
+                    id: ack_id.into(),
+                    client_message_id: "client-a".into(),
+                    ts: 3000,
+                    time: "3000".into(),
+                    is_outgoing: true,
+                    ..Default::default()
+                },
+            );
+            let chronology: Vec<_> = thread
+                .messages
+                .iter()
+                .map(|message| (message.id.as_str(), message.ts, message.time.as_str()))
+                .collect();
+            assert_eq!(
+                chronology,
+                [("server-a", 1000, "1000"), ("server-b", 2000, "2000")]
+            );
         }
     }
 

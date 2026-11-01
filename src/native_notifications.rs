@@ -1,4 +1,4 @@
-//! Bounded macOS notification authorization bridge, without notification delivery.
+//! Bounded macOS authorization and generic incoming-message notification bridge.
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
@@ -195,6 +195,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delivery_gates_disabled_mute_foreground_outgoing_stale_account_and_duplicates() {
+        for (enabled, muted, foreground, outgoing) in [
+            (false, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, true),
+        ] {
+            let mut gate = DeliveryGate::default();
+            assert!(!gate.admit("a", "a", "t", "m", enabled, muted, foreground, outgoing));
+            assert!(!gate.admit("a", "a", "t", "m", true, false, false, false));
+        }
+        let mut gate = DeliveryGate::default();
+        assert!(!gate.admit("a", "b", "t", "m", true, false, false, false));
+        assert!(!gate.admit("a", "a", "t", "", true, false, false, false));
+        assert!(gate.admit("a", "a", "t", "m", true, false, false, false));
+        assert!(!gate.admit("a", "a", "t", "m", true, false, false, false));
+        assert!(gate.admit("b", "b", "t", "m", true, false, false, false));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delivery_helper_uses_notify_generic_payload_sound_and_terminal_errors() {
+        for (output, expected) in [
+            ("submitted", Ok(DeliveryResult::Submitted)),
+            ("notAuthorized", Ok(DeliveryResult::NotAuthorized)),
+            ("failed", Err(NotificationError::InvalidResponse)),
+        ] {
+            let fixture = Fixture::new(&format!(
+                "cat > \"$0.payload\"; echo \"$1\" > \"$0.args\"; echo {output}"
+            ));
+            assert_eq!(
+                deliver_at(
+                    &fixture.0.join("helper"),
+                    "account-private",
+                    "thread-private",
+                    "message-private",
+                    true
+                )
+                .await,
+                expected
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.0.join("helper.args")).unwrap(),
+                "--notify\n"
+            );
+            let payload: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(fixture.0.join("helper.payload")).unwrap())
+                    .unwrap();
+            assert_eq!(payload["title"], "Zalo");
+            assert_eq!(payload["body"], "You have a new message.");
+            assert_eq!(payload["sound"], true);
+            assert_eq!(payload["id"].as_str().unwrap().len(), 64);
+            assert!(!payload.to_string().contains("private"));
+        }
+        assert_eq!(
+            deliver_at(Path::new("/missing-fixture/helper"), "a", "t", "m", false).await,
+            Err(NotificationError::HelperUnavailable)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delivery_helper_failed_exit_and_timeout_are_terminal() {
+        let fixture = Fixture::new("cat >/dev/null; echo submitted; exit 3");
+        assert_eq!(
+            deliver_at(&fixture.0.join("helper"), "a", "t", "m", false).await,
+            Err(NotificationError::InvalidResponse)
+        );
+        let fixture = Fixture::new("exec sleep 5");
+        assert_eq!(
+            deliver_at_with_deadline(
+                &fixture.0.join("helper"),
+                "a",
+                "t",
+                "m",
+                false,
+                Duration::from_millis(50)
+            )
+            .await,
+            Err(NotificationError::Timeout)
+        );
+    }
+
+    #[test]
     fn parser_accepts_all_statuses_and_rejects_unknown() {
         for (raw, expected) in [
             ("notDetermined", AuthorizationStatus::NotDetermined),
@@ -354,4 +437,159 @@ mod tests {
             Err(NotificationError::HelperUnavailable)
         );
     }
+}
+
+/// Terminal outcome; a denied permission is not a helper failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryResult {
+    /// The operating system accepted the generic alert.
+    Submitted,
+    /// The helper observed authorization that does not allow alerts.
+    NotAuthorized,
+}
+
+/// Bounded, account-scoped stable-message deduplication owned by the UI.
+#[derive(Default)]
+pub(crate) struct DeliveryGate {
+    account: String,
+    seen: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+impl DeliveryGate {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit(
+        &mut self,
+        current: &str,
+        account: &str,
+        thread: &str,
+        message: &str,
+        enabled: bool,
+        muted: bool,
+        foreground: bool,
+        outgoing: bool,
+    ) -> bool {
+        if current.is_empty() || account != current {
+            return false;
+        }
+        if self.account != current {
+            self.account = current.to_owned();
+            self.seen.clear();
+            self.order.clear();
+        }
+        if message.is_empty() || thread.is_empty() {
+            return false;
+        }
+        let id = delivery_id(account, thread, message);
+        // Mark even suppressed arrivals so changing focus/settings never replays history.
+        if !self.seen.insert(id.clone()) {
+            return false;
+        }
+        self.order.push_back(id);
+        if self.order.len() > 2048 {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        enabled && !muted && !foreground && !outgoing
+    }
+}
+fn delivery_id(account: &str, thread: &str, message: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for value in [account, thread, message] {
+        hash.update((value.len() as u64).to_le_bytes());
+        hash.update(value.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+async fn deliver_at(
+    path: &Path,
+    account: &str,
+    thread: &str,
+    message: &str,
+    sound: bool,
+) -> Result<DeliveryResult, NotificationError> {
+    deliver_at_with_deadline(
+        path,
+        account,
+        thread,
+        message,
+        sound,
+        Duration::from_secs(22),
+    )
+    .await
+}
+
+async fn deliver_at_with_deadline(
+    path: &Path,
+    account: &str,
+    thread: &str,
+    message: &str,
+    sound: bool,
+    deadline: Duration,
+) -> Result<DeliveryResult, NotificationError> {
+    use tokio::io::AsyncWriteExt;
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "title": "Zalo", "body": "You have a new message.",
+        "id": delivery_id(account, thread, message), "sound": sound,
+    }))
+    .map_err(|_| NotificationError::InvalidResponse)?;
+    let mut child = tokio::process::Command::new(path)
+        .arg("--notify")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| NotificationError::HelperUnavailable)?;
+    let operation = async {
+        let mut stdin = child.stdin.take().ok_or(NotificationError::Io)?;
+        stdin
+            .write_all(&payload)
+            .await
+            .map_err(|_| NotificationError::Io)?;
+        stdin.shutdown().await.map_err(|_| NotificationError::Io)?;
+        drop(stdin);
+        let mut output = Vec::new();
+        child
+            .stdout
+            .take()
+            .ok_or(NotificationError::Io)?
+            .take(4097)
+            .read_to_end(&mut output)
+            .await
+            .map_err(|_| NotificationError::Io)?;
+        if output.len() > 4096
+            || !child
+                .wait()
+                .await
+                .map_err(|_| NotificationError::Io)?
+                .success()
+        {
+            return Err(NotificationError::InvalidResponse);
+        }
+        match output.as_slice() {
+            b"submitted\n" | b"submitted" => Ok(DeliveryResult::Submitted),
+            b"notAuthorized\n" | b"notAuthorized" => Ok(DeliveryResult::NotAuthorized),
+            _ => Err(NotificationError::InvalidResponse),
+        }
+    };
+    tokio::time::timeout(deadline, operation)
+        .await
+        .map_err(|_| NotificationError::Timeout)?
+}
+/// Deliver generic content without requesting permission. Caller must admit the current runtime scope.
+///
+/// # Errors
+/// Returns typed helper errors, never raw helper output or private message data.
+pub async fn deliver(
+    account: &str,
+    thread: &str,
+    message: &str,
+    sound: bool,
+) -> Result<DeliveryResult, NotificationError> {
+    if !cfg!(target_os = "macos") || account.is_empty() || thread.is_empty() || message.is_empty() {
+        return Err(NotificationError::HelperUnavailable);
+    }
+    deliver_at(&helper_path(), account, thread, message, sound).await
 }

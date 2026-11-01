@@ -908,9 +908,13 @@ pub(super) fn render_date_divider(ui: &mut egui::Ui, msg: &ChatMessage, pal: &Th
     let avail_w = ui.available_width();
     ui.horizontal(|ui| {
         let text_w = ui.fonts(|f| {
-            f.layout_no_wrap(label.clone(), FontId::proportional(11.5), pal.text_secondary)
-                .size()
-                .x
+            f.layout_no_wrap(
+                label.clone(),
+                FontId::proportional(11.5),
+                pal.text_secondary,
+            )
+            .size()
+            .x
         });
         let pill_w = text_w + 26.0;
         let left_space = ((avail_w - pill_w) * 0.5).max(0.0);
@@ -962,9 +966,13 @@ pub(super) fn render_system_notice_pill(ui: &mut egui::Ui, msg: &ChatMessage, pa
     let text = msg.text.trim();
     ui.horizontal(|ui| {
         let text_w = ui.fonts(|f| {
-            f.layout_no_wrap(text.to_string(), FontId::proportional(12.0), pal.text_secondary)
-                .size()
-                .x
+            f.layout_no_wrap(
+                text.to_string(),
+                FontId::proportional(12.0),
+                pal.text_secondary,
+            )
+            .size()
+            .x
         });
         let pill_w = (text_w + 28.0).min(avail_w - 40.0);
         let left_pad = ((avail_w - pill_w) * 0.5).max(0.0);
@@ -1009,6 +1017,9 @@ pub(super) fn render_message_body(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
     thread_name: &str,
+    account: &str,
+    thread_id: &str,
+    failed_photos: &mut HashSet<String>,
     pal: &ThemePalette,
     outgoing: bool,
     max_text_width: f32,
@@ -1042,9 +1053,7 @@ pub(super) fn render_message_body(
     };
 
     // Dedicated inline Photo Card when the message is an uploaded/received Zalo photo
-    let is_zalo_photo = msg.link_src.as_deref() == Some("Hình ảnh Zalo")
-        || trimmed_text == "[Hình ảnh]"
-        || trimmed_text.starts_with("[Hình ảnh] ");
+    let is_zalo_photo = super::media_preview::is_photo_message(msg);
     if is_zalo_photo {
         if let Some(thumb_url) = msg
             .link_thumb
@@ -1052,14 +1061,23 @@ pub(super) fn render_message_body(
             .or(msg.link_url.as_deref())
             .filter(|u| !u.is_empty())
         {
-            let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
-            if !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
+            let media_key = super::media_preview::photo_key(account, thread_id, &msg.id);
+            let key = format!("photo_{}", media_key.cache_id());
+            if !failed_photos.contains(&key)
+                && !sticker_textures.contains_key(&key)
+                && loading_stickers.insert(key.clone())
+            {
                 if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::FetchStickerImage {
-                        key: key.clone(),
-                        url: thumb_url.to_string(),
+                    let _ = tx.send(WorkerCmd::FetchPhotoPreview {
+                        key: media_key,
+                        thumbnail: thumb_url.to_owned(),
+                        source: msg.link_url.clone(),
                     });
                 }
+            }
+            if failed_photos.contains(&key) && ui.button("Lỗi tải ảnh. Thử lại").clicked()
+            {
+                failed_photos.remove(&key);
             }
             let open_target = msg.link_url.as_deref().unwrap_or(thumb_url).to_string();
             let title_label = msg
@@ -1226,9 +1244,7 @@ pub(super) fn render_message_body(
     }
 
     let Some((caption, url, domain)) = extract_message_link_view(msg) else {
-        ui.add(
-            egui::Label::new(RichText::new(&msg.text).color(text_col).size(14.0)).wrap(),
-        );
+        ui.add(egui::Label::new(RichText::new(&msg.text).color(text_col).size(14.0)).wrap());
         return None;
     };
 
@@ -1261,9 +1277,7 @@ pub(super) fn render_message_body(
 
     // 1. Optional user comment above the link
     if !caption.is_empty() && caption != url {
-        ui.add(
-            egui::Label::new(RichText::new(&caption).color(text_col).size(13.8)).wrap(),
-        );
+        ui.add(egui::Label::new(RichText::new(&caption).color(text_col).size(13.8)).wrap());
         ui.add_space(4.0);
     }
 
@@ -1383,6 +1397,9 @@ pub(super) fn render_chat_bubble(
     is_latest_outgoing: bool,
     is_group: bool,
     thread_name: &str,
+    account: &str,
+    thread_id: &str,
+    failed_photos: &mut HashSet<String>,
     sender_avatar: Option<&str>,
     pal: &ThemePalette,
     sticker_textures: &HashMap<String, TextureHandle>,
@@ -1396,9 +1413,7 @@ pub(super) fn render_chat_bubble(
     let has_sticker = is_sticker_message(msg).is_some();
     let call_card_opt = extract_call_card_view(msg);
     let is_call_card = call_card_opt.is_some();
-    let is_photo_card = msg.link_src.as_deref() == Some("Hình ảnh Zalo")
-        || msg.text.trim() == "[Hình ảnh]"
-        || msg.text.trim().starts_with("[Hình ảnh] ");
+    let is_photo_card = super::media_preview::is_photo_message(msg);
     let is_file_card = matches!(
         msg.link_src.as_deref(),
         Some("Tập tin Zalo") | Some("Video Zalo")
@@ -1440,12 +1455,10 @@ pub(super) fn render_chat_bubble(
     } else if is_call_card {
         max_text_width.min(256.0)
     } else if is_photo_card {
-        let thumb_u = msg
-            .link_thumb
-            .as_deref()
-            .or(msg.link_url.as_deref())
-            .unwrap_or("");
-        let tkey = format!("thumb_{}", crate::crypto::md5_hex(thumb_u));
+        let tkey = format!(
+            "photo_{}",
+            super::media_preview::photo_key(account, thread_id, &msg.id).cache_id()
+        );
         let photo_w = if let Some(tex) = sticker_textures.get(&tkey) {
             let [tw, th] = tex.size();
             let tw_f = (tw.max(1)) as f32;
@@ -1492,7 +1505,13 @@ pub(super) fn render_chat_bubble(
                 .link_title
                 .as_deref()
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| if !url.is_empty() { &url } else { msg.text.trim() });
+                .unwrap_or_else(|| {
+                    if !url.is_empty() {
+                        &url
+                    } else {
+                        msg.text.trim()
+                    }
+                });
             let desc = msg.link_desc.as_deref().unwrap_or("");
             let measure = |s: &str, sz: f32| -> f32 {
                 if s.is_empty() {
@@ -1551,13 +1570,9 @@ pub(super) fn render_chat_bubble(
                     .filter(|sn| !sn.is_empty() && !sn.chars().all(|c| c.is_ascii_digit()))
                     .unwrap_or("Tin nhắn trích dẫn");
                 let q_who_w = ui.fonts(|f| {
-                    f.layout_no_wrap(
-                        who.to_string(),
-                        FontId::proportional(11.5),
-                        Color32::WHITE,
-                    )
-                    .size()
-                    .x
+                    f.layout_no_wrap(who.to_string(), FontId::proportional(11.5), Color32::WHITE)
+                        .size()
+                        .x
                 });
                 q_body_w.max(q_who_w) + 30.0
             }
@@ -1672,6 +1687,9 @@ pub(super) fn render_chat_bubble(
                                     ui,
                                     msg,
                                     thread_name,
+                                    account,
+                                    thread_id,
+                                    failed_photos,
                                     pal,
                                     true,
                                     content_width,
@@ -1806,6 +1824,9 @@ pub(super) fn render_chat_bubble(
                                     ui,
                                     msg,
                                     thread_name,
+                                    account,
+                                    thread_id,
+                                    failed_photos,
                                     pal,
                                     false,
                                     content_width,
@@ -1855,7 +1876,9 @@ pub(super) enum BubbleAction {
     ToggleStar,
     DeleteForMe,
     RecallForEveryone,
-    CallAgain { is_video: bool },
+    CallAgain {
+        is_video: bool,
+    },
     OpenImagePopup {
         tex_key: String,
         full_url: String,
@@ -2191,6 +2214,9 @@ mod quote_navigation_tests {
                                 false,
                                 false,
                                 "Thread",
+                                "account-1",
+                                "thread-1",
+                                &mut HashSet::new(),
                                 None,
                                 &ThemePalette::light(),
                                 &HashMap::new(),

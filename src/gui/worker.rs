@@ -6,6 +6,25 @@ pub(super) static KNOWN_THREADS: std::sync::Mutex<Vec<(String, String, bool)>> =
     std::sync::Mutex::new(Vec::new());
 
 pub enum WorkerCmd {
+    /// Import and hydrate local history on the blocking pool.
+    ImportHistory {
+        account: String,
+        path: std::path::PathBuf,
+        threads: Vec<Thread>,
+    },
+    /// Fetch only photo cards with a bounded original-source fallback.
+    FetchPhotoPreview {
+        key: crate::media_resources::MediaKey,
+        thumbnail: String,
+        source: Option<String>,
+    },
+    /// Deliver an already admitted background incoming-message alert.
+    DeliverIncomingNotification {
+        account: String,
+        thread: String,
+        message: String,
+        sound: bool,
+    },
     /// Replay durable reactions into a loaded snapshot on the blocking worker.
     ReplayReactions {
         account: String,
@@ -680,6 +699,58 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let captured = session.lock().await.clone();
                             if captured.login.as_ref().map(|l| l.uin.as_str()) == Some(account.as_str()) {
                                 process_reaction_journal(session.clone(), captured, gui_tx.clone(), Vec::new(), threads).await;
+                            }
+                        }
+                        WorkerCmd::ImportHistory { account, path, threads } => {
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            let current = session.lock().await.login.as_ref().map(|info| info.uin.clone()).unwrap_or_default();
+                            tokio::spawn(async move {
+                                let result = if current != account || account.is_empty() {
+                                    Err("Account mismatch".to_owned())
+                                } else {
+                                    import_history_async(path, "zalo_history.db".to_owned(), threads).await
+                                };
+                                let _ = tx.send(GuiEvent::HistoryImported { account, result });
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchPhotoPreview { key, thumbnail, source } => {
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            let snapshot = session.lock().await.clone();
+                            static JOBS: std::sync::OnceLock<crate::media_resources::MediaJobQueue> = std::sync::OnceLock::new();
+                            let admission = JOBS.get_or_init(Default::default).try_admit();
+                            let Some(admission) = admission else {
+                                let texture = format!("photo_{}", key.cache_id());
+                                let _ = tx.send(GuiEvent::PhotoPreviewReady { account: key.account, key: texture, result: Err(crate::media_resources::MediaError::Cancelled) });
+                                continue;
+                            };
+                            tokio::spawn(async move {
+                                let permit = admission.start().await;
+                                let result = if snapshot.login.as_ref().map(|info| info.uin.as_str()) != Some(key.account.as_str()) { Err(crate::media_resources::MediaError::AccountMismatch) }
+                                else if let Some(_permit) = permit {
+                                    let generation = crate::media_resources::RequestGeneration::default();
+                                    super::media_preview::load_photo(&snapshot.http, &key, &thumbnail, source.as_deref(), &generation, generation.capture()).await.map(|image| {
+                                        egui::ColorImage::from_rgba_unmultiplied([image.width() as usize, image.height() as usize], image.as_raw())
+                                    })
+                                } else { Err(crate::media_resources::MediaError::Cancelled) };
+                                let texture = format!("photo_{}", key.cache_id());
+                                let _ = tx.send(GuiEvent::PhotoPreviewReady { account: key.account, key: texture, result });
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::DeliverIncomingNotification { account, thread, message, sound } => {
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            if session.lock().await.login.as_ref().map(|info| info.uin.as_str()) == Some(account.as_str()) {
+                                tokio::spawn(async move {
+                                    let result = crate::native_notifications::deliver(&account, &thread, &message, sound).await;
+                                    let _ = tx.send(GuiEvent::IncomingNotificationFinished { result });
+                                    ctx.request_repaint();
+                                });
+                            } else {
+                                let _ = tx.send(GuiEvent::IncomingNotificationFinished { result: Err(crate::native_notifications::NotificationError::HelperUnavailable) });
                             }
                         }
                         WorkerCmd::ReadNotificationAuthorization { request_id }
@@ -3033,5 +3104,65 @@ mod reaction_consumer_tests {
         assert!(matches!(rx.try_recv().unwrap(), GuiEvent::StatusUpdate(_)));
         assert!(rx.try_recv().is_err());
         std::fs::remove_file(root).unwrap();
+    }
+}
+
+
+fn import_history(
+    path: &std::path::Path,
+    database: &str,
+    threads: &mut Vec<Thread>,
+) -> Result<(crate::store::ImportReport, Vec<Thread>), String> {
+    let report = crate::store::import_history_from_path(path, database)
+        .map_err(|_| "History import failed".to_owned())?;
+    let store =
+        crate::store::MessageStore::open(database).map_err(|_| "History open failed".to_owned())?;
+    store
+        .hydrate_threads(threads, crate::store::MessageStore::PRELOAD_MSGS)
+        .map_err(|_| "History hydration failed".to_owned())?;
+    Ok((report, std::mem::take(threads)))
+}
+
+async fn import_history_async(
+    path: std::path::PathBuf,
+    database: String,
+    mut threads: Vec<Thread>,
+) -> Result<(crate::store::ImportReport, Vec<Thread>), String> {
+    tokio::task::spawn_blocking(move || import_history(&path, &database, &mut threads))
+        .await
+        .map_err(|_| "Import task failed".to_owned())
+        .and_then(|result| result)
+}
+
+#[cfg(test)]
+mod media_import_regressions {
+    use super::*;
+    #[tokio::test]
+    async fn history_import_hydrates_off_runtime_thread_and_returns_terminal_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "zl-import-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let input = root.join("fixture.json");
+        let database = root.join("history.db").to_string_lossy().into_owned();
+        std::fs::write(&input, r#"[{"id":"thread-1","name":"Fixture","preview":"fixture","time":"","avatar":null,"is_group":false,"messages":[{"id":"message-1","sender":"Fixture","text":"fixture","time":"","is_outgoing":false,"ts":123}]}]"#).unwrap();
+        let (report, threads) = import_history_async(input, database.clone(), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(report.messages_imported, 1);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].messages[0].text, "fixture");
+        assert!(
+            import_history_async(root.join("missing.json"), database, threads)
+                .await
+                .is_err()
+        );
+        assert!(!include_str!("modals.rs").contains("crate::store::import_history_from_path"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
