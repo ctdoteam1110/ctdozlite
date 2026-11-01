@@ -25,7 +25,13 @@ pub const CONFIG_DOMAIN: &str = "zaloapp.com";
 /// `*.chat.zalo.me`, not the `*.zaloapp.com` names the PC bundle defaults to — the two
 /// flavours differ, and using the wrong set yields nginx 404s.
 ///
-/// [`Session::apply_server_info`] re-applies them from the login payload each run.
+/// The hosts that *are* in [`crate::endpoints::SERVICE_MAP_V3`] are authoritative:
+/// [`Domains::heal_from_verified`] restores them on every load and
+/// [`Session::apply_server_info`] refuses to overwrite them, because the server still
+/// hands out the stale `*.zaloapp.com` flavour for `friend`/`profile` (#22).
+///
+/// Only the hosts with no verified entry — `lp_chat`, `lp_control`, `ws`,
+/// `cloud_msg` — are taken from the login payload on each run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Domains {
     /// `wpa.zaloapp.com` — `reqqr`, password login.
@@ -98,7 +104,10 @@ fn default_ws() -> Vec<String> {
 
 impl Default for Domains {
     fn default() -> Self {
-        Self {
+        // `chat` / `conversation` are seeded with the two long-polling hosts the client
+        // has observed; `heal_from_verified` then rewrites **every** verified slot, so
+        // those seeds only survive if `SERVICE_MAP_V3` ever loses the key.
+        let mut domains = Self {
             auth: crate::endpoints::AUTH.into(),
             wpa_chat: crate::endpoints::WPA_CHAT.into(),
             chat: crate::endpoints::MSG_CHAT.into(),
@@ -114,6 +123,94 @@ impl Default for Domains {
             voice_call: default_voice_call(),
             sticker: default_sticker(),
             ws: default_ws(),
+        };
+        domains.heal_from_verified();
+        domains
+    }
+}
+
+/// First entry of a `zpw_service_map_v3` value, which can be either an array or a string.
+fn first_url(v: &Value) -> Option<String> {
+    v.as_array()
+        .and_then(|a| a.first())
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .or_else(|| v.as_str().map(|s| s.trim_end_matches('/').to_string()))
+}
+
+impl Domains {
+    /// Restore every endpoint that has a **verified** entry in
+    /// [`crate::endpoints::SERVICE_MAP_V3`], overriding whatever a previous run
+    /// persisted.
+    ///
+    /// A `session.json` written by an older build can carry hosts the server
+    /// handed out before they were verified — notably the stale
+    /// `*.zaloapp.com` flavour for `friend`/`profile`, which nginx answers
+    /// with 404 and which then looks like an expired session (#22).
+    ///
+    /// Endpoints that are *not* in the verified table are left untouched:
+    /// `lp_chat`, `lp_control`, `ws` and `cloud_msg` genuinely come from the
+    /// server and rotate.
+    pub fn heal_from_verified(&mut self) {
+        use crate::endpoints::service;
+
+        if let Some(v) = service("chat") {
+            self.chat = v.into();
+        }
+        if let Some(v) = service("conversation") {
+            // `conversation` is the control-plane REST host; `convers_api` is the
+            // same host used by `conv/*`. They were split historically.
+            self.conversation = v.into();
+            self.convers_api = v.into();
+        }
+        for (key, slot) in [
+            ("friend", &mut self.friend),
+            ("profile", &mut self.profile),
+            ("group", &mut self.group),
+            ("file", &mut self.file),
+            ("voice_call", &mut self.voice_call),
+            ("sticker", &mut self.sticker),
+        ] {
+            if let Some(v) = service(key) {
+                *slot = v.into();
+            }
+        }
+    }
+
+    /// Apply `zpw_service_map_v3` **without** overriding verified endpoints.
+    ///
+    /// The server has been observed returning stale hosts (e.g.
+    /// `tt-friend-wpa.zaloapp.com` instead of `tt-friend-wpa.chat.zalo.me`),
+    /// so a verified constant always wins. The map only fills keys that have no
+    /// verified entry, or slots that are still empty.
+    ///
+    /// Trade-off: if Zalo rotates a verified host (`tt-chat3` → `tt-chat4`), we
+    /// keep using the constant. Trying multiple candidates per endpoint is
+    /// tracked as a follow-up.
+    pub fn apply_service_map(&mut self, map: &Value) {
+        for (key, slot) in [
+            ("chat", &mut self.chat),
+            ("friend", &mut self.friend),
+            ("conversation", &mut self.convers_api),
+            ("profile", &mut self.profile),
+            ("group", &mut self.group),
+            ("file", &mut self.file),
+            ("group_cloud_message", &mut self.cloud_msg),
+            ("voice_call", &mut self.voice_call),
+            ("sticker", &mut self.sticker),
+        ] {
+            let Some(v) = map.get(key).and_then(first_url) else {
+                continue;
+            };
+            let verified = crate::endpoints::service(key).is_some();
+            if !verified || slot.is_empty() {
+                *slot = v;
+            }
+        }
+        if crate::endpoints::service("conversation").is_none() {
+            if let Some(v) = map.get("conversation").and_then(first_url) {
+                self.conversation = v;
+            }
         }
     }
 }
@@ -382,27 +479,26 @@ impl Session {
         };
         self.computer_name = saved.computer_name;
         self.domains = saved.domains;
-        // Auto-heal older session.json files where `zpw_chts_new` / `zpw_ctrs_new` overwrote REST domains
-        if self.domains.chat.contains("-msg-chat.") || self.domains.chat.contains("tt-chat2-wpa") || self.domains.chat.is_empty() {
-            if self.domains.chat.contains("-msg-chat.") && self.domains.lp_chat.is_empty() {
-                self.domains.lp_chat = self.domains.chat.clone();
-            }
-            self.domains.chat = crate::endpoints::service("chat")
-                .unwrap_or("https://tt-chat3-wpa.api.zaloapp.com")
-                .into();
+        // Older sessions stored the long-polling hosts in `chat` / `conversation`
+        // when `zpw_chts_new` / `zpw_ctrs_new` overwrote the REST domains. Rescind
+        // them before the verified baseline replaces the REST fields.
+        if self.domains.chat.contains("-msg-chat.") && self.domains.lp_chat.is_empty() {
+            self.domains.lp_chat = self.domains.chat.clone();
         }
-        if self.domains.conversation.contains("-ctl-chat.") || self.domains.conversation.is_empty() {
-            if self.domains.conversation.contains("-ctl-chat.") && self.domains.lp_control.is_empty() {
-                self.domains.lp_control = self.domains.conversation.clone();
-            }
-            self.domains.conversation = crate::endpoints::service("conversation")
-                .unwrap_or("https://tt-convers-wpa.chat.zalo.me")
-                .into();
+        if self.domains.conversation.contains("-ctl-chat.") && self.domains.lp_control.is_empty() {
+            self.domains.lp_control = self.domains.conversation.clone();
         }
-        if self.domains.sticker.is_empty() {
-            self.domains.sticker = crate::endpoints::service("sticker")
-                .unwrap_or("https://tt-sticker-wpa.chat.zalo.me")
-                .into();
+        // Verified endpoints win over anything a previous run persisted (#22).
+        self.domains.heal_from_verified();
+        // Server-owned endpoints are never in the verified table, so fill gaps.
+        if self.domains.lp_chat.is_empty() {
+            self.domains.lp_chat = default_lp_chat();
+        }
+        if self.domains.lp_control.is_empty() {
+            self.domains.lp_control = default_lp_control();
+        }
+        if self.domains.ws.is_empty() {
+            self.domains.ws = default_ws();
         }
         self.session_key = saved.session_key;
         let sek = saved
@@ -507,18 +603,10 @@ impl Session {
     /// `zpw_chts_new` → chat, `zpw_ctrs_new` → conversation,
     /// `zpw_service_map_new.{friend,conversation,profile,group,file}` → the rest.
     pub fn apply_server_info(&mut self, data: &Value) {
-        fn first(v: &Value) -> Option<String> {
-            v.as_array()
-                .and_then(|a| a.first())
-                .and_then(|x| x.as_str())
-                .map(|s| s.trim_end_matches('/').to_string())
-                .or_else(|| v.as_str().map(|s| s.trim_end_matches('/').to_string()))
-        }
-
-        if let Some(v) = data.get("zpw_chts_new").and_then(first) {
+        if let Some(v) = data.get("zpw_chts_new").and_then(first_url) {
             self.domains.lp_chat = v;
         }
-        if let Some(v) = data.get("zpw_ctrs_new").and_then(first) {
+        if let Some(v) = data.get("zpw_ctrs_new").and_then(first_url) {
             self.domains.lp_control = v;
         }
         if let Some(arr) = data.get("zpw_ws").and_then(|v| v.as_array()) {
@@ -536,24 +624,7 @@ impl Session {
             .get("zpw_service_map_v3")
             .or_else(|| data.get("zpw_service_map_new"))
         {
-            for (key, slot) in [
-                ("chat", &mut self.domains.chat),
-                ("friend", &mut self.domains.friend),
-                ("conversation", &mut self.domains.convers_api),
-                ("profile", &mut self.domains.profile),
-                ("group", &mut self.domains.group),
-                ("file", &mut self.domains.file),
-                ("group_cloud_message", &mut self.domains.cloud_msg),
-                ("voice_call", &mut self.domains.voice_call),
-                ("sticker", &mut self.domains.sticker),
-            ] {
-                if let Some(v) = map.get(key).and_then(first) {
-                    *slot = v;
-                }
-            }
-            if let Some(v) = map.get("conversation").and_then(first) {
-                self.domains.conversation = v;
-            }
+            self.domains.apply_service_map(map);
         }
     }
 
@@ -877,5 +948,172 @@ mod tests {
         assert_eq!(redact_secret("1234567890abcdef"), "12345678…<redacted>");
         assert_eq!(redact_secret("short"), "short…<redacted>");
         assert_eq!(redact_secret(""), "…<redacted>");
+    }
+
+    #[test]
+    fn server_map_cannot_override_verified_endpoints() {
+        let mut domains = Domains::default();
+        domains.apply_service_map(&serde_json::json!({
+            "friend": ["https://tt-friend-wpa.zaloapp.com"],
+            "profile": "https://tt-profile-wpa.zaloapp.com",
+            "chat": "https://tt-chat9-wpa.api.zaloapp.com",
+        }));
+
+        assert_eq!(domains.friend, "https://tt-friend-wpa.chat.zalo.me");
+        assert_eq!(domains.profile, "https://tt-profile-wpa.chat.zalo.me");
+        assert_eq!(domains.chat, crate::endpoints::service("chat").unwrap());
+    }
+
+    #[test]
+    fn server_map_fills_endpoints_without_a_verified_constant() {
+        let mut domains = Domains::default();
+        domains.apply_service_map(&serde_json::json!({
+            "group_cloud_message": "https://tt-group-cm.example.test/",
+        }));
+
+        assert_eq!(domains.cloud_msg, "https://tt-group-cm.example.test");
+    }
+
+    #[test]
+    fn server_map_fills_an_empty_verified_slot() {
+        let mut domains = Domains::default();
+        domains.sticker.clear();
+        domains.apply_service_map(&serde_json::json!({"sticker": "https://from-server.test"}));
+
+        assert_eq!(domains.sticker, "https://from-server.test");
+    }
+
+    #[test]
+    fn heal_restores_every_verified_domain() {
+        let mut domains = Domains::default();
+        domains.chat = "https://p4-msg-chat.zaloapp.com".into();
+        domains.conversation = "https://p4-ctl-chat.zaloapp.com".into();
+        domains.convers_api = "https://tt-convers-wpa.zaloapp.com/".into();
+        domains.friend = "https://tt-friend-wpa.zaloapp.com".into();
+        domains.profile = "https://tt-profile-wpa.zaloapp.com".into();
+        domains.group = String::new();
+        domains.file = "https://wrong.example/".into();
+        domains.voice_call = String::new();
+        domains.sticker = String::new();
+
+        domains.heal_from_verified();
+
+        for (key, actual) in [
+            ("friend", &domains.friend),
+            ("profile", &domains.profile),
+            ("group", &domains.group),
+            ("file", &domains.file),
+            ("voice_call", &domains.voice_call),
+            ("sticker", &domains.sticker),
+            ("chat", &domains.chat),
+            ("conversation", &domains.conversation),
+            ("conversation", &domains.convers_api),
+        ] {
+            assert_eq!(
+                actual.as_str(),
+                crate::endpoints::service(key).unwrap(),
+                "endpoint {key} was not healed"
+            );
+        }
+    }
+
+    #[test]
+    fn heal_leaves_server_owned_endpoints_untouched() {
+        let mut domains = Domains::default();
+        domains.lp_chat = "https://p9-msg-chat.zaloapp.com".into();
+        domains.lp_control = "https://p9-ctl-chat.zaloapp.com".into();
+        domains.cloud_msg = "https://tt-group-cm.example.test".into();
+        domains.ws = vec!["wss://ws99-msg.chat.zalo.me".into()];
+
+        domains.heal_from_verified();
+
+        assert_eq!(domains.lp_chat, "https://p9-msg-chat.zaloapp.com");
+        assert_eq!(domains.lp_control, "https://p9-ctl-chat.zaloapp.com");
+        assert_eq!(domains.cloud_msg, "https://tt-group-cm.example.test");
+        assert_eq!(domains.ws, vec!["wss://ws99-msg.chat.zalo.me"]);
+    }
+
+    #[test]
+    fn apply_server_info_takes_long_polling_hosts_from_the_server() {
+        let mut s = Session::new(false, false, false).unwrap();
+        s.apply_server_info(&serde_json::json!({
+            "zpw_chts_new": ["https://p7-msg-chat.zaloapp.com"],
+            "zpw_ctrs_new": ["https://p7-ctl-chat.zaloapp.com"],
+            "zpw_ws": ["wss://ws7-msg.chat.zalo.me"],
+            "zpw_service_map_v3": {
+                "friend": ["https://tt-friend-wpa.zaloapp.com"],
+                "group_cloud_message": ["https://tt-group-cm.example.test"],
+            },
+        }));
+
+        assert_eq!(s.domains.lp_chat, "https://p7-msg-chat.zaloapp.com");
+        assert_eq!(s.domains.lp_control, "https://p7-ctl-chat.zaloapp.com");
+        assert_eq!(s.domains.ws, vec!["wss://ws7-msg.chat.zalo.me"]);
+        // Verified endpoint survives the stale server value, unverified one is taken.
+        assert_eq!(s.domains.friend, "https://tt-friend-wpa.chat.zalo.me");
+        assert_eq!(s.domains.cloud_msg, "https://tt-group-cm.example.test");
+    }
+
+    /// `session.json` written by an older build holds the stale hosts the server used to
+    /// hand out (#22). Loading it must restore **every** verified endpoint and leave the
+    /// server-owned ones (`lp_*`, `ws`, `cloud_msg`) alone.
+    #[test]
+    fn loading_a_legacy_session_heals_every_verified_domain() {
+        let fixture = serde_json::json!({
+            "imei": "",
+            "computer_name": "DESKTOP-TEST",
+            "secret_key_b64": null,
+            "session_key": null,
+            "zpw_sek": "fixture-sek",
+            "login": null,
+            "domains": {
+                "auth": crate::endpoints::AUTH,
+                "wpa_chat": crate::endpoints::WPA_CHAT,
+                "chat": "https://p4-msg-chat.zaloapp.com",
+                "conversation": "https://p4-ctl-chat.zaloapp.com",
+                "lp_chat": "https://p9-msg-chat.zaloapp.com",
+                "lp_control": "https://p9-ctl-chat.zaloapp.com",
+                "friend": "https://tt-friend-wpa.zaloapp.com",
+                "convers_api": "https://tt-convers-wpa.zaloapp.com",
+                "profile": "https://tt-profile-wpa.zaloapp.com",
+                "group": "https://tt-group-wpa.zaloapp.com",
+                "file": "https://tt-files-wpa.zaloapp.com",
+                "cloud_msg": "https://tt-group-cm.api.zaloapp.com",
+                "voice_call": "https://voicecall-wpa.zaloapp.com",
+                "sticker": "https://tt-sticker-wpa.zaloapp.com",
+                "ws": ["wss://ws9-msg.chat.zalo.me"],
+            },
+        });
+        let path =
+            std::env::temp_dir().join(format!("ctdozlite-legacy-{}.json", std::process::id()));
+        std::fs::write(&path, fixture.to_string()).unwrap();
+
+        let mut s = Session::new(false, false, false).unwrap();
+        let loaded = s.load_from_file(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        loaded.unwrap();
+
+        for (key, actual) in [
+            ("friend", &s.domains.friend),
+            ("profile", &s.domains.profile),
+            ("group", &s.domains.group),
+            ("file", &s.domains.file),
+            ("voice_call", &s.domains.voice_call),
+            ("sticker", &s.domains.sticker),
+            ("chat", &s.domains.chat),
+            ("conversation", &s.domains.conversation),
+            ("conversation", &s.domains.convers_api),
+        ] {
+            assert_eq!(
+                actual.as_str(),
+                crate::endpoints::service(key).unwrap(),
+                "endpoint {key} was not healed on load"
+            );
+        }
+        assert_eq!(s.domains.lp_chat, "https://p9-msg-chat.zaloapp.com");
+        assert_eq!(s.domains.lp_control, "https://p9-ctl-chat.zaloapp.com");
+        assert_eq!(s.domains.cloud_msg, "https://tt-group-cm.api.zaloapp.com");
+        assert_eq!(s.domains.ws, vec!["wss://ws9-msg.chat.zalo.me"]);
+        assert_eq!(s.zpw_sek.as_deref(), Some("fixture-sek"));
     }
 }
