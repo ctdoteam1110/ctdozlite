@@ -474,10 +474,7 @@ fn parse_thread(v: &Value) -> Option<Thread> {
             Value::String(s) => s.parse::<i64>().ok(),
             _ => None,
         })
-        .map(|ts| {
-            let s = ts / 1000;
-            format!("{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60)
-        })
+        .map(crate::clock::message_time)
         .unwrap_or_default();
 
     Some(Thread {
@@ -3694,8 +3691,7 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         .unwrap_or(0);
 
     let time = if ts > 0 {
-        let s = ts / 1000;
-        format!("{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60)
+        crate::clock::message_time(ts)
     } else {
         crate::ui::clock()
     };
@@ -4451,6 +4447,66 @@ pub async fn find_user_by_phone(s: &Session, raw_phone: &str) -> Result<PhoneLoo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_time_when_parsing_millisecond_timestamps() {
+        use chrono::TimeZone;
+        let expected = chrono::Local
+            .timestamp_millis_opt(1793467800000)
+            .single()
+            .unwrap()
+            .format("%H:%M")
+            .to_string();
+        let thread = parse_thread(&serde_json::json!({
+            "userId": "user-1", "lastActionTime": 1793467800000_i64
+        }))
+        .unwrap();
+        assert_eq!(thread.time, expected);
+        let message = parse_chat_message(&serde_json::json!({
+            "msgId": "msg-0001", "content": "hello", "ts": 1793467800000_i64
+        }))
+        .unwrap();
+        assert_eq!(message.time, expected);
+        assert_eq!(message.ts, 1793467800000_i64);
+    }
+
+    #[test]
+    fn local_time_when_parsing_second_timestamps_and_invalid_values() {
+        let expected = crate::clock::message_time(1793467800000);
+        for ts in [
+            serde_json::json!(1793467800),
+            serde_json::json!("1793467800"),
+        ] {
+            let thread = parse_thread(&serde_json::json!({
+                "userId": "user-1", "lastActionTime": ts
+            }))
+            .unwrap();
+            let message = parse_chat_message(&serde_json::json!({
+                "msgId": "msg-0001", "content": "hello", "ts": ts
+            }))
+            .unwrap();
+            assert_eq!(thread.time, expected);
+            assert_eq!(message.time, expected);
+            assert_eq!(message.ts, 1793467800);
+        }
+        for ts in [
+            serde_json::json!(-1),
+            serde_json::json!(0),
+            serde_json::json!(i64::MAX),
+            serde_json::json!("invalid"),
+        ] {
+            let thread = parse_thread(&serde_json::json!({
+                "userId": "user-1", "lastActionTime": ts
+            }))
+            .unwrap();
+            assert_eq!(thread.time, "");
+        }
+        let message = parse_chat_message(&serde_json::json!({
+            "msgId": "msg-0001", "content": "hello", "ts": i64::MAX
+        }))
+        .unwrap();
+        assert_eq!(message.time, "");
+    }
 
     #[tokio::test]
     async fn unauthenticated_calls_fail_cleanly() {

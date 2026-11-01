@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod call;
 pub mod chat;
+mod clock;
 pub mod crypto;
 pub mod endpoints;
 pub mod gui;
