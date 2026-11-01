@@ -81,6 +81,20 @@ pub enum WorkerCmd {
     LookupPhone {
         phone: String,
     },
+    /// Save an attachment (file / video / original photo) into `dest_dir` ("Thư mục lưu file").
+    /// `url` and `suggested_name` come from a chat message and are untrusted; all policy lives in
+    /// [`crate::download`]. Progress is reported as `GuiEvent::Download*` keyed by `url`.
+    DownloadAttachment {
+        url: String,
+        suggested_name: String,
+        thread_id: String,
+        dest_dir: String,
+    },
+    /// Measure `paths::cache_dir()` → `GuiEvent::CacheSizeComputed`.
+    ComputeCacheSize,
+    /// Delete the contents of `paths::cache_dir()` (`stickers_cache/` only) →
+    /// `GuiEvent::ImageCacheCleared`.
+    ClearImageCache,
     StartCall {
         partner_id: String,
         partner_name: String,
@@ -1828,6 +1842,76 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         )));
                                     }
                                 }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::DownloadAttachment {
+                            url,
+                            suggested_name,
+                            thread_id: _,
+                            dest_dir,
+                        } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let result = match crate::download::validate_target_dir(&dest_dir) {
+                                    Err(e) => Err(e),
+                                    Ok(dir) => {
+                                        let client = { session_clone.lock().await.clone().http };
+                                        let tx = gui_tx_clone.clone();
+                                        let ctx = ctx_clone.clone();
+                                        let key = url.clone();
+                                        crate::download::download_to_dir(
+                                            &client,
+                                            &url,
+                                            &suggested_name,
+                                            &dir,
+                                            move |p| {
+                                                let _ = tx.send(GuiEvent::DownloadProgress {
+                                                    url: key.clone(),
+                                                    received: p.received,
+                                                    total: p.total,
+                                                });
+                                                ctx.request_repaint();
+                                            },
+                                        )
+                                        .await
+                                    }
+                                };
+                                match result {
+                                    Ok(path) => {
+                                        let _ = gui_tx_clone
+                                            .send(GuiEvent::DownloadFinished { url, path });
+                                    }
+                                    Err(error) => {
+                                        crate::logger::log_error("gui::download", &error);
+                                        let _ = gui_tx_clone
+                                            .send(GuiEvent::DownloadFailed { url, error });
+                                    }
+                                }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::ComputeCacheSize => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let bytes = crate::download::dir_size(&crate::paths::cache_dir());
+                                let _ = gui_tx_clone.send(GuiEvent::CacheSizeComputed(bytes));
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::ClearImageCache => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                // Only `stickers_cache/` — never session.json, the history DB or
+                                // app_settings.json, which live one level up.
+                                let (freed, failed) =
+                                    crate::download::clear_dir_contents(&crate::paths::cache_dir());
+                                let _ = gui_tx_clone
+                                    .send(GuiEvent::ImageCacheCleared { freed, failed });
                                 ctx_clone.request_repaint();
                             });
                         }

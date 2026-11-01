@@ -2,6 +2,7 @@ pub mod audio;
 pub mod call;
 pub mod chat;
 pub mod crypto;
+pub mod download;
 pub mod endpoints;
 pub mod gui;
 pub mod logger;

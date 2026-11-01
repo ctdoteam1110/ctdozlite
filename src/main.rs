@@ -8,6 +8,7 @@ mod audio;
 mod call;
 mod chat;
 mod crypto;
+mod download;
 mod endpoints;
 mod gui;
 mod logger;

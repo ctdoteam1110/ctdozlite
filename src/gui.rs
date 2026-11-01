@@ -137,6 +137,47 @@ pub enum GuiEvent {
     },
     StatusUpdate(String),
     LoggedOut,
+    /// Attachment download progress (`total` from `Content-Length`, if any). Keyed by URL.
+    DownloadProgress {
+        url: String,
+        received: u64,
+        total: Option<u64>,
+    },
+    DownloadFinished {
+        url: String,
+        path: std::path::PathBuf,
+    },
+    DownloadFailed {
+        url: String,
+        error: String,
+    },
+    /// Size in bytes of `paths::cache_dir()`.
+    CacheSizeComputed(u64),
+    ImageCacheCleared {
+        freed: u64,
+        failed: usize,
+    },
+}
+
+/// State of one attachment download, keyed by URL in `ZaloGuiApp::downloads`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DownloadState {
+    InProgress { received: u64, total: Option<u64> },
+    Done(std::path::PathBuf),
+    Failed(String),
+}
+
+impl DownloadState {
+    /// 0.0–1.0 when the size is known.
+    pub(crate) fn fraction(&self) -> Option<f32> {
+        match self {
+            DownloadState::InProgress {
+                received,
+                total: Some(t),
+            } if *t > 0 => Some((*received as f64 / *t as f64).clamp(0.0, 1.0) as f32),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +411,15 @@ pub struct ZaloGuiApp {
     info_drawer_open: bool,
     profile_menu_open: bool,
     toast_notice: Option<(String, std::time::Instant)>,
+    /// Attachment downloads by URL (see `DownloadState`).
+    downloads: HashMap<String, DownloadState>,
+    /// Last finished download, for the toast with "Mở" / "Mở thư mục" buttons.
+    download_toast: Option<(std::path::PathBuf, std::time::Instant)>,
+    /// Size of the image cache once measured (Settings → Dữ liệu).
+    cache_size: Option<u64>,
+    cache_size_loading: bool,
+    /// Settings: "Xoá cache ảnh" confirmation dialog open.
+    confirm_clear_cache: bool,
     phone_modal_open: bool,
     phone_modal_input: String,
     phone_lookup_loading: bool,
@@ -644,6 +694,11 @@ impl ZaloGuiApp {
             info_drawer_open: false,
             profile_menu_open: false,
             toast_notice: None,
+            downloads: HashMap::new(),
+            download_toast: None,
+            cache_size: None,
+            cache_size_loading: false,
+            confirm_clear_cache: false,
             phone_modal_open: false,
             phone_modal_input: String::new(),
             phone_lookup_loading: false,
@@ -856,6 +911,46 @@ impl ZaloGuiApp {
                         "{reason} — Quét mã QR bên dưới để khôi phục phiên trực tuyến."
                     );
                     self.status_msg = format!("{reason} (Lịch sử tin nhắn vẫn được bảo toàn)");
+                }
+                GuiEvent::DownloadProgress {
+                    url,
+                    received,
+                    total,
+                } => {
+                    self.downloads
+                        .insert(url, DownloadState::InProgress { received, total });
+                }
+                GuiEvent::DownloadFinished { url, path } => {
+                    self.status_msg = format!("Đã tải về: {}", path.display());
+                    self.toast_notice = None;
+                    self.download_toast = Some((path.clone(), std::time::Instant::now()));
+                    self.downloads.insert(url, DownloadState::Done(path));
+                }
+                GuiEvent::DownloadFailed { url, error } => {
+                    self.show_toast(format!("Tải về thất bại: {error}"));
+                    self.downloads.insert(url, DownloadState::Failed(error));
+                }
+                GuiEvent::CacheSizeComputed(bytes) => {
+                    self.cache_size = Some(bytes);
+                    self.cache_size_loading = false;
+                }
+                GuiEvent::ImageCacheCleared { freed, failed } => {
+                    // Drop decoded images so they are fetched again; keep live call video.
+                    self.sticker_textures.retain(|k, _| k.starts_with("call_"));
+                    self.loading_stickers.clear();
+                    self.cache_size = None;
+                    self.cache_size_loading = true;
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::ComputeCacheSize);
+                    }
+                    let freed_s = crate::download::format_bytes(freed);
+                    if failed == 0 {
+                        self.show_toast(format!("Đã xoá cache ảnh ({freed_s})."));
+                    } else {
+                        self.show_toast(format!(
+                            "Đã xoá {freed_s}; {failed} mục không xoá được (đang được dùng?)."
+                        ));
+                    }
                 }
                 GuiEvent::LoggedOut => {
                     self.is_logged_in = false;
