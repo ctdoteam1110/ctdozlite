@@ -1931,13 +1931,11 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
-            || ctx.input(|i| i.viewport().close_requested())
+        if !self.allow_quit && (ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
+            || ctx.input(|i| i.viewport().close_requested()))
         {
-            if !self.allow_quit {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.request_shutdown();
-            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_shutdown();
         }
         if self.theme_dirty {
             self.palette().apply_to_ctx(ctx);

@@ -469,12 +469,12 @@ mod scope_hook_tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let task = crate::runtime_scope::run_stale_for_test(scope, async {
-            crate::runtime_scope::spawn_blocking(move || {
+            (crate::runtime_scope::spawn_blocking(move || {
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 crate::runtime_scope::mutation().is_err()
-            })
-        }).await;
+            }),)
+        }).await.0;
         started_rx.await.unwrap();
         crate::runtime_scope::registry().invalidate_now();
         release_tx.send(()).unwrap();

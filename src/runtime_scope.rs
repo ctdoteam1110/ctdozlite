@@ -640,13 +640,13 @@ pub(crate) mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let task = run(scope, async {
-            spawn_blocking(move || {
+            (spawn_blocking(move || {
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
-            })
+            }),)
         })
         .await
-        .unwrap();
+        .unwrap().0;
         started_rx.await.unwrap();
         registry().invalidate_now();
         transition("").unwrap();
@@ -739,10 +739,10 @@ pub(crate) mod tests {
                 release_rx.await.unwrap();
                 let _ = child_done_tx.send(());
             });
-            child_done_rx
+            (child_done_rx,)
         })
         .await
-        .unwrap();
+        .unwrap().0;
         ready_rx.await.unwrap();
         let result = run(scope, async {
             let refreshed = transition("account-a").unwrap();

@@ -500,10 +500,8 @@ pub(super) fn preload_disk_sticker_thumbnails(
                     image: color_img,
                 });
                 continue;
-            } else {
-                if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
-                    let _ = std::fs::remove_file(&cache_path);
-                }
+            } else if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+                let _ = std::fs::remove_file(&cache_path);
             }
         }
         let url = if item.cate_id == 0 && (1..=30).contains(&item.sticker_id) {

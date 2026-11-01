@@ -895,7 +895,7 @@ mod inline_tests {
 
     #[test]
     fn inline_emoji_noncanonical_aliases_stay_raw_without_optional_pack() {
-        if !PACK.is_empty() {
+        if !std::hint::black_box(PACK).is_empty() {
             return;
         }
         assert!(parts(":))").iter().all(|part| part.image.is_none()));
@@ -906,7 +906,8 @@ mod inline_tests {
     #[test]
     #[ignore = "Requires explicit ZL_EMOJI_PACK containing all 1383 original PNGs"]
     fn all_assets_are_exact_original_pngs() {
-        assert!(!PACK.is_empty());
+        let packed = std::hint::black_box(PACK);
+        assert!(!packed.is_empty());
         assert_eq!(catalog().index.sprites.len(), 1383);
         for sprite in &catalog().index.sprites {
             assert!(decode_original(PACK, sprite).is_some());

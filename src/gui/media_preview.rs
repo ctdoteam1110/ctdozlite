@@ -15,6 +15,7 @@ pub enum ImageQuality {
 
 impl ImageQuality {
     /// Separate full textures from preview entries in the account-private cache.
+    #[cfg(test)]
     pub fn for_texture_key(key: &str) -> Self {
         if key.starts_with("hd_") {
             Self::Full

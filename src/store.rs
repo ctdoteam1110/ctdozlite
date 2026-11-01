@@ -508,8 +508,6 @@ impl MessageStore {
                     link_desc,
                     link_thumb,
                     link_src,
-
-                    ..Default::default()
                 };
                 saved_messages.push(cm);
             }
