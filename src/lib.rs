@@ -27,3 +27,7 @@ pub mod data_dir;
 pub mod media_resources;
 /// Bounded release downloads and transactional installation.
 pub mod updater;
+/// Scheduled message queue backed by SQLite (#38, #24).
+pub mod scheduler;
+/// Local HTTP REST API, MCP JSON-RPC 2.0 server, and auto-reply rules (#35).
+pub mod api_mcp;

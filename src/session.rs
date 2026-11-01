@@ -71,6 +71,17 @@ pub struct Domains {
     /// builds them from a literal. Real-time VoIP invites only arrive over this transport.
     #[serde(default = "default_ws")]
     pub ws: Vec<String>,
+    /// Candidate hosts returned by `zpw_service_map_v3` for each endpoint (#27),
+    /// kept in-memory as secondary candidates after the verified constant.
+    #[serde(skip)]
+    pub service_map_candidates: std::collections::BTreeMap<String, Vec<String>>,
+    /// Candidate hosts read from `session.json` before `heal_from_verified` replaced
+    /// the primary slots (#27), kept as tertiary candidates.
+    #[serde(skip)]
+    pub saved_candidates: std::collections::BTreeMap<String, String>,
+    /// Winning host per endpoint remembered in-memory for the current session (#27).
+    #[serde(skip)]
+    pub preferred_host: Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
 }
 
 fn default_lp_chat() -> String {
@@ -123,6 +134,9 @@ impl Default for Domains {
             voice_call: default_voice_call(),
             sticker: default_sticker(),
             ws: default_ws(),
+            service_map_candidates: std::collections::BTreeMap::new(),
+            saved_candidates: std::collections::BTreeMap::new(),
+            preferred_host: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         };
         domains.heal_from_verified();
         domains
@@ -131,35 +145,55 @@ impl Default for Domains {
 
 /// First entry of a `zpw_service_map_v3` value, which can be either an array or a string.
 fn first_url(v: &Value) -> Option<String> {
-    v.as_array()
-        .and_then(|a| a.first())
-        .and_then(|x| x.as_str())
-        .map(|s| s.trim_end_matches('/').to_string())
-        .or_else(|| v.as_str().map(|s| s.trim_end_matches('/').to_string()))
+    all_urls(v).into_iter().next()
+}
+
+/// All normalized URLs in a `zpw_service_map_v3` entry (array or string).
+fn all_urls(v: &Value) -> Vec<String> {
+    if let Some(arr) = v.as_array() {
+        arr.iter()
+            .filter_map(|x| x.as_str())
+            .map(|s| s.trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else if let Some(s) = v.as_str() {
+        let trimmed = s.trim_end_matches('/').to_string();
+        if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            vec![trimmed]
+        }
+    } else {
+        Vec::new()
+    }
+}
+
+fn push_unique_host(out: &mut Vec<String>, candidate: &str) {
+    let trimmed = candidate.trim().trim_end_matches('/');
+    if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+        out.push(trimmed.to_string());
+    }
 }
 
 impl Domains {
     /// Restore every endpoint that has a **verified** entry in
     /// [`crate::endpoints::SERVICE_MAP_V3`], overriding whatever a previous run
-    /// persisted.
-    ///
-    /// A `session.json` written by an older build can carry hosts the server
-    /// handed out before they were verified — notably the stale
-    /// `*.zaloapp.com` flavour for `friend`/`profile`, which nginx answers
-    /// with 404 and which then looks like an expired session (#22).
-    ///
-    /// Endpoints that are *not* in the verified table are left untouched:
-    /// `lp_chat`, `lp_control`, `ws` and `cloud_msg` genuinely come from the
-    /// server and rotate.
+    /// persisted while keeping the previous host in `saved_candidates` (#27).
     pub fn heal_from_verified(&mut self) {
         use crate::endpoints::service;
 
         if let Some(v) = service("chat") {
+            let prev = self.chat.trim_end_matches('/').to_string();
+            if !prev.is_empty() && !prev.contains("-msg-chat.") {
+                self.saved_candidates.insert("chat".into(), prev);
+            }
             self.chat = v.into();
         }
         if let Some(v) = service("conversation") {
-            // `conversation` is the control-plane REST host; `convers_api` is the
-            // same host used by `conv/*`. They were split historically.
+            let prev = self.convers_api.trim_end_matches('/').to_string();
+            if !prev.is_empty() && !prev.contains("-ctl-chat.") {
+                self.saved_candidates.insert("conversation".into(), prev);
+            }
             self.conversation = v.into();
             self.convers_api = v.into();
         }
@@ -172,21 +206,17 @@ impl Domains {
             ("sticker", &mut self.sticker),
         ] {
             if let Some(v) = service(key) {
+                let prev = slot.trim_end_matches('/').to_string();
+                if !prev.is_empty() {
+                    self.saved_candidates.insert(key.into(), prev);
+                }
                 *slot = v.into();
             }
         }
     }
 
-    /// Apply `zpw_service_map_v3` **without** overriding verified endpoints.
-    ///
-    /// The server has been observed returning stale hosts (e.g.
-    /// `tt-friend-wpa.zaloapp.com` instead of `tt-friend-wpa.chat.zalo.me`),
-    /// so a verified constant always wins. The map only fills keys that have no
-    /// verified entry, or slots that are still empty.
-    ///
-    /// Trade-off: if Zalo rotates a verified host (`tt-chat3` → `tt-chat4`), we
-    /// keep using the constant. Trying multiple candidates per endpoint is
-    /// tracked as a follow-up.
+    /// Apply `zpw_service_map_v3` **without** overriding verified primary slots,
+    /// while recording all server-returned hosts in `service_map_candidates` (#27).
     pub fn apply_service_map(&mut self, map: &Value) {
         for (key, slot) in [
             ("chat", &mut self.chat),
@@ -199,7 +229,11 @@ impl Domains {
             ("voice_call", &mut self.voice_call),
             ("sticker", &mut self.sticker),
         ] {
-            let Some(v) = map.get(key).and_then(first_url) else {
+            let urls = map.get(key).map(all_urls).unwrap_or_default();
+            if !urls.is_empty() {
+                self.service_map_candidates.insert(key.into(), urls.clone());
+            }
+            let Some(v) = urls.into_iter().next() else {
                 continue;
             };
             let verified = crate::endpoints::service(key).is_some();
@@ -210,6 +244,79 @@ impl Domains {
         if crate::endpoints::service("conversation").is_none() {
             if let Some(v) = map.get("conversation").and_then(first_url) {
                 self.conversation = v;
+            }
+        }
+    }
+
+    /// Primary slot value for a named endpoint key.
+    fn slot_for(&self, endpoint: &str) -> &str {
+        match endpoint {
+            "chat" => &self.chat,
+            "friend" => &self.friend,
+            "conversation" | "convers_api" => &self.convers_api,
+            "profile" => &self.profile,
+            "group" => &self.group,
+            "file" => &self.file,
+            "group_cloud_message" | "cloud_msg" => &self.cloud_msg,
+            "voice_call" => &self.voice_call,
+            "sticker" => &self.sticker,
+            "auth" => &self.auth,
+            "wpa_chat" => &self.wpa_chat,
+            _ => "",
+        }
+    }
+
+    /// Ordered candidate hosts for `endpoint` (#27):
+    /// 1. Winning host remembered in-memory during this session (if any)
+    /// 2. Verified constant from [`crate::endpoints::SERVICE_MAP_V3`] (or primary slot)
+    /// 3. Hosts returned by `zpw_service_map_v3`
+    /// 4. Host loaded from `session.json` before healing
+    /// 5. For `friend`, fallback to `profile` host if distinct
+    pub fn candidates(&self, endpoint: &str) -> Vec<String> {
+        let canonical = if endpoint == "convers_api" {
+            "conversation"
+        } else if endpoint == "cloud_msg" {
+            "group_cloud_message"
+        } else {
+            endpoint
+        };
+        let mut list = Vec::new();
+        if let Ok(pref) = self.preferred_host.lock() {
+            if let Some(winner) = pref.get(canonical) {
+                push_unique_host(&mut list, winner);
+            }
+        }
+        push_unique_host(&mut list, self.slot_for(canonical));
+        if let Some(v) = crate::endpoints::service(canonical) {
+            push_unique_host(&mut list, v);
+        }
+        if let Some(mapped) = self.service_map_candidates.get(canonical) {
+            for u in mapped {
+                push_unique_host(&mut list, u);
+            }
+        }
+        if let Some(saved) = self.saved_candidates.get(canonical) {
+            push_unique_host(&mut list, saved);
+        }
+        if canonical == "friend" {
+            push_unique_host(&mut list, &self.profile);
+        }
+        list
+    }
+
+    /// Remember the winning host for `endpoint` for the remainder of the session (#27).
+    pub fn remember_winner(&self, endpoint: &str, host: &str) {
+        let canonical = if endpoint == "convers_api" {
+            "conversation"
+        } else if endpoint == "cloud_msg" {
+            "group_cloud_message"
+        } else {
+            endpoint
+        };
+        let trimmed = host.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            if let Ok(mut pref) = self.preferred_host.lock() {
+                pref.insert(canonical.to_string(), trimmed.to_string());
             }
         }
     }
@@ -766,6 +873,89 @@ impl Session {
         self.send(Method::POST, url, Some(body)).await
     }
 
+    /// True only when an error is a transport failure or HTTP 404 (#27).
+    /// Business / auth errors (`SessionError` with `600`, `-102`, etc.) never failover.
+    pub fn should_failover_candidate(err: &anyhow::Error) -> bool {
+        if err.downcast_ref::<SessionError>().is_some() {
+            return false;
+        }
+        if err.downcast_ref::<reqwest::Error>().is_some() {
+            return true;
+        }
+        let msg = err.to_string();
+        msg.starts_with("HTTP 404")
+            || msg.contains("HTTP 404 ")
+            || msg.contains("connection refused")
+            || msg.contains("timed out")
+            || msg.contains("dns error")
+    }
+
+    /// Try each candidate host for `endpoint` in priority order until one succeeds (#27).
+    ///
+    /// Remembers the winning host in-memory for subsequent requests in the same session,
+    /// without mutating the `session.json` format. Stops immediately on `SessionError`
+    /// (`600`, `-102`, or any other non-zero `error_code`).
+    pub async fn request_with_candidates<F, Fut>(
+        &self,
+        endpoint: &str,
+        path_and_query: &str,
+        mut send_fn: F,
+    ) -> Result<Value>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<Value>>,
+    {
+        let candidates = self.domains.candidates(endpoint);
+        let suffix = if path_and_query.starts_with('/') {
+            path_and_query.to_string()
+        } else {
+            format!("/{path_and_query}")
+        };
+        let mut last_err: Option<anyhow::Error> = None;
+        for host in candidates {
+            let url = format!("{host}{suffix}");
+            match send_fn(url).await {
+                Ok(val) => {
+                    self.domains.remember_winner(endpoint, &host);
+                    return Ok(val);
+                }
+                Err(e) => {
+                    if !Self::should_failover_candidate(&e) {
+                        return Err(e);
+                    }
+                    crate::logger::log_error(
+                        &format!("session::failover::{endpoint}"),
+                        &format!("host {host} failed ({e}), trying next candidate"),
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no host candidates for endpoint {endpoint}")))
+    }
+
+    /// Perform a `GET` request against `endpoint` with multi-candidate host failover (#27).
+    pub async fn get_endpoint(&self, endpoint: &str, path_and_query: &str) -> Result<Value> {
+        self.request_with_candidates(endpoint, path_and_query, |url| async move {
+            self.get(&url).await
+        })
+        .await
+    }
+
+    /// Perform a `POST` form request against `endpoint` with multi-candidate host failover (#27).
+    pub async fn post_endpoint_form(
+        &self,
+        endpoint: &str,
+        path_and_query: &str,
+        body: String,
+    ) -> Result<Value> {
+        self.request_with_candidates(endpoint, path_and_query, |url| {
+            let b = body.clone();
+            async move { self.post_form(&url, b).await }
+        })
+        .await
+    }
+
     /// Send an RFC 7578 `multipart/form-data` binary upload (`chunkContent` or `fileContent`)
     /// to Zalo's file/photo servers.
     pub async fn post_multipart(
@@ -1308,6 +1498,117 @@ mod tests {
                 SessionStatus::from_error(&e),
                 SessionStatus::Unreachable,
                 "{msg} must not expire the session"
+            );
+        }
+    }
+
+    #[test]
+    fn candidates_preserve_priority_order_verified_then_service_map_then_saved() {
+        let mut domains = Domains::default();
+        domains.chat = "https://legacy-saved-chat.zaloapp.com/".into();
+        domains.heal_from_verified();
+        domains.apply_service_map(&serde_json::json!({
+            "chat": [
+                "https://tt-chat4-wpa.api.zaloapp.com/",
+                "https://tt-chat5-wpa.api.zaloapp.com"
+            ]
+        }));
+
+        let list = domains.candidates("chat");
+        assert_eq!(
+            list,
+            vec![
+                "https://tt-chat3-wpa.api.zaloapp.com",
+                "https://tt-chat4-wpa.api.zaloapp.com",
+                "https://tt-chat5-wpa.api.zaloapp.com",
+                "https://legacy-saved-chat.zaloapp.com",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn request_with_candidates_fails_over_on_404_and_remembers_winner() {
+        let mut s = Session::new(false, false, false).unwrap();
+        s.domains.apply_service_map(&serde_json::json!({
+            "chat": [
+                "https://tt-chat4-wpa.api.zaloapp.com",
+                "https://tt-chat5-wpa.api.zaloapp.com"
+            ]
+        }));
+
+        let tried = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let tried_c = tried.clone();
+        let res = s
+            .request_with_candidates("chat", "/api/message/sms?zpw_ver=694", move |url| {
+                let tried_inner = tried_c.clone();
+                async move {
+                    tried_inner.lock().unwrap().push(url.clone());
+                    if url.starts_with("https://tt-chat3-wpa.api.zaloapp.com") {
+                        anyhow::bail!("HTTP 404 Not Found from {url}: nginx")
+                    } else {
+                        Ok(serde_json::json!({ "error_code": 0, "winner": url }))
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res["winner"],
+            "https://tt-chat4-wpa.api.zaloapp.com/api/message/sms?zpw_ver=694"
+        );
+        assert_eq!(
+            *tried.lock().unwrap(),
+            vec![
+                "https://tt-chat3-wpa.api.zaloapp.com/api/message/sms?zpw_ver=694",
+                "https://tt-chat4-wpa.api.zaloapp.com/api/message/sms?zpw_ver=694",
+            ]
+        );
+
+        // Subsequent request in the same session starts directly with the remembered winner.
+        let tried2 = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let tried2_c = tried2.clone();
+        let _ = s
+            .request_with_candidates("chat", "/api/message/sms?zpw_ver=694", move |url| {
+                let tried_inner = tried2_c.clone();
+                async move {
+                    tried_inner.lock().unwrap().push(url.clone());
+                    Ok(serde_json::json!({ "error_code": 0 }))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            *tried2.lock().unwrap(),
+            vec!["https://tt-chat4-wpa.api.zaloapp.com/api/message/sms?zpw_ver=694"]
+        );
+    }
+
+    #[tokio::test]
+    async fn request_with_candidates_does_not_failover_on_auth_errors() {
+        let mut s = Session::new(false, false, false).unwrap();
+        s.domains.apply_service_map(&serde_json::json!({
+            "friend": ["https://tt-friend2-wpa.chat.zalo.me"]
+        }));
+
+        for code in [600_i64, -102_i64] {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_c = calls.clone();
+            let err = s
+                .request_with_candidates("friend", "/api/social/friend/getfriends", move |url| {
+                    let calls_inner = calls_c.clone();
+                    async move {
+                        calls_inner.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err(SessionError::new(code, "session expired").at(url).into())
+                    }
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(SessionStatus::from_error(&err), SessionStatus::Expired);
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "error_code {code} must stop immediately without failover"
             );
         }
     }

@@ -100,6 +100,19 @@ xattr -dr com.apple.quarantine /Applications/ctdozlite.app
 | Windows | Gỡ trong **Settings → Apps**, hoặc xoá file portable |
 | macOS | Xoá `ctdozlite.app` khỏi `/Applications` |
 
-## Tự biên dịch từ mã nguồn
+## Tự biên dịch & đóng gói cục bộ từ mã nguồn
 
 Xem mục **Tự biên dịch từ mã nguồn** trong [README](../README.md#tự-biên-dịch-từ-mã-nguồn-windows--linux--macos).
+
+Để tự đóng gói bộ cài `.dmg` (macOS), `.tar.gz` (Linux) hoặc `.exe` (Windows) trên máy cá nhân với số phiên bản tự động đọc từ `Cargo.toml` (không làm bẩn sentinel `0.0.0` trong `packaging/macos/Info.plist` và `packaging/windows/installer.iss`):
+
+- **macOS / Linux:**
+  ```bash
+  ./packaging/package-local.sh
+  ```
+- **Windows (PowerShell):**
+  ```powershell
+  pwsh -File packaging\package-local.ps1
+  ```
+
+Gói sinh ra nằm trong thư mục `dist/`.

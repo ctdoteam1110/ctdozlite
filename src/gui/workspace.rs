@@ -354,19 +354,16 @@ impl ZaloGuiApp {
                     if sync_resp
                         .on_hover_cursor(CursorIcon::PointingHand)
                         .on_hover_text(format!(
-                            "Trạng thái: {} · {} hội thoại (Bấm để đồng bộ ngay)",
+                            "Trạng thái: {} · {} hội thoại (Bấm để làm mới hội thoại)",
                             self.status_msg,
                             self.threads.len()
                         ))
                         .clicked()
                     {
                         if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::RefreshThreads);
+                            let _ = tx.send(WorkerCmd::RefreshThreadsManual);
                         }
-                        self.show_toast(format!(
-                            "Đang đồng bộ ngầm {} hội thoại…",
-                            self.threads.len()
-                        ));
+                        self.status_msg = "⏳ Đang làm mới danh sách hội thoại…".into();
                     }
 
                     ui.add_space(6.0);
@@ -734,7 +731,9 @@ impl ZaloGuiApp {
                                 let pinned_cnt = self
                                     .threads
                                     .iter()
-                                    .filter(|t| t.name.contains("Cloud của tôi"))
+                                    .filter(|t| {
+                                        t.name.contains("Cloud của tôi") || t.presentation.pinned
+                                    })
                                     .count();
                                 if pinned_cnt > 0 {
                                     ui.label(
@@ -831,7 +830,9 @@ impl ZaloGuiApp {
                                 ThreadFilter::Direct => !t.is_group,
                                 ThreadFilter::Groups => t.is_group,
                             };
+                            let not_hidden = !t.presentation.hidden || !query.is_empty();
                             pass_filter
+                                && not_hidden
                                 && (query.is_empty()
                                     || matches_vn_query(&t.name, &query, &query_folded)
                                     || t.id.contains(&query))
@@ -846,6 +847,9 @@ impl ZaloGuiApp {
                         let b_cloud = tb.name.contains("Cloud của tôi");
                         if a_cloud != b_cloud {
                             return b_cloud.cmp(&a_cloud);
+                        }
+                        if ta.presentation.pinned != tb.presentation.pinned {
+                            return tb.presentation.pinned.cmp(&ta.presentation.pinned);
                         }
                         let ts_a = ta
                             .messages
@@ -899,6 +903,11 @@ impl ZaloGuiApp {
 
                 let mut clicked_thread: Option<(usize, String, bool)> = None;
                 let mut clicked_msg_hit: Option<(usize, String)> = None;
+                let mut ctx_toggle_pin: Option<usize> = None;
+                let mut ctx_toggle_mute: Option<usize> = None;
+                let mut ctx_toggle_hide: Option<usize> = None;
+                let mut ctx_open_schedule: Option<usize> = None;
+                let mut ctx_delete_history: Option<(usize, String)> = None;
 
                 let row_target_w = (sidebar_exact_w - 14.0).max(44.0);
                 egui::ScrollArea::vertical()
@@ -912,7 +921,8 @@ impl ZaloGuiApp {
                         for &i in &filtered_indices {
                             let t = &self.threads[i];
                             let is_selected = i == self.selected_thread_index;
-                            let is_pinned_cloud = t.name.contains("Cloud của tôi");
+                            let is_pinned_cloud =
+                                t.name.contains("Cloud của tôi") || t.presentation.pinned;
 
                             let row_height = if is_narrow_w { 50.0 } else { 58.0 };
                             let (alloc_rect, row_resp) = ui.allocate_exact_size(
@@ -1122,6 +1132,60 @@ impl ZaloGuiApp {
                             if row_resp.clicked() {
                                 clicked_thread = Some((i, t.id.clone(), t.is_group));
                             }
+                            let is_pinned_row = t.presentation.pinned;
+                            let is_muted_row = t.presentation.muted;
+                            let is_hidden_row = t.presentation.hidden;
+                            let row_tid = t.id.clone();
+                            row_resp.context_menu(|ui| {
+                                if ui
+                                    .button(if is_pinned_row {
+                                        "📌 Bỏ ghim hội thoại"
+                                    } else {
+                                        "📌 Ghim hội thoại"
+                                    })
+                                    .clicked()
+                                {
+                                    ctx_toggle_pin = Some(i);
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .button(if is_muted_row {
+                                        "🔔 Bật thông báo hội thoại"
+                                    } else {
+                                        "🔕 Tắt thông báo hội thoại"
+                                    })
+                                    .clicked()
+                                {
+                                    ctx_toggle_mute = Some(i);
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .button(if is_hidden_row {
+                                        "👁 Hiện lại hội thoại"
+                                    } else {
+                                        "👁 Ẩn hội thoại"
+                                    })
+                                    .clicked()
+                                {
+                                    ctx_toggle_hide = Some(i);
+                                    ui.close_menu();
+                                }
+                                if ui.button("🕒 Hẹn giờ gửi tin nhắn / Nhắc hẹn").clicked() {
+                                    ctx_open_schedule = Some(i);
+                                    ui.close_menu();
+                                }
+                                ui.separator();
+                                if ui
+                                    .button(
+                                        RichText::new("🗑 Xóa lịch sử cuộc trò chuyện")
+                                            .color(pal.danger),
+                                    )
+                                    .clicked()
+                                {
+                                    ctx_delete_history = Some((i, row_tid.clone()));
+                                    ui.close_menu();
+                                }
+                            });
                         }
 
                         // Global Message Content Matches (`Tin nhắn tìm thấy`)
@@ -1214,6 +1278,58 @@ impl ZaloGuiApp {
                         }
                     });
 
+                if let Some(idx) = ctx_toggle_pin {
+                    if let Some(t) = self.threads.get_mut(idx) {
+                        t.presentation.pinned = !t.presentation.pinned;
+                        let msg = if t.presentation.pinned {
+                            format!("📌 Đã ghim hội thoại {}", t.name)
+                        } else {
+                            format!("Đã bỏ ghim {}", t.name)
+                        };
+                        self.persist_threads_async();
+                        self.show_toast(msg);
+                    }
+                }
+                if let Some(idx) = ctx_toggle_mute {
+                    if let Some(t) = self.threads.get_mut(idx) {
+                        t.presentation.muted = !t.presentation.muted;
+                        let msg = if t.presentation.muted {
+                            format!("🔕 Đã tắt thông báo {}", t.name)
+                        } else {
+                            format!("🔔 Đã bật thông báo {}", t.name)
+                        };
+                        self.persist_threads_async();
+                        self.show_toast(msg);
+                    }
+                }
+                if let Some(idx) = ctx_toggle_hide {
+                    if let Some(t) = self.threads.get_mut(idx) {
+                        t.presentation.hidden = !t.presentation.hidden;
+                        let msg = if t.presentation.hidden {
+                            format!("👁 Đã ẩn hội thoại {} (tìm kiếm tên để hiện lại)", t.name)
+                        } else {
+                            format!("👁 Đã hiện lại hội thoại {}", t.name)
+                        };
+                        self.persist_threads_async();
+                        self.show_toast(msg);
+                    }
+                }
+                if let Some(idx) = ctx_open_schedule {
+                    self.selected_thread_index = idx;
+                    self.schedule_modal_open = true;
+                }
+                if let Some((idx, tid)) = ctx_delete_history {
+                    if let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") {
+                        let _ = store.delete_thread(&tid);
+                    }
+                    if let Some(t) = self.threads.get_mut(idx) {
+                        let tname = t.name.clone();
+                        t.messages.clear();
+                        t.preview.clear();
+                        self.persist_threads_async();
+                        self.show_toast(format!("🗑 Đã xóa lịch sử cuộc trò chuyện với {tname}"));
+                    }
+                }
                 if let Some((idx, q_str)) = clicked_msg_hit {
                     self.selected_thread_index = idx;
                     self.in_chat_search_open = true;
@@ -3009,6 +3125,56 @@ impl ZaloGuiApp {
                         }
                     }
 
+                    // 3d. Pending Scheduled Messages Banner (#38)
+                    let thread_sched: Vec<crate::scheduler::ScheduledMessage> = self
+                        .scheduled_items
+                        .iter()
+                        .filter(|s| s.thread_id == thread_id)
+                        .cloned()
+                        .collect();
+                    if let Some(next_sched) = thread_sched.first() {
+                        let mut open_sched_mgr = false;
+                        let mut cancel_sched_id: Option<i64> = None;
+                        egui::Frame::none()
+                            .fill(pal.bg_elevated)
+                            .inner_margin(Margin::symmetric(14.0, 5.0))
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "🕒 Hẹn giờ gửi ({}) · Tiếp theo lúc {}: \"{}\"",
+                                            thread_sched.len(),
+                                            crate::scheduler::format_schedule_time(
+                                                next_sched.deliver_at
+                                            ),
+                                            truncate_chars(&next_sched.text, 36)
+                                        ))
+                                        .size(11.6)
+                                        .color(pal.primary_hover)
+                                        .strong(),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.small_button("Hủy").clicked() {
+                                            cancel_sched_id = Some(next_sched.id);
+                                        }
+                                        if ui.small_button("Quản lý").clicked() {
+                                            open_sched_mgr = true;
+                                        }
+                                    });
+                                });
+                            });
+                        if let Some(cid) = cancel_sched_id {
+                            let _ =
+                                crate::scheduler::cancel_scheduled_message("zalo_history.db", cid);
+                            self.refresh_scheduled_items();
+                            self.show_toast("Đã hủy tin nhắn hẹn giờ");
+                        }
+                        if open_sched_mgr {
+                            self.schedule_modal_open = true;
+                        }
+                    }
+
                     // 4. Bottom Message Composer Bar (Compact Icon Actions + Spacious Input + Padded Send Button)
                     let composer_frame = egui::Frame::none()
                         .fill(pal.bg_sidebar)
@@ -3165,8 +3331,12 @@ impl ZaloGuiApp {
                                         );
                                         // Responsive Borderless Input Field (shrinks gracefully down to 50px)
                                         let send_btn_w = if is_narrow_w { 52.0 } else { 76.0 };
-                                        let input_w =
-                                            (ui.available_width() - send_btn_w - 12.0).max(50.0);
+                                        let sched_btn_w = 34.0;
+                                        let input_w = (ui.available_width()
+                                            - send_btn_w
+                                            - sched_btn_w
+                                            - 16.0)
+                                            .max(50.0);
                                         let text_edit =
                                             egui::TextEdit::singleline(&mut self.input_message)
                                                 .id(Id::new(("chat_composer_input", &thread_id)))
@@ -3265,6 +3435,37 @@ impl ZaloGuiApp {
                                                 }
                                             }
                                         }
+                                        // Schedule Send Button (`🕒`, #38)
+                                        let (sched_rect, sched_resp) = ui.allocate_exact_size(
+                                            Vec2::new(32.0, 34.0),
+                                            Sense::click(),
+                                        );
+                                        if self.schedule_modal_open || sched_resp.hovered() {
+                                            ui.painter().rect_filled(
+                                                sched_rect,
+                                                Rounding::same(8.0),
+                                                pal.bg_hover,
+                                            );
+                                        }
+                                        ui.painter().text(
+                                            sched_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "🕒",
+                                            FontId::proportional(14.5),
+                                            if self.schedule_modal_open || sched_resp.hovered() {
+                                                pal.primary_hover
+                                            } else {
+                                                pal.text_secondary
+                                            },
+                                        );
+                                        if sched_resp
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .on_hover_text("Hẹn giờ gửi tin nhắn & Nhắc hẹn")
+                                            .clicked()
+                                        {
+                                            self.schedule_modal_open = !self.schedule_modal_open;
+                                        }
+
                                         // Responsive Padded Send Button (shows icon-only on very tight widths)
                                         let can_send = !self.input_message.trim().is_empty()
                                             || self.pending_clipboard_image.is_some();
@@ -3272,6 +3473,9 @@ impl ZaloGuiApp {
                                             Vec2::new(send_btn_w, 34.0),
                                             Sense::click(),
                                         );
+                                        if send_resp.secondary_clicked() {
+                                            self.schedule_modal_open = true;
+                                        }
                                         let send_bg = if !can_send {
                                             pal.primary.linear_multiply(0.42)
                                         } else if send_resp.hovered() {
@@ -3430,6 +3634,7 @@ impl ZaloGuiApp {
         self.render_call_overlay(ctx, pal);
         self.render_image_viewer_modal(ctx, pal);
         self.render_phone_lookup_modal(ctx, pal);
+        self.render_schedule_modal(ctx, pal);
         self.render_settings_modal(ctx, pal);
     }
 

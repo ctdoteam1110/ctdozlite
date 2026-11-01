@@ -139,6 +139,13 @@ pub enum GuiEvent {
         reason: String,
     },
     StatusUpdate(String),
+    RefreshFinished {
+        threads: usize,
+        messages: usize,
+        errors: Vec<String>,
+        manual: bool,
+    },
+    ScheduledListUpdated,
     SyncFinished {
         added: usize,
         errors: Vec<String>,
@@ -458,6 +465,10 @@ pub struct ZaloGuiApp {
     dev_tab: DevTab,
     selected_log: Option<LogEntry>,
     scanner_findings: Vec<ScanFinding>,
+    schedule_modal_open: bool,
+    schedule_custom_input: String,
+    schedule_editing_id: Option<i64>,
+    scheduled_items: Vec<crate::scheduler::ScheduledMessage>,
 
     // Background channels
     event_rx: Receiver<GuiEvent>,
@@ -499,11 +510,7 @@ impl ZaloGuiApp {
         crate::media::set_selected_mic_device(&loaded_settings.selected_mic_device);
         crate::media::set_selected_camera_device(&loaded_settings.selected_camera_device);
         let dark_mode = loaded_settings.theme_mode != "light";
-        if dark_mode {
-            ThemePalette::dark().apply_to_ctx(&cc.egui_ctx);
-        } else {
-            ThemePalette::light().apply_to_ctx(&cc.egui_ctx);
-        }
+        ThemePalette::load_with_custom_override(dark_mode).apply_to_ctx(&cc.egui_ctx);
 
         let (tx, rx) = channel();
 
@@ -640,10 +647,17 @@ impl ZaloGuiApp {
             dev_tab: DevTab::Logs,
             selected_log: None,
             scanner_findings: Vec::new(),
+            schedule_modal_open: false,
+            schedule_custom_input: String::new(),
+            schedule_editing_id: None,
+            scheduled_items: crate::scheduler::list_pending_scheduled("zalo_history.db", None)
+                .unwrap_or_default(),
             event_rx: rx,
             event_tx: tx.clone(),
             chat_render_window: (String::new(), CHAT_RENDER_STEP),
         };
+        let mut app = app;
+        let _ = app.reload_custom_sticker_packs();
 
         // Clean up any leftover `.old` executable from a previous in-place self-update
         if let Ok(exe_path) = std::env::current_exe() {
@@ -676,11 +690,30 @@ impl ZaloGuiApp {
     }
 
     fn palette(&self) -> ThemePalette {
-        if self.dark_mode {
-            ThemePalette::dark()
-        } else {
-            ThemePalette::light()
+        ThemePalette::load_with_custom_override(self.dark_mode)
+    }
+
+    pub(super) fn reload_custom_sticker_packs(&mut self) -> usize {
+        let packs = load_custom_sticker_packs();
+        let count = packs.len();
+        for p in packs {
+            if !self
+                .pinned_sticker_packs
+                .iter()
+                .any(|(cid, _)| *cid == p.cate_id)
+            {
+                self.pinned_sticker_packs.push((p.cate_id, p.name.clone()));
+            }
+            if let Some(items) = builtin_pack_stickers(p.cate_id) {
+                self.sticker_pack_items.insert(p.cate_id, items);
+            }
         }
+        count
+    }
+
+    pub(super) fn refresh_scheduled_items(&mut self) {
+        self.scheduled_items =
+            crate::scheduler::list_pending_scheduled("zalo_history.db", None).unwrap_or_default();
     }
 
     /// Hand the worker's poll timer the thread ids/names it maps incoming messages onto.
@@ -1238,6 +1271,29 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::StatusUpdate(msg) => {
                     self.status_msg = msg;
+                }
+                GuiEvent::RefreshFinished {
+                    threads,
+                    messages,
+                    errors,
+                    manual,
+                } => {
+                    let msg = if errors.is_empty() {
+                        format!("✅ Đã làm mới {threads} hội thoại ({messages} tin nhắn)")
+                    } else {
+                        format!(
+                            "⚠️ Làm mới {threads} hội thoại · {} lỗi (vd. {})",
+                            errors.len(),
+                            errors[0]
+                        )
+                    };
+                    self.status_msg = msg.clone();
+                    if manual {
+                        self.show_toast(msg);
+                    }
+                }
+                GuiEvent::ScheduledListUpdated => {
+                    self.refresh_scheduled_items();
                 }
                 GuiEvent::SyncFinished {
                     added,

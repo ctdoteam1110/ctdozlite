@@ -12,6 +12,7 @@ pub enum WorkerCmd {
         pass: String,
     },
     RefreshThreads,
+    RefreshThreadsManual,
     PollMessages {
         known_threads: Vec<(String, String, bool)>,
     },
@@ -290,6 +291,96 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                     }
                 });
+
+                // Scheduled messages worker (#38) + optional HTTP REST API server (#35)
+                if let Ok(port_str) = std::env::var("CTDOZLITE_API_PORT") {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        if port > 0 {
+                            let s_api = session.clone();
+                            tokio::spawn(async move {
+                                let _ = crate::api_mcp::run_local_http_server(
+                                    s_api,
+                                    port,
+                                    "zalo_history.db".into(),
+                                )
+                                .await;
+                            });
+                        }
+                    }
+                }
+                {
+                    let s_sched = session.clone();
+                    let gui_tx_sched = gui_tx.clone();
+                    let ctx_sched = egui_ctx.clone();
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(Duration::from_secs(2));
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        loop {
+                            tick.tick().await;
+                            let now_ts = crate::login::unix_now() as i64;
+                            let due = crate::scheduler::claim_due_scheduled_messages(
+                                "zalo_history.db",
+                                now_ts,
+                            )
+                            .unwrap_or_default();
+                            if due.is_empty() {
+                                continue;
+                            }
+                            let s = s_sched.lock().await.clone();
+                            if s.login.is_none() {
+                                for item in due {
+                                    let _ = crate::scheduler::mark_scheduled_failed(
+                                        "zalo_history.db",
+                                        item.id,
+                                        "Chưa đăng nhập phiên Zalo",
+                                    );
+                                }
+                                let _ = gui_tx_sched.send(GuiEvent::ScheduledListUpdated);
+                                ctx_sched.request_repaint();
+                                continue;
+                            }
+                            for item in due {
+                                let send_res = if item.is_group {
+                                    crate::chat::send_group_message(&s, &item.thread_id, &item.text)
+                                        .await
+                                } else {
+                                    crate::chat::send_message(&s, &item.thread_id, &item.text).await
+                                };
+                                match send_res {
+                                    Ok(resp) => {
+                                        if let Some(code) = resp_error_code(&resp) {
+                                            let _ = crate::scheduler::mark_scheduled_failed(
+                                                "zalo_history.db",
+                                                item.id,
+                                                &format!("Mã lỗi Zalo {code}"),
+                                            );
+                                        } else {
+                                            let msg_id = extract_msg_id(&resp);
+                                            let _ = crate::scheduler::mark_scheduled_sent(
+                                                "zalo_history.db",
+                                                item.id,
+                                            );
+                                            let _ = gui_tx_sched.send(GuiEvent::MessageSent {
+                                                thread_id: item.thread_id.clone(),
+                                                text: item.text.clone(),
+                                                msg_id,
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = crate::scheduler::mark_scheduled_failed(
+                                            "zalo_history.db",
+                                            item.id,
+                                            &e.to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                            let _ = gui_tx_sched.send(GuiEvent::ScheduledListUpdated);
+                            ctx_sched.request_repaint();
+                        }
+                    });
+                }
                 {
                     let s_kw = session.clone();
                     let gui_tx_kw = gui_tx.clone();
@@ -650,7 +741,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                             current_qr_task = Some(handle);
                         }
-                        WorkerCmd::RefreshThreads => {
+                        ref cmd @ (WorkerCmd::RefreshThreads | WorkerCmd::RefreshThreadsManual) => {
+                            let manual = matches!(cmd, WorkerCmd::RefreshThreadsManual);
                             let session_clone = session.clone();
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -716,44 +808,61 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         });
                                     }
                                     let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
-                                        "⏳ Đang đồng bộ danh bạ & nhóm từ máy chủ Zalo…".into(),
+                                        "⏳ Đang làm mới danh bạ & nhóm từ máy chủ Zalo (1/3)…".into(),
                                     ));
                                     ctx_clone.request_repaint();
                                     let mut list = crate::chat::load_threads_cache();
-                                    if let Ok(friends) = crate::chat::get_friends(&s).await {
-                                        for ft in friends {
-                                            if let Some(ex) = list.iter_mut().find(|t| t.id == ft.id) {
-                                                if !ft.name.is_empty() {
-                                                    ex.name = ft.name;
+                                    let mut errors = Vec::new();
+                                    match crate::chat::get_friends(&s).await {
+                                        Ok(friends) => {
+                                            for ft in friends {
+                                                if let Some(ex) = list.iter_mut().find(|t| t.id == ft.id) {
+                                                    if !ft.name.is_empty() {
+                                                        ex.name = ft.name;
+                                                    }
+                                                    if crate::chat::should_replace_avatar(
+                                                        ex.avatar.as_deref(),
+                                                        ft.avatar.as_deref(),
+                                                    ) {
+                                                        ex.avatar = ft.avatar;
+                                                    }
+                                                    ex.is_group = ex.is_group || ft.is_group;
+                                                } else {
+                                                    list.push(ft);
                                                 }
-                                                if crate::chat::should_replace_avatar(
-                                                    ex.avatar.as_deref(),
-                                                    ft.avatar.as_deref(),
-                                                ) {
-                                                    ex.avatar = ft.avatar;
-                                                }
-                                                ex.is_group = ex.is_group || ft.is_group;
-                                            } else {
-                                                list.push(ft);
                                             }
                                         }
+                                        Err(e) => {
+                                            crate::logger::log_error("gui::refresh_friends", &e.to_string());
+                                            errors.push(format!("Danh bạ: {e}"));
+                                        }
                                     }
-                                    if let Ok(groups) = crate::chat::get_groups(&s).await {
-                                        for gt in groups {
-                                            if let Some(ex) = list.iter_mut().find(|t| t.id == gt.id) {
-                                                if !gt.name.is_empty() {
-                                                    ex.name = gt.name;
+                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
+                                        "⏳ Đang tải danh sách nhóm Zalo (2/3)…".into(),
+                                    ));
+                                    ctx_clone.request_repaint();
+                                    match crate::chat::get_groups(&s).await {
+                                        Ok(groups) => {
+                                            for gt in groups {
+                                                if let Some(ex) = list.iter_mut().find(|t| t.id == gt.id) {
+                                                    if !gt.name.is_empty() {
+                                                        ex.name = gt.name;
+                                                    }
+                                                    if crate::chat::should_replace_avatar(
+                                                        ex.avatar.as_deref(),
+                                                        gt.avatar.as_deref(),
+                                                    ) {
+                                                        ex.avatar = gt.avatar;
+                                                    }
+                                                    ex.is_group = true;
+                                                } else {
+                                                    list.push(gt);
                                                 }
-                                                if crate::chat::should_replace_avatar(
-                                                    ex.avatar.as_deref(),
-                                                    gt.avatar.as_deref(),
-                                                ) {
-                                                    ex.avatar = gt.avatar;
-                                                }
-                                                ex.is_group = true;
-                                            } else {
-                                                list.push(gt);
                                             }
+                                        }
+                                        Err(e) => {
+                                            crate::logger::log_error("gui::refresh_groups", &e.to_string());
+                                            errors.push(format!("Nhóm: {e}"));
                                         }
                                     }
                                     crate::store::load_history_into_threads(
@@ -762,13 +871,17 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         crate::store::MessageStore::PRELOAD_MSGS,
                                     );
                                     let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
-                                        format!("⏳ Đang tải tin nhắn cho {} hội thoại…", list.len()),
+                                        format!("⏳ Đang làm mới tin nhắn cho {} hội thoại (3/3)…", list.len()),
                                     ));
                                     ctx_clone.request_repaint();
                                     let mut fresh_ps = crate::chat::PollState::default();
-                                    let _ =
+                                    if let Err(e) =
                                         crate::chat::poll_new_messages(&s, &mut fresh_ps, &mut list)
-                                            .await;
+                                            .await
+                                    {
+                                        crate::logger::log_error("gui::refresh_poll", &e.to_string());
+                                        errors.push(format!("Tin nhắn: {e}"));
+                                    }
                                     {
                                         let mut ps = poll_clone.lock().await;
                                         *ps = fresh_ps;
@@ -777,9 +890,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         list.iter().map(|t| t.messages.len()).sum();
                                     let n_threads = list.len();
                                     let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(list));
-                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                        "✅ Đã đồng bộ {n_threads} hội thoại ({total_msgs} tin nhắn)"
-                                    )));
+                                    let _ = gui_tx_clone.send(GuiEvent::RefreshFinished {
+                                        threads: n_threads,
+                                        messages: total_msgs,
+                                        errors,
+                                        manual,
+                                    });
                                     ctx_clone.request_repaint();
                                 }
                             });
@@ -886,6 +1002,33 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                     &mut temp_threads,
                                                 )
                                                 .await;
+                                                let rules = crate::api_mcp::load_autoreply_rules();
+                                                if rules.iter().any(|r| r.enabled) {
+                                                    for t in &temp_threads {
+                                                        for m in &t.messages {
+                                                            if !m.is_outgoing {
+                                                                if let Some(matched) = crate::api_mcp::match_autoreply_rule(&rules, &m.text, t.is_group) {
+                                                                    let reply_text = matched.reply_text;
+                                                                    let res = if t.is_group {
+                                                                        crate::chat::send_group_message(&s, &t.id, &reply_text).await
+                                                                    } else {
+                                                                        crate::chat::send_message(&s, &t.id, &reply_text).await
+                                                                    };
+                                                                    if let Ok(resp) = res {
+                                                                        if resp_error_code(&resp).is_none() {
+                                                                            let msg_id = extract_msg_id(&resp);
+                                                                            let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                                                                thread_id: t.id.clone(),
+                                                                                text: reply_text,
+                                                                                msg_id,
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                                 let _ = gui_tx_clone
                                                     .send(GuiEvent::ThreadsUpdated(temp_threads));
                                                 ctx_clone.request_repaint();

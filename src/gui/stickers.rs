@@ -42,7 +42,55 @@ pub(super) const FEATURED_PACK_TABS: &[(u64, &str)] = &[
     (10117, "Chó Toto"),
 ];
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct CustomStickerPack {
+    pub(super) cate_id: u64,
+    pub(super) name: String,
+    pub(super) sticker_ids: Vec<u64>,
+    #[serde(default = "default_sticker_type_7")]
+    pub(super) sticker_type: u32,
+}
+
+fn default_sticker_type_7() -> u32 {
+    7
+}
+
+pub(super) fn load_custom_sticker_packs() -> Vec<CustomStickerPack> {
+    std::fs::read_to_string("custom_stickers.json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<CustomStickerPack>>(&s).ok())
+        .unwrap_or_default()
+}
+
+pub(super) fn export_custom_stickers_template(path: &str) -> std::io::Result<()> {
+    let sample = vec![CustomStickerPack {
+        cate_id: 99001,
+        name: "Custom Pack Mẫu".into(),
+        sticker_ids: vec![98930, 98931, 98932, 101001, 101002],
+        sticker_type: 7,
+    }];
+    let text = serde_json::to_string_pretty(&sample).unwrap_or_default();
+    std::fs::write(path, text)
+}
+
 pub(super) fn builtin_pack_stickers(cate_id: u64) -> Option<Vec<crate::chat::StickerItem>> {
+    for custom in load_custom_sticker_packs() {
+        if custom.cate_id == cate_id {
+            return Some(
+                custom
+                    .sticker_ids
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, sid)| crate::chat::StickerItem {
+                        sticker_id: sid,
+                        cate_id: custom.cate_id,
+                        sticker_type: custom.sticker_type,
+                        label: format!("{} #{}", custom.name, i + 1),
+                    })
+                    .collect(),
+            );
+        }
+    }
     let (name, ids): (&str, Vec<u64>) = match cate_id {
         61900 => ("Zapy Dô Tri", (98930..=98941).collect()),
         12815 => ("Bé Hai", (101001..=101030).collect()),

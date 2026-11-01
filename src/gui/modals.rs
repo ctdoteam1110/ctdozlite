@@ -61,19 +61,20 @@ impl ZaloGuiApp {
                             .add_sized(
                                 [200.0, 28.0],
                                 egui::Button::new(
-                                    RichText::new(format!("{}  Đã đồng bộ đám mây", lucide::CHECK))
+                                    RichText::new(format!("{}  Làm mới hội thoại", lucide::REFRESH))
                                         .size(12.2)
                                         .color(pal.text_primary),
                                 )
                                 .fill(Color32::TRANSPARENT),
                             )
                             .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text("Làm mới danh bạ, nhóm và tin nhắn mới từ máy chủ Zalo")
                             .clicked()
                         {
                             if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::RefreshThreads);
+                                let _ = tx.send(WorkerCmd::RefreshThreadsManual);
                             }
-                            self.show_toast("Đang đồng bộ 20 hội thoại ngầm…");
+                            self.status_msg = "⏳ Đang làm mới danh sách hội thoại…".into();
                             close_menu = true;
                         }
 
@@ -736,6 +737,12 @@ impl ZaloGuiApp {
         let mut trigger_sync = false;
         let mut pick_dl_dir = false;
         let mut open_dl_dir = false;
+        let mut pick_migrate_file = false;
+        let mut export_theme_tpl = false;
+        let mut reload_theme_json = false;
+        let mut export_sticker_tpl = false;
+        let mut reload_sticker_json = false;
+        let mut export_autoreply_tpl = false;
 
         egui::Window::new("settings_window_modal")
             .order(egui::Order::Foreground)
@@ -1193,6 +1200,23 @@ impl ZaloGuiApp {
                                                         ui.label(RichText::new("Tải lịch sử cũ của các nhóm và Cloud của tôi từ máy chủ Zalo về zalo_history.db, mỗi lần tối đa 1.000 tin/hội thoại; bấm lần nữa để lùi xa hơn.").color(pal.text_primary).size(13.0));
                                                         ui.add_space(4.0);
                                                         ui.label(RichText::new("Zalo không cho tải lịch sử cũ của chat 1-1 qua máy chủ; tin 1-1 chỉ có từ lúc đăng nhập app.").color(pal.text_secondary).size(12.2));
+                                                        if ui
+                                                            .add(
+                                                                egui::Label::new(
+                                                                    RichText::new(format!(
+                                                                        "Tìm hiểu chi tiết cơ chế đồng bộ trong docs/TINH_NANG.md {}",
+                                                                        lucide::EXTERNAL_LINK
+                                                                    ))
+                                                                    .size(11.8)
+                                                                    .color(pal.primary_hover),
+                                                                )
+                                                                .sense(Sense::click()),
+                                                            )
+                                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                                            .clicked()
+                                                        {
+                                                            open_external_url("https://github.com/ctdoteam1110/ctdozlite/blob/main/docs/TINH_NANG.md");
+                                                        }
                                                         ui.add_space(4.0);
                                                         let total_msgs: usize = self.threads.iter().map(|t| t.messages.len()).sum();
                                                         ui.label(RichText::new(format!("Hiện có {} hội thoại ({total_msgs} tin nhắn) trong bộ nhớ.", self.threads.len())).color(pal.text_secondary).size(12.2));
@@ -1204,6 +1228,23 @@ impl ZaloGuiApp {
                                                             }
                                                         } else if ui.button(RichText::new(format!("{} Đồng bộ ngay", lucide::REFRESH)).size(13.0).strong()).clicked() {
                                                             trigger_sync = true;
+                                                        }
+                                                    });
+                                                });
+                                            ui.add_space(16.0);
+                                            ui.label(RichText::new("Di chuyển / Nhập lịch sử tin nhắn có sẵn (Migrate)").color(pal.text_primary).size(13.5).strong());
+                                            ui.add_space(6.0);
+                                            egui::Frame::none()
+                                                .fill(pal.bg_elevated)
+                                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                                .rounding(Rounding::same(10.0))
+                                                .inner_margin(Margin::same(14.0))
+                                                .show(ui, |ui| {
+                                                    ui.vertical(|ui| {
+                                                        ui.label(RichText::new("Nhập lịch sử tin nhắn từ bản sao lưu SQLite (.db / .sqlite) hoặc JSON (threads_cache.json / bản xuất lịch sử) vào zalo_history.db hiện tại mà không làm mất tin nhắn đang có.").color(pal.text_secondary).size(12.2));
+                                                        ui.add_space(8.0);
+                                                        if ui.button(RichText::new("Chọn file lịch sử (.db / .sqlite / .json) để nhập…").size(12.8).strong()).clicked() {
+                                                            pick_migrate_file = true;
                                                         }
                                                     });
                                                 });
@@ -1402,6 +1443,32 @@ impl ZaloGuiApp {
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                                             render_toggle_switch(ui, &mut self.settings.use_avatar_as_wallpaper, pal);
                                                         });
+                                                    });
+                                                });
+                                            ui.add_space(16.0);
+                                            ui.label(RichText::new("Theme & Sticker Pack tùy chỉnh (Plugin JSON)").color(pal.text_primary).size(13.5).strong());
+                                            ui.add_space(6.0);
+                                            egui::Frame::none()
+                                                .fill(pal.bg_elevated)
+                                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                                .rounding(Rounding::same(8.0))
+                                                .inner_margin(Margin::symmetric(14.0, 10.0))
+                                                .show(ui, |ui| {
+                                                    ui.label(RichText::new("Tùy biến bảng màu qua file theme.json hoặc nạp bộ nhãn dán riêng qua custom_stickers.json.").color(pal.text_secondary).size(12.0));
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        if ui.button("Xuất mẫu theme.json").clicked() {
+                                                            export_theme_tpl = true;
+                                                        }
+                                                        if ui.button("Tải lại theme.json").clicked() {
+                                                            reload_theme_json = true;
+                                                        }
+                                                        if ui.button("Xuất mẫu custom_stickers.json").clicked() {
+                                                            export_sticker_tpl = true;
+                                                        }
+                                                        if ui.button("Nạp lại Sticker Pack").clicked() {
+                                                            reload_sticker_json = true;
+                                                        }
                                                     });
                                                 });
                                         }
@@ -1699,6 +1766,25 @@ impl ZaloGuiApp {
                                                             render_toggle_switch(ui, &mut self.settings.enable_sticker_keyword_search, pal);
                                                         });
                                                     });
+                                                });
+                                            ui.add_space(16.0);
+                                            ui.label(RichText::new("Tự động trả lời (Auto-Reply) & REST API / MCP").color(pal.text_primary).size(13.5).strong());
+                                            ui.add_space(6.0);
+                                            egui::Frame::none()
+                                                .fill(pal.bg_elevated)
+                                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                                .rounding(Rounding::same(8.0))
+                                                .inner_margin(Margin::symmetric(14.0, 12.0))
+                                                .show(ui, |ui| {
+                                                    let rules = crate::api_mcp::load_autoreply_rules();
+                                                    let active_cnt = rules.iter().filter(|r| r.enabled).count();
+                                                    ui.label(RichText::new(format!("Quy tắc Auto-Reply đang bật: {active_cnt}/{} (cấu hình trong autoreply_rules.json)", rules.len())).color(pal.text_primary).size(12.6).strong());
+                                                    ui.add_space(4.0);
+                                                    ui.label(RichText::new("Khởi chạy REST API cục bộ với `--api-port 3789` hoặc chế độ MCP Server chuẩn JSON-RPC 2.0 với `--mcp` để kết nối Claude Desktop / Cursor / AI Agent.").color(pal.text_secondary).size(11.8));
+                                                    ui.add_space(8.0);
+                                                    if ui.button("Tạo / Xuất mẫu autoreply_rules.json").clicked() {
+                                                        export_autoreply_tpl = true;
+                                                    }
                                                 });
                                         }
                                         SettingsTab::Update => {
@@ -2182,11 +2268,313 @@ impl ZaloGuiApp {
             }
         }
 
+        if pick_migrate_file {
+            if let Some(src_path) = pick_native_file_dialog(false) {
+                match crate::store::import_history_from_path(&src_path, "zalo_history.db") {
+                    Ok(summary) => {
+                        let t_cnt = summary.threads_imported;
+                        let m_cnt = summary.messages_imported;
+                        crate::store::load_history_into_threads(
+                            "zalo_history.db",
+                            &mut self.threads,
+                            crate::store::MessageStore::PRELOAD_MSGS,
+                        );
+                        self.persist_threads_async();
+                        self.show_toast(format!(
+                            "✅ Đã nhập {m_cnt} tin nhắn từ {t_cnt} hội thoại vào zalo_history.db"
+                        ));
+                    }
+                    Err(e) => {
+                        self.show_toast(format!("⚠️ Lỗi nhập lịch sử: {e}"));
+                    }
+                }
+            }
+        }
+        if export_theme_tpl {
+            match ThemePalette::export_template("theme.json") {
+                Ok(_) => self.show_toast("Đã xuất mẫu theme.json tại thư mục ứng dụng"),
+                Err(e) => self.show_toast(format!("Lỗi xuất theme.json: {e}")),
+            }
+        }
+        if reload_theme_json {
+            self.theme_dirty = true;
+            self.show_toast("Đã áp dụng lại bảng màu từ theme.json");
+        }
+        if export_sticker_tpl {
+            match export_custom_stickers_template("custom_stickers.json") {
+                Ok(_) => self.show_toast("Đã xuất mẫu custom_stickers.json tại thư mục ứng dụng"),
+                Err(e) => self.show_toast(format!("Lỗi xuất custom_stickers.json: {e}")),
+            }
+        }
+        if reload_sticker_json {
+            let n = self.reload_custom_sticker_packs();
+            self.show_toast(format!("Đã nạp {n} bộ Sticker Pack tùy chỉnh từ custom_stickers.json"));
+        }
+        if export_autoreply_tpl {
+            let mut rules = crate::api_mcp::load_autoreply_rules();
+            if rules.is_empty() {
+                rules.push(crate::api_mcp::AutoReplyRule {
+                    id: "default_busy".into(),
+                    keyword: "/busy".into(),
+                    match_mode: "contains".into(),
+                    reply_text: "Hiện mình đang bận, mình sẽ phản hồi sớm nhé!".into(),
+                    enabled: false,
+                    scope: "direct".into(),
+                });
+            }
+            let _ = crate::api_mcp::save_autoreply_rules(&rules);
+            self.show_toast("Đã lưu cấu hình mẫu autoreply_rules.json");
+        }
+
         if !open {
             self.settings_modal_open = false;
             self.settings_blur_tex = None;
             self.settings_blur_req_at = None;
             self.settings.save();
+        }
+    }
+
+    pub(super) fn render_schedule_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        if !self.schedule_modal_open {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.schedule_modal_open = false;
+            self.schedule_editing_id = None;
+            return;
+        }
+
+        let mut open = true;
+        let cur_thread = self.threads.get(self.selected_thread_index).map(|t| {
+            (t.id.clone(), t.name.clone(), t.is_group)
+        });
+        let now_ts = crate::login::unix_now() as i64;
+        let mut schedule_at: Option<i64> = None;
+        let mut action_send_now: Option<crate::scheduler::ScheduledMessage> = None;
+        let mut action_cancel: Option<i64> = None;
+        let mut action_edit: Option<crate::scheduler::ScheduledMessage> = None;
+
+        egui::Window::new("🕒 Hẹn giờ gửi tin nhắn & Nhắc hẹn")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(440.0)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(pal.bg_elevated)
+                    .rounding(Rounding::same(12.0))
+                    .stroke(Stroke::new(1.2_f32, pal.primary))
+                    .inner_margin(Margin::symmetric(18.0, 14.0)),
+            )
+            .show(ctx, |ui| {
+                if let Some((_, ref tname, _)) = cur_thread {
+                    ui.label(
+                        RichText::new(format!("Hội thoại đích: {tname}"))
+                            .size(13.0)
+                            .color(pal.text_primary)
+                            .strong(),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Nội dung tin nhắn sẽ gửi:")
+                        .size(11.8)
+                        .color(pal.text_secondary),
+                );
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.input_message)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Nhập nội dung tin nhắn hẹn giờ hoặc lời nhắc..."),
+                );
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Chọn mốc thời gian nhanh:")
+                        .size(12.0)
+                        .color(pal.text_secondary),
+                );
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    for preset in [
+                        crate::scheduler::SchedulePreset::In15Minutes,
+                        crate::scheduler::SchedulePreset::In1Hour,
+                        crate::scheduler::SchedulePreset::Today18h,
+                        crate::scheduler::SchedulePreset::Tomorrow08h,
+                    ] {
+                        if ui
+                            .button(RichText::new(preset.label()).size(12.0))
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            schedule_at = Some(preset.resolve_unix_ts(now_ts));
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Hoặc nhập giờ tùy chỉnh:")
+                            .size(12.0)
+                            .color(pal.text_secondary),
+                    );
+                    let te = egui::TextEdit::singleline(&mut self.schedule_custom_input)
+                        .hint_text("VD: +30m, 18:30, 25/12/2026 09:00")
+                        .desired_width(180.0);
+                    ui.add(te);
+                    if ui
+                        .button(
+                            RichText::new(if self.schedule_editing_id.is_some() {
+                                "Cập nhật lịch"
+                            } else {
+                                "Đặt lịch"
+                            })
+                            .size(12.0)
+                            .strong(),
+                        )
+                        .clicked()
+                    {
+                        match crate::scheduler::parse_custom_schedule_input(
+                            &self.schedule_custom_input,
+                            now_ts,
+                        ) {
+                            Ok(ts) => schedule_at = Some(ts),
+                            Err(e) => self.show_toast(format!("⚠️ {e}")),
+                        }
+                    }
+                });
+
+                if !self.scheduled_items.is_empty() {
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Danh sách tin nhắn đang chờ gửi ({})",
+                            self.scheduled_items.len()
+                        ))
+                        .size(12.5)
+                        .color(pal.text_primary)
+                        .strong(),
+                    );
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            for item in &self.scheduled_items {
+                                egui::Frame::none()
+                                    .fill(pal.bg_input)
+                                    .stroke(Stroke::new(1.0_f32, pal.border))
+                                    .rounding(Rounding::same(8.0))
+                                    .inner_margin(Margin::symmetric(10.0, 6.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.vertical(|ui| {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{} · 🕒 {}",
+                                                        item.thread_name,
+                                                        crate::scheduler::format_schedule_time(
+                                                            item.deliver_at
+                                                        )
+                                                    ))
+                                                    .size(11.5)
+                                                    .color(pal.primary_hover)
+                                                    .strong(),
+                                                );
+                                                ui.label(
+                                                    RichText::new(truncate_chars(&item.text, 44))
+                                                        .size(12.0)
+                                                        .color(pal.text_primary),
+                                                );
+                                            });
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if ui.small_button("Hủy").clicked() {
+                                                        action_cancel = Some(item.id);
+                                                    }
+                                                    if ui.small_button("Sửa").clicked() {
+                                                        action_edit = Some(item.clone());
+                                                    }
+                                                    if ui.small_button("Gửi ngay").clicked() {
+                                                        action_send_now = Some(item.clone());
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    });
+                                ui.add_space(4.0);
+                            }
+                        });
+                }
+            });
+
+        if let Some(target_ts) = schedule_at {
+            let text = self.input_message.trim().to_string();
+            if text.is_empty() {
+                self.show_toast("Vui lòng nhập nội dung tin nhắn trước khi hẹn giờ");
+            } else if let Some((tid, tname, is_group)) = cur_thread {
+                if let Some(edit_id) = self.schedule_editing_id.take() {
+                    let _ = crate::scheduler::update_scheduled_message(
+                        "zalo_history.db",
+                        edit_id,
+                        &text,
+                        target_ts,
+                    );
+                    self.input_message.clear();
+                    self.refresh_scheduled_items();
+                    self.show_toast(format!(
+                        "✅ Đã cập nhật lịch gửi lúc {}",
+                        crate::scheduler::format_schedule_time(target_ts)
+                    ));
+                } else if crate::scheduler::schedule_message(
+                    "zalo_history.db",
+                    &tid,
+                    &tname,
+                    is_group,
+                    &text,
+                    target_ts,
+                    now_ts,
+                )
+                .is_ok()
+                {
+                    self.input_message.clear();
+                    self.refresh_scheduled_items();
+                    self.show_toast(format!(
+                        "✅ Đã hẹn giờ gửi tới {tname} lúc {}",
+                        crate::scheduler::format_schedule_time(target_ts)
+                    ));
+                }
+            }
+        }
+        if let Some(id) = action_cancel {
+            let _ = crate::scheduler::cancel_scheduled_message("zalo_history.db", id);
+            self.refresh_scheduled_items();
+            self.show_toast("Đã hủy tin nhắn hẹn giờ");
+        }
+        if let Some(item) = action_edit {
+            self.input_message = item.text;
+            self.schedule_editing_id = Some(item.id);
+            self.schedule_custom_input = crate::scheduler::format_schedule_time(item.deliver_at);
+        }
+        if let Some(item) = action_send_now {
+            let _ = crate::scheduler::cancel_scheduled_message("zalo_history.db", item.id);
+            self.refresh_scheduled_items();
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::SendMessage {
+                    to_id: item.thread_id,
+                    text: item.text,
+                    is_group: item.is_group,
+                });
+            }
+            self.show_toast("Đang gửi ngay tin nhắn hẹn giờ…");
+        }
+        if !open {
+            self.schedule_modal_open = false;
+            self.schedule_editing_id = None;
         }
     }
 

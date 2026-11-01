@@ -413,6 +413,9 @@ pub struct SidebarPresentation {
     pub last_sender: String,
     pub last_sender_id: String,
     pub last_outgoing: bool,
+    pub pinned: bool,
+    pub muted: bool,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1047,42 +1050,20 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
             Session::plain_params(&body)
         }
     };
-    // `friend` is the canonical host for `social/friend/getfriends`; `profile` is
-    // only a fallback for very old sessions where `friend` was never populated.
-    let hosts = [&s.domains.friend, &s.domains.profile];
-    let mut resp_opt = None;
-    let mut last_err = None;
-    for host in hosts {
-        if host.is_empty() {
-            continue;
+    let path_and_query = format!(
+        "/api/social/friend/getfriends?{}{}",
+        s.common_params(),
+        if params.is_empty() {
+            String::new()
+        } else {
+            format!("&{params}")
         }
-        let url = format!(
-            "{}/api/social/friend/getfriends?{}{}",
-            host,
-            s.common_params(),
-            if params.is_empty() { String::new() } else { format!("&{params}") }
-        );
-        match s.get(&url).await {
-            Ok(r) => {
-                resp_opt = Some(s.maybe_decrypt(r, s.session_key_bytes()).await);
-                break;
-            }
-            Err(e) => {
-                crate::logger::log_error(
-                    "chat::get_friends",
-                    &format!("host {} failed: {e}", host),
-                );
-                last_err = Some(e);
-            }
-        }
-    }
-    let resp = match resp_opt {
-        Some(r) => r,
-        None => {
-            let err = last_err.unwrap_or_else(|| anyhow::anyhow!("get_friends failed"));
-            return Err(err.context("không tải được danh sách bạn bè"));
-        }
-    };
+    );
+    let raw = s
+        .get_endpoint("friend", &path_and_query)
+        .await
+        .map_err(|e| e.context("không tải được danh sách bạn bè"))?;
+    let resp = s.maybe_decrypt(raw, s.session_key_bytes()).await;
     let data_root = resp.get("data").unwrap_or(&resp);
     let mut threads: Vec<Thread> = match data_root {
         Value::Array(items) => items.iter().filter_map(parse_thread).collect(),
