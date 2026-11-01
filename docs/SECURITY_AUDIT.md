@@ -44,8 +44,8 @@ Cột **Trạng thái** được cập nhật khi tích hợp bản sửa: `Đan
 | B2 | `zpw_service_map_v3` từ server ghi đè domain đã kiểm chứng, khiến danh sách bạn bè lỗi 404. Khi nạp phiên chỉ khôi phục 3/13 domain. | #3, #22 (PR #29) | `src/session.rs:385-406`, `src/session.rs:535-557`, `src/chat.rs` (`get_friends`) | Đã sửa (`6537b5c`, viết lại theo hướng của PR #29) |
 | B3 | Khoá gọi thử nghiệm còn sót: chỉ gọi được liên hệ có tên chứa "hoang", "do thanh", "dtc". | — | `src/call.rs:84-100`, `src/call.rs:156-192` | Đã sửa (`6537b5c`) |
 | B4 | Giờ tin nhắn hiển thị theo UTC (lệch 7 tiếng ở Việt Nam), trong khi một số chỗ lại cộng cứng UTC+7. | #4 | `src/chat.rs:467`, `src/chat.rs:3364`, `src/store.rs:278`, `src/ui.rs:51`, `src/gui/messages.rs:798` | Đã sửa (`9184156` + `6537b5c`, phần GUI ở bản giao diện mới) |
-| B5 | Thiếu font tiếng Việt trên Fedora, không có font chữ Hán (CJK) dự phòng. | #5, #6 | `src/gui/theme.rs:533-546` | Đang xử lý |
-| B6 | Nút "Đồng bộ tin nhắn" chỉ làm mới danh sách hội thoại nhưng thông báo như đã đồng bộ. | #8, #10, #19, #23 | `src/gui/modals.rs:73`, `src/gui/worker.rs:609` | Đang xử lý (đổi tên và báo đúng). Đồng bộ toàn bộ lịch sử (#19) để phiên bản sau. |
+| B5 | Thiếu font tiếng Việt trên Fedora, không có font chữ Hán (CJK) dự phòng. | #5, #6 | `src/gui/theme.rs:533-546` | Đã sửa (`56f4d16`) |
+| B6 | Nút "Đồng bộ tin nhắn" chỉ làm mới danh sách hội thoại nhưng thông báo như đã đồng bộ. | #8, #10, #19, #23 | `src/gui/modals.rs:73`, `src/gui/worker.rs:609` | Đã sửa phần hiển thị (`56f4d16`): đổi tên thành "Làm mới hội thoại", thông báo đúng sự thật. Đồng bộ toàn bộ lịch sử (#19) để phiên bản sau |
 | B7 | Phiên bản bị ghi cứng `0.0.1` trong CI và bộ cài. | #2 (PR #18) | `.github/workflows/ci-release.yml`, `packaging/` | Đã sửa trong workflow mới |
 | B8 | README ghi Rust 1.75+, thực tế cần **1.88**: Rust 1.87 bị cargo từ chối vì `cookie_store 0.22.1`, `darling 0.24.1`, `image 0.25.10`, `time 0.3.55`. | — | `README.md` | Đã sửa |
 | B9 | `build.rs` dùng `#[cfg(target_os = "windows")]` (kiểm tra máy build, không phải máy đích) nên không nhúng icon khi build chéo. | — | `build.rs` | Đã sửa (đọc `CARGO_CFG_TARGET_OS`) |
@@ -57,3 +57,4 @@ Cột **Trạng thái** được cập nhật khi tích hợp bản sửa: `Đan
 | 1.87.0 | Thất bại: `rustc 1.87.0 is not supported by the following packages: cookie_store@0.22.1, darling@0.24.1 …` |
 | 1.88.0 | `cargo check --locked` thành công |
 | 1.97.0 (stable lúc rà soát) | `cargo build` + `cargo test` thành công (95 test qua, 1 bỏ qua) |
+| 1.97.0 — bản QTzalo 0.1.0 | `cargo test --locked`: 123 test qua, 1 bỏ qua; `cargo check --target x86_64-pc-windows-gnu` sạch; CI Windows MSVC xanh |

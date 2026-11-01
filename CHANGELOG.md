@@ -59,7 +59,36 @@ Phiên bản đầu tiên của QTzalo.
 
 ### Giao diện
 
-<!-- Điền khi tích hợp: bố cục 3 cột mới, thu gọn cột thành biểu tượng, theme sáng. -->
+- **Thiết kế lại toàn bộ theo bố cục 3 cột**, giao diện sáng mặc định, tông xanh nhạt và bo góc mềm. Giao diện tối vẫn chọn được trong Cài đặt.
+- **Thanh điều hướng trái** gồm 3 nhóm:
+  - Hộp thư: Tin nhắn, Khác, Chưa đọc, Người lạ, Trò chuyện ẩn.
+  - Lưu trữ: Cloud của tôi, zCloud kèm thanh dung lượng dữ liệu trên máy.
+  - Danh bạ: Bạn bè, Nhóm và cộng đồng, Lời mời kết bạn.
+  - Có badge đếm, chân trang hồ sơ kèm nút cài đặt. Mục chưa có tính năng hiện "Sắp có".
+- **Danh sách hội thoại**
+  - Avatar chữ cái nhiều màu, badge chưa đọc, hàng đang chọn tô xanh nhạt.
+  - Ô tìm kiếm có phím tắt Ctrl+K (⌘K trên macOS).
+  - Giờ hiển thị kiểu HH:MM / Hôm qua / T2…CN / dd/mm.
+- **Thu gọn cột:**
+  - Nút thu gọn đưa thanh điều hướng về dạng chỉ còn icon và danh sách hội thoại về dạng chỉ còn avatar.
+  - Có hiệu ứng chuyển động, trạng thái được lưu lại.
+  - Cửa sổ hẹp hơn 1100 px tự thu gọn thanh điều hướng; hẹp hơn 760 px thu gọn cả hai cột.
+- **Khung chat**
+  - Nền gradient nhẹ, header có avatar, tên và số thành viên.
+  - Chip ngày "Hôm nay" / "Thứ Ba, 27/10".
+  - Bong bóng gửi đi màu xanh đặc, nhận vào màu sáng có tên người gửi.
+  - Chip reaction, khối trích dẫn, thẻ tệp, chỉ báo "đang nhập".
+  - Khung soạn tin có nút (+) mở menu ảnh/tệp/dán clipboard, nút sticker, emoji và nút gửi tròn.
+- Cửa sổ mặc định 1280×800, tối thiểu 480×360. Thanh tiêu đề hiện "QTzalo" và phiên bản.
+- **Font chữ (#5, #6)**
+  - Tự dò font hệ thống theo thứ tự: font Latin hỗ trợ tiếng Việt, font chữ Hán (CJK, đọc được file `.ttc`), rồi font emoji/ký hiệu.
+  - Hỗ trợ đường dẫn font của Fedora, Debian/Ubuntu, Arch, macOS và Windows (Segoe UI, Microsoft YaHei, Segoe UI Emoji).
+- Hiển thị giờ trên giao diện dùng múi giờ của máy, bỏ phép cộng cứng UTC+7 (#4).
+- **Đổi nút "Đồng bộ tin nhắn" thành "Làm mới hội thoại" (#23)**
+  - Thông báo đúng việc nút thực sự làm và không còn hiện khi app tự làm mới lúc khởi động.
+  - Đồng bộ toàn bộ lịch sử (#19) để phiên bản sau.
+- Chế độ `--demo`: giao diện với dữ liệu mẫu offline, không kết nối mạng, không đọc hay ghi dữ liệu thật. Dùng để chụp ảnh và kiểm thử giao diện.
+- Sửa lỗi crash `clamp(min > max)` khi khung chat quá hẹp, vạch đen giữa các panel, và lỗi theme hệ thống ghi đè bảng màu.
 
 ### Build & phát hành
 

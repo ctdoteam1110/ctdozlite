@@ -43,10 +43,12 @@ async fn main() -> Result<()> {
     let force_gui = args.iter().any(|a| a == "--gui");
     let force_qr = args.iter().any(|a| a == "--qr");
     let force_logout = args.iter().any(|a| a == "--logout");
+    // `--demo`: offline sample workspace for screenshots/tests. Never touch real user data.
+    let demo_mode = args.iter().any(|a| a == "--demo");
 
     // Older builds kept credentials and history in the working directory; move them into the
     // private per-user data directory before anything reads them.
-    let migrated = paths::migrate_legacy_files();
+    let migrated = if demo_mode { Vec::new() } else { paths::migrate_legacy_files() };
     if !migrated.is_empty() {
         println!(
             "✓ Đã chuyển dữ liệu cũ ({}) vào {}",
@@ -55,7 +57,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    if force_logout {
+    if force_logout && !demo_mode {
         let _ = std::fs::remove_file(paths::session_file());
         let _ = std::fs::remove_file(paths::threads_cache_file());
         println!(
@@ -78,7 +80,7 @@ async fn main() -> Result<()> {
     let mut s = Session::new(dev_mode, dump, dump_raw)?;
 
     // Attempt to restore persistent session from disk
-    let session_restored = if !force_logout {
+    let session_restored = if !force_logout && !demo_mode {
         if s.load().is_ok() {
             if let Some(li) = &s.login {
                 let name = if li.display_name.is_empty() { "Zalo User" } else { &li.display_name };
@@ -98,7 +100,7 @@ async fn main() -> Result<()> {
     // If `--gui` is specified (or default when not `--tui` / `--qr` / `--phone`):
     // Open the native GUI window IMMEDIATELY without blocking on network requests!
     // Background worker in `gui.rs` handles `get_server_info`, `get_friends`, and `poll_new_messages`.
-    if force_gui || (!force_tui && !force_qr && !args.iter().any(|a| a.starts_with("--phone"))) {
+    if demo_mode || force_gui || (!force_tui && !force_qr && !args.iter().any(|a| a.starts_with("--phone"))) {
         println!("🚀 Đang khởi chạy giao diện đồ họa Zalo GUI (egui)…");
         #[cfg(target_os = "windows")]
         if !dev_mode {
@@ -130,12 +132,15 @@ async fn main() -> Result<()> {
             ..Default::default()
         };
 
-        let mut initial_threads = chat::load_threads_cache();
-        store::load_history_into_threads(paths::history_db(), &mut initial_threads, 200);
+        let mut initial_threads = Vec::new();
+        if !demo_mode {
+            initial_threads = chat::load_threads_cache();
+            store::load_history_into_threads(paths::history_db(), &mut initial_threads, 200);
+        }
 
         let app_session = s;
         return eframe::run_native(
-            "Zalo - Rust Native Client",
+            "QTzalo",
             native_options,
             Box::new(move |cc| {
                 Ok(Box::new(gui::ZaloGuiApp::new(cc, app_session, dev_mode, initial_threads)))
