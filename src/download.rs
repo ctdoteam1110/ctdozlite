@@ -294,12 +294,24 @@ pub async fn download_to_dir(
     url: &str,
     suggested_name: &str,
     dir: &Path,
+    progress: impl FnMut(Progress),
+) -> Result<PathBuf, String> {
+    download_with_policy(client, url, suggested_name, dir, progress, download_url_allowed).await
+}
+
+/// [`download_to_dir`] with the URL policy injected (tests use a plain-http local server).
+async fn download_with_policy(
+    client: &reqwest::Client,
+    url: &str,
+    suggested_name: &str,
+    dir: &Path,
     mut progress: impl FnMut(Progress),
+    url_allowed: fn(&str) -> bool,
 ) -> Result<PathBuf, String> {
     use tokio::io::AsyncWriteExt;
 
     let url = url.trim();
-    if !download_url_allowed(url) {
+    if !url_allowed(url) {
         return Err("Liên kết tải không an toàn hoặc không hợp lệ (chỉ chấp nhận https).".into());
     }
     if !dir.is_absolute() {
@@ -313,7 +325,7 @@ pub async fn download_to_dir(
         .send()
         .await
         .map_err(|e| format!("Không kết nối được máy chủ tải tệp: {e}"))?;
-    if !download_url_allowed(resp.url().as_str()) {
+    if !url_allowed(resp.url().as_str()) {
         return Err("Máy chủ chuyển hướng tới địa chỉ không an toàn — đã huỷ tải.".into());
     }
     if !resp.status().is_success() {
@@ -747,5 +759,88 @@ mod tests {
         assert_eq!(std::fs::read(&fin2).unwrap(), b"new");
         assert!(!part.exists());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Serve `body` once per connection on 127.0.0.1 with the given Content-Length header.
+    async fn serve(body: Vec<u8>, content_length: Option<usize>, conns: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..conns {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let mut head = "HTTP/1.1 200 OK\r\nConnection: close\r\n".to_string();
+                if let Some(n) = content_length {
+                    head.push_str(&format!("Content-Length: {n}\r\n"));
+                }
+                head.push_str("\r\n");
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}/files/B%C3%A1o%20c%C3%A1o.pdf?token=x")
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("qtzalo_dl_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn streams_to_disk_without_overwriting() {
+        let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let url = serve(body.clone(), Some(body.len()), 2).await;
+        let dir = temp_dir("stream");
+        std::fs::write(dir.join("Báo cáo.pdf"), b"existing").unwrap();
+        let client = reqwest::Client::new();
+        let mut last = None;
+        let p = download_with_policy(&client, &url, "", &dir, |pr| last = Some(pr), |_| true)
+            .await
+            .unwrap();
+        assert_eq!(p, dir.join("Báo cáo (1).pdf"));
+        assert_eq!(std::fs::read(&p).unwrap(), body);
+        assert_eq!(std::fs::read(dir.join("Báo cáo.pdf")).unwrap(), b"existing");
+        assert_eq!(last, Some(Progress { received: 300_000, total: Some(300_000) }));
+        // Untrusted suggested name with traversal lands inside `dir`.
+        let p2 = download_with_policy(&client, &url, "../../evil.exe", &dir, |_| {}, |_| true)
+            .await
+            .unwrap();
+        assert_eq!(p2, dir.join("evil.exe"));
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn truncated_download_leaves_nothing_behind() {
+        let url = serve(vec![1u8; 1000], Some(5000), 1).await;
+        let dir = temp_dir("trunc");
+        let client = reqwest::Client::new();
+        let err = download_with_policy(&client, &url, "x.bin", &dir, |_| {}, |_| true).await;
+        assert!(err.is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn real_policy_refuses_plain_http_and_relative_dirs() {
+        let client = reqwest::Client::new();
+        let dir = temp_dir("policy");
+        let e = download_to_dir(&client, "http://127.0.0.1:1/a.pdf", "a.pdf", &dir, |_| {}).await;
+        assert!(e.is_err());
+        let e = download_to_dir(&client, "https://f.zdn.vn/a.pdf", "a.pdf", Path::new("rel"), |_| {})
+            .await;
+        assert!(e.is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
