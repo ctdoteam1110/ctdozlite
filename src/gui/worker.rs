@@ -728,7 +728,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             tokio::spawn(async move {
                                 let mut s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
-                                    match s.check_session().await {
+                                    let status = s.check_session().await;
+                                    crate::trace_shape::line(
+                                        "sync",
+                                        format!("refresh: check_session -> {status:?}"),
+                                    );
+                                    match status {
                                         crate::session::SessionStatus::Valid => {}
                                         crate::session::SessionStatus::Unreachable(why) => {
                                             // Keep the saved session; just say we are offline.
@@ -784,6 +789,15 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         &mut list,
                                         200,
                                     );
+                                    crate::trace_shape::line(
+                                        "sync",
+                                        format!(
+                                            "refresh: threads={} groups={} errors={}",
+                                            list.len(),
+                                            list.iter().filter(|t| t.is_group).count(),
+                                            errors.len()
+                                        ),
+                                    );
                                     {
                                         let mut ps = poll_clone.lock().await;
                                         if let Err(e) =
@@ -793,6 +807,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             errors.push(format!("Không tải được tin nhắn mới: {e:#}"));
                                         }
                                     }
+                                    crate::trace_shape::line("sync", "refresh: poll_new_messages done");
                                     let thread_count = list.len();
                                     let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(list));
                                     let status = if errors.is_empty() {

@@ -82,9 +82,53 @@ content: {
 - Không thấy `533 HAS_MSG` hay `534 PUSH_MISS_MSG`.
 - Tin đẩy trực tiếp trong lúc mở: `504` (xoá chưa đọc), `612` (reaction), `621` (Cloud cần xác minh).
 
-## Lượt 2 — mở lại sau thời gian tắt
+## Lượt 2 — mở lại sau khoảng 10 phút tắt (23:12–23:15)
 
-_Chờ thực hiện._
+Trong lúc QTzalo tắt (23:01:56 → khoảng 23:11:50), người dùng nhận tin và tự gửi tin từ điện thoại. Mở lại bằng phiên đã lưu (không quét QR), chạy 3 phút rồi tự tắt. Code nhận tin giống lượt 1 (vẫn `lastId: 1`, không lưu con trỏ).
+
+### 7. Kéo bù sau khi tắt [O]
+
+| Đường | Kết quả |
+|---|---|
+| Socket `510_1`, `{first: true, lastId: 1}` | **20 tin**, `more = 0`, `evict = 0`. `msgType`: `webchat` 14, `chat.photo` 5, `chat.video.msg` 1. `ts` trải từ tin đến lúc đăng nhập ở lượt 1 tới tin cuối cùng trong lúc tắt. |
+| Long-poll, cursor `1,1` | Cùng 20 tin đó, `more = 0`, không có `resetLastActionId`, `evict = 0` ở queue `1, 7, 8`. |
+| Socket `511_1` (nhóm), long-poll `groupMsgs` | **0 tin** |
+| `515_0`, `517_0`, `518_0` | 0 tin |
+| `603_1` | Vẫn còn đúng 2 control `transfer_after_login` của lượt 1 (cùng `ts`) |
+
+- Hàng đợi 1-1 **giữ tin trong lúc app tắt**, và kéo với `lastId: 1` lấy lại được hết, trong một trang.
+- Tin của lượt 1 vẫn được trả lại: **kéo về không làm máy chủ xoá tin khỏi hàng đợi**. QTzalo không gửi ACK. **[I]** Hàng đợi tích luỹ mọi thứ từ lúc đăng nhập cho tới khi client ACK, hoặc tới khi máy chủ đẩy bỏ (`evict`). Giới hạn kích thước và thời gian lưu **[U]**.
+- Tin người dùng tự gửi từ điện thoại cũng về qua `510_1` (12 trong 21 tin là tin gửi đi).
+- Tin đẩy trực tiếp trong lúc mở: `501_0` (1 tin 1-1), và cùng tin đó lại về qua long-poll. Ngoài ra có `502`, `504`.
+- DB sau lượt 2: hội thoại 1-1 có 21 tin (1 tin của lượt 1 + 19 tin trong lúc tắt + 1 tin đến khi đang mở), **không trùng tin** (`INSERT OR IGNORE` theo `msg_id`). Vẫn 0 tin nhóm.
+
+### 8. Làm mới lúc khởi động không chạy tới lịch sử nhóm [O]
+
+- Trong 3 phút, `WorkerCmd::RefreshThreads` không chạy tới `poll_new_messages`: không có lệnh `get-last-msgs` hay `getrecentv2` nào, nên lượt 2 **không có dữ liệu về lịch sử nhóm**.
+- Lệnh `friend/reqstatus` gửi lúc khởi động không có phản hồi trong log, và socket mất 16 giây để bắt tay. Bước nào chặn `RefreshThreads` (kiểm tra phiên `profile/me-v2` hay `get_friends`) chưa rõ; lượt 3 thêm trace cho từng bước.
+- Nếu `check_session` trả `Unreachable` thì `RefreshThreads` thoát và **không thử lại**. Cần tính đến điều này khi thiết kế A2.
+
+## Lượt 3 — mở lại ngay sau lượt 2, có trace từng bước làm mới (23:17–23:20)
+
+### 9. Làm mới chạy đủ; lịch sử nhóm vẫn trống [O]
+
+- `refresh: check_session -> Valid` ngay khi mở; danh sách có 1165 hội thoại, trong đó 60 nhóm; `poll_new_messages` xong sau khoảng 8 giây. Lần treo ở lượt 2 không lặp lại.
+- Socket `510_1` với `lastId: 1` trả **23 tin**: toàn bộ tin từ lúc đăng nhập, gồm cả những tin đã nhận ở lượt 1 và 2. Long-poll cursor `1` cũng trả 23 tin. → Xác nhận lại: hàng đợi tích luỹ, mỗi lần mở app QTzalo tải lại tất cả.
+- `getrecentv2` cho 60 nhóm: **0 tin ở cả 60 nhóm**. Giá trị cờ:
+
+| Số nhóm | `isFiltered` | `hasMore` | `isFilteredByPhase` | `isFilteredByTimeJoin` | `isOld` | `tsJoinGroup` |
+|---|---|---|---|---|---|---|
+| 42 | 0 | 0 | 0 | 0 | 0 | null |
+| 10 | 1 | 0 | 0 | 0 | 0 | null |
+| 8 | 1 | **1** | 0 | 0 | 0 | null |
+
+- 8 nhóm trả `hasMore = 1` nhưng không có tin nào: **[I]** có tin nhưng máy chủ lọc khỏi thiết bị này. Lọc theo tiêu chí gì **[U]**: không phải theo thời điểm vào nhóm (`isFilteredByTimeJoin = 0`).
+- Không thấy tin nhóm nào qua bất kỳ đường nào trong cả ba lượt (`511_1` rỗng, long-poll `groupMsgs` rỗng, không có `521`). Chưa rõ trong thời gian đo có tin nhóm thật hay không; cần người dùng xác nhận.
+- DB sau lượt 3: hội thoại 1-1 có 25 tin (13 gửi đi, 12 nhận), không trùng.
+
+### 10. Bằng chứng phụ: chỉ báo "đang nhập" [O]
+
+Khi đối phương gõ: socket nhận `602_0`, và `lp_control` trả `actions: [{act: "typing", act_type: "typing", data: <chuỗi 59 ký tự>}]`. Đây là bằng chứng giao thức cho mục tồn đọng "chỉ báo đang nhập".
 
 ## Kết luận theo giả thiết
 
@@ -94,7 +138,9 @@ _Chờ thực hiện._
 | `queue_actionid_map` dùng chung con trỏ socket ↔ long-poll (09 §2.1) | **Xác nhận** cho `510_1 ↔ 15`, `511_1 ↔ 16` |
 | Long-poll với cursor `1` trả lại tin cũ (09 §5) | **Bác bỏ** với phiên mới: chỉ trả con trỏ |
 | Nhóm đủ lịch sử nhờ `getrecentv2` (09 §1 B) | **Bác bỏ** với thiết bị mới: 0 tin, có cờ lọc |
-| Có `resetLastActionId` / `evict = true` | Chưa rõ (lượt 1 không có) |
-| Hàng đợi giữ tin trong lúc app tắt; `lastId: 1` lấy lại được | Chưa rõ (lượt 2) |
+| Có `resetLastActionId` / `evict = true` | Chưa gặp (ba lượt đều `evict = 0`, không có `resetLastActionId`); trường `evict` có thật trong `queueStatus` |
+| Hàng đợi 1-1 giữ tin trong lúc app tắt; `lastId: 1` lấy lại được (10 phút) | **Xác nhận**. Kéo về không xoá khỏi hàng đợi: mỗi lần mở app tải lại toàn bộ từ lúc đăng nhập |
+| Tin nhóm về qua hàng đợi offline `511_x` | Chưa rõ: `511_1` rỗng trong cả ba lượt, chưa xác nhận có tin nhóm thật |
+| Lịch sử nhóm từ `getrecentv2` nối được khoảng thiếu (A4) | **Bác bỏ** trên thiết bị này: 0 tin ở cả 60 nhóm, có cờ `isFiltered` |
 | Tin E2EE đến qua `513/713` | **Bác bỏ** queue: phiên này dùng `515/517`. Có tin E2EE thật hay không: chưa rõ |
 | PC nhận `temp_key` sau đăng nhập QR (Phần B) | **Xác nhận**: `transfer_after_login` / `transfer_sync2` trong `603_1` |
