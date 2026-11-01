@@ -19,6 +19,72 @@ use crate::scheduler;
 use crate::session::Session;
 use crate::store::{self, MessageStore};
 
+// Only the embedded GUI listener installs this immutable, acceptance-time owner.
+#[derive(Clone)]
+struct AccountHistoryContext {
+    root: std::path::PathBuf,
+    account: String,
+}
+tokio::task_local! {
+    static ACCOUNT_HISTORY: AccountHistoryContext;
+}
+
+async fn history_read<T: Send + 'static>(
+    db_path: &str,
+    operation: impl FnOnce(Option<crate::store_v2::AccountStore>, &str) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let context = ACCOUNT_HISTORY.try_with(Clone::clone).ok();
+    let db_path = db_path.to_owned();
+    crate::runtime_scope::spawn_blocking(move || {
+        let _guard = crate::runtime_scope::mutation()?;
+        let account_store = context.map(|context| {
+            crate::store_v2::AccountStore::open(&context.root, &context.account)
+        }).transpose()?;
+        operation(account_store, &db_path)
+    }).await??
+}
+
+fn account_messages(
+    store: &crate::store_v2::AccountStore, thread: &str, limit: usize,
+) -> Result<Vec<store::StoredMessage>> {
+    use crate::store_v2::{HistoryCursor, PageDirection};
+    let mut messages = Vec::new();
+    let mut cursor = None;
+    // At most three 200-row queries preserve the existing API cap of 500.
+    for _ in 0..3 {
+        if messages.len() >= limit.min(500) { break; }
+        let page = store.history_page(thread, cursor.as_ref(), PageDirection::Before)?;
+        let Some(first) = page.messages.first() else { break; };
+        cursor = Some(HistoryCursor { ts: first.ts, msg_id: first.msg_id.clone() });
+        let take = (limit.min(500) - messages.len()).min(page.messages.len());
+        let start = page.messages.len() - take;
+        messages.splice(0..0, page.messages.into_iter().skip(start));
+        if !page.has_more { break; }
+    }
+    Ok(messages)
+}
+
+async fn history_threads(db_path: &str, limit: usize) -> Result<Vec<chat::Thread>> {
+    history_read(db_path, move |account, db| {
+        if let Some(store) = account {
+            let mut threads = store.all_thread_metadata()?;
+            for thread in &mut threads {
+                thread.messages = account_messages(&store, &thread.id, limit)?
+                    .iter().map(|row| store.chat_message(row)).collect::<Result<_>>()?;
+                if let Some(last) = thread.messages.last() {
+                    thread.preview = last.text.replace('\n', " ");
+                    thread.time = last.time.clone();
+                }
+            }
+            Ok(threads)
+        } else {
+            let mut threads = chat::load_threads_cache();
+            store::load_history_into_threads(db, &mut threads, limit);
+            Ok(threads)
+        }
+    }).await
+}
+
 pub const AUTOREPLY_FILE: &str = "autoreply_rules.json";
 pub const DEFAULT_API_PORT: u16 = 17890;
 
@@ -165,9 +231,11 @@ pub async fn handle_mcp_request(
             let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
             let content = match uri {
                 "zalo://threads" => {
-                    let mut threads = chat::load_threads_cache();
-                    store::load_history_into_threads(db_path, &mut threads, 20);
-                    serde_json::to_string_pretty(&threads).unwrap_or_else(|_| "[]".into())
+                    match history_threads(db_path, 20).await {
+                        Ok(threads) => serde_json::to_string_pretty(&threads).unwrap_or_else(|_| "[]".into()),
+                        Err(_) => return Some(json!({ "jsonrpc": "2.0", "id": req_id,
+                            "error": { "code": -32603, "message": "Local history unavailable" } })),
+                    }
                 }
                 "zalo://scheduled" => {
                     let list = scheduler::list_pending_scheduled(db_path, None).unwrap_or_default();
@@ -318,7 +386,7 @@ async fn execute_tool_call(
 ) -> (bool, Value) {
     match name {
         "zalo_status" => {
-            let s = session.lock().await;
+            let s = session.lock().await.clone();
             let logged_in = s.login.is_some() && s.zpw_sek.is_some();
             let uin = s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or("");
             let display_name = s
@@ -326,10 +394,12 @@ async fn execute_tool_call(
                 .as_ref()
                 .map(|l| l.display_name.as_str())
                 .unwrap_or("");
-            let thread_count = MessageStore::open(db_path)
-                .and_then(|st| st.all_threads())
-                .map(|v| v.len())
-                .unwrap_or(0);
+            let thread_count = history_read(db_path, |account, db| {
+                match account {
+                    Some(store) => Ok(store.all_threads()?.len()),
+                    None => Ok(MessageStore::open(db)?.all_threads()?.len()),
+                }
+            }).await.unwrap_or(0);
             let scheduled_count = scheduler::list_pending_scheduled(db_path, None)
                 .map(|v| v.len())
                 .unwrap_or(0);
@@ -353,8 +423,10 @@ async fn execute_tool_call(
                 .and_then(Value::as_u64)
                 .unwrap_or(50)
                 .min(500) as usize;
-            let mut threads = chat::load_threads_cache();
-            store::load_history_into_threads(db_path, &mut threads, 5);
+            let threads = match history_threads(db_path, 5).await {
+                Ok(threads) => threads,
+                Err(_) => return (true, json!({ "error": "Local history unavailable" })),
+            };
             let items: Vec<Value> = threads
                 .into_iter()
                 .take(limit)
@@ -380,7 +452,11 @@ async fn execute_tool_call(
                 .and_then(Value::as_u64)
                 .unwrap_or(50)
                 .min(500) as usize;
-            match MessageStore::open(db_path).and_then(|st| st.messages_for(tid, limit)) {
+            let tid_owned = tid.to_owned();
+            match history_read(db_path, move |account, db| match account {
+                Some(store) => account_messages(&store, &tid_owned, limit),
+                None => MessageStore::open(db)?.messages_for(&tid_owned, limit),
+            }).await {
                 Ok(msgs) => (false, json!({ "thread_id": tid, "messages": msgs })),
                 Err(e) => (true, json!({ "error": e.to_string() })),
             }
@@ -394,7 +470,11 @@ async fn execute_tool_call(
                 .and_then(Value::as_u64)
                 .unwrap_or(50)
                 .min(200) as usize;
-            match MessageStore::open(db_path).and_then(|st| st.search_messages(q, limit)) {
+            let query = q.to_owned();
+            match history_read(db_path, move |account, db| match account {
+                Some(store) => Ok(store.search(&query, None, 0, limit)?.into_iter().map(|hit| hit.message).collect()),
+                None => MessageStore::open(db)?.search_messages(&query, limit),
+            }).await {
                 Ok(hits) => (false, json!({ "query": q, "results": hits })),
                 Err(e) => (true, json!({ "error": e.to_string() })),
             }
@@ -669,8 +749,10 @@ pub async fn handle_rest_request(
             }
         }
         ("GET", "/api/v1/export") => {
-            let mut threads = chat::load_threads_cache();
-            store::load_history_into_threads(db_path, &mut threads, 1000);
+            let threads = match history_threads(db_path, 1000).await {
+                Ok(threads) => threads,
+                Err(_) => return (500, json!({ "ok": false, "error": "Local history unavailable" })),
+            };
             let scheduled = scheduler::list_pending_scheduled(db_path, None).unwrap_or_default();
             let autoreply = load_autoreply_rules();
             (
@@ -745,6 +827,12 @@ async fn run_local_http_server_inner(
 ) -> Result<()> {
     let bind_addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&bind_addr).await?;
+    serve_local_http_listener(session, listener, db_path, scoped).await
+}
+
+async fn serve_local_http_listener(
+    session: Arc<Mutex<Session>>, listener: TcpListener, db_path: String, scoped: bool,
+) -> Result<()> {
     let expected_token = std::env::var("CTDOZLITE_API_TOKEN")
         .ok()
         .filter(|s| !s.trim().is_empty());
@@ -755,8 +843,17 @@ async fn run_local_http_server_inner(
         let db = db_path.clone();
         let tok = expected_token.clone();
         let scope = scoped.then(|| crate::runtime_scope::registry().current());
+        let context = scope.as_ref().map(|scope| AccountHistoryContext {
+            root: std::path::Path::new(&db_path).parent().filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new(".")).to_owned(),
+            account: scope.account.clone(),
+        });
+        // The account and epoch belong to this accepted connection, never a later login.
+        let owner_matches = if let Some(scope) = scope.as_ref() {
+            session.lock().await.login.as_ref().is_some_and(|login| login.uin == scope.account)
+        } else { true };
         tokio::spawn(async move {
-            if scope.as_ref().is_some_and(|scope| scope.account.is_empty()) {
+            if !owner_matches || scope.as_ref().is_some_and(|scope| scope.account.is_empty()) {
                 let response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 let _ = stream.write_all(response.as_bytes()).await;
                 return;
@@ -823,7 +920,9 @@ async fn run_local_http_server_inner(
             let _ = stream.write_all(resp.as_bytes()).await;
             };
             if let Some(scope) = scope {
-                crate::runtime_scope::run(scope, operation).await;
+                if let Some(context) = context {
+                    crate::runtime_scope::run(scope, ACCOUNT_HISTORY.scope(context, operation)).await;
+                }
             } else { operation.await; }
         });
     }
@@ -969,5 +1068,132 @@ mod tests {
         assert_eq!(sched_val["ok"], true);
 
         let _ = std::fs::remove_file(&db_file);
+    }
+}
+
+#[cfg(test)]
+mod account_history_consumer_tests {
+    use super::*;
+    use crate::store::{StoredMessage, StoredThread};
+    use crate::store_v2::{AccountStore, StoreDelta};
+
+    async fn request(address: std::net::SocketAddr, method: &str, path: &str, body: &str) -> (u16, Value) {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let auth = std::env::var("CTDOZLITE_API_TOKEN").ok()
+            .map(|token| format!("Authorization: Bearer {token}\r\n")).unwrap_or_default();
+        let message = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Length: {}\r\n\r\n{body}", body.len());
+        stream.write_all(message.as_bytes()).await.unwrap();
+        let mut output = Vec::new();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_to_end(&mut output)).await.unwrap();
+        if let Err(error) = read {
+            // Rejected connections may close with unread request bytes after a complete 503.
+            assert!(error.kind() == std::io::ErrorKind::ConnectionReset && !output.is_empty(), "{method} {path}: {error}");
+        }
+        let text = String::from_utf8(output).unwrap();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (status, serde_json::from_str(body).unwrap_or(Value::Null))
+    }
+
+    fn seed(root: &std::path::Path, account: &str) {
+        let mut store = AccountStore::open(root, account).unwrap();
+        let rows: Vec<_> = (0..501).map(|n| StoredMessage {
+            msg_id: format!("message-{n:04}"), thread_id: "same-thread".into(),
+            sender_id: "same-sender".into(), sender_name: "Fixture".into(),
+            text: format!("needle owner-{account}"), msg_type: "chat.text".into(),
+            ts: n, is_outgoing: false, raw_json: String::new(),
+        }).collect();
+        store.apply_delta(StoreDelta {
+            threads: &[StoredThread { thread_id: "same-thread".into(), name: format!("owner-{account}"), is_group: false, last_ts: 500 }],
+            messages: &rows, unread: &[], deleted_messages: &[],
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn embedded_http_mcp_history_isolates_a_b_a_with_identical_request_metadata() {
+        let _serial = crate::runtime_scope::tests::TEST_LOCK.lock().await;
+        let root = std::env::temp_dir().join(format!("account-api-{}-{}", std::process::id(), crate::login::unix_now()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("messages.db").to_string_lossy().into_owned();
+        let mut legacy = MessageStore::open(&db).unwrap();
+        legacy.upsert_message(&StoredMessage {
+            msg_id: "legacy-only".into(), thread_id: "same-thread".into(), sender_id: "legacy".into(),
+            sender_name: String::new(), text: "needle legacy-private".into(), msg_type: "chat.text".into(),
+            ts: 600, is_outgoing: false, raw_json: String::new(),
+        }).unwrap();
+        drop(legacy);
+        seed(&root, "a"); seed(&root, "b");
+        let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_local_http_listener(session.clone(), listener, db.clone(), true));
+        for account in ["a", "b", "a"] {
+            session.lock().await.login = Some(crate::session::LoginInfo { uin: account.into(), ..Default::default() });
+            crate::runtime_scope::transition(account).unwrap();
+            for path in ["/api/v1/threads", "/api/v1/threads/same-thread/messages?limit=500", "/api/v1/search?q=needle", "/api/v1/export"] {
+                let (status, value) = request(address, "GET", path, "").await;
+                assert_eq!(status, 200, "{path}: {value}");
+                let text = value.to_string();
+                assert!(text.contains(&format!("owner-{account}")), "{path}");
+                assert!(!text.contains("legacy-private"));
+                let other = if account == "a" { "b" } else { "a" };
+                assert!(!text.contains(&format!("owner-{other}")));
+                if path.contains("/messages?") {
+                    let messages = value["messages"].as_array().unwrap();
+                    assert_eq!(messages.len(), 500);
+                    assert_eq!(messages[0]["msg_id"], "message-0001");
+                    assert_eq!(messages[499]["msg_id"], "message-0500");
+                }
+            }
+            for payload in [
+                json!({"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"zalo_search_messages","arguments":{"query":"needle"}}}),
+                json!({"jsonrpc":"2.0","id":17,"method":"resources/read","params":{"uri":"zalo://threads"}}),
+            ] {
+                let (status, value) = request(address,"POST","/api/v1/mcp",&payload.to_string()).await;
+                assert_eq!(status,200);
+                assert_eq!(value["id"],17);
+                let text=value.to_string();
+                assert!(text.contains(&format!("owner-{account}")));
+                assert!(!text.contains("legacy-private"));
+                assert!(!text.contains(if account=="a" {"owner-b"} else {"owner-a"}));
+            }
+        }
+        // A second completed request proves the earlier idle connection was accepted.
+        let mut stale = tokio::net::TcpStream::connect(address).await.unwrap();
+        assert_eq!(request(address, "GET", "/api/v1/status", "").await.0, 200);
+        for account in ["b", "a"] {
+            session.lock().await.login.as_mut().unwrap().uin = account.into();
+            crate::runtime_scope::transition(account).unwrap();
+        }
+        let _ = stale.write_all(b"GET /api/v1/search?q=needle HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        let mut old_output = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), stale.read_to_end(&mut old_output)).await.unwrap();
+        assert!(old_output.is_empty(), "an accepted old request survived A/B/A");
+        // A fresh account must not inherit any legacy/global-cache rows.
+        session.lock().await.login = Some(crate::session::LoginInfo { uin: "empty".into(), ..Default::default() });
+        crate::runtime_scope::transition("empty").unwrap();
+        let (_, result) = request(address,"GET","/api/v1/search?q=needle","").await;
+        assert!(result["results"].as_array().unwrap().is_empty());
+        // An incompatible V2 database is an error, never a legacy fallback.
+        let account_path = AccountStore::open(&root, "empty").unwrap().path.unwrap();
+        rusqlite::Connection::open(account_path).unwrap()
+            .pragma_update(None, "user_version", 999).unwrap();
+        let (status, result) = request(address,"GET","/api/v1/search?q=needle","").await;
+        assert_eq!(status,400);
+        assert!(result.get("error").is_some());
+        assert!(!result.to_string().contains("legacy-private"));
+        // A session/epoch owner mismatch fails closed before dispatch.
+        session.lock().await.login.as_mut().unwrap().uin = "a".into();
+        assert_eq!(request(address,"GET","/api/v1/search?q=needle","").await.0,503);
+        server.abort(); let _ = server.await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_local_http_listener(session,listener,db,false));
+        let (_, value) = request(address,"GET","/api/v1/search?q=needle","").await;
+        assert!(value.to_string().contains("legacy-private"));
+        assert!(!value.to_string().contains("owner-a"));
+        server.abort(); let _ = server.await;
+        crate::runtime_scope::transition("").unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
