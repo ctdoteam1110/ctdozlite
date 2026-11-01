@@ -1,29 +1,46 @@
-# Tài liệu kỹ thuật ctdozlite
+# Tài liệu QTzalo
 
-Thư mục này chứa tài liệu chi tiết về cách sử dụng, cấu trúc mã nguồn và giao thức mạng của `ctdozlite` (`zalo-rust`).
+Tài liệu cho người dùng và người phát triển QTzalo (`zalo-rust`).
 
-## Danh mục tài liệu
+## Cho người dùng
 
 | Tài liệu | Nội dung |
 |---|---|
-| [1. Hướng dẫn sử dụng](HUONG_DAN_SU_DUNG.md) | Các tham số CLI, thao tác trên GUI (`egui`), phím tắt TUI (`ratatui`) và công cụ kiểm thử. |
-| [2. Kiến trúc hệ thống](KIEN_TRUC_HE_THONG.md) | Mô hình phân tách UI thread / Tokio worker, đồng bộ WebSocket + HTTP polling và lưu trữ SQLite. |
-| [3. Đặc tả giao thức Zalo](GIAO_THUC_ZALO.md) | Cấu trúc tham số `zpw_ver=694`, `ParamCipher v2`, `PasswordCipher`, `signkey` và cơ chế mã hóa AES. |
-| [4. Xử lý sự cố](KHAC_PHUC_SU_CO.md) | Bảng mã lỗi máy chủ Zalo (`18012`, `18060`, `18022`, `600`, `102`, `114`, `429`) và cách khắc phục. |
+| [Cài đặt](CAI_DAT.md) | Tải và cài trên Windows / Linux / macOS, kiểm tra SHA256, xử lý SmartScreen, gỡ cài đặt. |
+| [Hướng dẫn sử dụng](HUONG_DAN_SU_DUNG.md) | Tham số dòng lệnh, thao tác GUI, phím tắt TUI. |
+| [Xử lý sự cố](KHAC_PHUC_SU_CO.md) | Mã lỗi máy chủ Zalo, font, phiên đăng nhập, giờ hiển thị, lỗi build. |
 
-## Biên dịch và chạy nhanh
+## Cho người phát triển
+
+| Tài liệu | Nội dung |
+|---|---|
+| [Kiến trúc hệ thống](KIEN_TRUC_HE_THONG.md) | Phân tách UI thread / Tokio worker, WebSocket + HTTP polling, lưu trữ SQLite. |
+| [Đặc tả giao thức Zalo](GIAO_THUC_ZALO.md) | `zpw_ver=694`, `ParamCipher v2`, `PasswordCipher`, `signkey`, mã hoá AES. |
+| [Rà soát bảo mật](SECURITY_AUDIT.md) | Các vấn đề bảo mật và lỗi chức năng đã phát hiện, trạng thái khắc phục. |
+| [Kế hoạch production](KE_HOACH_PRODUCTION.md) | Lộ trình kế thừa từ dự án gốc. |
+| [../re-notes/](../re-notes/) | Ghi chú reverse-engineering giao thức (đăng nhập, dữ liệu chat, cuộc gọi). |
+
+## Build và chạy nhanh
+
+Yêu cầu Rust ≥ 1.88, CMake, `pkg-config`, trình biên dịch C. Chi tiết theo từng hệ điều hành xem [README](../README.md#tự-build-từ-mã-nguồn).
 
 ```bash
-git clone https://github.com/ctdoteam1110/ctdozlite.git
-cd ctdozlite
-cargo build --release
+git clone https://github.com/quangthoai1985/QTzalo.git
+cd QTzalo
+CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo build --release --locked
+./target/release/zalo-rust
+```
 
-# Chạy giao diện đồ họa (mặc định)
-./target/release/zalo-rust --gui
+Các lệnh hữu ích khi phát triển:
 
-# Chạy giao diện terminal
-./target/release/zalo-rust --tui --qr
+```bash
+cargo test --locked
+```
 
-# Bật thêm bảng kiểm tra mạng (Dev Inspector)
+```bash
+scripts/check-windows.sh
+```
+
+```bash
 ./target/release/zalo-rust --gui --dev
 ```

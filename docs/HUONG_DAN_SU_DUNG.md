@@ -1,4 +1,4 @@
-# Hướng dẫn sử dụng ctdozlite
+# Hướng dẫn sử dụng QTzalo
 
 Tài liệu tóm tắt các tùy chọn dòng lệnh, thao tác trên giao diện đồ họa (GUI) và bảng phím tắt của giao diện terminal (TUI).
 
@@ -12,10 +12,11 @@ Tài liệu tóm tắt các tùy chọn dòng lệnh, thao tác trên giao diệ
 | `--tui` | Chạy chế độ giao diện dòng lệnh trong terminal. | `zalo-rust --tui` |
 | `--qr` | Yêu cầu tạo mã QR đăng nhập ngay khi khởi động TUI. | `zalo-rust --tui --qr` |
 | `--dev` | Bật thanh công cụ Dev Inspector để xem log mạng và payload giải mã. | `zalo-rust --gui --dev` |
-| `--logout` | Xóa phiên đăng nhập hiện tại (`session.json`) rồi thoát. | `zalo-rust --logout` |
+| `--logout` | Xóa phiên đăng nhập đã lưu (`session.json` trong thư mục dữ liệu) rồi thoát. Lịch sử tin nhắn được giữ lại. | `zalo-rust --logout` |
+| `--version` | In phiên bản rồi thoát. | `zalo-rust --version` |
 | `--phone <SỐ>` | Điền sẵn số điện thoại khi thử đăng nhập bằng mật khẩu. | `zalo-rust --tui --phone 0912345678` |
-| `--pass <MK>` | Điền sẵn mật khẩu. | `zalo-rust --tui --phone 0912345678 --pass ...` |
-| `--dump` | Lưu các gói phản hồi JSON ra thư mục `dump/` để phục vụ phân tích. | `zalo-rust --dump` |
+| `--pass-stdin` | Đọc mật khẩu từ dòng đầu tiên của stdin (thay cho `--pass <MK>` đã bị bỏ vì làm lộ mật khẩu trong danh sách tiến trình). | `printf '%s\n' "$MK" \| zalo-rust --tui --phone 0912345678 --pass-stdin` |
+| `--dump` | Lưu các gói phản hồi JSON (đã che thông tin xác thực) ra thư mục `dump/` trong thư mục dữ liệu để phục vụ phân tích. | `zalo-rust --dump` |
 
 ---
 
@@ -24,7 +25,8 @@ Tài liệu tóm tắt các tùy chọn dòng lệnh, thao tác trên giao diệ
 ### 2.1. Đăng nhập
 1. Chạy `./target/release/zalo-rust --gui`.
 2. Mở ứng dụng Zalo trên điện thoại, quét mã QR hiển thị trên màn hình và bấm **Đăng nhập**.
-3. Sau khi xác nhận, phiên làm việc được lưu vào `session.json`. Ở những lần mở tiếp theo, ứng dụng tự nạp lại phiên này mà không cần quét lại mã QR.
+3. Sau khi xác nhận, phiên làm việc được lưu vào `session.json` trong thư mục dữ liệu của người dùng (`%APPDATA%\QTzalo` trên Windows, `~/.local/share/qtzalo` trên Linux). Ở những lần mở tiếp theo, ứng dụng tự nạp lại phiên này mà không cần quét lại mã QR.
+4. Nếu mạng chập chờn khi mở app, phiên **không** bị xoá; ứng dụng chỉ yêu cầu quét lại QR khi máy chủ Zalo xác nhận phiên đã hết hạn.
 
 ### 2.2. Nhắn tin & Gợi ý Sticker tự động
 - **Tìm kiếm và lọc hội thoại:** Sử dụng ô tìm kiếm phía trên danh sách bên trái (hỗ trợ tìm tiếng Việt không dấu) hoặc lọc theo các tab *Tất cả*, *Cá nhân*, *Nhóm*.
@@ -62,7 +64,7 @@ Khởi chạy:
 | `Tab` | Chuyển đổi qua lại giữa danh sách hội thoại và ô nhập |
 | `r` | Đồng bộ lại danh bạ và tin nhắn mới |
 | `h` | Tải thêm lịch sử tin nhắn của nhóm đang chọn |
-| `x` | Đăng xuất và xóa `session.json` |
+| `x` | Đăng xuất (xóa `session.json`, giữ lịch sử tin nhắn) |
 | `l` | Mở bảng xem log mạng (khi chạy kèm cờ `--dev`) |
 | `q` | Thoát ứng dụng |
 

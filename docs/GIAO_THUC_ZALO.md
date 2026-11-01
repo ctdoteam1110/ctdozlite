@@ -1,6 +1,6 @@
 # Đặc tả giao thức Zalo Web/PC
 
-Tài liệu tổng hợp cấu trúc tham số, bảng phân bổ domain và các thuật toán mã hóa sử dụng trong `ctdozlite`.
+Tài liệu tổng hợp cấu trúc tham số, bảng phân bổ domain và các thuật toán mã hóa sử dụng trong QTzalo (kế thừa từ `ctdozlite`).
 
 ---
 
