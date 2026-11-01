@@ -27,6 +27,7 @@ call_trace.log
 
 # Generated graph/tooling output
 graphify-out/
+/book/
 
 # Temporary and backup files
 *.tmp
