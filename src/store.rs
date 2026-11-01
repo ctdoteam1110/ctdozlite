@@ -35,11 +35,18 @@ pub struct MessageStore {
 
 impl MessageStore {
     /// Open SQLite database at `path` and initialize table schemas and indices if absent.
-    pub fn open(path: &str) -> Result<Self> {
-        let conn = if path == ":memory:" {
+    ///
+    /// `":memory:"` opens an in-memory database. The bare legacy name `"zalo_history.db"` is
+    /// redirected to the per-user [`crate::paths::history_db`] so older call sites never create
+    /// a stray copy in the working directory. The file is restricted to the owner on Unix.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = resolve_db_path(path.as_ref());
+        let conn = if path.as_os_str() == ":memory:" {
             Connection::open_in_memory()?
         } else {
-            Connection::open(path)?
+            let c = Connection::open(&path)?;
+            crate::paths::restrict_file(&path);
+            c
         };
 
         conn.execute_batch(
@@ -274,8 +281,7 @@ impl MessageStore {
             let saved_msgs = self.messages_for(&t.id, limit_per_thread)?;
             for sm in saved_msgs {
                 let time = if sm.ts > 0 {
-                    let s = sm.ts / 1000;
-                    format!("{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60)
+                    crate::timefmt::hm_from_ms(sm.ts)
                 } else {
                     crate::ui::clock()
                 };
@@ -529,9 +535,22 @@ pub fn persist_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<u
 }
 
 /// Convenience helper: open `zalo_history.db` (or `path`) and hydrate `threads` with saved history.
-pub fn load_history_into_threads(path: &str, threads: &mut Vec<Thread>, limit_per_thread: usize) {
+pub fn load_history_into_threads(
+    path: impl AsRef<std::path::Path>,
+    threads: &mut Vec<Thread>,
+    limit_per_thread: usize,
+) {
     if let Ok(store) = MessageStore::open(path) {
         let _ = store.hydrate_threads(threads, limit_per_thread);
+    }
+}
+
+/// Redirect the legacy bare `zalo_history.db` name to the per-user data directory.
+fn resolve_db_path(path: &std::path::Path) -> std::path::PathBuf {
+    if path == std::path::Path::new("zalo_history.db") {
+        crate::paths::history_db()
+    } else {
+        path.to_path_buf()
     }
 }
 

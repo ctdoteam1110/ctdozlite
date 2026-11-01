@@ -139,11 +139,111 @@ pub(super) fn resp_error_code(resp: &serde_json::Value) -> Option<i64> {
         .filter(|c| *c != 0)
 }
 
+/// `true` only for an explicit Zalo auth error (`server error 600` / `-102`, see
+/// [`crate::session::AUTH_ERROR_CODES`]). Network failures and other HTTP errors never count as
+/// an expired session (upstream issue #21).
 pub(super) fn is_session_expired_error(err_str: &str) -> bool {
-    err_str.contains("server error 600")
-        || err_str.contains("zpw_sek")
-        || err_str.contains("server error -102")
-        || err_str.contains("chưa đăng nhập")
+    crate::session::AUTH_ERROR_CODES
+        .iter()
+        .any(|code| err_str.contains(&format!("server error {code}:")))
+}
+
+/// Largest image accepted from the network or disk for stickers / thumbnails / avatars.
+pub(super) const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
+
+/// Zalo's own static/CDN hosts (`*.zalo.me`, `*.zaloapp.com`, `*.zdn.vn`, `*.zadn.vn`).
+fn is_zalo_cdn_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    crate::session::is_zalo_host(&h)
+        || h == "zdn.vn"
+        || h.ends_with(".zdn.vn")
+        || h == "zadn.vn"
+        || h.ends_with(".zadn.vn")
+}
+
+/// May this URL be fetched automatically to render an image?
+///
+/// `https://` always; plain `http://` only for Zalo's own CDN hosts (some legacy stickers are
+/// still served that way). Anything else (`file:`, `ftp:`, other `http://` hosts) is refused.
+pub(super) fn image_url_allowed(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    match u.scheme() {
+        "https" => u.host_str().is_some(),
+        "http" => u.host_str().map(is_zalo_cdn_host).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Resolve the path of a locally sent image (`local://<absolute path>` or an absolute path).
+///
+/// UNC / network paths (`\\server\share\x.png`, `//server/x`) are refused: on Windows merely
+/// opening one makes the OS connect to that host and offer the user's NTLM credentials.
+pub(super) fn local_image_path(url: &str) -> Option<std::path::PathBuf> {
+    let raw = url.strip_prefix("local://").unwrap_or(url).trim();
+    if raw.is_empty() || raw.starts_with("\\\\") || raw.starts_with("//") {
+        return None;
+    }
+    let p = std::path::Path::new(raw);
+    if !p.is_absolute() {
+        return None;
+    }
+    let meta = std::fs::metadata(p).ok()?;
+    if !meta.is_file() || meta.len() > MAX_IMAGE_BYTES as u64 {
+        return None;
+    }
+    Some(p.to_path_buf())
+}
+
+/// Download an image (stickers, thumbnails, avatars) with the scheme/host policy of
+/// [`image_url_allowed`] and a [`MAX_IMAGE_BYTES`] cap.
+pub(super) async fn fetch_image_bytes(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
+    if !image_url_allowed(url) {
+        return None;
+    }
+    let mut resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    if resp.content_length().is_some_and(|n| n > MAX_IMAGE_BYTES as u64) {
+        return None;
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if buf.len() + chunk.len() > MAX_IMAGE_BYTES {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Some(buf)
+}
+
+/// Status line shown when Zalo cannot be reached; the saved session is kept.
+pub(super) fn unreachable_status(why: &str) -> String {
+    let why = crate::session::truncate(why, 140);
+    format!("Không kết nối được máy chủ Zalo — vẫn giữ phiên đăng nhập. ({why})")
+}
+
+/// The server rejected the session: forget it **in memory** and ask for a new QR login.
+///
+/// `session.json` stays on disk and is only overwritten after a new login succeeds, so a
+/// misclassified error can never destroy working credentials (upstream issue #21).
+pub(super) async fn on_session_expired(
+    session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+    gui_tx: &Sender<GuiEvent>,
+    ctx: &egui::Context,
+    reason: &str,
+) {
+    {
+        let mut sl = session.lock().await;
+        sl.logout();
+    }
+    let _ = gui_tx.send(GuiEvent::SessionExpired(reason.to_string()));
+    ctx.request_repaint();
+    if let Some(tx) = WORKER_TX.get() {
+        let _ = tx.send(WorkerCmd::RequestQr);
+    }
 }
 
 /// Immediately decode any disk-cached sticker thumbnails (`stickers_cache/stk_{cid}_{sid}.png`)
@@ -154,8 +254,8 @@ pub(super) fn preload_disk_sticker_thumbnails(
     gui_tx: &Sender<GuiEvent>,
     limit: usize,
 ) -> Vec<(String, String, std::path::PathBuf)> {
-    let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    let cache_dir_buf = crate::paths::cache_dir();
+    let cache_dir = cache_dir_buf.as_path();
 
     let mut missing = Vec::new();
     for item in items.iter().take(limit) {
@@ -208,24 +308,19 @@ async fn prefetch_missing_sticker_thumbnails(
         let tx = gui_tx.clone();
         let ctx = egui_ctx.clone();
         async move {
-            if let Ok(resp) = client.get(&url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(b) = resp.bytes().await {
-                        let vec = b.to_vec();
-                        if let Ok(dyn_img) = image::load_from_memory(&vec) {
-                            let _ = std::fs::write(&cache_path, &vec);
-                            let rgba = dyn_img.to_rgba8();
-                            let size = [rgba.width() as usize, rgba.height() as usize];
-                            let pixels = rgba.as_flat_samples();
-                            let color_img =
-                                egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
-                            let _ = tx.send(GuiEvent::StickerImageReady {
-                                key,
-                                image: color_img,
-                            });
-                            ctx.request_repaint();
-                        }
-                    }
+            if let Some(vec) = fetch_image_bytes(&client, &url).await {
+                if let Ok(dyn_img) = image::load_from_memory(&vec) {
+                    let _ = std::fs::write(&cache_path, &vec);
+                    let rgba = dyn_img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let pixels = rgba.as_flat_samples();
+                    let color_img =
+                        egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
+                    let _ = tx.send(GuiEvent::StickerImageReady {
+                        key,
+                        image: color_img,
+                    });
+                    ctx.request_repaint();
                 }
             }
         }
@@ -404,7 +499,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                         WorkerCmd::PersistThreads(threads_snapshot) => {
                             tokio::task::spawn_blocking(move || {
                                 if let Ok(mut store) =
-                                    crate::store::MessageStore::open("zalo_history.db")
+                                    crate::store::MessageStore::open(crate::paths::history_db())
                                 {
                                     let _ =
                                         crate::store::persist_threads(&mut store, &threads_snapshot);
@@ -416,9 +511,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             if let Some(task) = current_qr_task.take() {
                                 task.abort();
                             }
-                            let _ = std::fs::remove_file("session.json");
-                            let _ = std::fs::remove_file("threads_cache.json");
-                            let _ = std::fs::remove_file("zalo_history.db");
+                            // Logging out removes credentials only. The local message history
+                            // (`zalo_history.db`) is kept: deleting it is a separate, explicit action.
+                            let _ = std::fs::remove_file(crate::paths::session_file());
+                            let _ = std::fs::remove_file(crate::paths::threads_cache_file());
                             {
                                 let mut s = session.lock().await;
                                 s.logout();
@@ -523,7 +619,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                                 &mut s, data,
                                                             );
                                                         }
-                                                        let _ = s.save_to_file("session.json");
+                                                        let _ = s.save();
 
                                                         if let Ok(info) =
                                                             crate::login::get_login_info(&s).await
@@ -536,7 +632,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                             }
                                                         }
                                                         let _ = s.sync_profile_me().await;
-                                                        let _ = s.save_to_file("session.json");
+                                                        let _ = s.save();
 
                                                         let uin = s
                                                             .login
@@ -562,11 +658,15 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                         );
                                                         ctx_clone.request_repaint();
 
-                                                        let mut list = crate::chat::get_friends(&s)
-                                                            .await
-                                                            .unwrap_or_default();
+                                                        let mut list = match crate::chat::get_friends(&s).await {
+                                                            Ok(l) => l,
+                                                            Err(e) => {
+                                                                let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("{e:#}")));
+                                                                Vec::new()
+                                                            }
+                                                        };
                                                         crate::store::load_history_into_threads(
-                                                            "zalo_history.db",
+                                                            crate::paths::history_db(),
                                                             &mut list,
                                                             200,
                                                         );
@@ -614,21 +714,25 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             tokio::spawn(async move {
                                 let mut s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
-                                    if !s.validate_session().await {
-                                        let _ = std::fs::remove_file("session.json");
-                                        {
-                                            let mut sl = session_clone.lock().await;
-                                            sl.logout();
+                                    match s.check_session().await {
+                                        crate::session::SessionStatus::Valid => {}
+                                        crate::session::SessionStatus::Unreachable(why) => {
+                                            // Keep the saved session; just say we are offline.
+                                            let _ = gui_tx_clone
+                                                .send(GuiEvent::StatusUpdate(unreachable_status(&why)));
+                                            ctx_clone.request_repaint();
+                                            return;
                                         }
-                                        let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
-                                            "Phiên đăng nhập (zpw_sek) đã hết hạn trên máy chủ Zalo"
-                                                .into(),
-                                        ));
-                                        ctx_clone.request_repaint();
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::RequestQr);
+                                        crate::session::SessionStatus::Expired => {
+                                            on_session_expired(
+                                                &session_clone,
+                                                &gui_tx_clone,
+                                                &ctx_clone,
+                                                "Máy chủ Zalo báo phiên đăng nhập đã hết hạn — vui lòng quét mã QR để đăng nhập lại",
+                                            )
+                                            .await;
+                                            return;
                                         }
-                                        return;
                                     }
                                     if let Some((uid, name)) = s.sync_profile_me().await {
                                         {
@@ -639,7 +743,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                     li.display_name = name.clone();
                                                 }
                                             }
-                                            let _ = sl.save_to_file("session.json");
+                                            let _ = sl.save();
                                         }
                                         let u_ava = s
                                             .login
@@ -652,20 +756,40 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             avatar: u_ava,
                                         });
                                     }
-                                    let mut list =
-                                        crate::chat::get_friends(&s).await.unwrap_or_default();
+                                    // Surface failures instead of silently showing an empty list.
+                                    let mut errors: Vec<String> = Vec::new();
+                                    let mut list = match crate::chat::get_friends(&s).await {
+                                        Ok(l) => l,
+                                        Err(e) => {
+                                            errors.push(format!("{e:#}"));
+                                            Vec::new()
+                                        }
+                                    };
                                     crate::store::load_history_into_threads(
-                                        "zalo_history.db",
+                                        crate::paths::history_db(),
                                         &mut list,
                                         200,
                                     );
                                     {
                                         let mut ps = poll_clone.lock().await;
-                                        let _ =
+                                        if let Err(e) =
                                             crate::chat::poll_new_messages(&s, &mut ps, &mut list)
-                                                .await;
+                                                .await
+                                        {
+                                            errors.push(format!("Không tải được tin nhắn mới: {e:#}"));
+                                        }
                                     }
+                                    let thread_count = list.len();
                                     let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(list));
+                                    let status = if errors.is_empty() {
+                                        format!(
+                                            "Đã làm mới {thread_count} hội thoại lúc {}",
+                                            crate::ui::clock()
+                                        )
+                                    } else {
+                                        crate::session::truncate(&errors.join(" · "), 220)
+                                    };
+                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(status));
                                     ctx_clone.request_repaint();
                                 }
                             });
@@ -733,18 +857,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
 
                                     if let Some(err_s) = poll_err {
                                         if is_session_expired_error(&err_s) {
-                                            let _ = std::fs::remove_file("session.json");
-                                            {
-                                                let mut sl = session_clone.lock().await;
-                                                sl.logout();
-                                            }
-                                            let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
-                                                "Phiên đăng nhập (zpw_sek) đã hết hạn".into(),
-                                            ));
-                                            ctx_clone.request_repaint();
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::RequestQr);
-                                            }
+                                            on_session_expired(
+                                                &session_clone,
+                                                &gui_tx_clone,
+                                                &ctx_clone,
+                                                "Phiên đăng nhập (zpw_sek) đã hết hạn",
+                                            )
+                                            .await;
                                         }
                                     } else {
                                         temp_threads.retain(|t| !t.messages.is_empty());
@@ -786,7 +905,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                     };
                                     let mut t_list = vec![t];
                                     crate::store::load_history_into_threads(
-                                        "zalo_history.db",
+                                        crate::paths::history_db(),
                                         &mut t_list,
                                         500,
                                     );
@@ -848,7 +967,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
                                 if let Some(found_url) = crate::chat::extract_first_url(&text) {
-                                    let meta = crate::chat::parse_link_metadata(&s, &found_url)
+                                    // The user is sending this link: a direct OpenGraph fetch
+                                    // from this machine is acceptable here.
+                                    let meta = crate::chat::parse_link_metadata(&s, &found_url, true)
                                         .await
                                         .unwrap_or_else(|_| crate::chat::LinkMetadata {
                                             url: found_url.clone(),
@@ -947,17 +1068,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             error: err_s.clone(),
                                         });
                                         if is_session_expired_error(&err_s) {
-                                            let _ = std::fs::remove_file("session.json");
-                                            {
-                                                let mut sl = session_clone.lock().await;
-                                                sl.logout();
-                                            }
-                                            let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
-                                                "Không thể gửi vì phiên zpw_sek đã hết hạn".into(),
-                                            ));
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::RequestQr);
-                                            }
+                                            on_session_expired(
+                                                &session_clone,
+                                                &gui_tx_clone,
+                                                &ctx_clone,
+                                                "Không thể gửi vì phiên zpw_sek đã hết hạn",
+                                            )
+                                            .await;
                                         }
                                         ctx_clone.request_repaint();
                                     }
@@ -1129,7 +1246,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             (to_id.clone(), msg.id.clone(), msg.ts);
                                         let _ = tokio::task::spawn_blocking(move || {
                                             if let Ok(mut store) =
-                                                crate::store::MessageStore::open("zalo_history.db")
+                                                crate::store::MessageStore::open(crate::paths::history_db())
                                             {
                                                 let _ = store.delete_message(&tid, &mid, ts);
                                             }
@@ -1257,18 +1374,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             error: err_s.clone(),
                                         });
                                         if is_session_expired_error(&err_s) {
-                                            let _ = std::fs::remove_file("session.json");
-                                            {
-                                                let mut sl = session_clone.lock().await;
-                                                sl.logout();
-                                            }
-                                            let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
-                                                "Không thể gửi nhãn dán vì phiên zpw_sek đã hết hạn"
-                                                    .into(),
-                                            ));
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::RequestQr);
-                                            }
+                                            on_session_expired(
+                                                &session_clone,
+                                                &gui_tx_clone,
+                                                &ctx_clone,
+                                                "Không thể gửi nhãn dán vì phiên zpw_sek đã hết hạn",
+                                            )
+                                            .await;
                                         }
                                         ctx_clone.request_repaint();
                                     }
@@ -1280,9 +1392,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
-                                let cache_dir = std::path::Path::new("stickers_cache");
-                                let _ = std::fs::create_dir_all(cache_dir);
-                                let cache_path = cache_dir.join(format!("{key}.png"));
+                                let cache_path =
+                                    crate::paths::cache_dir().join(format!("{key}.png"));
 
                                 let bytes_opt = if let Ok(disk_bytes) = std::fs::read(&cache_path) {
                                     if image::load_from_memory(&disk_bytes).is_ok() {
@@ -1292,27 +1403,16 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         None
                                     }
                                 } else if !url.starts_with("http://") && !url.starts_with("https://") {
-                                    std::fs::read(&url).ok()
+                                    // Locally sent photos only — never UNC / network paths.
+                                    local_image_path(&url).and_then(|p| std::fs::read(p).ok())
                                 } else {
                                     let client = { session_clone.lock().await.clone().http };
-                                    if let Ok(resp) = client.get(&url).send().await {
-                                        if resp.status().is_success() {
-                                            if let Ok(b) = resp.bytes().await {
-                                                let vec = b.to_vec();
-                                                if image::load_from_memory(&vec).is_ok() {
-                                                    let _ = std::fs::write(&cache_path, &vec);
-                                                    Some(vec)
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        } else {
-                                            None
+                                    match fetch_image_bytes(&client, &url).await {
+                                        Some(vec) if image::load_from_memory(&vec).is_ok() => {
+                                            let _ = std::fs::write(&cache_path, &vec);
+                                            Some(vec)
                                         }
-                                    } else {
-                                        None
+                                        _ => None,
                                     }
                                 };
 
@@ -1322,8 +1422,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         // Apply smooth anti-aliased circular alpha mask for avatar textures (`ava_*`)
                                         if key.starts_with("ava_") {
                                             let side = rgba.width().min(rgba.height()).clamp(32, 160);
-                                            let x0 = (rgba.width() - side) / 2;
-                                            let y0 = (rgba.height() - side) / 2;
+                                            let x0 = rgba.width().saturating_sub(side) / 2;
+                                            let y0 = rgba.height().saturating_sub(side) / 2;
                                             let cropped = image::imageops::crop_imm(
                                                 &rgba, x0, y0, side, side,
                                             )
@@ -1500,7 +1600,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                if let Ok(meta) = crate::chat::parse_link_metadata(&s, &url).await {
+                                // Automatic previews (received messages, composer) only use
+                                // Zalo's server-side parser: no request from this machine to an
+                                // arbitrary URL (privacy: IP leak / LAN probing).
+                                if let Ok(meta) = crate::chat::parse_link_metadata(&s, &url, false).await {
                                     let _ = gui_tx_clone.send(GuiEvent::LinkPreviewReady(meta));
                                     ctx_clone.request_repaint();
                                 }
@@ -1770,7 +1873,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             if let Some(cfg) = info.get("data") {
                                                 crate::login::apply_login_config(&mut s, cfg);
                                                 s.apply_server_info(cfg);
-                                                let _ = s.save_to_file("session.json");
+                                                let _ = s.save();
 
                                                 let uin = s
                                                     .login
@@ -1825,5 +1928,50 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
             });
         })
         .expect("Failed to spawn zalo-worker thread");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_explicit_auth_codes_count_as_expired() {
+        assert!(is_session_expired_error("server error 600: zpw_sek not found (from https://x)"));
+        assert!(is_session_expired_error("server error -102: chưa đăng nhập"));
+        // Network / HTTP problems never log the user out (issue #21).
+        assert!(!is_session_expired_error("HTTP 404 Not Found from https://tt-friend-wpa.zaloapp.com"));
+        assert!(!is_session_expired_error("error sending request: dns error"));
+        assert!(!is_session_expired_error("server error 6001: something else"));
+        assert!(!is_session_expired_error("zpw_sek appears in some other message"));
+    }
+
+    #[test]
+    fn image_urls_follow_scheme_policy() {
+        assert!(image_url_allowed("https://s120-ava-talk.zadn.vn/a.jpg"));
+        assert!(image_url_allowed("https://example.com/og.png"));
+        assert!(image_url_allowed("http://stc-chat.zdn.vn/images/stickers/default/thumb/1.png"));
+        assert!(!image_url_allowed("http://example.com/tracker.png"));
+        assert!(!image_url_allowed("file:///etc/passwd"));
+        assert!(!image_url_allowed("ftp://zdn.vn/x.png"));
+        assert!(!image_url_allowed("not a url"));
+    }
+
+    #[test]
+    fn local_images_refuse_network_paths() {
+        assert!(local_image_path(r"\\attacker.example\share\x.png").is_none());
+        assert!(local_image_path("local://\\\\attacker\\share\\x.png").is_none());
+        assert!(local_image_path("//attacker/share/x.png").is_none());
+        assert!(local_image_path("relative/x.png").is_none());
+        assert!(local_image_path("").is_none());
+
+        let dir = std::env::temp_dir().join(format!("qtzalo-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.png");
+        std::fs::write(&f, b"\x89PNG").unwrap();
+        let as_local = format!("local://{}", f.display());
+        assert_eq!(local_image_path(&as_local).as_deref(), Some(f.as_path()));
+        assert_eq!(local_image_path(&f.display().to_string()).as_deref(), Some(f.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 

@@ -35,6 +35,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 cpal = "0.15"
 opus = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+getrandom = "0.2"
 
 [lib]
 name = "zalo_rust"

@@ -75,121 +75,20 @@ impl CallType {
     }
 }
 
-/// Outbound-dial allowlist - test lock, not a protocol feature.
+/// Outbound-call gate.
 ///
-/// Only these three contacts may be dialed. Every other target is refused before any request
-/// reaches the server. The lock is enforced twice: in the `CallEngineCmd::MakeCall` arm (friendly
-/// UI error) and inside [`dispatch_send_signal_inner`] for `401`/`416` (hard stop, also covers
-/// `call_probe` and any future caller). Group calls are always refused.
-pub const CALL_ALLOWED_NAMES: [&str; 3] = ["hoang", "do thanh", "dtc"];
-
-/// Known id aliases of the allowlisted accounts: 19-digit thread ids, 19-digit uins, 32-bit uids.
-///
-/// The 19-digit ids are *not* 32-bit truncations of the uids, so both forms are listed per person.
-pub const CALL_ALLOWED_IDS: [&str; 8] = [
-    // Test Account 1 (mock IDs; override at runtime via ZALO_CALL_ALLOW_IDS)
-    "100000001",
-    "1000000000000000001",
-    "1000000000000000002",
-    // Test Account 2
-    "100000002",
-    "1000000000000000003",
-    "1000000000000000004",
-    // Test Account 3
-    "100000003",
-    "1000000000000000005",
-];
-
-/// Strip every non-digit character so `"1000000000000000001"`/`"'1000...'"` compare equal.
-fn only_digits(s: &str) -> String {
-    s.chars().filter(|c| c.is_ascii_digit()).collect()
-}
-
-/// Lowercase and strip Vietnamese diacritics: `"Đỗ Thành"` -> `"do thanh"`.
-///
-/// Non-alphanumeric characters collapse into single spaces so emoji or decorations in a Zalo
-/// display name do not defeat the match.
-fn fold_call_label(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut pending_space = false;
-    for raw in name.chars() {
-        let c = raw.to_lowercase().next().unwrap_or(raw);
-        let mapped = match c {
-            'a' | 'à' | 'á' | 'ạ' | 'ả' | 'ã' | 'â' | 'ầ' | 'ấ' | 'ậ' | 'ẩ' | 'ẫ' | 'ă' | 'ằ'
-            | 'ắ' | 'ặ' | 'ẳ' | 'ẵ' => 'a',
-            'e' | 'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => 'e',
-            'i' | 'ì' | 'í' | 'ị' | 'ỉ' | 'ĩ' => 'i',
-            'o' | 'ò' | 'ó' | 'ọ' | 'ỏ' | 'õ' | 'ô' | 'ồ' | 'ố' | 'ộ' | 'ổ' | 'ỗ' | 'ơ' | 'ờ'
-            | 'ớ' | 'ợ' | 'ở' | 'ỡ' => 'o',
-            'u' | 'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => 'u',
-            'y' | 'ỳ' | 'ý' | 'ỵ' | 'ỷ' | 'ỹ' => 'y',
-            'd' | 'đ' => 'd',
-            other => other,
-        };
-        if mapped.is_ascii_alphanumeric() {
-            if pending_space && !out.is_empty() {
-                out.push(' ');
-            }
-            pending_space = false;
-            out.push(mapped);
-        } else {
-            pending_space = true;
-        }
-    }
-    out
-}
-
-/// Does a display name contain one of the allowlisted labels as a whole token sequence?
-fn call_name_allowed(name: &str) -> bool {
-    let folded = fold_call_label(name);
-    if folded.is_empty() {
-        return false;
-    }
-    let tokens: Vec<&str> = folded.split(' ').filter(|t| !t.is_empty()).collect();
-    CALL_ALLOWED_NAMES.iter().any(|allowed| {
-        let want: Vec<&str> = allowed.split(' ').filter(|t| !t.is_empty()).collect();
-        !want.is_empty() && tokens.windows(want.len()).any(|w| w == want.as_slice())
-    })
-}
-
-/// Allowlist gate for an outbound call. `is_group` always fails.
-pub fn call_target_allowed(partner_id: &str, partner_name: &str, is_group: bool) -> bool {
+/// Earlier builds shipped a test lock that only allowed dialing three hard-coded test accounts
+/// (any contact whose name contained "hoang", "do thanh" or "dtc"). It is gone: every 1-1
+/// contact can be called. Group calls stay refused because the group-call signaling
+/// (`/api/voicecall/group/*`) is not implemented in this client.
+pub fn call_target_allowed(partner_id: &str, _partner_name: &str, is_group: bool) -> bool {
     if is_group {
         return false;
     }
-    let id = only_digits(partner_id);
-    if !id.is_empty() {
-        if CALL_ALLOWED_IDS.contains(&id.as_str()) {
-            return true;
-        }
-        if let Ok(extra) = std::env::var("ZALO_CALL_ALLOW_IDS") {
-            if extra
-                .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
-                .map(only_digits)
-                .any(|allowed| !allowed.is_empty() && allowed == id)
-            {
-                return true;
-            }
-        }
-    }
-    if partner_id.trim_start().to_ascii_lowercase().starts_with("group") {
-        return false;
-    }
-    if call_name_allowed(partner_name) || call_name_allowed(partner_id) {
-        return true;
-    }
-    // When `dispatch_send_signal_inner` only has `calleeId` (`partner_name == ""`), look up the
-    // contact's display name in the local gitignored `threads_cache.json` so allowlisted contacts
-    // (Hoang, Đỗ Thành, ĐTC) work out of the box without hardcoding live UIDs in Git.
-    if !id.is_empty() && partner_name.trim().is_empty() {
-        for t in crate::chat::load_threads_cache() {
-            if !t.is_group && only_digits(&t.id) == id && call_name_allowed(&t.name) {
-                return true;
-            }
-        }
-    }
-    false
+    let id = partner_id.trim();
+    !id.is_empty() && !id.to_ascii_lowercase().starts_with("group")
 }
+
 /// Same as [`call_target_allowed`], returning the Vietnamese refusal reason for the UI.
 pub fn ensure_call_target_allowed(
     partner_id: &str,
@@ -199,15 +98,10 @@ pub fn ensure_call_target_allowed(
     if call_target_allowed(partner_id, partner_name, is_group) {
         return Ok(());
     }
-    if is_group {
-        bail!("Cuộc gọi nhóm đang bị khoá: chỉ cho phép gọi 3 tài khoản test (Hoang, Đỗ Thành, ĐTC)");
+    if is_group || partner_id.trim().to_ascii_lowercase().starts_with("group") {
+        bail!("Chưa hỗ trợ gọi nhóm trong phiên bản này");
     }
-    let who = if partner_name.trim().is_empty() {
-        partner_id.trim().to_string()
-    } else {
-        partner_name.trim().to_string()
-    };
-    bail!("Đã khoá gọi ra: chỉ được gọi Hoang, Đỗ Thành, ĐTC (đích: {who})")
+    bail!("Không xác định được người nhận cuộc gọi")
 }
 
 /// Encrypt a JSON string into a `$`-terminated hex AES-128-CBC frame (`encrypt` in module `"vqv6"`).
@@ -278,14 +172,12 @@ pub fn compute_file_md5(path: &Path) -> Result<String> {
     }))
 }
 
-/// Locate `ZaloCall.exe` across workspace and standard Zalo PC install directories.
+/// Locate `ZaloCall.exe` in the standard Zalo PC install directory (`%LOCALAPPDATA%\Programs\Zalo`).
+///
+/// Working-directory-relative candidates and a developer's hard-coded `F:\…` path were removed:
+/// an executable must never be picked up from wherever the app happens to be started.
 pub fn find_zalocall_exe() -> Option<PathBuf> {
-    let mut candidates = vec![
-        PathBuf::from(r"..\Zalo-26.10.11\plugins\capture\ZaloCall.exe"),
-        PathBuf::from(r"Zalo-26.10.11\plugins\capture\ZaloCall.exe"),
-        PathBuf::from(r"plugins\capture\ZaloCall.exe"),
-        PathBuf::from(r"F:\CODE\Reverse-engineer\DATA\4_zalo\Zalo-26.10.11\plugins\capture\ZaloCall.exe"),
-    ];
+    let mut candidates: Vec<PathBuf> = Vec::new();
 
     if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
         let zalo_root = Path::new(&local_app).join("Programs").join("Zalo");
@@ -326,9 +218,7 @@ pub fn build_init_payload(s: &Session, command: &str, should_start_native: bool)
         })
         .unwrap_or_else(|| ("0".into(), "Zalo User".into()));
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let log_dir = cwd.join("dump");
-    let _ = std::fs::create_dir_all(&log_dir);
+    let log_dir = crate::paths::dump_dir();
 
     let call_log = log_dir.join("call.log").to_string_lossy().to_string();
     let zrtc_log = log_dir.join("zrtc.log").to_string_lossy().to_string();
@@ -487,19 +377,33 @@ async fn voicecall_get(s: &Session, endpoint_path: &str, payload: &Value) -> Res
     Ok(normalize_voicecall_data(raw_data))
 }
 
-/// Append a diagnostic line to `call_trace.log` (current directory) and mirror it to stderr.
+/// Is call tracing enabled? Only in dev mode (`--dev`) or with `ZALO_CALL_TRACE=1`.
+pub fn call_trace_enabled() -> bool {
+    crate::logger::is_dev_mode()
+        || std::env::var("ZALO_CALL_TRACE").ok().as_deref() == Some("1")
+}
+
+/// Append a diagnostic line to `logs/call_trace.log` (per-user data dir) and mirror it to stderr.
 ///
-/// The trace contains decrypted signaling payloads (call ids, session ids, RTP addresses),
-/// so treat `call_trace.log` like `session.json`: never commit it.
+/// The trace contains decrypted signaling payloads (call ids, session ids, RTP addresses), so it
+/// is **off by default**: it is only written in dev mode or with `ZALO_CALL_TRACE=1`
+/// ([`call_trace_enabled`]). Earlier builds always wrote it into the working directory.
 pub fn trace_line(tag: &str, body: impl AsRef<str>) {
     use std::io::Write;
+    if !call_trace_enabled() {
+        return;
+    }
     let body = body.as_ref();
     let ts = crate::login::unix_now();
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("call_trace.log")
+    let path = crate::paths::logs_dir().join("call_trace.log");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(&path) {
         let _ = writeln!(f, "[{ts}] {tag} {body}");
     }
     eprintln!("[call] {tag} {body}");
@@ -1613,17 +1517,8 @@ pub fn official_imei() -> String {
 /// `answer` (402).
 pub fn generate_call_session() -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    let hex = crate::param_cipher::random_hex(230);
-    let bytes = hex.as_bytes();
-    let mut raw = Vec::with_capacity(114);
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16).unwrap_or(0) as u8;
-        let lo = (bytes[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
-        raw.push((hi << 4) | lo);
-        i += 2;
-    }
-    URL_SAFE_NO_PAD.encode(raw)
+    // 115 bytes from the OS CSPRNG → 154 url-safe base64 chars (same shape as before).
+    URL_SAFE_NO_PAD.encode(crate::param_cipher::random_bytes(115))
 }
 
 pub fn build_pure_rust_invite_fields_with_port(
@@ -1942,7 +1837,7 @@ impl CallBridge {
                                 .unwrap_or(false);
                             if needs_uid {
                                 if s_lock.sync_profile_me().await.is_some() {
-                                    let _ = s_lock.save_to_file("session.json");
+                                    let _ = s_lock.save();
                                 }
                             }
                             s_lock.clone()
@@ -3023,39 +2918,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn outbound_call_lock_allows_only_test_accounts() {
-        // 19-digit mock thread ids / uins
-        assert!(call_target_allowed("1000000000000000001", "", false));
-        assert!(call_target_allowed("1000000000000000002", "", false));
-        assert!(call_target_allowed("1000000000000000003", "", false));
-        assert!(call_target_allowed("1000000000000000004", "", false));
-        assert!(call_target_allowed("1000000000000000005", "", false));
-        // 32-bit mock aliases
-        assert!(call_target_allowed("100000001", "", false));
-        assert!(call_target_allowed("100000002", "", false));
-        assert!(call_target_allowed("100000003", "", false));
-        // accent-folded display names
-        assert!(call_target_allowed("", "Hoàng", false));
-        assert!(call_target_allowed("", "Đỗ Thành", false));
-        assert!(call_target_allowed("", "ĐTC", false));
-        assert!(call_target_allowed("", "Nguyễn Hoàng (Zalo)", false));
-        // everyone else is refused
-        assert!(!call_target_allowed("123456789012345678", "", false));
+    fn any_one_to_one_contact_can_be_called() {
+        // The old test lock (three hard-coded accounts) is gone.
+        assert!(call_target_allowed("123456789012345678", "", false));
+        assert!(call_target_allowed("100000001", "Nguyễn Văn A", false));
+        assert!(ensure_call_target_allowed("123456789", "", false).is_ok());
+        // An empty target is still refused.
         assert!(!call_target_allowed("", "Nguyễn Văn A", false));
-        assert!(!call_target_allowed("", "", false));
-        // group calls are always refused, even for an allowlisted person
-        assert!(!call_target_allowed("1000000000000000001", "Hoàng", true));
-        assert!(!call_target_allowed("group_123", "", true));
-        assert!(!call_target_allowed("group_123", "", false));
-        assert!(ensure_call_target_allowed("123456789", "", false).is_err());
-        assert!(ensure_call_target_allowed("1000000000000000001", "", false).is_ok());
+        assert!(ensure_call_target_allowed("  ", "", false).is_err());
     }
 
     #[test]
-    fn fold_call_label_strips_vietnamese_diacritics() {
-        assert_eq!(fold_call_label("Đỗ Thành"), "do thanh");
-        assert_eq!(fold_call_label("  Hoàng  "), "hoang");
-        assert_eq!(fold_call_label("ĐTC 🚀"), "dtc");
+    fn group_calls_are_refused_honestly() {
+        assert!(!call_target_allowed("1000000000000000001", "Nhóm", true));
+        assert!(!call_target_allowed("group_123", "", false));
+        let err = ensure_call_target_allowed("group_123", "", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gọi nhóm"), "{err}");
     }
 
     #[test]
@@ -3263,7 +3143,7 @@ mod tests {
     #[ignore]
     async fn live_call_dtc_trace() {
         let mut s = Session::new(true, false, false).unwrap();
-        s.load_from_file("session.json").expect("load session.json");
+        s.load().expect("load session.json");
         let partner_id = "1000000000000000005";
         let mut ctrl_state = CtrlPollState::default();
         let _ = poll_voip_controls(&s, &mut ctrl_state).await;

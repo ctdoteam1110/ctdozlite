@@ -11,10 +11,9 @@ use std::fs;
 use zalo_rust::session::Session;
 
 fn save(name: &str, v: &Value) {
-    let _ = fs::create_dir_all("dump");
-    let path = format!("dump/probe-{name}.json");
+    let path = zalo_rust::paths::dump_dir().join(format!("probe-{name}.json"));
     let _ = fs::write(&path, serde_json::to_string_pretty(v).unwrap_or_default());
-    println!("  → đã lưu {path}");
+    println!("  → đã lưu {}", path.display());
 }
 
 /// Pull the `data` payload out of a Zalo envelope, JSON-decoding string payloads.
@@ -105,7 +104,7 @@ fn truncate(s: &str, n: usize) -> String {
 async fn main() -> Result<()> {
     println!("=== PROBE MEDIA / MSGTYPE / HISTORY ===");
     let mut s = Session::new(true, true, true)?;
-    s.load_from_file("session.json")?;
+    s.load()?;
     println!("Login: {:?}", s.login.as_ref().map(|l| &l.uin));
 
     // ---------- 1. get-last-msgs raw dump ----------

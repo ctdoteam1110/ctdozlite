@@ -36,19 +36,19 @@ pub fn encrypt_password(phone: &str, imei: &str, password: &str, salt: &str) -> 
     crate::crypto::encode_aes(enk.as_bytes(), &plain)
 }
 
-/// Salt generator for encrypt_password: 8 random alphanumerics.
+/// Salt generator for encrypt_password: 8 random alphanumerics from the OS CSPRNG.
+///
+/// Rejection sampling (bytes ≥ 252 are redrawn) keeps the 36-symbol alphabet unbiased.
 pub fn random_salt() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
     const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(1)
-        ^ ((std::process::id() as u64) << 17);
+    const LIMIT: u8 = (256 / ALPHA.len() * ALPHA.len()) as u8; // 252
     let mut out = String::with_capacity(8);
-    for _ in 0..8 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        out.push(ALPHA[(seed >> 33) as usize % ALPHA.len()] as char);
+    while out.len() < 8 {
+        for b in crate::param_cipher::random_bytes(16) {
+            if b < LIMIT && out.len() < 8 {
+                out.push(ALPHA[b as usize % ALPHA.len()] as char);
+            }
+        }
     }
     out
 }

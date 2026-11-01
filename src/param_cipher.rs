@@ -22,25 +22,51 @@ fn split_even_odd(s: &str) -> (Vec<char>, Vec<char>) {
     (even, odd)
 }
 
-/// `Math.random().toString(16).substr(2, n)` — 8 random hex chars would be 4 bytes;
-/// the bundle produces 6..12 hex chars.
-pub fn random_hex(len: usize) -> String {
+/// `n` bytes from the operating system's CSPRNG (`getrandom`).
+///
+/// Earlier builds derived every random value (device id, call session, salt, `zcid_ext`) from
+/// a time-seeded xorshift, which is predictable and repeats within the same nanosecond. If the
+/// OS generator is unavailable (practically never), a time/pid-seeded fallback keeps the client
+/// working rather than panicking.
+pub fn random_bytes(n: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; n];
+    if getrandom::getrandom(&mut buf).is_err() {
+        fallback_fill(&mut buf);
+    }
+    buf
+}
+
+/// Last-resort filler used only when the OS CSPRNG fails.
+fn fallback_fill(buf: &mut [u8]) {
     use std::time::{SystemTime, UNIX_EPOCH};
     let mut seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(1)
-        ^ (std::process::id() as u64) << 23;
-    const HEX: &[u8] = b"0123456789abcdef";
-    let mut out = String::with_capacity(len);
-    for _ in 0..len {
+        ^ ((std::process::id() as u64) << 23)
+        | 1;
+    for b in buf.iter_mut() {
         // xorshift64*
         seed ^= seed >> 12;
         seed ^= seed << 25;
         seed ^= seed >> 27;
-        let r = seed.wrapping_mul(0x2545F4914F6CDD1D);
-        out.push(HEX[(r >> 33) as usize % 16] as char);
+        *b = (seed.wrapping_mul(0x2545F4914F6CDD1D) >> 56) as u8;
     }
+}
+
+/// `len` lowercase hex characters of OS randomness.
+///
+/// Mirrors `Math.random().toString(16).substr(2, n)` in shape (the bundle produces 6..12 hex
+/// chars for `zcid_ext`), but uses the OS CSPRNG.
+pub fn random_hex(len: usize) -> String {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let bytes = random_bytes(len.div_ceil(2));
+    let mut out = String::with_capacity(len);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    out.truncate(len);
     out
 }
 
@@ -202,7 +228,18 @@ mod tests {
     #[test]
     fn random_hex_length() {
         assert_eq!(random_hex(10).len(), 10);
+        assert_eq!(random_hex(9).len(), 9);
+        assert_eq!(random_hex(0).len(), 0);
         assert!(random_hex(10).chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn random_values_do_not_repeat() {
+        // Back-to-back calls used to collide within the same clock tick (time-seeded PRNG).
+        let a = random_hex(32);
+        let b = random_hex(32);
+        assert_ne!(a, b);
+        assert_ne!(random_bytes(16), random_bytes(16));
     }
 
     /// Real capture from a live login: the server answered error_code 0 and returned this
