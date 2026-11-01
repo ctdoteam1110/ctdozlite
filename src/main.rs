@@ -133,7 +133,11 @@ async fn main() -> Result<()> {
         };
 
         let mut initial_threads = chat::load_threads_cache();
-        store::load_history_into_threads("zalo_history.db", &mut initial_threads, 200);
+        store::load_history_into_threads(
+            "zalo_history.db",
+            &mut initial_threads,
+            store::MessageStore::PRELOAD_MSGS,
+        );
 
         let app_session = s;
         let res = eframe::run_native(

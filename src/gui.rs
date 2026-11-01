@@ -494,22 +494,9 @@ impl ZaloGuiApp {
             })
             .unwrap_or_default();
 
-        let mut threads = if initial_threads.is_empty() {
-            crate::chat::load_threads_cache()
-        } else {
-            let mut cached = crate::chat::load_threads_cache();
-            for t in initial_threads {
-                if let Some(c) = cached
-                    .iter_mut()
-                    .find(|c| crate::chat::threads_represent_same_contact(c, &t))
-                {
-                    crate::chat::merge_thread_into(c, t, true);
-                } else {
-                    cached.push(t);
-                }
-            }
-            cached
-        };
+        // main() already read threads_cache.json and hydrated it from SQLite; reading, merging,
+        // hydrating and rewriting the cache again here doubled startup I/O.
+        let mut threads = initial_threads;
         if let Some(li) = session.login.as_ref() {
             if !li.send2me_id.is_empty() {
                 for t in threads.iter_mut() {
@@ -520,9 +507,6 @@ impl ZaloGuiApp {
             }
         }
         crate::chat::deduplicate_threads(&mut threads, None);
-        crate::store::load_history_into_threads("zalo_history.db", &mut threads, 200);
-        crate::chat::deduplicate_threads(&mut threads, None);
-        crate::chat::save_threads_cache(&threads);
 
         let selected_thread_index = threads
             .iter()

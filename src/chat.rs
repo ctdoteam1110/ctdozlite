@@ -338,9 +338,24 @@ pub fn load_threads_cache() -> Vec<Thread> {
     Vec::new()
 }
 
-/// Persist conversations and message history locally so they survive app restarts.
+/// Snapshot of the thread list for an instant first paint. Only the newest
+/// `PRELOAD_MSGS` messages per thread are kept: full history lives in `zalo_history.db`, and
+/// rewriting every message as pretty JSON on each change cost more than the SQLite write.
 pub fn save_threads_cache(threads: &[Thread]) {
-    if let Ok(text) = serde_json::to_string_pretty(threads) {
+    let keep = crate::store::MessageStore::PRELOAD_MSGS;
+    let slim: Vec<Thread> = threads
+        .iter()
+        .map(|t| Thread {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            preview: t.preview.clone(),
+            time: t.time.clone(),
+            avatar: t.avatar.clone(),
+            is_group: t.is_group,
+            messages: t.messages[t.messages.len().saturating_sub(keep)..].to_vec(),
+        })
+        .collect();
+    if let Ok(text) = serde_json::to_string(&slim) {
         let _ = std::fs::write("threads_cache.json", text);
     }
 }
@@ -438,7 +453,11 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
     }
 
     // Hydrate with locally persisted history from SQLite (`zalo_history.db`)
-    crate::store::load_history_into_threads("zalo_history.db", &mut threads, 200);
+    crate::store::load_history_into_threads(
+        "zalo_history.db",
+        &mut threads,
+        crate::store::MessageStore::PRELOAD_MSGS,
+    );
 
     // Merge user groups (`getlg/v4` + `getmg-v2`) into threads list, upgrading any placeholder group names
     if let Ok(mut groups) = get_groups(s).await {
