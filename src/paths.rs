@@ -110,6 +110,53 @@ pub fn cache_dir() -> PathBuf {
     dir
 }
 
+/// Delete `clipboard_*.png` files in [`cache_dir`] older than `max_age`; returns how many.
+///
+/// Pasting an image from the clipboard writes a temporary PNG into the cache before upload.
+/// Those files are never needed again, so they are swept once at GUI startup.
+pub fn cleanup_old_clipboard_images(max_age: std::time::Duration) -> usize {
+    cleanup_clipboard_images_in(&cache_dir(), max_age, std::time::SystemTime::now())
+}
+
+/// Testable core of [`cleanup_old_clipboard_images`]: only regular files (never symlinks or
+/// directories) named `clipboard_*.png` whose modification time is more than `max_age` before
+/// `now` are removed. Files with a future or unreadable mtime are kept.
+fn cleanup_clipboard_images_in(
+    dir: &Path,
+    max_age: std::time::Duration,
+    now: std::time::SystemTime,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with("clipboard_") && name.ends_with(".png")) {
+            continue;
+        }
+        // `DirEntry::metadata` does not follow symlinks, so a link is never treated as a file.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let old_enough = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > max_age);
+        if old_enough && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Diagnostic logs (`logs/`). Created on demand. Only written in dev mode.
 pub fn logs_dir() -> PathBuf {
     let dir = data_dir().join("logs");
@@ -249,6 +296,51 @@ mod tests {
         write_private(&f, b"second").unwrap();
         assert_eq!(std::fs::read(&f).unwrap(), b"second");
         assert!(!dir.join("session.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_removes_only_old_clipboard_pngs() {
+        use std::time::{Duration, SystemTime};
+        let dir = temp_dir("clip");
+        for name in [
+            "clipboard_1.png",
+            "clipboard_2.png",
+            "clipboard_3.jpg",
+            "sticker_1.png",
+            "my_clipboard_4.png",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        std::fs::create_dir(dir.join("clipboard_dir.png")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("sticker_1.png"), dir.join("clipboard_link.png"))
+            .unwrap();
+        let day = Duration::from_secs(24 * 3600);
+
+        // Just written: nothing is old enough yet.
+        assert_eq!(cleanup_clipboard_images_in(&dir, day, SystemTime::now()), 0);
+
+        // Two days later: only the two `clipboard_*.png` regular files go.
+        let later = SystemTime::now() + 2 * day;
+        assert_eq!(cleanup_clipboard_images_in(&dir, day, later), 2);
+        assert!(!dir.join("clipboard_1.png").exists());
+        assert!(!dir.join("clipboard_2.png").exists());
+        for kept in [
+            "clipboard_3.jpg",
+            "sticker_1.png",
+            "my_clipboard_4.png",
+            "clipboard_dir.png",
+        ] {
+            assert!(dir.join(kept).exists(), "{kept} must be kept");
+        }
+        #[cfg(unix)]
+        assert!(dir.join("clipboard_link.png").symlink_metadata().is_ok());
+
+        assert_eq!(
+            cleanup_clipboard_images_in(&dir.join("missing"), day, later),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

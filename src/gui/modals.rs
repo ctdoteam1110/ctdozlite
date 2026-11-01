@@ -581,9 +581,28 @@ impl ZaloGuiApp {
             return;
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            self.settings_modal_open = false;
-            self.settings.save();
+            if self.confirm_clear_cache {
+                // Esc dismisses the confirmation first, not the whole Settings window.
+                self.confirm_clear_cache = false;
+            } else {
+                self.settings_modal_open = false;
+                self.settings.save();
+            }
             return;
+        }
+
+        let demo = crate::gui::is_demo_mode();
+        // Measure the image cache lazily, only while the storage section is visible, and always
+        // on the worker's blocking pool (walking a large cache must never stall the UI thread).
+        if self.settings_tab == SettingsTab::Sync
+            && !demo
+            && self.cache_size.is_none()
+            && !self.cache_size_loading
+        {
+            if let Some(tx) = WORKER_TX.get() {
+                self.cache_size_loading = true;
+                let _ = tx.send(WorkerCmd::ComputeCacheSize);
+            }
         }
 
         let mut open = true;
@@ -595,11 +614,26 @@ impl ZaloGuiApp {
         let mut trigger_sync = false;
         let mut pick_dl_dir = false;
         let mut open_dl_dir = false;
+        let mut open_data_dir = false;
+        let mut refresh_cache_size = false;
+        let mut ask_clear_cache = false;
+        let cache_label = if demo {
+            // Fixed sample value: demo mode never reads or deletes the real data folder.
+            "48,2 MB".to_string()
+        } else if self.cache_size_loading {
+            "Đang tính…".to_string()
+        } else {
+            self.cache_size
+                .map(crate::download::format_bytes)
+                .unwrap_or_else(|| "—".to_string())
+        };
+        let data_dir_label = crate::paths::data_dir().display().to_string();
 
         egui::Window::new("settings_window_modal")
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
+            .interactable(!self.confirm_clear_cache)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .fixed_size(Vec2::new(win_w, win_h))
             .frame(
@@ -701,6 +735,8 @@ impl ZaloGuiApp {
                         .fill(pal.bg_chat_canvas)
                         .inner_margin(Margin::symmetric(24.0, 16.0))
                         .show(ui, |ui| {
+                            // The Frame inherits the surrounding `ui.horizontal`; lay the panel out top-down.
+                            ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             ui.set_width(content_w);
                             ui.set_height(win_h - 32.0);
 
@@ -1034,9 +1070,69 @@ impl ZaloGuiApp {
                                                         let total_msgs: usize = self.threads.iter().map(|t| t.messages.len()).sum();
                                                         ui.label(RichText::new(format!("Hiện có {} hội thoại ({total_msgs} tin nhắn) trong bộ nhớ.", self.threads.len())).color(pal.text_secondary).size(12.2));
                                                         ui.add_space(10.0);
-                                                        if ui.button(RichText::new(format!("{} Làm mới hội thoại", lucide::REFRESH)).size(13.0).strong()).clicked() {
+                                                        if ui.button(RichText::new(format!("{} Làm mới hội thoại", lucide::REFRESH)).size(13.0).strong().color(pal.text_primary)).clicked() {
                                                             trigger_sync = true;
                                                         }
+                                                    });
+                                                });
+                                            ui.add_space(14.0);
+
+                                            ui.label(RichText::new("Lưu trữ trên máy").color(pal.text_primary).size(13.5).strong());
+                                            ui.add_space(2.0);
+                                            ui.label(RichText::new("Phiên đăng nhập, lịch sử tin nhắn, cài đặt và cache ảnh của QTzalo đều nằm trong thư mục dữ liệu.").color(pal.text_secondary).size(12.0));
+                                            ui.add_space(6.0);
+                                            egui::Frame::none()
+                                                .fill(pal.bg_elevated)
+                                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                                .rounding(Rounding::same(8.0))
+                                                .inner_margin(Margin::symmetric(14.0, 10.0))
+                                                .show(ui, |ui| {
+                                                    ui.set_min_width(ui.available_width());
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new("Thư mục dữ liệu").color(pal.text_primary).size(13.2));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            if ui.button(format!("{} Mở thư mục dữ liệu", lucide::FOLDER_OPEN)).clicked() {
+                                                                open_data_dir = true;
+                                                            }
+                                                        });
+                                                    });
+                                                    ui.add_space(4.0);
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(&data_dir_label)
+                                                                .monospace()
+                                                                .size(11.5)
+                                                                .color(pal.text_muted),
+                                                        )
+                                                        .selectable(true)
+                                                        .wrap(),
+                                                    );
+                                                    ui.add_space(10.0);
+                                                    ui.separator();
+                                                    ui.add_space(6.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.vertical(|ui| {
+                                                            ui.horizontal(|ui| {
+                                                                ui.spacing_mut().item_spacing.x = 6.0;
+                                                                ui.label(RichText::new("Cache ảnh").color(pal.text_primary).size(13.2));
+                                                                ui.label(RichText::new(&cache_label).color(pal.text_primary).size(13.2).strong());
+                                                                let busy = !demo && self.cache_size_loading;
+                                                                if ui
+                                                                    .add_enabled(!busy, egui::Button::new(lucide::REFRESH).small().frame(false))
+                                                                    .on_hover_text("Tính lại dung lượng")
+                                                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                                                    .clicked()
+                                                                {
+                                                                    refresh_cache_size = true;
+                                                                }
+                                                            });
+                                                            ui.label(RichText::new("Ảnh, sticker và avatar đã tải về. Xoá đi sẽ được tải lại khi cần.").color(pal.text_secondary).size(11.8));
+                                                        });
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            if ui.button("Xoá cache ảnh").clicked() {
+                                                                ask_clear_cache = true;
+                                                            }
+                                                        });
                                                     });
                                                 });
                                         }
@@ -1345,6 +1441,7 @@ impl ZaloGuiApp {
                                         }
                                     }
                                 });
+                        }); // top-down content column
                         });
                 });
             });
@@ -1388,10 +1485,134 @@ impl ZaloGuiApp {
                 let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
             }
         }
+        if open_data_dir {
+            crate::download::open_folder(crate::paths::data_dir());
+        }
+        if refresh_cache_size {
+            if demo {
+                self.show_toast("Chế độ demo: không xoá dữ liệu thật.");
+            } else if let Some(tx) = WORKER_TX.get() {
+                self.cache_size = None;
+                self.cache_size_loading = true;
+                let _ = tx.send(WorkerCmd::ComputeCacheSize);
+            }
+        }
+        if ask_clear_cache {
+            self.confirm_clear_cache = true;
+        }
+        if self.confirm_clear_cache && open {
+            self.render_clear_cache_confirm(ctx, pal, demo, &cache_label);
+        }
 
         if !open {
+            self.confirm_clear_cache = false;
             self.settings_modal_open = false;
             self.settings.save();
+        }
+    }
+
+    /// "Xoá cache ảnh" confirmation, drawn above the Settings window.
+    fn render_clear_cache_confirm(
+        &mut self,
+        ctx: &egui::Context,
+        pal: &ThemePalette,
+        demo: bool,
+        cache_label: &str,
+    ) {
+        let mut confirmed = false;
+        let mut cancelled = false;
+        // Dim the Settings window behind the dialog.
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("clear_cache_confirm_backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let (_, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter()
+                    .rect_filled(screen, Rounding::ZERO, Color32::from_black_alpha(90));
+                if resp.clicked() {
+                    cancelled = true;
+                }
+            });
+        egui::Window::new("clear_cache_confirm")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .fixed_size(Vec2::new(400.0, 0.0))
+            .frame(
+                egui::Frame::none()
+                    .fill(pal.bg_chat_canvas)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(Margin::symmetric(22.0, 18.0)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Xoá cache ảnh?")
+                        .size(15.5)
+                        .color(pal.text_primary)
+                        .strong(),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Chỉ xoá ảnh, sticker và avatar đã lưu đệm trên máy ({cache_label}). \
+                         Chúng sẽ được tải lại từ Zalo khi bạn mở lại hội thoại."
+                    ))
+                    .size(13.0)
+                    .color(pal.text_primary),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Phiên đăng nhập, lịch sử tin nhắn và cài đặt sẽ KHÔNG bị ảnh hưởng.",
+                    )
+                    .size(12.2)
+                    .color(pal.text_secondary),
+                );
+                ui.add_space(16.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let del = egui::Button::new(
+                        RichText::new("Xoá cache ảnh")
+                            .size(13.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(pal.danger)
+                    .min_size(Vec2::new(0.0, 28.0));
+                    if ui
+                        .add(del)
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        confirmed = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Huỷ").size(13.0))
+                                .min_size(Vec2::new(64.0, 28.0)),
+                        )
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        cancelled = true;
+                    }
+                });
+            });
+        if confirmed {
+            self.confirm_clear_cache = false;
+            if demo {
+                self.show_toast("Chế độ demo: không xoá dữ liệu thật.");
+            } else if let Some(tx) = WORKER_TX.get() {
+                self.cache_size_loading = true;
+                let _ = tx.send(WorkerCmd::ClearImageCache);
+                self.show_toast("Đang xoá cache ảnh…");
+            }
+        } else if cancelled {
+            self.confirm_clear_cache = false;
         }
     }
 
