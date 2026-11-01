@@ -1,6 +1,33 @@
 use super::*;
 
 impl ZaloGuiApp {
+    /// Start loading the full-resolution texture the image viewer shows. Message bubbles and
+    /// the media grid keep a 480 px copy; the `hd_` key keeps this one (and its disk cache) apart.
+    fn request_hd_texture(&mut self, full_url: &str) -> Option<String> {
+        let lower_u = full_url.to_lowercase();
+        let is_direct_img = lower_u.contains("zdn.vn")
+            || lower_u.ends_with(".png")
+            || lower_u.ends_with(".jpg")
+            || lower_u.ends_with(".jpeg")
+            || lower_u.ends_with(".webp")
+            || lower_u.ends_with(".gif")
+            || lower_u.ends_with(".bmp")
+            || (!lower_u.starts_with("http://") && !lower_u.starts_with("https://"));
+        if full_url.is_empty() || !is_direct_img {
+            return None;
+        }
+        let hk = format!("hd_{}", crate::crypto::md5_hex(full_url));
+        if !self.sticker_textures.contains_key(&hk) && self.loading_stickers.insert(hk.clone()) {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::FetchStickerImage {
+                    key: hk.clone(),
+                    url: full_url.to_string(),
+                });
+            }
+        }
+        Some(hk)
+    }
+
     pub(super) fn render_chat_workspace(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         // Responsive breakpoints based on live viewport width
         // -------------------------------------------------------------------
@@ -890,6 +917,11 @@ impl ZaloGuiApp {
                                 Sense::click(),
                             );
                             let row_rect = alloc_rect.translate(Vec2::new(4.0, 0.0));
+                            // Space is still allocated so the scrollbar is right, but off-screen rows
+                            // skip painting, and with it the avatar download/texture for every thread.
+                            if !ui.is_rect_visible(row_rect) {
+                                continue;
+                            }
 
                             let bg = if is_selected {
                                 pal.bg_selected
@@ -1507,7 +1539,7 @@ impl ZaloGuiApp {
                                             {
                                                 self.image_viewer = Some(ImageViewerModal {
                                                     tex_key: tkey.clone(),
-                                                    hd_tex_key: None,
+                                                    hd_tex_key: self.request_hd_texture(full_u),
                                                     full_url: full_u.clone(),
                                                     title: ptitle.clone(),
                                                     sender: d_name.clone(),
@@ -2470,6 +2502,24 @@ impl ZaloGuiApp {
                         });
                     let mut pending_action: Option<(usize, BubbleAction)> = None;
                     let mut load_older_clicked = false;
+                    // Render only the newest `render_limit` bubbles: egui lays out every bubble
+                    // each frame, so a 2 000-message group re-laid out 2 000 galleys per repaint.
+                    // "Tải thêm tin nhắn cũ" widens the window before asking the server.
+                    if self.chat_render_window.0 != thread_id {
+                        self.chat_render_window = (thread_id.clone(), CHAT_RENDER_STEP);
+                    }
+                    let render_limit = self.chat_render_window.1;
+                    let mut widen_window = false;
+                    // Group sender -> avatar, built once per frame instead of a scan per bubble.
+                    let avatar_by_name: HashMap<&str, &str> = if is_group {
+                        self.threads
+                            .iter()
+                            .filter(|th| !th.is_group)
+                            .filter_map(|th| Some((th.name.as_str(), th.avatar.as_deref()?)))
+                            .collect()
+                    } else {
+                        HashMap::new()
+                    };
                     let msg_area_height =
                         (ui.available_height() - 66.0 - picker_reserve).max(100.0);
 
@@ -2520,15 +2570,19 @@ impl ZaloGuiApp {
                                                         )
                                                         .clicked()
                                                     {
-                                                        if let Some(tx) = WORKER_TX.get() {
-                                                            let _ = tx.send(
-                                                                WorkerCmd::LoadGroupHistory {
-                                                                    group_id: thread_id.clone(),
-                                                                    is_group,
-                                                                },
-                                                            );
+                                                        if thread.messages.len() > render_limit {
+                                                            widen_window = true;
+                                                        } else {
+                                                            if let Some(tx) = WORKER_TX.get() {
+                                                                let _ = tx.send(
+                                                                    WorkerCmd::LoadGroupHistory {
+                                                                        group_id: thread_id.clone(),
+                                                                        is_group,
+                                                                    },
+                                                                );
+                                                            }
+                                                            load_older_clicked = true;
                                                         }
-                                                        load_older_clicked = true;
                                                     }
                                                     ui.add_space(6.0);
                                                 });
@@ -2560,6 +2614,16 @@ impl ZaloGuiApp {
                                                 })
                                                 .map(|(i, _)| i)
                                                 .collect();
+                                            // Search and the starred filter still scan everything.
+                                            let visible_indices: Vec<usize> =
+                                                if only_starred || !in_chat_q.is_empty() {
+                                                    visible_indices
+                                                } else {
+                                                    let skip = visible_indices
+                                                        .len()
+                                                        .saturating_sub(render_limit);
+                                                    visible_indices[skip..].to_vec()
+                                                };
                                             if visible_indices.is_empty() && !in_chat_q.is_empty() {
                                                 ui.vertical_centered(|ui| {
                                                     ui.add_space(56.0);
@@ -2619,10 +2683,7 @@ impl ZaloGuiApp {
                                                 let sender_ava_opt = if !is_group {
                                                     thread_avatar.as_deref()
                                                 } else {
-                                                    self.threads
-                                                        .iter()
-                                                        .find(|th| !th.is_group && th.name == msg.sender)
-                                                        .and_then(|th| th.avatar.as_deref())
+                                                    avatar_by_name.get(msg.sender.as_str()).copied()
                                                 };
                                                 if let Some(action) = render_chat_bubble(
                                                     ui,
@@ -2651,6 +2712,9 @@ impl ZaloGuiApp {
                                     }
                                 });
                         });
+                    if widen_window {
+                        self.chat_render_window.1 += CHAT_RENDER_STEP;
+                    }
                     if load_older_clicked {
                         self.show_toast("Đang tải thêm tin nhắn cũ từ máy chủ Zalo…");
                     }
@@ -2780,36 +2844,7 @@ impl ZaloGuiApp {
                                     sender,
                                     time,
                                 } => {
-                                    let lower_u = full_url.to_lowercase();
-                                    let is_direct_img = lower_u.contains("zdn.vn")
-                                        || lower_u.ends_with(".png")
-                                        || lower_u.ends_with(".jpg")
-                                        || lower_u.ends_with(".jpeg")
-                                        || lower_u.ends_with(".webp")
-                                        || lower_u.ends_with(".gif")
-                                        || lower_u.ends_with(".bmp")
-                                        || (!lower_u.starts_with("http://")
-                                            && !lower_u.starts_with("https://"));
-                                    let hd_tex_key = if !full_url.is_empty() && is_direct_img {
-                                        let hk = format!(
-                                            "thumb_{}",
-                                            crate::crypto::md5_hex(&full_url)
-                                        );
-                                        if hk != tex_key
-                                            && !self.sticker_textures.contains_key(&hk)
-                                            && self.loading_stickers.insert(hk.clone())
-                                        {
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                                    key: hk.clone(),
-                                                    url: full_url.clone(),
-                                                });
-                                            }
-                                        }
-                                        Some(hk)
-                                    } else {
-                                        None
-                                    };
+                                    let hd_tex_key = self.request_hd_texture(&full_url);
                                     self.image_viewer = Some(ImageViewerModal {
                                         tex_key,
                                         hd_tex_key,

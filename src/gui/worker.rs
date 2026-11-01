@@ -1475,40 +1475,51 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                 let _ = std::fs::create_dir_all(cache_dir);
                                 let cache_path = cache_dir.join(format!("{key}.png"));
 
-                                let bytes_opt = if let Ok(disk_bytes) = std::fs::read(&cache_path) {
-                                    if image::load_from_memory(&disk_bytes).is_ok() {
-                                        Some(disk_bytes)
+                                // Bytes come from the disk cache, a local file or the network. They
+                                // used to be decoded once to validate and again to use; now once, on
+                                // the blocking pool so a large photo cannot stall the 2-thread runtime.
+                                let (bytes_opt, from_network) =
+                                    if let Ok(disk_bytes) = std::fs::read(&cache_path) {
+                                        (Some(disk_bytes), false)
+                                    } else if !url.starts_with("http://")
+                                        && !url.starts_with("https://")
+                                    {
+                                        (std::fs::read(&url).ok(), false)
                                     } else {
-                                        let _ = std::fs::remove_file(&cache_path);
-                                        None
-                                    }
-                                } else if !url.starts_with("http://") && !url.starts_with("https://") {
-                                    std::fs::read(&url).ok()
-                                } else {
-                                    let client = { session_clone.lock().await.clone().http };
-                                    if let Ok(resp) = client.get(&url).send().await {
-                                        if resp.status().is_success() {
-                                            if let Ok(b) = resp.bytes().await {
-                                                let vec = b.to_vec();
-                                                if image::load_from_memory(&vec).is_ok() {
-                                                    let _ = std::fs::write(&cache_path, &vec);
-                                                    Some(vec)
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
+                                        let client = { session_clone.lock().await.clone().http };
+                                        let body = match client.get(&url).send().await {
+                                            Ok(resp) if resp.status().is_success() => {
+                                                resp.bytes().await.ok()
                                             }
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
+                                            _ => None,
+                                        };
+                                        (body.map(|b| b.to_vec()), true)
+                                    };
+                                let Some(bytes) = bytes_opt else {
+                                    return;
                                 };
 
-                                if let Some(bytes) = bytes_opt {
-                                    if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    let Ok(mut dyn_img) = image::load_from_memory(&bytes) else {
+                                        if !from_network {
+                                            // Corrupt cache entry: drop it so the next request refetches.
+                                            let _ = std::fs::remove_file(&cache_path);
+                                        }
+                                        return;
+                                    };
+                                    if from_network {
+                                        let _ = std::fs::write(&cache_path, &bytes);
+                                    }
+                                    // Bubbles draw images at most 240 pt wide; full-size photos kept as
+                                    // textures cost ~8 MB each (1080p) and are never freed.
+                                    // The viewer's `hd_` textures stay full size.
+                                    if !key.starts_with("ava_")
+                                        && !key.starts_with("hd_")
+                                        && (dyn_img.width() > 480 || dyn_img.height() > 480)
+                                    {
+                                        dyn_img = dyn_img.thumbnail(480, 480);
+                                    }
+                                    {
                                         let mut rgba = dyn_img.to_rgba8();
                                         // Apply smooth anti-aliased circular alpha mask for avatar textures (`ava_*`)
                                         if key.starts_with("ava_") {
@@ -1559,7 +1570,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         });
                                         ctx_clone.request_repaint();
                                     }
-                                }
+                                })
+                                .await;
                             });
                         }
                         WorkerCmd::FetchStickerStore => {

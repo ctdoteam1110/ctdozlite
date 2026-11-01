@@ -331,6 +331,9 @@ impl AppSettings {
 }
 
 
+/// Bubbles rendered per step in the chat view; "Tải thêm tin nhắn cũ" adds another step.
+const CHAT_RENDER_STEP: usize = 150;
+
 pub struct ZaloGuiApp {
     // Theme state
     dark_mode: bool,
@@ -437,6 +440,8 @@ pub struct ZaloGuiApp {
     event_rx: Receiver<GuiEvent>,
     #[allow(dead_code)]
     event_tx: Sender<GuiEvent>,
+    /// (thread id, number of newest bubbles rendered) — see `CHAT_RENDER_STEP`.
+    chat_render_window: (String, usize),
 
     // Background poll trigger
     last_poll: std::time::Instant,
@@ -617,6 +622,7 @@ impl ZaloGuiApp {
             scanner_findings: Vec::new(),
             event_rx: rx,
             event_tx: tx.clone(),
+            chat_render_window: (String::new(), CHAT_RENDER_STEP),
             last_poll: std::time::Instant::now(),
         };
 
