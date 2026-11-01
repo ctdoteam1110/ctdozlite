@@ -26,6 +26,8 @@ mod messages;
 mod modals;
 mod stickers;
 mod theme;
+mod demo;
+mod sidebar;
 mod worker;
 mod workspace;
 
@@ -214,6 +216,45 @@ struct AppSettings {
     // 7. Thiết bị cuộc gọi (Mic & Camera)
     selected_mic_device: String,
     selected_camera_device: String,
+    // 8. Bố cục (thu gọn cột)
+    nav_collapsed: bool,
+    list_collapsed: bool,
+    list_width: f32,
+}
+
+/// Set once at startup when the GUI runs with `--demo` (offline sample data, nothing persisted).
+static DEMO_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn is_demo_mode() -> bool {
+    DEMO_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Left-navigation destinations (mirrors the "Hộp thư / Lưu trữ / Danh bạ" sidebar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavSection {
+    Messages,
+    Other,
+    Unread,
+    Strangers,
+    Hidden,
+    Friends,
+    Groups,
+    FriendRequests,
+}
+
+impl NavSection {
+    fn title(self) -> &'static str {
+        match self {
+            NavSection::Messages => "Tin nhắn",
+            NavSection::Other => "Khác",
+            NavSection::Unread => "Chưa đọc",
+            NavSection::Strangers => "Người lạ",
+            NavSection::Hidden => "Trò chuyện ẩn",
+            NavSection::Friends => "Bạn bè",
+            NavSection::Groups => "Nhóm và cộng đồng",
+            NavSection::FriendRequests => "Lời mời kết bạn",
+        }
+    }
 }
 
 impl Default for AppSettings {
@@ -242,7 +283,7 @@ impl Default for AppSettings {
             friend_src_qr: true,
             friend_src_group: true,
             friend_src_card: true,
-            theme_mode: "dark".into(),
+            theme_mode: "light".into(),
             use_avatar_as_wallpaper: false,
             enable_notifications: true,
             play_notification_sound: false,
@@ -258,21 +299,31 @@ impl Default for AppSettings {
             enable_sticker_keyword_search: true,
             selected_mic_device: String::new(),
             selected_camera_device: String::new(),
+            nav_collapsed: false,
+            list_collapsed: false,
+            list_width: 320.0,
         }
     }
 }
 
 impl AppSettings {
     fn load() -> Self {
-        std::fs::read_to_string("app_settings.json")
+        if is_demo_mode() {
+            return Self::default();
+        }
+        std::fs::read_to_string(crate::paths::settings_file())
             .ok()
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
             .unwrap_or_default()
     }
 
     fn save(&self) {
+        // Demo mode never writes anything to disk.
+        if is_demo_mode() {
+            return;
+        }
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write("app_settings.json", json);
+            let _ = crate::paths::write_private(&crate::paths::settings_file(), json);
         }
     }
 }
@@ -379,6 +430,26 @@ pub struct ZaloGuiApp {
 
     // Background poll trigger
     last_poll: std::time::Instant,
+
+    // Redesigned workspace state
+    /// Offline sample workspace (`--demo`): no worker, no network, nothing written to disk.
+    demo_mode: bool,
+    nav_section: NavSection,
+    /// `thread_id → "Tên đang nhập"` typing indicators shown above the composer.
+    typing_indicators: HashMap<String, String>,
+    /// Known member counts for group threads (header subtitle "N thành viên").
+    group_member_counts: HashMap<String, usize>,
+    emoji_popup_open: bool,
+    attach_menu_open: bool,
+    list_filter_menu_open: bool,
+    search_focus_pending: bool,
+    /// Bytes used by local data (history DB + caches), refreshed in the background.
+    local_storage_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    storage_scan_at: Option<std::time::Instant>,
+    /// Demo-only: resize the window on the first frame (`QTZALO_DEMO_SIZE=WxH`, for screenshots).
+    pending_viewport_size: Option<Vec2>,
+    /// Session-only manual nav toggle; wins over the narrow-window auto-collapse (not persisted).
+    nav_user_override: Option<bool>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -401,6 +472,10 @@ impl ZaloGuiApp {
         dev_mode: bool,
         initial_threads: Vec<Thread>,
     ) -> Self {
+        let demo_mode = std::env::args().any(|a| a == "--demo");
+        if demo_mode {
+            DEMO_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         setup_custom_fonts(&cc.egui_ctx);
         let loaded_settings = AppSettings::load();
         crate::media::set_selected_mic_device(&loaded_settings.selected_mic_device);
@@ -413,6 +488,48 @@ impl ZaloGuiApp {
         }
 
         let (tx, rx) = channel();
+
+        if demo_mode {
+            let demo = demo::DemoWorkspace::build();
+            let mut app = Self::empty_state(cc, loaded_settings, dark_mode, dev_mode, rx, tx);
+            app.demo_mode = true;
+            app.is_logged_in = true;
+            app.user_name = demo.user_name;
+            app.user_uin = "demo".into();
+            app.threads = demo.threads;
+            app.unread_counts = demo.unread_counts;
+            app.typing_indicators = demo.typing;
+            app.group_member_counts = demo.member_counts;
+            app.friend_status_map = demo.friend_status;
+            app.selected_thread_index = 0;
+            app.status_msg = "Chế độ demo · Không kết nối mạng".into();
+            // Demo-only knobs used by automated screenshots.
+            let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+            if let Some(size) = env("QTZALO_DEMO_SIZE") {
+                if let Some((w, h)) = size.split_once('x') {
+                    if let (Ok(w), Ok(h)) = (w.trim().parse::<f32>(), h.trim().parse::<f32>()) {
+                        app.pending_viewport_size = Some(Vec2::new(w, h));
+                    }
+                }
+            }
+            if env("QTZALO_DEMO_THEME").as_deref() == Some("dark") {
+                app.dark_mode = true;
+                app.theme_dirty = true;
+            }
+            app.settings.nav_collapsed = env("QTZALO_DEMO_NAV").as_deref() == Some("collapsed");
+            app.settings.list_collapsed = env("QTZALO_DEMO_LIST").as_deref() == Some("collapsed");
+            if let Some(idx) = env("QTZALO_DEMO_THREAD").and_then(|v| v.parse::<usize>().ok()) {
+                app.selected_thread_index = idx.min(app.threads.len().saturating_sub(1));
+            }
+            if env("QTZALO_DEMO_DRAWER").as_deref() == Some("open") {
+                app.info_drawer_open = true;
+            }
+            // Deliberately NOT spawning the session worker: WORKER_TX stays unset, so every
+            // `WORKER_TX.get()` send is a no-op and no network request can leave the process.
+            drop(session);
+            let _ = initial_threads;
+            return app;
+        }
 
         let is_logged_in = session.login.is_some();
         let (user_name, user_uin, user_avatar) = session
@@ -457,7 +574,7 @@ impl ZaloGuiApp {
             }
         }
         crate::chat::deduplicate_threads(&mut threads, None);
-        crate::store::load_history_into_threads("zalo_history.db", &mut threads, 200);
+        crate::store::load_history_into_threads(crate::paths::history_db(), &mut threads, 200);
         crate::chat::deduplicate_threads(&mut threads, None);
         crate::chat::save_threads_cache(&threads);
 
@@ -468,13 +585,43 @@ impl ZaloGuiApp {
             .map(|(idx, _)| idx)
             .unwrap_or(0);
 
-        let app = Self {
+        let mut app = Self::empty_state(cc, loaded_settings, dark_mode, dev_mode, rx, tx.clone());
+        app.is_logged_in = is_logged_in;
+        app.user_name = user_name;
+        app.user_uin = user_uin;
+        app.user_avatar = user_avatar;
+        app.threads = threads;
+        app.selected_thread_index = selected_thread_index;
+
+        spawn_session_worker(session, tx, cc.egui_ctx.clone());
+
+        if let Some(wtx) = WORKER_TX.get() {
+            if is_logged_in {
+                let _ = wtx.send(WorkerCmd::RefreshThreads);
+            } else {
+                let _ = wtx.send(WorkerCmd::RequestQr);
+            }
+        }
+
+        app
+    }
+
+    /// Base state shared by the normal and `--demo` constructors.
+    fn empty_state(
+        cc: &eframe::CreationContext<'_>,
+        settings: AppSettings,
+        dark_mode: bool,
+        dev_mode: bool,
+        rx: Receiver<GuiEvent>,
+        tx: Sender<GuiEvent>,
+    ) -> Self {
+        Self {
             dark_mode,
             theme_dirty: false,
-            is_logged_in,
-            user_name,
-            user_uin,
-            user_avatar,
+            is_logged_in: false,
+            user_name: String::new(),
+            user_uin: String::new(),
+            user_avatar: None,
             login_tab: LoginTab::QrCode,
             phone_input: String::new(),
             password_input: String::new(),
@@ -482,8 +629,8 @@ impl ZaloGuiApp {
             login_status_msg: String::new(),
             qr_texture: None,
             qr_status: "Đang tạo mã QR đăng nhập…".into(),
-            threads,
-            selected_thread_index,
+            threads: Vec::new(),
+            selected_thread_index: 0,
             thread_filter: ThreadFilter::All,
             search_query: String::new(),
             input_message: String::new(),
@@ -494,7 +641,7 @@ impl ZaloGuiApp {
             active_call: None,
             image_viewer: None,
             status_msg: "Trực tuyến · Sẵn sàng".into(),
-            info_drawer_open: true,
+            info_drawer_open: false,
             profile_menu_open: false,
             toast_notice: None,
             phone_modal_open: false,
@@ -546,28 +693,28 @@ impl ZaloGuiApp {
             allow_quit: false,
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
-            settings: loaded_settings,
+            settings,
             dev_mode,
             dev_panel_open: false,
             dev_tab: DevTab::Logs,
             selected_log: None,
             scanner_findings: Vec::new(),
             event_rx: rx,
-            event_tx: tx.clone(),
+            event_tx: tx,
             last_poll: std::time::Instant::now(),
-        };
-
-        spawn_session_worker(session, tx, cc.egui_ctx.clone());
-
-        if let Some(wtx) = WORKER_TX.get() {
-            if is_logged_in {
-                let _ = wtx.send(WorkerCmd::RefreshThreads);
-            } else {
-                let _ = wtx.send(WorkerCmd::RequestQr);
-            }
+            demo_mode: false,
+            nav_section: NavSection::Messages,
+            typing_indicators: HashMap::new(),
+            group_member_counts: HashMap::new(),
+            emoji_popup_open: false,
+            attach_menu_open: false,
+            list_filter_menu_open: false,
+            search_focus_pending: false,
+            local_storage_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            storage_scan_at: None,
+            pending_viewport_size: None,
+            nav_user_override: None,
         }
-
-        app
     }
 
     fn palette(&self) -> ThemePalette {
@@ -1125,9 +1272,13 @@ impl eframe::App for ZaloGuiApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
-        if self.theme_dirty {
+        // eframe may re-apply the OS light/dark visuals (follow_system_theme); keep our palette.
+        if self.theme_dirty || ctx.style().visuals.dark_mode != self.dark_mode {
             self.palette().apply_to_ctx(ctx);
             self.theme_dirty = false;
+        }
+        if let Some(size) = self.pending_viewport_size.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
 
         self.check_events(ctx);
@@ -1283,17 +1434,17 @@ impl ZaloGuiApp {
         let total_unread: usize = self.unread_counts.values().sum();
 
         egui::TopBottomPanel::top("custom_title_bar")
-            .exact_height(32.0)
+            .exact_height(34.0)
+            .show_separator_line(true)
             .frame(
                 egui::Frame::none()
-                    .fill(pal.bg_app)
+                    .fill(pal.bg_nav)
                     .inner_margin(Margin {
-                        left: 12.0,
+                        left: 14.0,
                         right: 0.0,
                         top: 0.0,
                         bottom: 0.0,
-                    })
-                    .stroke(Stroke::new(1.0_f32, pal.border)),
+                    }),
             )
             .show(ctx, |ui| {
                 let bar_rect = ui.max_rect();
@@ -1317,30 +1468,33 @@ impl ZaloGuiApp {
 
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new("Zalo")
+                        RichText::new("QTzalo")
                             .color(pal.text_primary)
                             .size(13.5)
                             .strong(),
                     );
 
-                    // Subtle "Native v0.0.1" pill badge
+                    // Subtle version pill badge
                     egui::Frame::none()
-                        .fill(pal.primary.linear_multiply(0.14))
-                        .rounding(Rounding::same(4.0))
-                        .inner_margin(Margin::symmetric(5.0, 1.5))
+                        .fill(pal.primary.linear_multiply(0.12))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::symmetric(6.0, 1.5))
                         .show(ui, |ui| {
                             ui.label(
-                                RichText::new(format!("Native v{}", env!("CARGO_PKG_VERSION")))
-                                    .color(pal.primary)
-                                    .size(10.5)
-                                    .strong(),
+                                RichText::new(if self.demo_mode {
+                                    format!("v{} · demo", env!("CARGO_PKG_VERSION"))
+                                } else {
+                                    format!("v{}", env!("CARGO_PKG_VERSION"))
+                                })
+                                .color(pal.primary)
+                                .size(10.5),
                             );
                         });
 
                     if total_unread > 0 {
                         ui.add_space(4.0);
                         egui::Frame::none()
-                            .fill(pal.danger)
+                            .fill(pal.badge)
                             .rounding(Rounding::same(8.0))
                             .inner_margin(Margin::symmetric(6.0, 1.5))
                             .show(ui, |ui| {
@@ -1366,7 +1520,7 @@ impl ZaloGuiApp {
 
                         // Close Button (46x32)
                         let (close_rect, close_resp) =
-                            ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
+                            ui.allocate_exact_size(Vec2::new(46.0, 34.0), Sense::click());
                         if close_resp.hovered() {
                             ui.painter().rect_filled(
                                 close_rect,
@@ -1409,7 +1563,7 @@ impl ZaloGuiApp {
 
                         // Maximize / Restore Button (46x32)
                         let (max_rect, max_resp) =
-                            ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
+                            ui.allocate_exact_size(Vec2::new(46.0, 34.0), Sense::click());
                         if max_resp.hovered() {
                             ui.painter()
                                 .rect_filled(max_rect, Rounding::ZERO, pal.bg_hover);
@@ -1437,7 +1591,7 @@ impl ZaloGuiApp {
                                 if max_resp.hovered() {
                                     pal.bg_hover
                                 } else {
-                                    pal.bg_app
+                                    pal.bg_nav
                                 },
                             );
                             ui.painter()
@@ -1460,7 +1614,7 @@ impl ZaloGuiApp {
 
                         // Minimize Button (46x32)
                         let (min_rect, min_resp) =
-                            ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
+                            ui.allocate_exact_size(Vec2::new(46.0, 34.0), Sense::click());
                         if min_resp.hovered() {
                             ui.painter()
                                 .rect_filled(min_rect, Rounding::ZERO, pal.bg_hover);
@@ -1481,7 +1635,7 @@ impl ZaloGuiApp {
 
                         // Quick Theme Toggle (36x32)
                         let (th_rect, th_resp) =
-                            ui.allocate_exact_size(Vec2::new(36.0, 32.0), Sense::click());
+                            ui.allocate_exact_size(Vec2::new(36.0, 34.0), Sense::click());
                         if th_resp.hovered() {
                             ui.painter()
                                 .rect_filled(th_rect, Rounding::ZERO, pal.bg_hover);

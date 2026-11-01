@@ -30,6 +30,23 @@ pub(super) struct ThemePalette {
     pub(super) bubble_in_border: Color32,
     pub(super) bubble_in_text: Color32,
     pub(super) bubble_in_meta: Color32,
+    /// Left navigation sidebar surface.
+    pub(super) bg_nav: Color32,
+    /// Conversation list surface.
+    pub(super) bg_list: Color32,
+    /// Active navigation item fill.
+    pub(super) nav_active: Color32,
+    /// Chat canvas gradient (top-left → bottom-right).
+    pub(super) canvas_top: Color32,
+    pub(super) canvas_bottom: Color32,
+    /// Unread badge fill.
+    pub(super) badge: Color32,
+    /// Date chip / reaction chip surface.
+    pub(super) chip_bg: Color32,
+    /// Composer input surface.
+    pub(super) composer_bg: Color32,
+    /// Soft drop shadow tint.
+    pub(super) shadow: Color32,
 }
 
 impl ThemePalette {
@@ -53,42 +70,61 @@ impl ThemePalette {
             accent_online: Color32::from_rgb(152, 195, 121), // #98C379 Atom @hue-4 Green
             danger: Color32::from_rgb(224, 108, 117),       // #E06C75 Atom @hue-5 Coral Red
             warning: Color32::from_rgb(229, 192, 123),      // #E5C07B Atom @hue-62 Warm Gold
-            bubble_out_bg: Color32::from_rgb(37, 55, 77),   // #25374D Zalo Dark Slate-Navy Outgoing Bubble
-            bubble_out_text: Color32::from_rgb(235, 240, 246), // #EBF0F6
-            bubble_out_meta: Color32::from_rgb(154, 171, 192), // #9AABC0
+            bubble_out_bg: Color32::from_rgb(46, 110, 230), // solid blue outgoing bubble
+            bubble_out_text: Color32::from_rgb(255, 255, 255),
+            bubble_out_meta: Color32::from_rgba_unmultiplied(255, 255, 255, 190),
             bubble_in_bg: Color32::from_rgb(50, 56, 66),    // #323842 Atom Elevated Incoming Bubble
             bubble_in_border: Color32::from_rgb(62, 68, 81), // #3E4451 Atom Gutter Border
             bubble_in_text: Color32::from_rgb(215, 218, 224), // #D7DAE0
             bubble_in_meta: Color32::from_rgb(142, 150, 165), // #8E96A5
+            bg_nav: Color32::from_rgb(28, 31, 37),
+            bg_list: Color32::from_rgb(33, 37, 43),
+            nav_active: Color32::from_rgb(45, 62, 92),
+            canvas_top: Color32::from_rgb(40, 44, 52),
+            canvas_bottom: Color32::from_rgb(31, 38, 50),
+            badge: Color32::from_rgb(64, 132, 255),
+            chip_bg: Color32::from_rgb(50, 56, 66),
+            composer_bg: Color32::from_rgb(44, 49, 58),
+            shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 60),
         }
     }
 
     pub(super) fn light() -> Self {
+        // Airy light theme: frosted blue-gray rails, soft blue selection, solid blue outgoing bubbles.
         Self {
             is_dark: false,
-            bg_app: Color32::from_rgb(255, 255, 255),      // #FFFFFF
-            bg_sidebar: Color32::from_rgb(255, 255, 255),  // #FFFFFF
-            bg_chat_canvas: Color32::from_rgb(235, 240, 247), // Authentic Zalo PC cool blue-gray canvas
-            bg_elevated: Color32::from_rgb(255, 255, 255), // #FFFFFF
-            bg_hover: Color32::from_rgb(241, 245, 249),    // #F1F5F9
-            bg_selected: Color32::from_rgb(229, 241, 255), // #E5F1FF Zalo active row
-            bg_input: Color32::from_rgb(248, 250, 252),    // #F8FAFC
-            border: Color32::from_rgb(226, 232, 240),      // #E2E8F0
-            text_primary: Color32::from_rgb(15, 23, 42),   // #0F172A (16.1:1 contrast)
-            text_secondary: Color32::from_rgb(71, 85, 105), // #475569 (7.2:1 contrast)
-            text_muted: Color32::from_rgb(100, 116, 139),  // #64748B (4.6:1 contrast)
-            primary: Color32::from_rgb(0, 104, 255),       // #0068FF Zalo Blue
-            primary_hover: Color32::from_rgb(37, 99, 235), // #2563EB
-            accent_online: Color32::from_rgb(5, 150, 105), // #059669 Emerald
-            danger: Color32::from_rgb(220, 38, 38),        // #DC2626
-            warning: Color32::from_rgb(217, 119, 6),       // #D97706
-            bubble_out_bg: Color32::from_rgb(229, 239, 255), // Zalo Desktop Light Outgoing (#E5EFFF)
-            bubble_out_text: Color32::from_rgb(15, 23, 42),  // Crisp dark text on light blue (14:1)
-            bubble_out_meta: Color32::from_rgb(71, 92, 122),
-            bubble_in_bg: Color32::WHITE,
-            bubble_in_border: Color32::from_rgb(216, 224, 236),
-            bubble_in_text: Color32::from_rgb(15, 23, 42),
-            bubble_in_meta: Color32::from_rgb(100, 116, 139),
+            bg_app: Color32::from_rgb(243, 247, 252),       // title bar blends with the nav rail
+            bg_sidebar: Color32::from_rgb(248, 251, 255),   // headers / drawers
+            bg_chat_canvas: Color32::from_rgb(244, 249, 254),
+            bg_elevated: Color32::from_rgb(255, 255, 255),
+            bg_hover: Color32::from_rgb(232, 240, 250),
+            bg_selected: Color32::from_rgb(207, 227, 253),  // selected conversation row
+            bg_input: Color32::from_rgb(255, 255, 255),
+            border: Color32::from_rgb(224, 232, 242),
+            text_primary: Color32::from_rgb(24, 33, 48),
+            text_secondary: Color32::from_rgb(84, 96, 114),
+            text_muted: Color32::from_rgb(128, 140, 158),
+            primary: Color32::from_rgb(10, 110, 245),        // #0A6EF5
+            primary_hover: Color32::from_rgb(8, 94, 214),
+            accent_online: Color32::from_rgb(22, 163, 74),
+            danger: Color32::from_rgb(220, 38, 38),
+            warning: Color32::from_rgb(217, 119, 6),
+            bubble_out_bg: Color32::from_rgb(10, 110, 245),
+            bubble_out_text: Color32::WHITE,
+            bubble_out_meta: Color32::from_rgba_unmultiplied(255, 255, 255, 200),
+            bubble_in_bg: Color32::from_rgb(242, 244, 247),
+            bubble_in_border: Color32::from_rgb(232, 236, 242),
+            bubble_in_text: Color32::from_rgb(24, 33, 48),
+            bubble_in_meta: Color32::from_rgb(128, 140, 158),
+            bg_nav: Color32::from_rgb(243, 247, 252),
+            bg_list: Color32::from_rgb(249, 251, 254),
+            nav_active: Color32::from_rgb(214, 230, 251),
+            canvas_top: Color32::from_rgb(252, 253, 255),
+            canvas_bottom: Color32::from_rgb(225, 240, 250),
+            badge: Color32::from_rgb(10, 110, 245),
+            chip_bg: Color32::from_rgb(255, 255, 255),
+            composer_bg: Color32::from_rgb(255, 255, 255),
+            shadow: Color32::from_rgba_unmultiplied(30, 60, 110, 22),
         }
     }
 
@@ -134,8 +170,10 @@ impl ThemePalette {
 
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.button_padding = Vec2::new(10.0, 6.0);
-        style.spacing.scroll = egui::style::ScrollStyle::solid();
+        // Thin floating scroll bars (appear on hover) keep the airy look of the reference design.
+        style.spacing.scroll = egui::style::ScrollStyle::floating();
         style.spacing.scroll.bar_width = 6.0;
+        style.spacing.scroll.floating_allocated_width = 0.0;
         style.visuals = visuals;
         ctx.set_style(style);
     }
@@ -147,14 +185,14 @@ impl ThemePalette {
 
 pub(super) fn avatar_color_for(name: &str, is_group: bool) -> Color32 {
     const PALETTE: &[Color32] = &[
-        Color32::from_rgb(64, 120, 192),  // Atom Blue (#4078C0)
-        Color32::from_rgb(56, 148, 160),  // Atom Cyan (#3894A0)
-        Color32::from_rgb(152, 88, 178),  // Atom Purple (#9858B2)
-        Color32::from_rgb(190, 80, 70),   // Atom Red (#BE5046)
-        Color32::from_rgb(184, 118, 62),  // Atom Orange (#B8763E)
-        Color32::from_rgb(98, 148, 72),   // Atom Green (#629448)
-        Color32::from_rgb(82, 116, 196),  // Atom Indigo
-        Color32::from_rgb(72, 138, 182),  // Atom Cerulean
+        Color32::from_rgb(24, 132, 236),  // blue
+        Color32::from_rgb(240, 129, 78),  // orange
+        Color32::from_rgb(123, 97, 255),  // violet
+        Color32::from_rgb(28, 176, 125),  // green
+        Color32::from_rgb(232, 121, 168), // pink
+        Color32::from_rgb(20, 158, 196),  // cyan
+        Color32::from_rgb(234, 88, 92),   // coral
+        Color32::from_rgb(92, 120, 220),  // indigo
     ];
     let mut hash: usize = if is_group { 3 } else { 0 };
     for b in name.bytes() {
@@ -172,6 +210,28 @@ pub(super) fn truncate_chars<'a>(s: &'a str, max_chars: usize) -> std::borrow::C
 }
 
 /// Extract up to 2 uppercase initials from a display name (e.g. `"Nguyễn An"` -> `"NA"`, `"Hoang"` -> `"H"`).
+///
+/// Group names drop a leading "Nhóm" and use their first two words
+/// (`"Nhóm Thiết kế"` -> `"TK"`, `"Đội bóng công ty"` -> `"ĐB"`).
+pub(super) fn avatar_initials_for(name: &str, is_group: bool) -> String {
+    if is_group {
+        let mut words: Vec<&str> = name.split_whitespace().collect();
+        if words.len() >= 2 && words[0].to_lowercase() == "nhóm" {
+            words.remove(0);
+        }
+        let initials: String = words
+            .iter()
+            .take(2)
+            .filter_map(|w| w.chars().next())
+            .flat_map(|c| c.to_uppercase())
+            .collect();
+        if !initials.is_empty() {
+            return initials;
+        }
+    }
+    avatar_initials(name)
+}
+
 pub(super) fn avatar_initials(name: &str) -> String {
     let words: Vec<&str> = name.split_whitespace().filter(|w| !w.is_empty()).collect();
     if words.len() >= 2 {
@@ -271,8 +331,8 @@ pub(super) fn paint_user_avatar(
 
     let av_col = avatar_color_for(name, is_group);
     painter.circle_filled(center, radius, av_col);
-    let initial = if radius >= 18.0 {
-        avatar_initials(name)
+    let initial = if radius >= 14.0 {
+        avatar_initials_for(name, is_group)
     } else {
         name.chars()
             .next()
@@ -284,7 +344,7 @@ pub(super) fn paint_user_avatar(
         center,
         egui::Align2::CENTER_CENTER,
         initial,
-        FontId::proportional((radius * 0.72).max(11.0)),
+        FontId::proportional((radius * 0.72).max(10.5)),
         Color32::WHITE,
     );
 }
@@ -339,6 +399,24 @@ pub mod lucide {
     pub const CHEVRON_RIGHT: &str = "\u{e06f}";
     pub const CHEVRON_DOWN: &str = "\u{e06d}";
     pub const USER: &str = "\u{e19f}";
+    pub const INBOX: &str = "\u{e0f7}";
+    pub const ARCHIVE: &str = "\u{e041}";
+    pub const MESSAGES_SQUARE: &str = "\u{e40d}";
+    pub const MESSAGE_CIRCLE_MORE: &str = "\u{e565}";
+    pub const USER_SEARCH: &str = "\u{e578}";
+    pub const EYE_OFF: &str = "\u{e0bb}";
+    pub const HARD_DRIVE: &str = "\u{e0ed}";
+    pub const TAG: &str = "\u{e17f}";
+    pub const EDIT: &str = "\u{e172}";
+    pub const PANEL_LEFT_CLOSE: &str = "\u{e21c}";
+    pub const PANEL_LEFT_OPEN: &str = "\u{e21d}";
+    pub const CHEVRONS_LEFT: &str = "\u{e072}";
+    pub const CHEVRONS_RIGHT: &str = "\u{e073}";
+    pub const FILE: &str = "\u{e0c0}";
+    pub const STICKER: &str = "\u{e302}";
+    pub const ARROW_UP: &str = "\u{e04a}";
+    pub const ELLIPSIS: &str = "\u{e0b6}";
+    pub const HEART: &str = "\u{e0f2}";
 }
 
 pub(super) fn draw_lucide_icon(painter: &egui::Painter, center: Pos2, icon: &str, size: f32, color: Color32) {
@@ -355,16 +433,8 @@ pub(super) fn draw_icon_search(painter: &egui::Painter, center: Pos2, size: f32,
     draw_lucide_icon(painter, center, lucide::SEARCH, size, color);
 }
 
-pub(super) fn draw_icon_refresh(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    draw_lucide_icon(painter, center, lucide::REFRESH, size, color);
-}
-
 pub(super) fn draw_icon_sticker(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     draw_lucide_icon(painter, center, lucide::SMILE, size, color);
-}
-
-pub(super) fn draw_icon_send(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    draw_lucide_icon(painter, center, lucide::SEND, size, color);
 }
 
 pub(super) fn draw_icon_phone(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
@@ -379,32 +449,8 @@ pub(super) fn draw_icon_image(painter: &egui::Painter, center: Pos2, size: f32, 
     draw_lucide_icon(painter, center, lucide::IMAGE, size, color);
 }
 
-pub(super) fn draw_icon_attachment(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    draw_lucide_icon(painter, center, lucide::PAPERCLIP, size, color);
-}
-
-pub(super) fn draw_icon_chat_nav(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    draw_lucide_icon(painter, center, lucide::MESSAGE_SQUARE, size, color);
-}
-
-pub(super) fn draw_icon_contacts(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    draw_lucide_icon(painter, center, lucide::USERS, size, color);
-}
-
-pub(super) fn draw_icon_cloud(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    draw_lucide_icon(painter, center, lucide::CLOUD, size, color);
-}
-
-pub(super) fn draw_icon_settings(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    draw_lucide_icon(painter, center, lucide::SETTINGS, size, color);
-}
-
 pub(super) fn draw_icon_drawer(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     draw_lucide_icon(painter, center, lucide::PANEL_RIGHT, size, color);
-}
-
-pub(super) fn draw_icon_pin(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    draw_lucide_icon(painter, center, lucide::PIN, size, color);
 }
 
 pub(super) fn draw_icon_copy(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
@@ -519,56 +565,504 @@ pub(super) fn render_toggle_switch(ui: &mut egui::Ui, value: &mut bool, pal: &Th
 }
 
 
+/// One font file chosen for the egui font stack (`index` selects a face inside a `.ttc`).
+#[derive(Debug, Clone)]
+struct FontPick {
+    path: std::path::PathBuf,
+    index: u32,
+}
+
+/// Number of faces in a TrueType collection (`ttcf` header), or 1 for a plain font.
+fn ttc_face_count(bytes: &[u8]) -> u32 {
+    if bytes.len() >= 12 && &bytes[0..4] == b"ttcf" {
+        u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]).max(1)
+    } else {
+        1
+    }
+}
+
+/// Recursively list font files below `roots` (depth-limited, capped).
+#[cfg_attr(any(target_os = "windows", target_os = "macos"), allow(dead_code))]
+fn scan_font_dirs(roots: &[std::path::PathBuf], max_depth: usize) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(std::path::PathBuf, usize)> = roots
+        .iter()
+        .filter(|r| r.is_dir())
+        .map(|r| (r.clone(), 0))
+        .collect();
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < max_depth {
+                    stack.push((path, depth + 1));
+                }
+            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if matches!(ext.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc") {
+                    out.push(path);
+                }
+                if out.len() > 20_000 {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Pick the first file (by priority order of `wanted` file names, case-insensitive) present in `files`.
+#[cfg_attr(any(target_os = "windows", target_os = "macos"), allow(dead_code))]
+fn pick_by_name(files: &[std::path::PathBuf], wanted: &[&str]) -> Option<std::path::PathBuf> {
+    for want in wanted {
+        if let Some(found) = files.iter().find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.eq_ignore_ascii_case(want))
+                .unwrap_or(false)
+        }) {
+            return Some(found.clone());
+        }
+    }
+    None
+}
+
+/// Locate a Vietnamese-capable Latin UI font, a CJK fallback and a monochrome symbol font.
+fn discover_system_fonts() -> (Option<FontPick>, Option<FontPick>, Vec<FontPick>) {
+    let pick = |p: std::path::PathBuf| FontPick { path: p, index: 0 };
+
+    #[cfg(target_os = "windows")]
+    {
+        let windir = std::env::var_os("WINDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+        let mut roots = vec![windir.join("Fonts")];
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            roots.push(std::path::PathBuf::from(local).join(r"Microsoft\Windows\Fonts"));
+        }
+        let find = |names: &[&str]| -> Option<std::path::PathBuf> {
+            for root in &roots {
+                for n in names {
+                    let p = root.join(n);
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+            None
+        };
+        let latin = find(&["segoeui.ttf", "arial.ttf", "tahoma.ttf"]).map(pick);
+        let cjk = find(&[
+            "msyh.ttc",
+            "msyhl.ttc",
+            "msjh.ttc",
+            "simsun.ttc",
+            "YuGothM.ttc",
+            "meiryo.ttc",
+            "malgun.ttf",
+        ])
+        .map(pick);
+        // Segoe UI Emoji (outline glyphs, rendered monochrome) then Segoe UI Symbol, so
+        // characters like 👀 / 🙏 / ✓ never fall back to empty boxes.
+        let symbols: Vec<FontPick> = ["seguiemj.ttf", "seguisym.ttf"]
+            .iter()
+            .filter_map(|n| find(&[n]))
+            .map(pick)
+            .collect();
+        (latin, cjk, symbols)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let first = |names: &[&str]| -> Option<std::path::PathBuf> {
+            names
+                .iter()
+                .map(std::path::PathBuf::from)
+                .find(|p| p.is_file())
+        };
+        let latin = first(&[
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/System/Library/Fonts/SFNS.ttf",
+            "/System/Library/Fonts/Supplemental/Tahoma.ttf",
+        ])
+        .map(pick);
+        let cjk = first(&[
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/Library/Fonts/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        ])
+        .map(pick);
+        let symbols: Vec<FontPick> = first(&[
+            "/System/Library/Fonts/Apple Symbols.ttf",
+            "/System/Library/Fonts/Supplemental/Apple Symbols.ttf",
+        ])
+        .map(pick)
+        .into_iter()
+        .collect();
+        (latin, cjk, symbols)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let mut roots = vec![
+            std::path::PathBuf::from("/usr/share/fonts"),
+            std::path::PathBuf::from("/usr/local/share/fonts"),
+        ];
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            roots.push(home.join(".local/share/fonts"));
+            roots.push(home.join(".fonts"));
+        }
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from) {
+            roots.push(xdg.join("fonts"));
+        }
+        let files = scan_font_dirs(&roots, 5);
+        let latin = pick_by_name(
+            &files,
+            &[
+                "NotoSans-Regular.ttf",
+                "NotoSans[wdth,wght].ttf",
+                "NotoSans[wght].ttf",
+                "NotoSans-Regular.otf",
+                "DejaVuSans.ttf",
+                "Ubuntu-R.ttf",
+                "Ubuntu[wdth,wght].ttf",
+                "LiberationSans-Regular.ttf",
+                "OpenSans-Regular.ttf",
+                "OpenSans[wdth,wght].ttf",
+                "Roboto-Regular.ttf",
+                "FreeSans.ttf",
+            ],
+        )
+        .map(pick);
+        let cjk = pick_by_name(
+            &files,
+            &[
+                "NotoSansCJK-Regular.ttc",
+                "NotoSansCJK-VF.ttc",
+                "NotoSansCJK-VF.otf.ttc",
+                "NotoSansCJKsc-Regular.otf",
+                "NotoSansSC-Regular.otf",
+                "NotoSansSC[wght].ttf",
+                "NotoSansSC-Regular.ttf",
+                "SourceHanSans-Regular.ttc",
+                "SourceHanSansSC-Regular.otf",
+                "SourceHanSansCN-Regular.otf",
+                "wqy-microhei.ttc",
+                "wqy-zenhei.ttc",
+                "DroidSansFallbackFull.ttf",
+                "DroidSansFallback.ttf",
+                "NotoSerifCJK-Regular.ttc",
+            ],
+        )
+        .map(pick);
+        let symbols: Vec<FontPick> = [
+            "NotoSansSymbols2-Regular.ttf",
+            "NotoSansSymbols-Regular.ttf",
+            "Symbola.ttf",
+        ]
+        .iter()
+        .filter_map(|n| pick_by_name(&files, &[n]))
+        .map(pick)
+        .collect();
+        (latin, cjk, symbols)
+    }
+}
+
+/// Load `pick` into `fonts` under `name`; for CJK collections prefer the Simplified Chinese face.
+fn insert_font(
+    fonts: &mut egui::FontDefinitions,
+    name: &str,
+    pick: &FontPick,
+    prefer_sc_face: bool,
+) -> bool {
+    let Ok(bytes) = std::fs::read(&pick.path) else {
+        return false;
+    };
+    if bytes.len() < 12 {
+        return false;
+    }
+    let faces = ttc_face_count(&bytes);
+    let file_name = pick
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // Noto Sans CJK / Source Han Sans collections are ordered JP, KR, SC, TC(, HK).
+    let index = if prefer_sc_face
+        && faces > 2
+        && (file_name.starts_with("notosanscjk")
+            || file_name.starts_with("sourcehansans")
+            || file_name.starts_with("notoserifcjk"))
+    {
+        2
+    } else {
+        pick.index.min(faces.saturating_sub(1))
+    };
+    let mut data = egui::FontData::from_owned(bytes);
+    data.index = index;
+    fonts.font_data.insert(name.to_owned(), data);
+    true
+}
+
 pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // 1. Embed official Lucide Icon Font (vector glyphs for all UI icons)
+    // 1. Embedded Lucide icon font (Private Use Area glyphs for every UI icon).
     const LUCIDE_BYTES: &[u8] = include_bytes!("../assets/fonts/lucide.ttf");
     fonts.font_data.insert(
         "lucide_font".to_owned(),
         egui::FontData::from_static(LUCIDE_BYTES),
     );
 
-    // 2. Load system Vietnamese sans-serif font
-    let font_candidates = [
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
-        "C:\\Windows\\Fonts\\tahoma.ttf",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/System/Library/Fonts/Supplemental/Tahoma.ttf",
-        "/Library/Fonts/Arial.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ];
-
-    for path in font_candidates {
-        if let Ok(font_data) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "vietnamese_font".to_owned(),
-                egui::FontData::from_owned(font_data),
-            );
-            break;
+    // 2. System fonts: Vietnamese-capable Latin UI font, CJK fallback, symbols.
+    let (latin, cjk, extras) = discover_system_fonts();
+    let has_latin = latin
+        .as_ref()
+        .map(|p| insert_font(&mut fonts, "ui_latin", p, false))
+        .unwrap_or(false);
+    let has_cjk = cjk
+        .as_ref()
+        .map(|p| insert_font(&mut fonts, "ui_cjk", p, true))
+        .unwrap_or(false);
+    let mut extra_names: Vec<String> = Vec::new();
+    for (i, p) in extras.iter().enumerate() {
+        let name = format!("ui_symbols_{i}");
+        if insert_font(&mut fonts, &name, p, false) {
+            extra_names.push(name);
         }
     }
 
-    // Fallback order: Proportional text prefers Vietnamese sans, then Lucide for icon glyphs
-    let prop = fonts.families.entry(egui::FontFamily::Proportional).or_default();
-    if fonts.font_data.contains_key("vietnamese_font") {
-        prop.insert(0, "vietnamese_font".to_owned());
-        prop.push("lucide_font".to_owned());
-    } else {
-        prop.insert(0, "lucide_font".to_owned());
+    // Proportional: Latin → Lucide → CJK → symbols → egui defaults (Ubuntu-Light, emoji).
+    // Lucide sits before CJK so CJK fonts that ship Private-Use glyphs never shadow UI icons.
+    let prop = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
+    let defaults: Vec<String> = std::mem::take(prop);
+    if has_latin {
+        prop.push("ui_latin".to_owned());
     }
+    prop.push("lucide_font".to_owned());
+    if has_cjk {
+        prop.push("ui_cjk".to_owned());
+    }
+    prop.extend(extra_names.iter().cloned());
+    prop.extend(defaults);
 
-    let mono = fonts.families.entry(egui::FontFamily::Monospace).or_default();
-    if fonts.font_data.contains_key("vietnamese_font") {
-        mono.push("vietnamese_font".to_owned());
+    let mono = fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default();
+    if has_latin {
+        mono.push("ui_latin".to_owned());
     }
     mono.push("lucide_font".to_owned());
+    if has_cjk {
+        mono.push("ui_cjk".to_owned());
+    }
 
     ctx.set_fonts(fonts);
+}
+
+// ---------------------------------------------------------------------------
+// Layout helpers shared by the redesigned workspace
+// ---------------------------------------------------------------------------
+
+/// Conversation-list timestamp: `HH:MM` today, `Hôm qua`, weekday `T2…CN` within a week, else `dd/mm`.
+pub(super) fn format_list_time(ts_ms: i64, fallback: &str) -> String {
+    if ts_ms <= 0 {
+        return fallback.to_string();
+    }
+    let now = crate::timefmt::now_ms();
+    let days = crate::timefmt::local_day_index(now) - crate::timefmt::local_day_index(ts_ms);
+    match days {
+        i64::MIN..=0 => crate::timefmt::hm_from_ms(ts_ms),
+        1 => "Hôm qua".to_string(),
+        2..=6 => weekday_short(crate::timefmt::local_weekday(ts_ms)).to_string(),
+        _ => {
+            let (y, m, d) = crate::timefmt::local_ymd(ts_ms);
+            let (ny, _, _) = crate::timefmt::local_ymd(now);
+            if y == ny {
+                format!("{d:02}/{m:02}")
+            } else {
+                format!("{d:02}/{m:02}/{:02}", y.rem_euclid(100))
+            }
+        }
+    }
+}
+
+/// `T2`…`T7`, `CN` for Monday = 1 … Sunday = 7.
+pub(super) fn weekday_short(wd: u32) -> &'static str {
+    match wd {
+        1 => "T2",
+        2 => "T3",
+        3 => "T4",
+        4 => "T5",
+        5 => "T6",
+        6 => "T7",
+        _ => "CN",
+    }
+}
+
+/// `Thứ Hai`…`Chủ nhật` for Monday = 1 … Sunday = 7.
+pub(super) fn weekday_long(wd: u32) -> &'static str {
+    match wd {
+        1 => "Thứ Hai",
+        2 => "Thứ Ba",
+        3 => "Thứ Tư",
+        4 => "Thứ Năm",
+        5 => "Thứ Sáu",
+        6 => "Thứ Bảy",
+        _ => "Chủ nhật",
+    }
+}
+
+/// Paint a diagonal two-stop gradient across `rect` (top-left `top` → bottom-right `bottom`).
+pub(super) fn paint_diagonal_gradient(
+    painter: &egui::Painter,
+    rect: Rect,
+    top: Color32,
+    bottom: Color32,
+) {
+    use egui::epaint::{Mesh, Vertex};
+    let mid = lerp_color(top, bottom, 0.5);
+    let mut mesh = Mesh::default();
+    let uv = egui::epaint::WHITE_UV;
+    for (pos, color) in [
+        (rect.left_top(), top),
+        (rect.right_top(), mid),
+        (rect.right_bottom(), bottom),
+        (rect.left_bottom(), mid),
+    ] {
+        mesh.vertices.push(Vertex { pos, uv, color });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Linear interpolation between two colours (sRGB space; good enough for UI tints).
+pub(super) fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| -> u8 { (x as f32 + (y as f32 - x as f32) * t).round() as u8 };
+    Color32::from_rgba_unmultiplied(
+        mix(a.r(), b.r()),
+        mix(a.g(), b.g()),
+        mix(a.b(), b.b()),
+        mix(a.a(), b.a()),
+    )
+}
+
+/// Pill badge with a count (e.g. unread). Returns the painted rect.
+pub(super) fn paint_count_badge(
+    painter: &egui::Painter,
+    center: Pos2,
+    count: usize,
+    fill: Color32,
+) -> Rect {
+    let txt = if count > 99 {
+        "99+".to_string()
+    } else {
+        count.to_string()
+    };
+    let w = match txt.chars().count() {
+        1 => 20.0,
+        2 => 24.0,
+        _ => 30.0,
+    };
+    let rect = Rect::from_center_size(center, Vec2::new(w, 20.0));
+    painter.rect_filled(rect, Rounding::same(10.0), fill);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        txt,
+        FontId::proportional(11.5),
+        Color32::WHITE,
+    );
+    rect
+}
+
+/// Draw a clickable square icon button; returns the response.
+pub(super) fn icon_button(
+    ui: &mut egui::Ui,
+    icon: &str,
+    size: f32,
+    icon_size: f32,
+    active: bool,
+    pal: &ThemePalette,
+    tooltip: &str,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let bg = if active {
+        pal.nav_active
+    } else if resp.hovered() {
+        pal.bg_hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(size * 0.28), bg);
+    draw_lucide_icon(
+        ui.painter(),
+        rect.center(),
+        icon,
+        icon_size,
+        if active {
+            pal.primary
+        } else if resp.hovered() {
+            pal.text_primary
+        } else {
+            pal.text_secondary
+        },
+    );
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    if tooltip.is_empty() {
+        resp
+    } else {
+        resp.on_hover_text(tooltip)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ttc_header_face_count() {
+        let mut ttc = b"ttcf\x00\x02\x00\x00".to_vec();
+        ttc.extend_from_slice(&5u32.to_be_bytes());
+        assert_eq!(ttc_face_count(&ttc), 5);
+        assert_eq!(ttc_face_count(b"\x00\x01\x00\x00plainfontdata"), 1);
+    }
+
+    #[test]
+    fn list_time_uses_weekday_and_dates() {
+        let now = crate::timefmt::now_ms();
+        let today = format_list_time(now, "");
+        assert_eq!(today.len(), 5, "today renders HH:MM, got {today}");
+        assert_eq!(format_list_time(now - 86_400_000, ""), "Hôm qua");
+        let three_days = format_list_time(now - 3 * 86_400_000, "");
+        assert!(["T2", "T3", "T4", "T5", "T6", "T7", "CN"].contains(&three_days.as_str()));
+        assert!(format_list_time(now - 40 * 86_400_000, "").contains('/'));
+        assert_eq!(format_list_time(0, "09:30"), "09:30");
+    }
+
+    #[test]
+    fn pick_by_name_respects_priority_order() {
+        let files = vec![
+            std::path::PathBuf::from("/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"),
+            std::path::PathBuf::from("/usr/share/fonts/google-noto-vf/NotoSans[wght].ttf"),
+        ];
+        let got = pick_by_name(
+            &files,
+            &["NotoSans-Regular.ttf", "NotoSans[wght].ttf", "DejaVuSans.ttf"],
+        );
+        assert_eq!(got.unwrap().file_name().unwrap(), "NotoSans[wght].ttf");
+    }
 }
