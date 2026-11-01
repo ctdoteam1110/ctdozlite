@@ -330,7 +330,137 @@
   @media (max-width: 560px) {
     .nav-right .btn-primary { display: none; }
   }
-</style>
+
+    .section-divider {
+      margin: 48px 0 24px;
+      padding-top: 32px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    .gh-filter-bar {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+    .gh-btn {
+      padding: 6px 14px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--card-bg);
+      color: var(--text-2);
+      cursor: pointer;
+      transition: all 0.15s ease;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .gh-btn:hover {
+      border-color: var(--accent);
+      color: var(--text);
+    }
+    .gh-btn.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .gh-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+      margin-bottom: 12px;
+      transition: border-color 0.15s ease;
+    }
+    .gh-card:hover {
+      border-color: var(--accent);
+    }
+    .gh-card-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+    .gh-card-title {
+      font-size: 1.02rem;
+      font-weight: 600;
+      color: var(--text);
+      text-decoration: none;
+    }
+    .gh-card-title:hover {
+      color: var(--accent);
+    }
+    .gh-meta {
+      font-size: 0.8rem;
+      color: var(--text-3);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .gh-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+    .gh-badge.open {
+      background: rgba(46, 160, 67, 0.15);
+      color: #3fb950;
+      border: 1px solid rgba(46, 160, 67, 0.3);
+    }
+    .gh-badge.closed {
+      background: rgba(163, 113, 247, 0.15);
+      color: #a371f7;
+      border: 1px solid rgba(163, 113, 247, 0.3);
+    }
+    .gh-badge.pr {
+      background: rgba(97, 175, 239, 0.15);
+      color: #61afef;
+      border: 1px solid rgba(97, 175, 239, 0.3);
+    }
+    .gh-body-preview {
+      font-size: 0.85rem;
+      color: var(--text-2);
+      line-height: 1.5;
+      margin-top: 8px;
+      white-space: pre-line;
+      background: var(--bg);
+      padding: 10px 14px;
+      border-radius: 6px;
+      border-left: 3px solid var(--accent);
+      max-height: none;
+      overflow: visible;
+    }
+    .gh-labels {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+      flex-wrap: wrap;
+    }
+    .gh-label-tag {
+      font-size: 0.72rem;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text-3);
+    }
+
+  </style>
 </head>
 <body>
 
@@ -388,6 +518,55 @@
 
     <div class="section-title">Danh sách vấn đề</div>
     <div id="issueList"></div>
+
+    <!-- PHẦN RIÊNG: ĐÓNG GÓP TỪ GITHUB ISSUES & PULL REQUESTS -->
+    <div class="section-divider" id="github-section">
+      <div>
+        <div class="section-title" style="margin-top: 0;">
+          <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" style="vertical-align: middle; margin-right: 8px;">
+            <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+          </svg>
+          Đóng góp từ GitHub Issues & Pull Requests
+        </div>
+        <p style="font-size: 0.9rem; color: var(--text-2); margin-top: 4px; line-height: 1.5;">
+          Toàn bộ thảo luận kỹ thuật, báo cáo lỗi và đóng góp mã nguồn chính thức được đồng bộ trực tiếp từ repository 
+          <a href="https://github.com/ctdoteam1110/ctdozlite" target="_blank" rel="noreferrer" style="color:var(--accent); text-decoration: underline;">ctdoteam1110/ctdozlite</a> qua <code>gh CLI</code>.
+        </p>
+      </div>
+      <div>
+        <a href="https://github.com/ctdoteam1110/ctdozlite/issues/new" target="_blank" rel="noreferrer" class="btn btn-primary btn-sm">
+          + Tạo Issue trên GitHub
+        </a>
+      </div>
+    </div>
+
+    <!-- Stat boxes for GitHub -->
+    <div class="stat-row" style="margin: 20px 0 28px;">
+      <div class="stat" style="border-top-color: var(--accent);"><div class="stat-num" id="ghTotalIssues" style="color:var(--accent);">27</div>
+        <div class="stat-label">Tổng Issues</div>
+      </div>
+      <div class="stat" style="border-top-color: #3fb950;"><div class="stat-num" id="ghOpenIssues" style="color:#3fb950;">26</div>
+        <div class="stat-label">Issues Đang Mở</div>
+      </div>
+      <div class="stat" style="border-top-color: #61afef;"><div class="stat-num" id="ghTotalPrs" style="color:#61afef;">7</div>
+        <div class="stat-label">Pull Requests</div>
+      </div>
+      <div class="stat" style="border-top-color: #e5c07b;"><div class="stat-num" id="ghContributors" style="color:#e5c07b;">16</div>
+        <div class="stat-label">Contributors GitHub</div>
+      </div>
+    </div>
+
+    <!-- Filter tabs for GitHub -->
+    <div class="gh-filter-bar">
+      <button class="gh-btn active" id="ghTabAll" type="button" onclick="filterGh('all')">Tất cả (34)</button>
+      <button class="gh-btn" id="ghTabIssues" type="button" onclick="filterGh('issues')">Chỉ Issues (27)</button>
+      <button class="gh-btn" id="ghTabPrs" type="button" onclick="filterGh('prs')">Chỉ Pull Requests (7)</button>
+      <button class="gh-btn" id="ghTabBug" type="button" onclick="filterGh('bugs')">Báo lỗi</button>
+      <button class="gh-btn" id="ghTabFeat" type="button" onclick="filterGh('feats')">Tính năng & Kiến trúc</button>
+    </div>
+
+    <div id="ghList"></div>
+
   </div>
 </main>
 
@@ -404,6 +583,7 @@
 </footer>
 
 <script src="assets/issues.js"></script>
+<script src="assets/github_issues.js"></script>
 <script>
 (function () {
   const root = document.documentElement;
@@ -494,6 +674,109 @@
 
     list.appendChild(card);
   });
+
+  // GITHUB ISSUES & PRS RENDERER
+  const GH_DATA = window.CTD_GITHUB || { issues: [], prs: [] };
+  const ghList = document.getElementById('ghList');
+  let currentGhFilter = 'all';
+
+  window.filterGh = function(type) {
+    currentGhFilter = type;
+    document.querySelectorAll('.gh-filter-bar .gh-btn').forEach(function(b) { b.classList.remove('active'); });
+    if (type === 'all') document.getElementById('ghTabAll').classList.add('active');
+    else if (type === 'issues') document.getElementById('ghTabIssues').classList.add('active');
+    else if (type === 'prs') document.getElementById('ghTabPrs').classList.add('active');
+    else if (type === 'bugs') document.getElementById('ghTabBug').classList.add('active');
+    else if (type === 'feats') document.getElementById('ghTabFeat').classList.add('active');
+    renderGhList();
+  };
+
+  function renderGhList() {
+    if (!ghList) return;
+    ghList.innerHTML = '';
+
+    var items = [];
+    if (currentGhFilter === 'all' || currentGhFilter === 'issues') {
+      items = items.concat(GH_DATA.issues.map(function(i) { return Object.assign({}, i, { kind: 'issue' }); }));
+    }
+    if (currentGhFilter === 'all' || currentGhFilter === 'prs') {
+      items = items.concat(GH_DATA.prs.map(function(p) { return Object.assign({}, p, { kind: 'pr' }); }));
+    }
+    if (currentGhFilter === 'bugs') {
+      items = items.concat(
+        GH_DATA.issues.filter(function(i) {
+          return /lỗi|bug|fix/i.test(i.title) || (i.labels && i.labels.some(function(l) { return /bug/i.test(l); }));
+        }).map(function(i) { return Object.assign({}, i, { kind: 'issue' }); })
+      );
+      items = items.concat(
+        GH_DATA.prs.filter(function(p) { return /fix/i.test(p.title); })
+          .map(function(p) { return Object.assign({}, p, { kind: 'pr' }); })
+      );
+    }
+    if (currentGhFilter === 'feats') {
+      items = items.concat(
+        GH_DATA.issues.filter(function(i) {
+          return /feat|task|docs|build|rủi ro|đề xuất|hỗ trợ/i.test(i.title);
+        }).map(function(i) { return Object.assign({}, i, { kind: 'issue' }); })
+      );
+      items = items.concat(
+        GH_DATA.prs.filter(function(p) { return !/fix/i.test(p.title); })
+          .map(function(p) { return Object.assign({}, p, { kind: 'pr' }); })
+      );
+    }
+
+    items.sort(function(a, b) { return b.number - a.number; });
+
+    items.forEach(function(item) {
+      var card = el('div', 'gh-card');
+
+      var head = el('div', 'gh-card-head');
+      var titleLink = el('a', 'gh-card-title', (item.kind === 'pr' ? 'PR #' : 'Issue #') + item.number + ': ' + item.title);
+      titleLink.href = 'https://github.com/ctdoteam1110/ctdozlite/' + (item.kind === 'pr' ? 'pull/' : 'issues/') + item.number;
+      titleLink.target = '_blank';
+      titleLink.rel = 'noreferrer';
+      head.appendChild(titleLink);
+
+      var badges = el('div', 'badges');
+      if (item.kind === 'pr') {
+        badges.appendChild(el('span', 'gh-badge pr', 'Pull Request'));
+      }
+      badges.appendChild(el('span', 'gh-badge ' + (item.state === 'OPEN' ? 'open' : 'closed'), item.state));
+      head.appendChild(badges);
+      card.appendChild(head);
+
+      var meta = el('div', 'gh-meta');
+      meta.innerHTML = '<span>Tác giả: <strong>@' + item.author.login + '</strong>' + (item.author.name && item.author.name !== item.author.login ? ' (' + item.author.name + ')' : '') + '</span>' +
+                       '<span>•</span>' +
+                       '<span>Ngày tạo: ' + new Date(item.createdAt).toLocaleDateString('vi-VN') + '</span>';
+      card.appendChild(meta);
+
+      if (item.body && item.body.trim().length > 0) {
+        var preview = el('div', 'gh-body-preview');
+        var cleanBody = item.body
+    .replace(/<img[^>]*>/gi, '')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  preview.textContent = cleanBody.length > 280 ? cleanBody.slice(0, 280) + '...' : cleanBody;
+        card.appendChild(preview);
+      }
+
+      if (item.labels && item.labels.length > 0) {
+        var lblWrap = el('div', 'gh-labels');
+        item.labels.forEach(function(lbl) {
+          lblWrap.appendChild(el('span', 'gh-label-tag', lbl));
+        });
+        card.appendChild(lblWrap);
+      }
+
+      ghList.appendChild(card);
+    });
+  }
+
+  // Initial call
+  renderGhList();
+
 })();
 </script>
 
