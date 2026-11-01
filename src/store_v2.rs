@@ -820,9 +820,13 @@ impl AccountStore {
         // Server tombstones survive canonical-key changes and reused client aliases.
         let deleted_key: Option<String> = self.conn.query_row("SELECT msg_id FROM message_tombstones WHERE thread_id=?1 AND server_id=?2 LIMIT 1", params![thread_id,server], |row|row.get(0)).optional()?;
         if let Some(key) = deleted_key { normalized.id = key; return Ok(normalized); }
-        if canonical.is_none() && self.is_deleted(thread_id, &message.id)? && message.id != server {
+        if canonical.is_none() && self.is_deleted(thread_id, &message.id)? {
             let prior_server: Option<String> = self.conn.query_row("SELECT server_id FROM message_tombstones WHERE thread_id=?1 AND msg_id=?2", params![thread_id,message.id], |row|row.get(0))?;
             ensure!(prior_server.is_some(), "Tombstoned canonical alias has no verified server provenance");
+            ensure!(message.id != server, "Verified server identity collides with a tombstoned storage key");
+            if let Some(existing) = self.get_message(thread_id, &server)? {
+                ensure!(verified_server_id(&existing).as_deref() == Some(server.as_str()), "Ambiguous server storage key");
+            }
             normalized.id = server;
             return Ok(normalized);
         }

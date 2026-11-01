@@ -1456,3 +1456,30 @@ fn verified_tombstones_preserve_fresh_server_reuse_and_block_old_replays_after_r
         drop(store);std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn tombstone_rekey_rejects_an_existing_key_owned_by_another_server_identity() {
+    use zalo_rust::message_model::WireMessageRef;
+    let mut store = AccountStore::in_memory("three-identities").unwrap();
+    let mut old = ChatMessage { id:"777".into(),client_message_id:"777".into(),wire_ref:WireMessageRef::from_raw(&serde_json::json!({"globalMsgId":"111","cliMsgId":"777"})),text:"Deleted".into(),..Default::default() };
+    let occupied = ChatMessage { id:"222".into(),client_message_id:"222".into(),wire_ref:WireMessageRef::from_raw(&serde_json::json!({"globalMsgId":"333","cliMsgId":"222"})),text:"Preserved".into(),..Default::default() };
+    let mut t=thread("same");t.messages=vec![old.clone(),occupied];store.persist_threads(&[t.clone()]).unwrap();
+    store.apply_delta(StoreDelta{deleted_messages:&[MessageKey{thread_id:"same".into(),msg_id:"777".into()}],..Default::default()}).unwrap();
+    old.wire_ref=WireMessageRef::from_raw(&serde_json::json!({"globalMsgId":"222","cliMsgId":"777"}));t.messages=vec![old];
+    assert!(store.persist_threads(&[t]).is_err());
+    assert_eq!(store.get_message("same","222").unwrap().unwrap().text,"Preserved");
+    assert_eq!(store.navigation_page("same","333").unwrap().unwrap().0,"222");
+}
+
+#[test]
+fn fresh_server_equal_to_a_tombstoned_canonical_key_is_explicitly_ambiguous() {
+    use zalo_rust::message_model::WireMessageRef;
+    let mut store=AccountStore::in_memory("server-key-collision").unwrap();
+    let mut row=ChatMessage{id:"777".into(),wire_ref:WireMessageRef::from_raw(&serde_json::json!({"globalMsgId":"111","cliMsgId":"777"})),..Default::default()};
+    let mut t=thread("same");t.messages=vec![row.clone()];store.persist_threads(&[t.clone()]).unwrap();
+    store.apply_delta(StoreDelta{deleted_messages:&[MessageKey{thread_id:"same".into(),msg_id:"777".into()}],..Default::default()}).unwrap();
+    row.wire_ref=WireMessageRef::from_raw(&serde_json::json!({"globalMsgId":"777","cliMsgId":"777"}));t.messages=vec![row];
+    let error=store.persist_threads(&[t]).unwrap_err();
+    assert!(error.to_string().contains("tombstoned storage key"));
+    assert!(store.get_message("same","777").unwrap().is_none());
+}
