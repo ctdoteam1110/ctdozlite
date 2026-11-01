@@ -1474,6 +1474,18 @@ pub(crate) async fn send_group_message_with_client_id(
     text: &str,
     now: u64,
 ) -> Result<Value> {
+    send_group_message_with_mentions_and_client_id(s, grid, text, now, &[]).await
+}
+
+/// Send group text with explicit verified mentions, preserving the caller-owned request ID.
+///
+/// # Errors
+/// Returns an error for invalid mention spans, authentication, encoding or API failures.
+pub(crate) async fn send_group_message_with_mentions_and_client_id(
+    s: &Session, grid: &str, text: &str, now: u64,
+    mentions: &[crate::composer_mentions::OutgoingMention],
+) -> Result<Value> {
+    crate::composer_mentions::validate_mentions(text, mentions)?;
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -1481,15 +1493,20 @@ pub(crate) async fn send_group_message_with_client_id(
         .trim_start_matches("group_")
         .trim_start_matches('g')
         .trim_start_matches('G');
-    let body = obj(&[
+    let mut body = obj(&[
         ("grid", json!(clean_grid)),
         ("message", json!(text)),
         ("clientId", json!(now)),
         ("imei", json!(s.imei)),
         ("visibility", json!(0)),
     ]);
+    if !mentions.is_empty() {
+        body["mentionInfo"] = json!(serde_json::to_string(mentions)?);
+        body["language"] = json!("vi");
+    }
     let params = s.encoded_params(&body)?;
-    let url = format!("{}/api/group/sendmsg?{}", s.domains.group, s.common_params());
+    let operation = if mentions.is_empty() { "sendmsg" } else { "mention" };
+    let url = format!("{}/api/group/{operation}?{}", s.domains.group, s.common_params());
     let form = format!("params={params}");
     let resp = s.post_form(&url, form).await?;
     let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
@@ -3059,6 +3076,20 @@ pub(crate) async fn send_quote_message_with_client_id(
     is_group: bool,
     now: u64,
 ) -> Result<Value> {
+    send_quote_message_with_mentions_and_client_id(s, to_id, text, quoted, is_group, now, &[]).await
+}
+
+/// Keep explicit mention metadata through group replies and their existing plain-text fallback.
+///
+/// # Errors
+/// Returns an error for invalid spans, unsupported direct mentions, authentication or API failures.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_quote_message_with_mentions_and_client_id(
+    s: &Session, to_id: &str, text: &str, quoted: &ChatMessage, is_group: bool, now: u64,
+    mentions: &[crate::composer_mentions::OutgoingMention],
+) -> Result<Value> {
+    crate::composer_mentions::validate_mentions(text, mentions)?;
+    anyhow::ensure!(is_group || mentions.is_empty(), "Chưa xác minh gửi nhắc tên trong hội thoại cá nhân");
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -3097,7 +3128,7 @@ pub(crate) async fn send_quote_message_with_client_id(
                 .trim_start_matches("group_")
                 .trim_start_matches('g')
                 .trim_start_matches('G');
-            let body = obj(&[
+            let mut body = obj(&[
                 ("grid", json!(clean_grid)),
                 ("message", json!(text)),
                 ("clientId", json!(now)),
@@ -3113,6 +3144,9 @@ pub(crate) async fn send_quote_message_with_client_id(
                 ("imei", json!(s.imei)),
                 ("zsource", json!(101)),
             ]);
+            if !mentions.is_empty() {
+                body["mentionInfo"] = json!(serde_json::to_string(mentions)?);
+            }
             let params = s.encoded_params(&body)?;
             let url = format!("{}/api/group/quote?{}", s.domains.group, s.common_params());
             let resp = s.post_form(&url, format!("params={params}")).await?;
@@ -3164,7 +3198,7 @@ pub(crate) async fn send_quote_message_with_client_id(
         Ok(r) => Ok(r),
         Err(_) => {
             if is_group {
-                send_group_message_with_client_id(s, to_id, text, now).await
+                send_group_message_with_mentions_and_client_id(s, to_id, text, now, mentions).await
             } else {
                 send_message_with_client_id(s, to_id, text, now).await
             }
@@ -6509,4 +6543,103 @@ mod send_identity_tests {
             assert_eq!(body["clientId"], json!(client_id));
         }
     }
+    #[tokio::test]
+    async fn composer_signed_group_mentions_preserve_raw_spans_quote_and_request_id() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+        // Only loopback fixture traffic is used; all keys and identifiers are synthetic.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let fixture = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                    assert!(headers.len() < 16_384);
+                }
+                let headers = String::from_utf8(headers).unwrap();
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                assert!(size < 16_384);
+                let mut body = vec![0; size];
+                stream.read_exact(&mut body).unwrap();
+                let query = reqwest::Url::parse(&format!(
+                    "http://fixture.invalid/?{}",
+                    String::from_utf8(body).unwrap()
+                ))
+                .unwrap();
+                let encrypted = query
+                    .query_pairs()
+                    .find(|(key, _)| key == "params")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                let body: Value =
+                    serde_json::from_str(&crate::crypto::decode_aes(&[7; 32], &encrypted).unwrap())
+                        .unwrap();
+                let path = headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                let fail = body["qmsgId"] == json!(999);
+                requests.push((path, body));
+                let response = if fail {
+                    r#"{"error_code":114}"#
+                } else {
+                    r#"{"error_code":0,"data":{"msgId":"server-a"}}"#
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", response.len(), response).unwrap();
+            }
+            requests
+        });
+
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo::default());
+        session.secret_key = Some(vec![7; 32]);
+        session.domains.group = host;
+        let sample: Value = serde_json::from_str(include_str!("../tests/fixtures/composer_group_mentions.json")).unwrap();
+        let client_id = sample["client_id"].as_u64().unwrap();
+        let text = sample["text"].as_str().unwrap();
+        let mentions: Vec<crate::composer_mentions::OutgoingMention> = serde_json::from_value(sample["mentions"].clone()).unwrap();
+        send_group_message_with_mentions_and_client_id(&session, "group_123", text, client_id, &mentions).await.unwrap();
+        for id in ["123", "999", "local_1"] {
+            let quoted = ChatMessage { id: id.into(), sender: "33".into(), text: "Raw :+1: 😀".into(), ts: 123456, ..Default::default() };
+            send_quote_message_with_mentions_and_client_id(&session, "group_123", text, &quoted, true, client_id, &mentions).await.unwrap();
+        }
+        let requests = fixture.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        for (index, (path, body)) in requests.iter().enumerate() {
+            assert!(path.starts_with(if matches!(index, 1 | 2) { "/api/group/quote?" } else { "/api/group/mention?" }));
+            assert_eq!(body["message"], text);
+            assert_eq!(body["grid"], "123");
+            assert_eq!(body["clientId"], json!(client_id));
+            assert_eq!(body["language"], "vi");
+            let actual: Vec<crate::composer_mentions::OutgoingMention> = serde_json::from_str(body["mentionInfo"].as_str().expect("PC encodes mentionInfo as a JSON string")).unwrap();
+            assert_eq!(actual, mentions);
+            if matches!(index, 1 | 2) {
+                assert_eq!(body["qmsg"], "Raw :+1: 😀");
+                assert_eq!(body["qmsgOwner"], "33");
+                assert_eq!(body["qmsgTs"], 123456);
+            }
+        }
+    }
+
 }

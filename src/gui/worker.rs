@@ -66,6 +66,13 @@ pub enum WorkerCmd {
         text: String,
         is_group: bool,
     },
+    /// Explicit member mentions are group-only; optional quote retains its original message object.
+    SendWithMentions {
+        to_id: String,
+        text: String,
+        mentions: Vec<crate::composer_mentions::OutgoingMention>,
+        quoted: Option<ChatMessage>,
+    },
     SendQuote {
         to_id: String,
         text: String,
@@ -1789,6 +1796,33 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         ctx_clone.request_repaint();
                                     }
                                 }
+                            });
+                        }
+                        WorkerCmd::SendWithMentions { to_id, text, mentions, quoted } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let client_id = crate::chat::next_client_message_id();
+                                // Keep raw text/offsets intact instead of rewriting a URL into link-card params.
+                                let result = if let Some(quote) = &quoted {
+                                    crate::chat::send_quote_message_with_mentions_and_client_id(
+                                        &s, &to_id, &text, quote, true, client_id, &mentions).await
+                                } else {
+                                    crate::chat::send_group_message_with_mentions_and_client_id(
+                                        &s, &to_id, &text, client_id, &mentions).await
+                                };
+                                let account = s.login.as_ref().map(|login| login.uin.clone()).unwrap_or_default();
+                                let event = match result {
+                                    Ok(response) => {
+                                        let msg_id = extract_msg_id(&response);
+                                        let msg = composed_sent_message(&text, &mentions, quoted.as_ref(), client_id, msg_id);
+                                        GuiEvent::ComposerMessageSent { account, thread_id: to_id, msg }
+                                    }
+                                    Err(error) => GuiEvent::ComposerSendFailed { account, thread_id: to_id, text, mentions, quoted, error: error.to_string() },
+                                };
+                                // GuiTx wakes the UI; a closed receiver means the app has exited.
+                                let _ = gui_tx_clone.send(event);
                             });
                         }
                         WorkerCmd::SendQuote {
@@ -3547,5 +3581,35 @@ mod original_reaction_import_consumer_tests {
             }
         ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Construct the same confirmed local row the GUI inserts, retaining the exact selected identities.
+fn composed_sent_message(text: &str, mentions: &[crate::composer_mentions::OutgoingMention], quoted: Option<&ChatMessage>, client_id: u64, server_id: String) -> ChatMessage {
+    ChatMessage {
+        id: if server_id.is_empty() { format!("out_{client_id}") } else { server_id },
+        client_message_id: client_id.to_string(), text: text.into(), sender: "Tôi".into(),
+        time: crate::ui::clock(), is_outgoing: true, ts: (crate::login::unix_now() * 1000) as i64,
+        wire_ref: crate::message_model::WireMessageRef::from_raw(&serde_json::json!({"mentions": mentions})),
+        reply_to_id: quoted.map(|quote| quote.id.clone()),
+        reply_to_text: quoted.map(|quote| quote.text.clone()),
+        reply_to_sender: quoted.map(|quote| quote.sender.clone()),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::*;
+    #[test]
+    fn composer_confirmed_local_row_keeps_request_identity_mentions_and_raw_reply() {
+        let mentions = [crate::composer_mentions::OutgoingMention { uid: "22".into(), pos: 3, len: 3, kind: 0 }];
+        let quote = ChatMessage { id: "original-1".into(), text: "Reply :+1:".into(), ..Default::default() };
+        let row = composed_sent_message("😀 @An", &mentions, Some(&quote), 1234567, "server-1".into());
+        assert_eq!(row.client_message_id, "1234567");
+        assert_eq!(row.id, "server-1");
+        assert_eq!(row.text, "😀 @An");
+        assert_eq!(row.reply_to_text.as_deref(), Some("Reply :+1:"));
+        assert_eq!(crate::message_navigation::message_mentions(&row)[0].user_id, "22");
     }
 }

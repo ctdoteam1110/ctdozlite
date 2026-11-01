@@ -1818,6 +1818,10 @@ impl ZaloGuiApp {
                 }
             });
 
+        if let Some(thread_id) = self.threads.get(self.selected_thread_index).map(|thread| thread.id.clone()) {
+            self.composer_mentions.switch_thread(&thread_id, &mut self.input_message, &mut self.replying_to);
+        }
+
         // Extract lightweight metadata for Header, Right Info Drawer, and Central Chat Stream
         let thread_meta = self.threads.get(self.selected_thread_index).map(|t| {
             (
@@ -4017,6 +4021,7 @@ impl ZaloGuiApp {
                                         let input_w = (ui.available_width()
                                             - send_btn_w
                                             - sched_btn_w
+                                            - if is_group { 28.0 } else { 0.0 }
                                             - 16.0)
                                             .max(50.0);
                                         let text_edit =
@@ -4030,7 +4035,22 @@ impl ZaloGuiApp {
                                                 .margin(Margin::symmetric(6.0, 7.0))
                                                 .desired_width(input_w);
 
-                                        let response = ui.add(text_edit);
+                                        let mut text_output = text_edit.show(ui);
+                                        let response = text_output.response;
+                                        self.composer_mentions.reconcile(&self.input_message);
+                                        if is_group {
+                                            let selection = text_output.cursor_range.map(|range| range.as_sorted_char_range())
+                                                .unwrap_or_else(|| { let end = self.input_message.chars().count(); end..end });
+                                            if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                                                if let Some(cursor) = super::composer::member_picker(ui, &thread.presentation.members,
+                                                    &mut self.input_message, &mut self.composer_mentions, selection) {
+                                                    text_output.state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(cursor))));
+                                                    text_output.state.store(ui.ctx(), response.id);
+                                                    response.request_focus();
+                                                }
+                                            }
+                                        }
+
                                         if response.changed() {
                                             ensure_cjk_font(
                                                 ui.ctx(),
@@ -4247,27 +4267,23 @@ impl ZaloGuiApp {
                                                 }
                                             }
                                         } else if (send_clicked || enter_pressed) && can_send {
-                                            let text = self.input_message.trim().to_string();
-                                            self.input_message.clear();
-                                            self.dismissed_sticker_suggest_for.clear();
-                                            self.composer_sticker_selected = None;
-                                            response.request_focus();
-                                            let quoted = self.replying_to.take();
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                if let Some(quoted) = quoted {
-                                                    let _ = tx.send(WorkerCmd::SendQuote {
-                                                        to_id: thread_id.clone(),
-                                                        text,
-                                                        quoted,
-                                                        is_group,
-                                                    });
-                                                } else {
-                                                    let _ = tx.send(WorkerCmd::SendMessage {
-                                                        to_id: thread_id.clone(),
-                                                        text,
-                                                        is_group,
-                                                    });
+                                            let mentions = self.composer_mentions.outgoing(&self.input_message);
+                                            let text = if mentions.is_empty() { self.input_message.trim().to_string() } else { self.input_message.clone() };
+                                            let quoted = self.replying_to.clone();
+                                            match super::composer::send_command(thread_id.clone(), text, is_group, quoted, mentions) {
+                                                Ok(command) => {
+                                                    if WORKER_TX.get().is_some_and(|tx| tx.send(command).is_ok()) {
+                                                        self.input_message.clear();
+                                                        self.composer_mentions.clear();
+                                                        self.replying_to = None;
+                                                        self.dismissed_sticker_suggest_for.clear();
+                                                        self.composer_sticker_selected = None;
+                                                        response.request_focus();
+                                                    } else {
+                                                        self.show_toast("Bộ xử lý gửi chưa sẵn sàng; bản nháp được giữ nguyên");
+                                                    }
                                                 }
+                                                Err(error) => self.show_toast(error.to_string()),
                                             }
                                         } else if enter_pressed {
                                             response.request_focus();

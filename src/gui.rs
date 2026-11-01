@@ -24,6 +24,7 @@ use crate::session::Session;
 mod media_preview;
 mod messages;
 mod emoji_text;
+mod composer;
 mod modals;
 mod stickers;
 mod theme;
@@ -121,6 +122,11 @@ pub enum GuiEvent {
     },
     /// Terminal result of a bounded background native emoji render.
     InlineEmojiReady { cluster: String, sprite_id: Option<u16>, image: Option<egui::ColorImage> },
+    /// Confirmed composer text with the exact request ID and selected mention metadata.
+    ComposerMessageSent { account: String, thread_id: String, msg: ChatMessage },
+    /// An in-memory composer failure preserves explicit selections and the original reply.
+    ComposerSendFailed { account: String, thread_id: String, text: String,
+        mentions: Vec<crate::composer_mentions::OutgoingMention>, quoted: Option<ChatMessage>, error: String },
     StickerImageReady {
         key: String,
         image: egui::ColorImage,
@@ -523,6 +529,7 @@ pub struct ZaloGuiApp {
     thread_filter: ThreadFilter,
     search_query: String,
     input_message: String,
+    composer_mentions: crate::composer_mentions::ComposerMentions,
     status_msg: String,
 
     // Reply / forward state
@@ -732,6 +739,7 @@ impl ZaloGuiApp {
             thread_filter: ThreadFilter::All,
             search_query: String::new(),
             input_message: String::new(),
+            composer_mentions: Default::default(),
             replying_to: None,
             forward_msg: None,
             forward_filter: String::new(),
@@ -1005,6 +1013,11 @@ impl ZaloGuiApp {
                     self.original_reaction_import_pending = false;
                     self.is_logged_in = true;
                     self.user_name = name;
+                    if self.user_uin != uin {
+                        self.composer_mentions = Default::default();
+                        self.input_message.clear();
+                        self.replying_to = None;
+                    }
                     self.user_uin = uin;
                     if avatar.is_some() {
                         self.user_avatar = avatar;
@@ -1158,6 +1171,9 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::LocalDataWiped => {
                     self.threads.clear();
+                    self.composer_mentions = Default::default();
+                    self.input_message.clear();
+                    self.replying_to = None;
                     self.selected_thread_index = 0;
                     self.status_msg = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên)".into();
                 }
@@ -1167,10 +1183,30 @@ impl ZaloGuiApp {
                     self.user_name.clear();
                     self.user_uin.clear();
                     self.threads.clear();
+                    self.composer_mentions = Default::default();
+                    self.input_message.clear();
+                    self.replying_to = None;
                     self.selected_thread_index = 0;
                     self.qr_texture = None;
                     self.qr_status = "Đang xin mã QR mới…".into();
                     self.status_msg = "Đã đăng xuất".into();
+                }
+                GuiEvent::ComposerMessageSent { account, thread_id, msg } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == thread_id) {
+                            thread.preview = msg.text.clone();
+                            thread.time = msg.time.clone();
+                            merge_sent_message(thread, msg);
+                            self.persist_threads_async();
+                        }
+                    }
+                }
+                GuiEvent::ComposerSendFailed { account, thread_id, text, mentions, quoted, error } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        self.composer_mentions.restore_failed(&thread_id, text, &mentions, quoted,
+                            &mut self.input_message, &mut self.replying_to);
+                        self.show_toast(format!("Gửi thất bại: {error}"));
+                    }
                 }
                 GuiEvent::MessageSent {
                     client_message_id,

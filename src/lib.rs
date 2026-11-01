@@ -2,6 +2,8 @@ pub mod audio;
 pub mod call;
 pub mod chat;
 pub mod clock;
+/// Explicit outgoing mention selections and UTF-16 metadata.
+pub mod composer_mentions;
 pub mod crypto;
 pub mod endpoints;
 pub mod feed;

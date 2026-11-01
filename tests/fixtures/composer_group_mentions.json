@@ -1,0 +1,19 @@
+{
+  "text": "  😀 @An @An  ",
+  "mentions": [
+    {
+      "uid": "11",
+      "pos": 5,
+      "len": 3,
+      "type": 0
+    },
+    {
+      "uid": "22",
+      "pos": 9,
+      "len": 3,
+      "type": 0
+    }
+  ],
+  "quoted_text": "Raw :+1: 😀",
+  "client_id": 1793425680123
+}
