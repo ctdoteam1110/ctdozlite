@@ -132,5 +132,25 @@ window.CTD_ISSUES = [
       "src/store.rs"
     ],
     "confirmations": 1
+  },
+  {
+    "id": "RAM-LEAK-GROUP",
+    "title": "Chiếm tới 2GB RAM khi tham gia nhiều nhóm chat đông thành viên",
+    "area": "Hiệu năng / Bộ nhớ (Memory)",
+    "severity": "p1",
+    "confirmations": 2,
+    "reporters": [
+      "heroes1412 (GitHub Issue #56)",
+      "Cộng đồng người dùng Windows / Windows Server"
+    ],
+    "symptom": "Phiên bản v0.0.2 chỉ chiếm ~400MB RAM, nhưng lên v0.0.3 thì ngốn tới 2.0GB RAM trong Task Manager khi người dùng tham gia nhiều nhóm chat có số lượng tin nhắn và hình ảnh lớn.",
+    "evidence": "Do thiếu cơ chế Virtualization khiến egui dựng lại toàn bộ bong bóng chat mỗi frame; ảnh xem trước trong tin nhắn nạp nguyên kích thước gốc vào GPU/RAM không thu nhỏ; và hàm hydrate_threads nạp sẵn quá sâu từ SQLite.",
+    "files": [
+      "src/gui/workspace.rs",
+      "src/gui/worker.rs",
+      "src/store.rs",
+      "src/media_resources.rs"
+    ],
+    "fix": "Đã khắc phục hoàn toàn trên nhánh main (PR #44, #47, #48, #53, sẽ có mặt trong v0.0.4): Áp dụng ảo hóa (virtualization) chỉ vẽ 150 tin trong tầm nhìn, giới hạn ảnh chat dưới 480px, nạp nhanh 20 tin lúc mở app. RAM giảm từ >2GB xuống chỉ còn ~160MB."
   }
 ];

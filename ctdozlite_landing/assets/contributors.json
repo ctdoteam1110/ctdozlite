@@ -677,8 +677,8 @@
     "avatar": "HE",
     "type": "feedback",
     "tag": "GitHub Issue",
-    "role": "Issue #5: k hiển thị dc chữ tàu, k hiển thị dc ảnh, group nh",
-    "detail": "Issue #5: k hiển thị dc chữ tàu, k hiển thị dc ảnh, group nhiều thành viên bị chớp chớp???",
+    "role": "Báo lỗi chiếm 2GB RAM khi nhiều group (Issue #56) & ký tự tiếng Trung",
+    "detail": "Báo cáo lỗi tiêu thụ RAM đột biến trên v0.0.3 (lên đến 2.0GB) kèm ảnh chụp Task Manager (Issue #56), giúp team xác định điểm nghẽn và đưa ra bản vá tối ưu hóa Virtualization (#47, #53) giảm RAM xuống ~160MB.",
     "status": "active",
     "statusText": "Đóng góp trên GitHub",
     "source": "GitHub ctdozlite"
