@@ -1491,6 +1491,40 @@ impl ZaloGuiApp {
                                                 });
                                         }
                                         SettingsTab::Notifications => {
+                                            #[cfg(target_os = "macos")]
+                                            {
+                                                ui.label(RichText::new("Quyền thông báo macOS").strong());
+                                                let authorization = &self.notification_authorization;
+                                                ui.label(if authorization.pending.is_some() {
+                                                    "Đang kiểm tra quyền…".to_owned()
+                                                } else {
+                                                    match &authorization.result {
+                                                        Some(Ok(status)) => status.label().to_owned(),
+                                                        Some(Err(error)) => error.to_string(),
+                                                        None => "Chưa kiểm tra quyền thông báo".to_owned(),
+                                                    }
+                                                });
+                                                ui.label("Quyền hệ điều hành tách biệt với cài đặt Bật/Tắt bên dưới. Chưa bật gửi thông báo native.");
+                                                let ready = authorization.pending.is_none();
+                                                ui.horizontal(|ui| {
+                                                    let refresh = ui.add_enabled(ready, egui::Button::new("Đọc lại quyền")).clicked();
+                                                    let request = ui.add_enabled(ready, egui::Button::new("Yêu cầu quyền macOS")).clicked();
+                                                    if refresh || request {
+                                                        if let Some(request_id) = self.notification_authorization.begin() {
+                                                            let command = if request {
+                                                                WorkerCmd::RequestNotificationAuthorization { request_id }
+                                                            } else {
+                                                                WorkerCmd::ReadNotificationAuthorization { request_id }
+                                                            };
+                                                            if worker::WORKER_TX.get().map(|tx| tx.send(command).is_ok()) != Some(true) {
+                                                                self.notification_authorization.finish(request_id, Err(crate::native_notifications::NotificationError::Io));
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                                ui.add_space(16.0);
+                                            }
+
                                             ui.label(RichText::new("Cài đặt thông báo").color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(2.0);
                                             ui.label(RichText::new("Nhận được thông báo mỗi khi có tin nhắn mới").color(pal.text_secondary).size(12.2));
