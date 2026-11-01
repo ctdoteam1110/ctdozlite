@@ -2724,6 +2724,47 @@ pub async fn get_group_history_raw(s: &Session, grid: &str, count: u32) -> Resul
     Ok(resp)
 }
 
+/// Read the group's member count from one `getmg-v2` `gridInfoMap` entry.
+///
+/// Evidence: the Zalo web bundle's local `Group` table (removed from the repo in 54314e0,
+/// `web-bundle/default-embed-render.js`) declares `totalMember:{type:integer}` next to
+/// `desc`, `type`, `creatorId`, `topMember`, and uses `e.totalMember` for the "seen by" logic.
+/// The field is treated as optional: numbers and numeric strings are accepted, anything
+/// else (missing, negative, zero, non-numeric) yields `None` so the header keeps "Nhóm".
+pub fn parse_group_total_member(info: &Value) -> Option<u32> {
+    let v = info.get("totalMember")?;
+    let n = match v {
+        Value::Number(n) => n.as_u64()?,
+        Value::String(s) => s.trim().parse::<u64>().ok()?,
+        _ => return None,
+    };
+    if n == 0 {
+        return None;
+    }
+    u32::try_from(n).ok()
+}
+
+/// Process-wide cache of real group member counts filled by [`get_groups`].
+///
+/// Kept outside [`Thread`] so the on-disk thread cache format stays unchanged; counts are
+/// refreshed every time the group list is fetched.
+fn group_member_counts() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+    static COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
+        std::sync::OnceLock::new();
+    COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn remember_group_member_count(group_id: &str, n: u32) {
+    if let Ok(mut map) = group_member_counts().lock() {
+        map.insert(group_id.to_string(), n);
+    }
+}
+
+/// Real member count of a group, if `getmg-v2` reported one this session.
+pub fn group_member_count(group_id: &str) -> Option<u32> {
+    group_member_counts().lock().ok()?.get(group_id).copied()
+}
+
 /// `GET /api/group/getlg/v4` (cmd 12027) — list of all groups user belongs to.
 pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
     if s.login.is_none() {
@@ -2762,6 +2803,9 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
                                         }
                                         if let Some(avt) = pick_str(info, &["avt", "fullAvt", "avatar"]) {
                                             g.avatar = Some(avt);
+                                        }
+                                        if let Some(n) = parse_group_total_member(info) {
+                                            remember_group_member_count(&g.id, n);
                                         }
                                     }
                                 }
@@ -4755,5 +4799,44 @@ mod tests {
         assert_eq!(list[0].messages.len(), 1);
         assert!(list[1].messages.is_empty());
         assert!(list[1].preview.is_empty());
+    }
+
+    #[test]
+    fn group_total_member_parsing_is_conservative() {
+        // Shaped like a `getmg-v2` response: `data.gridInfoMap.{groupId}` with the fields the
+        // existing parser reads (`name`, `avt`) plus `totalMember`.
+        let resp = json!({
+            "data": {
+                "gridInfoMap": {
+                    "100": { "name": "Nhóm A", "avt": "https://ava.zdn.vn/a.jpg", "totalMember": 42 },
+                    "200": { "name": "Nhóm B", "totalMember": "7" },
+                    "300": { "name": "Nhóm C" },
+                    "400": { "name": "Nhóm D", "totalMember": 0 },
+                    "500": { "name": "Nhóm E", "totalMember": -3 },
+                    "600": { "name": "Nhóm F", "totalMember": "nhiều" },
+                    "700": { "name": "Nhóm G", "totalMember": 12.5 },
+                    "800": { "name": "Nhóm H", "totalMember": 99999999999u64 }
+                }
+            }
+        });
+        let map = resp.pointer("/data/gridInfoMap").and_then(Value::as_object).unwrap();
+        let got = |id: &str| parse_group_total_member(&map[id]);
+        assert_eq!(got("100"), Some(42));
+        assert_eq!(got("200"), Some(7));
+        assert_eq!(got("300"), None);
+        assert_eq!(got("400"), None);
+        assert_eq!(got("500"), None);
+        assert_eq!(got("600"), None);
+        assert_eq!(got("700"), None);
+        assert_eq!(got("800"), None);
+    }
+
+    #[test]
+    fn group_member_count_cache_round_trip() {
+        assert_eq!(group_member_count("test_grp_cache_unknown"), None);
+        remember_group_member_count("test_grp_cache_1", 15);
+        assert_eq!(group_member_count("test_grp_cache_1"), Some(15));
+        remember_group_member_count("test_grp_cache_1", 16);
+        assert_eq!(group_member_count("test_grp_cache_1"), Some(16));
     }
 }

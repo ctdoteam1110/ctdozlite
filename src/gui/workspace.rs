@@ -537,7 +537,13 @@ impl ZaloGuiApp {
                                             }
                                         });
                                         let sub = if is_group {
-                                            match self.group_member_counts.get(&thread_id) {
+                                            // Demo counts first, then the real `totalMember` from `getmg-v2`.
+                                            let count = self
+                                                .group_member_counts
+                                                .get(&thread_id)
+                                                .copied()
+                                                .or_else(|| crate::chat::group_member_count(&thread_id).map(|n| n as usize));
+                                            match count {
                                                 Some(n) => format!("{n} thành viên"),
                                                 None => "Nhóm".to_string(),
                                             }
