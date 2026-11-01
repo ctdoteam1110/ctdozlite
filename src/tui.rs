@@ -189,7 +189,7 @@ pub struct TuiApp<'a> {
 
 impl<'a> TuiApp<'a> {
     pub fn new(session: &'a mut Session, mut threads: Vec<Thread>) -> Self {
-        let store = crate::store::MessageStore::open("zalo_history.db").ok();
+        let store = crate::store::MessageStore::open(crate::paths::history_db()).ok();
         if let Some(ref st) = store {
             let _ = st.hydrate_threads(&mut threads, 200);
         }
@@ -459,7 +459,7 @@ impl<'a> TuiApp<'a> {
     fn persist_snapshot(&mut self, threads: &[Thread]) {
         if let Some(ref mut st) = self.store {
             let _ = crate::store::persist_threads(st, threads);
-        } else if let Ok(mut st) = crate::store::MessageStore::open("zalo_history.db") {
+        } else if let Ok(mut st) = crate::store::MessageStore::open(crate::paths::history_db()) {
             let _ = crate::store::persist_threads(&mut st, threads);
             self.store = Some(st);
         }
@@ -485,7 +485,7 @@ impl<'a> TuiApp<'a> {
         let snapshot = self.threads.clone();
         tokio::spawn(async move {
             let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(mut st) = crate::store::MessageStore::open("zalo_history.db") {
+                if let Ok(mut st) = crate::store::MessageStore::open(crate::paths::history_db()) {
                     let _ = crate::store::persist_threads(&mut st, &snapshot);
                 }
             })
@@ -942,8 +942,8 @@ impl<'a> TuiApp<'a> {
     fn run_confirm(&mut self, action: ConfirmAction) {
         match action.kind {
             ConfirmKind::Logout => {
-                let _ = std::fs::remove_file("session.json");
-                let _ = std::fs::remove_file("threads_cache.json");
+                let _ = std::fs::remove_file(crate::paths::session_file());
+                let _ = std::fs::remove_file(crate::paths::threads_cache_file());
                 self.session.logout();
                 self.threads.clear();
                 self.filtered.clear();

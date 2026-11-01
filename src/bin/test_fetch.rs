@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
 
     let mut s = Session::new(false, false, false)?;
 
-    if let Err(e) = s.load_from_file("session.json") {
+    if let Err(e) = s.load() {
         bail!("Không tìm thấy hoặc không đọc được session.json ({e}). Vui lòng quét QR đăng nhập trước!");
     }
 

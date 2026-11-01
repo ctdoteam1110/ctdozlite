@@ -65,7 +65,7 @@ fn pretty(v: &Value) -> String {
 
 fn load_session() -> Result<Session> {
     let mut s = Session::new(false, false, false)?;
-    if let Err(e) = s.load_from_file("session.json") {
+    if let Err(e) = s.load() {
         bail!("không đọc được session.json trong thư mục hiện tại ({e})");
     }
     if s.login.is_none() {

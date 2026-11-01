@@ -147,6 +147,22 @@ fn percent_decode(s: &str) -> String {
 /// [O] The server sends **gzip** (`1f 8b 08 …`) for `encrypt` 2/3; the JS side calls a generic
 /// `inflate` helper that sniffs the container. Older captures decoded zlib, so try gzip first
 /// (by magic), then zlib, then raw deflate.
+/// Upper bound for one inflated socket payload (decompression-bomb guard).
+pub const MAX_INFLATED_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Read a decoder to the end, refusing output larger than [`MAX_INFLATED_BYTES`].
+fn read_capped(reader: impl std::io::Read, out: &mut Vec<u8>) -> std::io::Result<()> {
+    use std::io::Read;
+    let n = reader.take(MAX_INFLATED_BYTES + 1).read_to_end(out)?;
+    if n as u64 > MAX_INFLATED_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "inflated payload exceeds 32 MiB",
+        ));
+    }
+    Ok(())
+}
+
 fn inflate(buf: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read;
     if trace_on() {
@@ -166,7 +182,7 @@ fn inflate(buf: &[u8]) -> Result<Vec<u8>> {
     for idx in order {
         let (name, make) = attempts[idx];
         let mut out = Vec::new();
-        match make(buf).read_to_end(&mut out) {
+        match read_capped(make(buf), &mut out) {
             Ok(_) if !out.is_empty() => {
                 trace(format!("inflate ok via {name}: {} -> {} bytes", buf.len(), out.len()));
                 return Ok(out);
@@ -176,7 +192,7 @@ fn inflate(buf: &[u8]) -> Result<Vec<u8>> {
         }
     }
     let mut out = Vec::new();
-    flate2::read::DeflateDecoder::new(buf).read_to_end(&mut out)?;
+    read_capped(flate2::read::DeflateDecoder::new(buf), &mut out)?;
     if out.is_empty() {
         return Err(last_err.unwrap_or_else(|| anyhow!("empty inflate output")));
     }
@@ -268,9 +284,11 @@ impl WsEvent {
 
 fn build_url(sess: &Session, endpoint_idx: usize) -> String {
     let endpoints = &sess.domains.ws;
+    // `ZCALL_WS` is a developer override: honoured only in dev mode, and the cookie gate in
+    // `run_once` still refuses to authenticate against anything but `wss://*.zalo.me`.
     let base = std::env::var("ZCALL_WS")
         .ok()
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && crate::logger::is_dev_mode())
         .or_else(|| {
             if endpoints.is_empty() {
                 None
@@ -386,6 +404,11 @@ async fn run_once(
 ) -> Result<String> {
     let url = build_url(sess, endpoint_idx);
     trace(format!("connect {url}"));
+    // The session cookie authenticates the handshake: never send it in clear text (`ws://`) or
+    // to a host that is not Zalo's.
+    if !crate::session::is_trusted_zalo_url(&url, &["wss"]) {
+        bail!("refusing websocket endpoint that is not wss://*.zalo.me / *.zaloapp.com");
+    }
 
     let mut req = url.clone().into_client_request()?;
     {
@@ -600,5 +623,32 @@ mod tests {
     fn gcm_rejects_short_blob() {
         let err = gcm_decrypt(&[0u8; 32], &[0u8; 16]).unwrap_err().to_string();
         assert!(err.contains("too short"), "{err}");
+    }
+
+    #[test]
+    fn inflate_roundtrip_and_bomb_guard() {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(br#"{"ok":1}"#).unwrap();
+        let gz = enc.finish().unwrap();
+        assert_eq!(inflate(&gz).unwrap(), br#"{"ok":1}"#);
+
+        // 33 MiB of zeros compresses to a few KiB: must be refused, not inflated.
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        let chunk = vec![0u8; 1024 * 1024];
+        for _ in 0..33 {
+            enc.write_all(&chunk).unwrap();
+        }
+        let bomb = enc.finish().unwrap();
+        assert!(bomb.len() < 1024 * 1024);
+        assert!(inflate(&bomb).is_err());
+    }
+
+    #[test]
+    fn default_ws_url_is_trusted() {
+        let s = Session::new(false, false, false).unwrap();
+        let url = build_url(&s, 0);
+        assert!(url.starts_with("wss://"), "{url}");
+        assert!(crate::session::is_trusted_zalo_url(&url, &["wss"]), "{url}");
     }
 }

@@ -82,7 +82,8 @@ fn url_decode(s: &str) -> String {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let session_path = args.get(1).map(String::as_str).unwrap_or("session.json");
+    let default_session = zalo_rust::paths::session_file().display().to_string();
+    let session_path = args.get(1).map(String::as_str).unwrap_or(&default_session);
     let capture_path = args
         .get(2)
         .map(String::as_str)

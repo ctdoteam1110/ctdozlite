@@ -4,10 +4,12 @@
 //! the video payload type, the effective MTU, and whether PLI / FIR actually arrive (and on which socket).
 //!
 //! Format: plain UTF-8 text, one event per line: `YYYY-MM-DD HH:MM:SS.mmm<TAB>TAG key=value ...` (UTC).
-//! This is **not** the substitution-encoded `voip.log` that `ZaloCall.exe` writes, and the default path is
-//! `./voip.log` (next to `call_trace.log`), so it never touches `%APPDATA%\ZaloData\cal\voip.log`.
-//! Override with `ZALO_VOIP_LOG=<path>`; set `ZALO_VOIP_LOG=off` to disable. The file rotates at 2 MiB
-//! (`voip.log` -> `voip.log.1`).
+//! This is **not** the substitution-encoded `voip.log` that `ZaloCall.exe` writes.
+//!
+//! **Off by default.** It is written only in dev mode (`--dev`) or when `ZALO_VOIP_LOG` is set:
+//! `ZALO_VOIP_LOG=1` (or `on`) writes `logs/voip.log` in the per-user data directory
+//! ([`crate::paths::logs_dir`]), any other value is used as the file path, and `off` / `0` disables
+//! it even in dev mode. The file rotates at 2 MiB (`voip.log` -> `voip.log.1`).
 //!
 //! Tags: `RTP>` / `RTP<` (per packet, rate-limited), `RTCP>` / `RTCP<` (every packet), `UNK<` (datagram that
 //! `unwrap_zalo_relay_rtp` rejects), `STAT` (periodic per stream summary, includes the MTU hint), `SIG` (remote
@@ -35,10 +37,29 @@ pub const STAT_INTERVAL: Duration = Duration::from_secs(5);
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 fn log_path() -> Option<String> {
-    match std::env::var("ZALO_VOIP_LOG") {
-        Ok(v) if v.eq_ignore_ascii_case("off") || v == "0" => None,
-        Ok(v) if !v.trim().is_empty() => Some(v),
-        _ => Some("voip.log".to_string()),
+    resolve_log_path(
+        std::env::var("ZALO_VOIP_LOG").ok().as_deref(),
+        crate::logger::is_dev_mode(),
+    )
+}
+
+fn default_log_path() -> String {
+    crate::paths::logs_dir()
+        .join("voip.log")
+        .display()
+        .to_string()
+}
+
+/// Pure policy behind [`log_path`] (unit-tested): `env` = value of `ZALO_VOIP_LOG`.
+fn resolve_log_path(env: Option<&str>, dev_mode: bool) -> Option<String> {
+    match env.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("off") || v == "0" => None,
+        Some(v) if v.eq_ignore_ascii_case("on") || v == "1" || v.eq_ignore_ascii_case("true") => {
+            Some(default_log_path())
+        }
+        Some(v) if !v.is_empty() => Some(v.to_string()),
+        _ if dev_mode => Some(default_log_path()),
+        _ => None,
     }
 }
 
@@ -552,6 +573,17 @@ pub fn log_signal_media(act: &str, params: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voip_log_is_off_by_default() {
+        assert_eq!(resolve_log_path(None, false), None);
+        assert_eq!(resolve_log_path(Some(""), false), None);
+        assert!(resolve_log_path(None, true).unwrap().ends_with("voip.log"));
+        assert!(resolve_log_path(Some("1"), false).unwrap().ends_with("voip.log"));
+        assert_eq!(resolve_log_path(Some("off"), true), None);
+        assert_eq!(resolve_log_path(Some("0"), true), None);
+        assert_eq!(resolve_log_path(Some("/tmp/x.log"), false).as_deref(), Some("/tmp/x.log"));
+    }
 
     fn rtp(pt: u8, marker: bool, seq: u16, payload: &[u8]) -> Vec<u8> {
         let mut p = vec![0x80, if marker { 0x80 | pt } else { pt }];

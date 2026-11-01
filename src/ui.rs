@@ -33,28 +33,77 @@ pub fn prompt_default(label: &str, default: &str) -> Result<String> {
     })
 }
 
-/// Password prompt.
+/// Password prompt that does not echo what is typed.
 ///
-/// Deliberately does NOT touch console mode. Toggling `ENABLE_ECHO_INPUT` around
-/// `std::io::stdin()` deadlocks on Windows because the Rust stdin handle keeps its own
-/// line buffer and the line never completes while echo is off. Reading normally is
-/// slightly worse UX but always works; `--pass-stdin` covers unattended runs.
+/// Older builds read the password with `read_line`, which printed it on screen (toggling
+/// `ENABLE_ECHO_INPUT` around `std::io::stdin()` deadlocks on Windows). This reads key events
+/// through crossterm's raw mode instead, which goes through the console input API rather than
+/// the std line buffer. Raw mode is restored on every exit path, including Ctrl+C / Esc.
+/// When stdin is not a terminal (piped), one line is read instead — nothing to echo there.
 pub fn prompt_password(label: &str) -> Result<String> {
+    use std::io::IsTerminal;
     print!("{label}");
     io::stdout().flush()?;
+    if !io::stdin().is_terminal() {
+        return read_stdin_line();
+    }
+    let result = read_password_raw();
+    // Raw mode is off again here (guard dropped inside), so a plain newline works.
+    println!();
+    match result? {
+        Some(pwd) => Ok(pwd),
+        None => anyhow::bail!("Đã huỷ nhập mật khẩu"),
+    }
+}
+
+/// Collect a password from raw key events. `Ok(None)` = cancelled with Ctrl+C / Esc.
+fn read_password_raw() -> Result<Option<String>> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::terminal;
+
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+
+    terminal::enable_raw_mode()?;
+    let _guard = RawModeGuard;
+    let mut pwd = String::new();
+    loop {
+        match event::read()? {
+            // Windows reports both press and release; only act on presses / repeats.
+            Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+                KeyCode::Enter => return Ok(Some(pwd)),
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Char('c') | KeyCode::Char('C')
+                    if k.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    return Ok(None)
+                }
+                KeyCode::Backspace => {
+                    pwd.pop();
+                }
+                KeyCode::Char(c) => pwd.push(c),
+                _ => {}
+            },
+            Event::Paste(s) => pwd.push_str(s.trim_end_matches(['\r', '\n'])),
+            _ => {}
+        }
+    }
+}
+
+/// Read one line from stdin without a prompt (`--pass-stdin`).
+pub fn read_stdin_line() -> Result<String> {
     let mut s = String::new();
     io::stdin().lock().read_line(&mut s)?;
     Ok(s.trim_end_matches(['\r', '\n']).to_string())
 }
 
+/// Current local time `HH:MM:SS` (operating-system time zone; was UTC before — issue #4).
 pub fn clock() -> String {
-    let secs = crate::login::unix_now();
-    format!(
-        "{:02}:{:02}:{:02}",
-        (secs / 3600) % 24,
-        (secs / 60) % 60,
-        secs % 60
-    )
+    crate::timefmt::hms_now()
 }
 
 /// Repaint the thread list and wait for one key.

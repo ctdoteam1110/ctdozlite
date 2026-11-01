@@ -33,7 +33,7 @@ pub const POLL_SECS: u64 = 4;
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("ctdozlite v{} (zalo-rust)", env!("CARGO_PKG_VERSION"));
+        println!("QTzalo v{} (zalo-rust)", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     let dev_mode = args.iter().any(|a| a == "--dev" || a == "-v" || a == "--verbose");
@@ -44,10 +44,24 @@ async fn main() -> Result<()> {
     let force_qr = args.iter().any(|a| a == "--qr");
     let force_logout = args.iter().any(|a| a == "--logout");
 
+    // Older builds kept credentials and history in the working directory; move them into the
+    // private per-user data directory before anything reads them.
+    let migrated = paths::migrate_legacy_files();
+    if !migrated.is_empty() {
+        println!(
+            "✓ Đã chuyển dữ liệu cũ ({}) vào {}",
+            migrated.join(", "),
+            paths::data_dir().display()
+        );
+    }
+
     if force_logout {
-        let _ = std::fs::remove_file("session.json");
-        let _ = std::fs::remove_file("threads_cache.json");
-        println!("✓ Đã đăng xuất và xóa phiên lưu trữ cũ (session.json, threads_cache.json).");
+        let _ = std::fs::remove_file(paths::session_file());
+        let _ = std::fs::remove_file(paths::threads_cache_file());
+        println!(
+            "✓ Đã đăng xuất và xóa phiên lưu trữ (session.json, threads_cache.json) trong {}.",
+            paths::data_dir().display()
+        );
         if !force_gui && !force_tui && !force_qr {
             return Ok(());
         }
@@ -65,7 +79,7 @@ async fn main() -> Result<()> {
 
     // Attempt to restore persistent session from disk
     let session_restored = if !force_logout {
-        if let Ok(_) = s.load_from_file("session.json") {
+        if s.load().is_ok() {
             if let Some(li) = &s.login {
                 let name = if li.display_name.is_empty() { "Zalo User" } else { &li.display_name };
                 println!("✓ Đã khôi phục phiên từ session.json: {name} (UIN: {})", li.uin);
@@ -117,7 +131,7 @@ async fn main() -> Result<()> {
         };
 
         let mut initial_threads = chat::load_threads_cache();
-        store::load_history_into_threads("zalo_history.db", &mut initial_threads, 200);
+        store::load_history_into_threads(paths::history_db(), &mut initial_threads, 200);
 
         let app_session = s;
         return eframe::run_native(
@@ -144,15 +158,20 @@ async fn main() -> Result<()> {
     println!("🖥️ Khởi chạy chế độ dòng lệnh TUI…");
 
     // Validate session on server to avoid getting stuck in an expired session
+    // Only an explicit auth error means the session is gone (issue #21); a network problem keeps
+    // `session.json` untouched. The file is only overwritten after a successful new login.
     let session_restored = if session_restored {
-        if s.validate_session().await {
-            true
-        } else {
-            println!("⚠️ Phiên đăng nhập trong session.json đã hết hạn. Đang chuyển sang đăng nhập mới…");
-            let _ = std::fs::remove_file("session.json");
-            let _ = std::fs::remove_file("threads_cache.json");
-            s.logout();
-            false
+        match s.check_session().await {
+            session::SessionStatus::Valid => true,
+            session::SessionStatus::Unreachable(why) => {
+                println!("⚠️ Không kết nối được máy chủ Zalo ({why}). Giữ nguyên phiên đã lưu, thử lại sau.");
+                true
+            }
+            session::SessionStatus::Expired => {
+                println!("⚠️ Máy chủ Zalo báo phiên đăng nhập đã hết hạn. Đang chuyển sang đăng nhập mới…");
+                s.logout();
+                false
+            }
         }
     } else {
         false
@@ -175,9 +194,15 @@ async fn main() -> Result<()> {
                 Some(v) => v,
                 None => ui::prompt("Số điện thoại: ")?,
             };
-            let password = match arg_val("--pass") {
-                Some(v) => v,
-                None => ui::prompt_password("Mật khẩu: ")?,
+            // `--pass <pwd>` was removed: it leaked the password into the process list and
+            // shell history. `--pass-stdin` reads one line from stdin for unattended runs.
+            if args.iter().any(|a| a == "--pass") {
+                eprintln!("! Tuỳ chọn --pass đã bị gỡ vì làm lộ mật khẩu. Dùng --pass-stdin hoặc nhập khi được hỏi.");
+            }
+            let password = if args.iter().any(|a| a == "--pass-stdin") {
+                ui::read_stdin_line()?
+            } else {
+                ui::prompt_password("Mật khẩu: ")?
             };
             let iso = match arg_val("--iso") {
                 Some(v) => v,
@@ -192,13 +217,19 @@ async fn main() -> Result<()> {
                 } else {
                     login::login_by_password(&mut s, phone.trim(), &password, iso.trim()).await?
                 };
+                drop(password);
+                if s.login.is_some() {
+                    if let Err(e) = s.save() {
+                        eprintln!("! Lỗi lưu session.json: {e}");
+                    }
+                }
             }
         }
     }
 
     // Fetch initial threads and hydrate with local SQLite history
     let mut initial_threads = chat::load_threads_cache();
-    store::load_history_into_threads("zalo_history.db", &mut initial_threads, 200);
+    store::load_history_into_threads(paths::history_db(), &mut initial_threads, 200);
     if s.login.is_some() {
         match chat::get_friends(&s).await {
             Ok(list) => {

@@ -79,13 +79,7 @@ pub fn log_request(
     if !is_dev_mode() {
         return;
     }
-    let now = crate::login::unix_now();
-    let time_str = format!(
-        "{:02}:{:02}:{:02}",
-        (now / 3600) % 24,
-        (now / 60) % 60,
-        now % 60
-    );
+    let time_str = crate::timefmt::hms_now();
 
     let is_error = status.map(|s| s >= 400).unwrap_or(false) || error_msg.is_some();
 
@@ -115,13 +109,7 @@ pub fn log_error(context: &str, err: &str) {
     if !is_dev_mode() {
         return;
     }
-    let now = crate::login::unix_now();
-    let time_str = format!(
-        "{:02}:{:02}:{:02}",
-        (now / 3600) % 24,
-        (now / 60) % 60,
-        now % 60
-    );
+    let time_str = crate::timefmt::hms_now();
 
     if let Ok(mut state) = LOGGER.lock() {
         state.counter += 1;
