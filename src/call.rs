@@ -2799,6 +2799,7 @@ impl CallBridge {
                                     reason: last_err_reason.clone(),
                                 });
                                 let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                    client_message_id: String::new(),
                                     thread_id: partner_id,
                                     text: if is_video {
                                         format!(
@@ -2946,6 +2947,7 @@ impl CallBridge {
                                     let _ = gui_tx_clone
                                         .send(GuiEvent::CallStateChanged("free".into()));
                                     let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                        client_message_id: String::new(),
                                         thread_id: partner_id,
                                         text: if was_video {
                                             "📹 Cuộc gọi video đến (Đã từ chối)".into()
@@ -3073,6 +3075,7 @@ impl CallBridge {
                                     (false, false) => format!("📞 Cuộc gọi đến ({duration_sec}s)"),
                                 };
                                 let _ = gui_tx.send(GuiEvent::MessageSent {
+                                    client_message_id: String::new(),
                                     thread_id: thread_id.clone(),
                                     text: label,
                                     msg_id: format!("call_{}", crate::login::unix_now()),
@@ -3603,6 +3606,7 @@ impl CallBridge {
                                     });
                                     if let Some(st) = taken {
                                         let _ = gui_tx.send(GuiEvent::MessageSent {
+                                            client_message_id: String::new(),
                                             thread_id: st.thread_id.clone(),
                                             text: if st.is_video {
                                                 format!("📹 Cuộc gọi video đi (0s) — {reason}")
@@ -3758,6 +3762,7 @@ impl CallBridge {
                                         (false, false, false) => "📞 Cuộc gọi nhỡ".to_string(),
                                     };
                                     let _ = gui_tx.send(GuiEvent::MessageSent {
+                                        client_message_id: String::new(),
                                         thread_id: st.thread_id.clone(),
                                         text: label,
                                         msg_id: format!("call_{}", crate::login::unix_now()),
