@@ -2,7 +2,7 @@
 
 Trang này cho biết **cái gì đang chạy, cái gì chạy một phần, cái gì chưa có** — để bạn không mất thời gian báo lại những lỗi đã biết.
 
-> **Kiểm chứng trên nhánh `main` (v0.0.4).** Bảng này được cập nhật mỗi lần release.
+> **Kiểm chứng trên nhánh `main` (v0.0.5).** Bảng này được cập nhật mỗi lần release.
 > Nếu bạn đang dùng bản build cũ hơn, một số dòng có thể đã khác.
 
 ## Cách đọc
