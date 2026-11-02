@@ -3472,6 +3472,249 @@ fn extract_link_info(
         _ => (None, None, None, None, None),
     }
 }
+
+/// Kind of attachment a chat message carries (photo / video / file / voice note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Photo,
+    Video,
+    File,
+    Voice,
+}
+
+/// Media kind for a normalised `msgType` (see [`normalize_msg_type`]). Queue messages use
+/// `chat.photo`, `chat.video.msg`, `chat.voice`, `share.file`; history uses `chat.video` /
+/// `chat.file` or the numeric codes. `chat.recommended` (shared links) stays a link card.
+fn media_kind_for_type(msg_type: &str) -> Option<MediaKind> {
+    match msg_type {
+        "chat.photo" | "photo" | "2" => Some(MediaKind::Photo),
+        "chat.video" | "video" | "4" => Some(MediaKind::Video),
+        t if t.starts_with("chat.video.") => Some(MediaKind::Video),
+        "chat.voice" | "voice" | "3" => Some(MediaKind::Voice),
+        "share.file" | "chat.file" | "file" | "19" => Some(MediaKind::File),
+        _ => None,
+    }
+}
+
+/// Fields of a media bubble derived from a rich `content` object (`ChatMessage::text` and the
+/// `link_*` card fields). `text` is always a label (`[Hình ảnh]`, `[Video]`, …), never a URL.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct MediaFields {
+    text: String,
+    link_url: Option<String>,
+    link_title: Option<String>,
+    link_desc: Option<String>,
+    link_thumb: Option<String>,
+    link_src: Option<String>,
+}
+
+/// `content` as a JSON object, whether it arrived as an object or as a JSON string.
+fn rich_content_object(v: &Value) -> Option<serde_json::Map<String, Value>> {
+    match v {
+        Value::Object(o) => Some(o.clone()),
+        Value::String(s) => {
+            let t = s.trim();
+            if t.starts_with('{') && t.ends_with('}') {
+                match serde_json::from_str::<Value>(t) {
+                    Ok(Value::Object(o)) => Some(o),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `content.params`: a JSON string in real messages, sometimes already an object.
+fn content_params(o: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    match o.get("params") {
+        Some(Value::Object(p)) => p.clone(),
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(s.trim()) {
+            Ok(Value::Object(p)) => p,
+            _ => serde_json::Map::new(),
+        },
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// A trimmed `http(s)://` URL without whitespace, or `None`.
+fn web_url(v: Option<&Value>) -> Option<String> {
+    let s = v?.as_str()?.trim();
+    let ok = (s.starts_with("https://") || s.starts_with("http://"))
+        && s.len() > "https://".len()
+        && !s.chars().any(char::is_whitespace);
+    ok.then(|| s.to_string())
+}
+
+/// A caption / name typed by a person: non-empty, not a URL, not a JSON blob.
+fn human_text(v: Option<&Value>) -> Option<String> {
+    let s = v?.as_str()?.trim();
+    let lower = s.to_ascii_lowercase();
+    let reject = s.is_empty()
+        || s == "sendBubbleMessage"
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("www.")
+        || (s.starts_with('{') && s.ends_with('}'));
+    (!reject).then(|| s.to_string())
+}
+
+/// A non-negative integer from a JSON number or numeric string (`"12345"`).
+fn json_u64(v: Option<&Value>) -> Option<u64> {
+    match v? {
+        Value::Number(n) => n.as_u64().or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+/// Build the bubble fields for a media message. `content` may be missing or not an object
+/// (then only the label is set).
+fn media_fields(kind: MediaKind, content: Option<&Value>) -> MediaFields {
+    let label = match kind {
+        MediaKind::Photo => "[Hình ảnh]",
+        MediaKind::Video => "[Video]",
+        MediaKind::File => "[Tập tin]",
+        MediaKind::Voice => "[Tin nhắn thoại]",
+    };
+    let mut f = MediaFields {
+        text: label.to_string(),
+        ..Default::default()
+    };
+    let Some(o) = content.and_then(rich_content_object) else {
+        return f;
+    };
+    let params = content_params(&o);
+    let href = web_url(o.get("href"));
+    let thumb = web_url(o.get("thumb"));
+    // Zalo durations are milliseconds.
+    let duration = json_u64(params.get("duration"))
+        .filter(|ms| *ms > 0)
+        .map(|ms| crate::video::format_clock(ms as f64 / 1000.0));
+    let size = json_u64(params.get("fileSize").or_else(|| params.get("size")))
+        .filter(|b| *b > 0)
+        .map(crate::download::format_bytes);
+    match kind {
+        MediaKind::Photo => {
+            let caption = human_text(o.get("description")).or_else(|| human_text(o.get("title")));
+            let hd = web_url(params.get("hd")).filter(|u| u.starts_with("https://"));
+            if let Some(c) = &caption {
+                f.text = format!("{label} {c}");
+            }
+            f.link_url = hd.or_else(|| href.clone()).or_else(|| thumb.clone());
+            f.link_thumb = thumb.or(href);
+            f.link_desc = caption;
+            f.link_src = Some("Hình ảnh Zalo".into());
+        }
+        MediaKind::Video => {
+            f.link_title = human_text(o.get("title"));
+            f.link_url = href;
+            f.link_thumb = thumb;
+            f.link_desc = match (duration, size) {
+                (Some(d), Some(s)) => Some(format!("{d} · {s}")),
+                (d, s) => d.or(s),
+            };
+            f.link_src = Some("Video Zalo".into());
+        }
+        MediaKind::File => {
+            let name = human_text(o.get("title"))
+                .or_else(|| human_text(params.get("fileName")))
+                .or_else(|| human_text(o.get("fileName")))
+                .or_else(|| human_text(o.get("name")));
+            if let Some(n) = &name {
+                f.text = format!("{label} {n}");
+            }
+            f.link_title = name;
+            f.link_url = href;
+            f.link_desc = size;
+            f.link_src = Some("Tập tin Zalo".into());
+        }
+        MediaKind::Voice => {
+            f.link_title = Some("Tin nhắn thoại".into());
+            f.link_url = href;
+            f.link_desc = duration;
+        }
+    }
+    f
+}
+
+/// Media kind of a bare Zalo CDN URL, for rows stored before media messages were recognised
+/// (their `text` is the URL itself). Conservative on purpose: only `*.zdn.vn` / `*.zadn.vn`
+/// hosts, and only when the path ends in a photo / video extension or a host label names the
+/// media (`photo-…`, `video-…`). Everything else stays an ordinary link.
+pub fn media_kind_from_legacy_url(url: &str) -> Option<MediaKind> {
+    let u = url.trim();
+    let rest = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"))?;
+    if rest.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    if authority.contains('@') {
+        return None;
+    }
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let base = ["zdn.vn", "zadn.vn"]
+        .into_iter()
+        .find(|b| host == *b || host.ends_with(&format!(".{b}")))?;
+    let path = rest[auth_end..]
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let ext = path
+        .rsplit('/')
+        .next()
+        .and_then(|seg| seg.rsplit_once('.'))
+        .map(|(_, e)| e)
+        .unwrap_or("");
+    match ext {
+        // Only formats the image decoder can show (png / jpeg).
+        "jpg" | "jpeg" | "png" => return Some(MediaKind::Photo),
+        "mp4" | "mov" | "m4v" | "3gp" | "webm" | "mkv" => return Some(MediaKind::Video),
+        _ => {}
+    }
+    let labels = host.strip_suffix(base).unwrap_or("").trim_end_matches('.');
+    for label in labels.split('.') {
+        if label.contains("photo") {
+            return Some(MediaKind::Photo);
+        }
+        if label.contains("video") {
+            return Some(MediaKind::Video);
+        }
+    }
+    None
+}
+
+/// Media kind of a stored row that predates media parsing: `text` is exactly its `link_url`
+/// and that URL is a Zalo media URL ([`media_kind_from_legacy_url`]). Rows that already carry
+/// a media marker, a sticker, or any other text are not legacy rows.
+pub fn legacy_media_kind(msg: &ChatMessage) -> Option<MediaKind> {
+    if msg.sticker_id.is_some() {
+        return None;
+    }
+    if matches!(
+        msg.link_src.as_deref(),
+        Some("Hình ảnh Zalo" | "Video Zalo" | "Tập tin Zalo")
+    ) {
+        return None;
+    }
+    let url = msg.link_url.as_deref()?.trim();
+    if url.is_empty() || msg.text.trim() != url {
+        return None;
+    }
+    media_kind_from_legacy_url(url)
+}
+
 fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     let msg_type = normalize_msg_type(it);
 
@@ -3484,7 +3727,7 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     if sticker_meta.is_none() && (msg_type == "chat.sticker" || msg_type == "sticker" || msg_type == "5") {
         sticker_meta = extract_sticker_info(it);
     }
-    let (link_url, link_title, link_desc, link_thumb, link_src) = raw_content_val
+    let (mut link_url, mut link_title, mut link_desc, mut link_thumb, mut link_src) = raw_content_val
         .map(extract_link_info)
         .unwrap_or((None, None, None, None, None));
 
@@ -3497,6 +3740,17 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         sticker_meta = None;
     } else if sticker_meta.is_some() && (content.is_empty() || content.starts_with('{')) {
         content = "[Nhãn dán]".to_string();
+    } else if let Some(kind) = media_kind_for_type(&msg_type).filter(|_| sticker_meta.is_none()) {
+        // Photos / videos / files / voice notes: a label plus card fields, never the raw CDN
+        // URL as text (photo `title` / `description` are usually empty, so the generic path
+        // above would have returned `href`).
+        let f = media_fields(kind, raw_content_val);
+        content = f.text;
+        link_url = f.link_url;
+        link_title = f.link_title;
+        link_desc = f.link_desc;
+        link_thumb = f.link_thumb;
+        link_src = f.link_src;
     }
 
     if content.is_empty() {
@@ -3509,7 +3763,7 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
             "chat.location" | "location" | "24" => "[Vị trí]".to_string(),
             "chat.contact" | "contact" => "[Danh thiếp]".to_string(),
             "chat.undo" | "undo" | "31" => "[Tin nhắn đã thu hồi]".to_string(),
-            "chat.recommended" | "share.file" => "[Chia sẻ]".to_string(),
+            "chat.recommended" => "[Chia sẻ]".to_string(),
             _ => {
                 let obj = it.get("content").or_else(|| it.get("message"));
                 if let Some(o) = obj {
@@ -4693,6 +4947,170 @@ mod tests {
         let parsed = parse_chat_message(&msg).unwrap();
         assert_eq!(parsed.text, "Xin chao buoi sang");
         assert_eq!(parsed.sender, "Charlie");
+    }
+
+    /// Synthetic queue message shaped like `510_1` / `501` entries (no real data).
+    fn queue_msg(msg_type: &str, content: Value) -> Value {
+        json!({
+            "msgId": "m_1",
+            "msgType": msg_type,
+            "uidFrom": "user_x",
+            "ts": "1700000000000",
+            "content": content
+        })
+    }
+
+    #[test]
+    fn queue_photo_gets_photo_card_without_url_text() {
+        let content = json!({
+            "action": "", "childnumber": 0, "description": "", "title": "", "type": "",
+            "href": "https://photo.example.zdn.vn/a/full.jpg",
+            "thumb": "https://photo.example.zdn.vn/a/thumb.jpg",
+            "params": "{\"width\":1280,\"height\":960,\"hd\":\"https://photo.example.zdn.vn/a/hd.jpg\"}"
+        });
+        let m = parse_chat_message(&queue_msg("chat.photo", content)).unwrap();
+        assert_eq!(m.text, "[Hình ảnh]");
+        assert_eq!(m.link_src.as_deref(), Some("Hình ảnh Zalo"));
+        assert_eq!(m.link_url.as_deref(), Some("https://photo.example.zdn.vn/a/hd.jpg"));
+        assert_eq!(m.link_thumb.as_deref(), Some("https://photo.example.zdn.vn/a/thumb.jpg"));
+        assert_eq!(m.link_desc, None);
+    }
+
+    #[test]
+    fn photo_caption_is_kept_but_urls_never_become_text() {
+        // Caption in `description`; `hd` over plain http is ignored in favour of `href`.
+        let with_caption = json!({
+            "description": "Ảnh đi chơi", "title": "",
+            "href": "https://p.zdn.vn/full.jpg", "thumb": "https://p.zdn.vn/t.jpg",
+            "params": "{\"hd\":\"http://p.zdn.vn/hd.jpg\"}"
+        });
+        let m = parse_chat_message(&queue_msg("chat.photo", with_caption)).unwrap();
+        assert_eq!(m.text, "[Hình ảnh] Ảnh đi chơi");
+        assert_eq!(m.link_desc.as_deref(), Some("Ảnh đi chơi"));
+        assert_eq!(m.link_url.as_deref(), Some("https://p.zdn.vn/full.jpg"));
+
+        // A URL in title/description is not a caption; a JSON-string content works too.
+        let url_title = json!({
+            "description": "https://p.zdn.vn/full.jpg", "title": "https://p.zdn.vn/x",
+            "href": "https://p.zdn.vn/full.jpg"
+        })
+        .to_string();
+        let m = parse_chat_message(&queue_msg("chat.photo", Value::String(url_title))).unwrap();
+        assert_eq!(m.text, "[Hình ảnh]");
+        assert_eq!(m.link_desc, None);
+        assert_eq!(m.link_thumb.as_deref(), Some("https://p.zdn.vn/full.jpg"));
+
+        // Non-web URLs are dropped.
+        let bad = json!({ "href": "file:///C:/x.jpg", "thumb": "javascript:alert(1)" });
+        let m = parse_chat_message(&queue_msg("chat.photo", bad)).unwrap();
+        assert_eq!((m.link_url, m.link_thumb), (None, None));
+        assert_eq!(m.text, "[Hình ảnh]");
+    }
+
+    #[test]
+    fn queue_video_msg_gets_video_card_with_duration() {
+        let content = json!({
+            "title": "", "description": "",
+            "href": "https://video.example.zdn.vn/v/clip.mp4",
+            "thumb": "https://video.example.zdn.vn/v/clip.jpg",
+            "params": "{\"duration\":42500,\"video_width\":720,\"video_height\":1280,\"fileSize\":\"9030000\"}"
+        });
+        let m = parse_chat_message(&queue_msg("chat.video.msg", content)).unwrap();
+        assert_eq!(m.text, "[Video]");
+        assert_eq!(m.link_src.as_deref(), Some("Video Zalo"));
+        assert_eq!(m.link_url.as_deref(), Some("https://video.example.zdn.vn/v/clip.mp4"));
+        assert_eq!(m.link_thumb.as_deref(), Some("https://video.example.zdn.vn/v/clip.jpg"));
+        assert_eq!(m.link_desc.as_deref(), Some("0:42 · 8,61 MB"));
+
+        // Numeric history type 4 without content still yields the label.
+        let bare = json!({ "msgId": "v2", "msgType": 4, "content": "", "uidFrom": "u", "ts": 1 });
+        assert_eq!(parse_chat_message(&bare).unwrap().text, "[Video]");
+    }
+
+    #[test]
+    fn share_file_gets_file_card_with_name_and_size() {
+        let content = json!({
+            "title": "Bao cao quy 3.pdf",
+            "href": "https://dl.example.zdn.vn/f/abc",
+            "params": "{\"checksum\":\"00\",\"checksumSha\":\"00\",\"fType\":1,\"fdata\":\"{}\",\"fileExt\":\"pdf\",\"fileSize\":\"25270000\"}"
+        });
+        let m = parse_chat_message(&queue_msg("share.file", content)).unwrap();
+        assert_eq!(m.text, "[Tập tin] Bao cao quy 3.pdf");
+        assert_eq!(m.link_src.as_deref(), Some("Tập tin Zalo"));
+        assert_eq!(m.link_title.as_deref(), Some("Bao cao quy 3.pdf"));
+        assert_eq!(m.link_desc.as_deref(), Some("24,1 MB"));
+        assert_eq!(m.link_url.as_deref(), Some("https://dl.example.zdn.vn/f/abc"));
+        assert_eq!(m.link_thumb, None);
+
+        // No name: label only, never the URL.
+        let nameless = json!({ "title": "", "href": "https://dl.example.zdn.vn/f/abc" });
+        let m = parse_chat_message(&queue_msg("chat.file", nameless)).unwrap();
+        assert_eq!(m.text, "[Tập tin]");
+    }
+
+    #[test]
+    fn voice_and_links_and_text_keep_their_shape() {
+        let voice = json!({ "href": "https://voice.example.zdn.vn/a.m4a", "params": "{\"duration\":7000}" });
+        let m = parse_chat_message(&queue_msg("chat.voice", voice)).unwrap();
+        assert_eq!(m.text, "[Tin nhắn thoại]");
+        assert_eq!(m.link_url.as_deref(), Some("https://voice.example.zdn.vn/a.m4a"));
+        assert_eq!(m.link_desc.as_deref(), Some("0:07"));
+        assert_eq!(m.link_src, None);
+
+        // Shared links stay ordinary link cards.
+        let link = json!({
+            "action": "recommened.link", "title": "Tin tức", "description": "",
+            "href": "https://news.example.com/a", "thumb": "https://news.example.com/t.jpg",
+            "params": "{\"src\":\"news.example.com\"}"
+        });
+        let m = parse_chat_message(&queue_msg("chat.recommended", link)).unwrap();
+        assert_eq!(m.text, "Tin tức");
+        assert_eq!(m.link_url.as_deref(), Some("https://news.example.com/a"));
+        assert_eq!(m.link_src.as_deref(), Some("news.example.com"));
+
+        let text = parse_chat_message(&queue_msg("webchat", json!("xin chào"))).unwrap();
+        assert_eq!(text.text, "xin chào");
+        assert_eq!(text.link_url, None);
+    }
+
+    #[test]
+    fn legacy_media_url_classifier_is_conservative() {
+        use MediaKind::*;
+        let k = media_kind_from_legacy_url;
+        assert_eq!(k("https://f21-zpc.zdn.vn/123/abc.jpg"), Some(Photo));
+        assert_eq!(k("https://s120.zadn.vn/x/y.JPEG?w=1"), Some(Photo));
+        assert_eq!(k("https://photo-stal-1.zdn.vn/a/b"), Some(Photo));
+        assert_eq!(k("https://f9-zpc.zdn.vn/v/clip.mp4"), Some(Video));
+        assert_eq!(k("http://video-hcm.zdn.vn/abc"), Some(Video));
+        // Not Zalo's CDN, not media, or suspicious.
+        assert_eq!(k("https://example.com/photo.jpg"), None);
+        assert_eq!(k("https://zdn.vn.example.com/a.jpg"), None);
+        assert_eq!(k("https://evilzdn.vn/a.jpg"), None);
+        assert_eq!(k("https://dl.zdn.vn/f/report.pdf"), None);
+        assert_eq!(k("https://user@photo.zdn.vn/a.jpg"), None);
+        assert_eq!(k("https://f.zdn.vn/a.jpg?x=.mp4"), Some(Photo));
+        assert_eq!(k("https://f.zdn.vn/a.webp"), None);
+        assert_eq!(k("ftp://photo.zdn.vn/a.jpg"), None);
+        assert_eq!(k("xem https://photo.zdn.vn/a.jpg"), None);
+
+        let row = |text: &str, url: Option<&str>| ChatMessage {
+            text: text.into(),
+            link_url: url.map(Into::into),
+            link_src: Some("f21-zpc.zdn.vn".into()),
+            ..Default::default()
+        };
+        let u = "https://f21-zpc.zdn.vn/123/abc.jpg";
+        assert_eq!(legacy_media_kind(&row(u, Some(u))), Some(Photo));
+        // Text that is more than the URL, no link_url, or an already-marked row: unchanged.
+        assert_eq!(legacy_media_kind(&row(&format!("xem {u}"), Some(u))), None);
+        assert_eq!(legacy_media_kind(&row(u, None)), None);
+        let mut marked = row(u, Some(u));
+        marked.link_src = Some("Hình ảnh Zalo".into());
+        assert_eq!(legacy_media_kind(&marked), None);
+        assert_eq!(
+            legacy_media_kind(&row("https://news.example.com/a", Some("https://news.example.com/a"))),
+            None
+        );
     }
 
     #[test]

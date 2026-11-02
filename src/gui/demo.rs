@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use eframe::egui;
+
 use crate::chat::{ChatMessage, FriendshipStatus, Thread};
 
 pub(super) struct DemoWorkspace {
@@ -21,6 +23,78 @@ pub(super) struct DemoWorkspace {
 pub(super) const DEMO_FILE_URL: &str = "https://f21-zpc.zdn.vn/demo/QTzalo-landing.fig";
 pub(super) const DEMO_VIDEO_URL: &str = "https://video.zdn.vn/demo/demo-onboarding.mp4";
 pub(super) const DEMO_PHOTO_URL: &str = "https://photo-stal-1.zdn.vn/demo/bang-mau.jpg";
+/// Thumbnail key of the demo video (drawn locally by [`demo_video_thumb_image`]).
+pub(super) const DEMO_VIDEO_THUMB_URL: &str = "https://video.zdn.vn/demo/demo-onboarding.jpg";
+
+/// Fill a rectangle with rounded corners (radius `r`) into `img`.
+fn fill_round_rect(img: &mut egui::ColorImage, x: usize, y: usize, w: usize, h: usize, r: usize, c: egui::Color32) {
+    let [iw, ih] = img.size;
+    for py in y..(y + h).min(ih) {
+        for px in x..(x + w).min(iw) {
+            let (dx, dy) = (px - x, py - y);
+            let cx = if dx < r { r - dx } else if dx >= w - r { dx + r + 1 - w } else { 0 };
+            let cy = if dy < r { r - dy } else if dy >= h - r { dy + r + 1 - h } else { 0 };
+            if cx * cx + cy * cy <= r * r {
+                img.pixels[py * iw + px] = c;
+            }
+        }
+    }
+}
+
+/// Local stand-in for the demo photo ("Ảnh chụp màn hình bảng màu"): a colour-palette sheet.
+pub(super) fn demo_photo_image() -> egui::ColorImage {
+    use egui::Color32;
+    let mut img = egui::ColorImage::new([480, 320], Color32::from_rgb(245, 247, 251));
+    fill_round_rect(&mut img, 0, 0, 480, 44, 0, Color32::from_rgb(0, 104, 255));
+    fill_round_rect(&mut img, 20, 15, 120, 14, 7, Color32::from_rgba_unmultiplied(255, 255, 255, 230));
+    let swatches = [
+        (0, 104, 255),
+        (37, 99, 235),
+        (5, 150, 105),
+        (245, 158, 11),
+        (239, 68, 68),
+        (139, 92, 246),
+        (14, 165, 233),
+        (17, 24, 39),
+    ];
+    for (i, (r, g, b)) in swatches.into_iter().enumerate() {
+        let (col, row) = (i % 4, i / 4);
+        let (x, y) = (28 + col * 110, 66 + row * 124);
+        fill_round_rect(&mut img, x, y, 94, 82, 12, Color32::from_rgb(r, g, b));
+        fill_round_rect(&mut img, x, y + 92, 70, 9, 4, Color32::from_rgb(203, 213, 225));
+        fill_round_rect(&mut img, x, y + 106, 44, 7, 3, Color32::from_rgb(226, 232, 240));
+    }
+    img
+}
+
+/// Local stand-in for the demo video's thumbnail: an app screen on a blue–violet gradient.
+pub(super) fn demo_video_thumb_image() -> egui::ColorImage {
+    use egui::Color32;
+    let (w, h) = (480usize, 270usize);
+    let mut img = egui::ColorImage::new([w, h], Color32::BLACK);
+    for y in 0..h {
+        for x in 0..w {
+            let t = (x as f32 / w as f32) * 0.6 + (y as f32 / h as f32) * 0.4;
+            let mix = |a: f32, b: f32| (a + (b - a) * t) as u8;
+            img.pixels[y * w + x] = Color32::from_rgb(mix(30.0, 124.0), mix(58.0, 58.0), mix(138.0, 237.0));
+        }
+    }
+    let white = Color32::from_rgb(255, 255, 255);
+    fill_round_rect(&mut img, 90, 40, 300, 190, 14, white);
+    fill_round_rect(&mut img, 90, 40, 86, 190, 14, Color32::from_rgb(241, 245, 249));
+    fill_round_rect(&mut img, 162, 40, 14, 190, 0, Color32::from_rgb(241, 245, 249));
+    for i in 0..4 {
+        let y = 58 + i * 40;
+        fill_round_rect(&mut img, 102, y, 22, 22, 11, Color32::from_rgb(148, 163, 184));
+        fill_round_rect(&mut img, 130, y + 4, 38, 6, 3, Color32::from_rgb(203, 213, 225));
+        fill_round_rect(&mut img, 130, y + 14, 26, 5, 2, Color32::from_rgb(226, 232, 240));
+    }
+    fill_round_rect(&mut img, 192, 62, 120, 26, 13, Color32::from_rgb(226, 232, 240));
+    fill_round_rect(&mut img, 250, 100, 124, 26, 13, Color32::from_rgb(0, 104, 255));
+    fill_round_rect(&mut img, 192, 138, 150, 26, 13, Color32::from_rgb(226, 232, 240));
+    fill_round_rect(&mut img, 192, 194, 182, 22, 11, Color32::from_rgb(241, 245, 249));
+    img
+}
 
 fn msg(id: &str, sender: &str, text: &str, ts_ms: i64, outgoing: bool) -> ChatMessage {
     ChatMessage {
@@ -97,6 +171,7 @@ impl DemoWorkspace {
         g1[5].link_title = Some("demo-onboarding.mp4".into());
         g1[5].link_desc = Some("Video · 0:42 · 8,6 MB".into());
         g1[5].link_url = Some(DEMO_VIDEO_URL.into());
+        g1[5].link_thumb = Some(DEMO_VIDEO_THUMB_URL.into());
         g1[6].link_src = Some("Tập tin Zalo".into());
         g1[6].link_title = Some("QTzalo-landing.fig".into());
         g1[6].link_desc = Some("24,1 MB".into());
@@ -231,5 +306,17 @@ mod tests {
         assert_eq!(d.typing.get("demo_tk").map(String::as_str), Some("Anh Minh"));
         // No remote avatars: rendering demo threads never asks the worker for images.
         assert!(d.threads.iter().all(|t| t.avatar.is_none()));
+        // The video card has a thumbnail (drawn locally, see `demo_video_thumb_image`).
+        let v = g.messages.iter().find(|m| m.link_src.as_deref() == Some("Video Zalo")).unwrap();
+        assert_eq!(v.link_thumb.as_deref(), Some(DEMO_VIDEO_THUMB_URL));
+    }
+
+    #[test]
+    fn demo_thumbnails_are_drawn_locally() {
+        let p = demo_photo_image();
+        assert_eq!(p.size, [480, 320]);
+        let v = demo_video_thumb_image();
+        assert_eq!(v.size, [480, 270]);
+        assert_ne!(v.pixels[0], v.pixels[v.pixels.len() - 1], "gradient background");
     }
 }

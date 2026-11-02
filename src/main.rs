@@ -24,6 +24,7 @@ mod timefmt;
 mod trace_shape;
 mod tui;
 mod ui;
+mod video;
 mod voip_log;
 
 use anyhow::Result;

@@ -2661,34 +2661,14 @@ impl ZaloGuiApp {
         }
     }
 
+    /// Photo viewer in its own OS window (`Xem ảnh — <title>`): mouse-wheel / button zoom, drag
+    /// to pan, double-click toggles 100% ↔ 200%, "Tải về" saves the original. Escape or the
+    /// window's close button closes it (and clears `self.image_viewer`). Never opens a browser.
     pub(super) fn render_image_viewer_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         let Some(mut viewer) = self.image_viewer.clone() else {
+            self.media.image_window = None;
             return;
         };
-
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            self.image_viewer = None;
-            return;
-        }
-
-        let screen_rect = ctx.screen_rect();
-        // Start below the 32px custom frameless title bar so window controls stay accessible
-        let viewer_top = (screen_rect.top() + 32.0).min(screen_rect.bottom());
-        let toolbar_h = 46.0_f32;
-        let toolbar_rect = Rect::from_min_max(
-            Pos2::new(screen_rect.left(), viewer_top),
-            Pos2::new(screen_rect.right(), (viewer_top + toolbar_h).min(screen_rect.bottom())),
-        );
-        let stage_area_rect = Rect::from_min_max(
-            Pos2::new(screen_rect.left(), toolbar_rect.bottom()),
-            screen_rect.max,
-        );
-        let mut should_close = false;
-        // "Tải về" in the toolbar: only for real web URLs (the worker enforces the full policy).
-        let can_download = viewer.full_url.starts_with("https://")
-            || viewer.full_url.starts_with("http://");
-        let dl_state = self.downloads.get(&viewer.full_url).cloned();
-        let mut dl_action: Option<BubbleAction> = None;
 
         let active_tex = viewer
             .hd_tex_key
@@ -2696,412 +2676,93 @@ impl ZaloGuiApp {
             .and_then(|hk| self.sticker_textures.get(hk))
             .or_else(|| self.sticker_textures.get(&viewer.tex_key))
             .cloned();
+        let natural_dims = active_tex.as_ref().map(|t| t.size());
+        let clean_title = image_viewer_title(&viewer.title);
 
-        let max_stage_w = (stage_area_rect.width() - 48.0).max(160.0);
-        let max_stage_h = (stage_area_rect.height() - 36.0).max(120.0);
-
-        let (base_w, base_h, natural_dims) = if let Some(ref tex) = active_tex {
-            let [tw, th] = tex.size();
-            let tw_f = (tw.max(1)) as f32;
-            let th_f = (th.max(1)) as f32;
-            let fit_scale = (max_stage_w / tw_f).min(max_stage_h / th_f).min(1.5);
-            (tw_f * fit_scale, th_f * fit_scale, Some((tw, th)))
-        } else {
-            (340.0_f32.min(max_stage_w), 220.0_f32.min(max_stage_h), None)
+        // The window size is chosen once per opened image, so the user's own resizing sticks.
+        let ident = format!("{}|{}", viewer.tex_key, viewer.full_url);
+        let win_size = match &self.media.image_window {
+            Some((id, size)) if *id == ident => *size,
+            _ => {
+                let size = image_window_size(ctx, natural_dims);
+                self.media.image_window = Some((ident, size));
+                size
+            }
         };
 
-        // Mouse-wheel zoom (zooms smoothly around cursor without clamping disp_w/disp_h to max_stage)
-        let scroll_y = ctx.input(|i| {
-            if i.raw_scroll_delta.y.abs() > 0.1 {
-                i.raw_scroll_delta.y
-            } else {
-                i.smooth_scroll_delta.y
-            }
-        });
-        if scroll_y.abs() > 0.1 {
-            let old_zoom = viewer.zoom;
-            let factor = if scroll_y > 0.0 { 1.15 } else { 1.0 / 1.15 };
-            let new_zoom = (old_zoom * factor).clamp(0.25, 8.0);
-            if let Some(ptr) = ctx.input(|i| i.pointer.hover_pos()) {
-                if stage_area_rect.contains(ptr) {
-                    let rel = ptr - (stage_area_rect.center() + viewer.pan);
-                    viewer.pan -= rel * (new_zoom / old_zoom - 1.0);
-                }
-            }
-            viewer.zoom = new_zoom;
+        // "Tải về": only for real web URLs (the worker enforces the full policy).
+        let can_download =
+            viewer.full_url.starts_with("https://") || viewer.full_url.starts_with("http://");
+        let dl_state = self.downloads.get(&viewer.full_url).cloned();
+        let mut dl_action: Option<BubbleAction> = None;
+        let mut should_close = false;
+        let mut copied = false;
+
+        let window_title = format!("Xem ảnh — {clean_title}");
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(window_title.clone())
+            .with_inner_size(win_size)
+            .with_min_inner_size([420.0, 320.0]);
+        if let Some(icon) = media_view::media_window_icon() {
+            builder = builder.with_icon(icon);
         }
 
-        let disp_w = (base_w * viewer.zoom).max(48.0);
-        let disp_h = (base_h * viewer.zoom).max(48.0);
-
-        // Clamp pan so the image stays centered when <= stage size, and pans within bounds when enlarged
-        let max_pan_x = ((disp_w - stage_area_rect.width() + 40.0) * 0.5).max(0.0);
-        let max_pan_y = ((disp_h - stage_area_rect.height() + 40.0) * 0.5).max(0.0);
-        viewer.pan.x = viewer.pan.x.clamp(-max_pan_x, max_pan_x);
-        viewer.pan.y = viewer.pan.y.clamp(-max_pan_y, max_pan_y);
-
-        // 1. Unified Clipped Stage Canvas (never uses a floating Area at img_pos so it NEVER shifts left!)
-        egui::Area::new(Id::new("image_viewer_backdrop"))
-            .order(egui::Order::Foreground)
-            .constrain(false)
-            .fixed_pos(stage_area_rect.min)
-            .show(ctx, |ui| {
-                let (bg_rect, bg_resp) =
-                    ui.allocate_exact_size(stage_area_rect.size(), Sense::click_and_drag());
-                let painter = ui.painter().with_clip_rect(bg_rect);
-                let bg_col = if pal.is_dark {
-                    Color32::from_rgba_unmultiplied(24, 26, 31, 244)
-                } else {
-                    Color32::from_rgba_unmultiplied(24, 28, 36, 228)
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("qtzalo_image_viewer_window"),
+            builder,
+            |vctx, class| {
+                if vctx.input(|i| i.viewport().close_requested() || i.key_pressed(Key::Escape)) {
+                    should_close = true;
+                }
+                let mut toolbar = |ui: &mut egui::Ui, viewer: &mut ImageViewerModal| {
+                    let (a, c) = image_viewer_toolbar(
+                        ui,
+                        viewer,
+                        pal,
+                        &clean_title,
+                        natural_dims,
+                        can_download,
+                        dl_state.as_ref(),
+                    );
+                    if a.is_some() {
+                        dl_action = a;
+                    }
+                    copied |= c;
                 };
-                painter.rect_filled(bg_rect, Rounding::ZERO, bg_col);
-
-                let img_center = bg_rect.center() + viewer.pan;
-                let img_rect = Rect::from_center_size(img_center, Vec2::new(disp_w, disp_h));
-
-                if let Some(ref tex) = active_tex {
-                    painter.image(
-                        tex.id(),
-                        img_rect,
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
-                    painter.rect_stroke(
-                        img_rect,
-                        Rounding::ZERO,
-                        Stroke::new(1.0_f32, pal.border),
-                    );
-
-                    if bg_resp.dragged_by(egui::PointerButton::Primary) {
-                        viewer.pan += bg_resp.drag_delta();
-                        viewer.pan.x = viewer.pan.x.clamp(-max_pan_x, max_pan_x);
-                        viewer.pan.y = viewer.pan.y.clamp(-max_pan_y, max_pan_y);
-                        ctx.set_cursor_icon(CursorIcon::Grabbing);
-                    } else if let Some(ptr) = bg_resp.hover_pos() {
-                        if img_rect.contains(ptr) && (max_pan_x > 1.0 || max_pan_y > 1.0) {
-                            ctx.set_cursor_icon(CursorIcon::Grab);
-                        }
-                    }
-
-                    if bg_resp.double_clicked() {
-                        if (viewer.zoom - 1.0).abs() < 0.05 {
-                            viewer.zoom = 2.0;
-                        } else {
-                            viewer.zoom = 1.0;
-                            viewer.pan = Vec2::ZERO;
-                        }
-                    } else if bg_resp.clicked() {
-                        let ptr = bg_resp
-                            .interact_pointer_pos()
-                            .or_else(|| ctx.input(|i| i.pointer.latest_pos()));
-                        if ptr.map(|p| !img_rect.contains(p)).unwrap_or(false) {
-                            should_close = true;
-                        }
-                    }
-                } else {
-                    painter.rect_filled(img_rect, Rounding::same(8.0), pal.bg_elevated);
-                    painter.rect_stroke(
-                        img_rect,
-                        Rounding::same(8.0),
-                        Stroke::new(1.0_f32, pal.border),
-                    );
-                    painter.text(
-                        img_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "Đang tải hình ảnh…",
-                        FontId::proportional(13.0),
-                        pal.text_primary,
-                    );
-                    if bg_resp.clicked() {
-                        should_close = true;
-                    }
-                }
-            });
-        // 3. Clean Unified Top Toolbar Bar (docked under custom title bar, matching Atom One Dark pal.bg_sidebar)
-        let clean_title = {
-            let mut t = viewer
-                .title
-                .trim()
-                .trim_start_matches(lucide::IMAGE)
-                .trim();
-            if let Some(paren_idx) = t.rfind(" (") {
-                if t[paren_idx..].contains('×') || t[paren_idx..].contains("KB") || t[paren_idx..].contains("MB") {
-                    t = t[..paren_idx].trim();
-                }
-            }
-            if t.is_empty() {
-                "Hình ảnh đính kèm"
-            } else {
-                t
-            }
-        };
-
-        egui::Area::new(Id::new("image_viewer_top_bar"))
-            .order(egui::Order::Tooltip)
-            .fixed_pos(toolbar_rect.min)
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(pal.bg_sidebar)
-                    .stroke(Stroke::new(1.0_f32, pal.border))
-                    .inner_margin(Margin::symmetric(16.0, 6.0))
-                    .show(ui, |ui| {
-                        ui.set_min_size(Vec2::new(
-                            (toolbar_rect.width() - 32.0).max(200.0),
-                            toolbar_h - 12.0,
-                        ));
-                        ui.set_max_size(Vec2::new(
-                            (toolbar_rect.width() - 32.0).max(200.0),
-                            toolbar_h - 12.0,
-                        ));
-                        ui.horizontal_centered(|ui| {
-                            // Left: Subtle icon badge + filename + sender/time/dimensions
-                            let (badge_r, _) =
-                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
-                            ui.painter().rect_filled(
-                                badge_r,
-                                Rounding::same(6.0),
-                                pal.bg_elevated,
-                            );
-                            draw_icon_image(
-                                ui.painter(),
-                                badge_r.center(),
-                                15.0,
-                                pal.primary_hover,
-                            );
-                            ui.add_space(4.0);
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 1.0;
-                                ui.label(
-                                    RichText::new(truncate_chars(clean_title, 44))
-                                        .size(13.0)
-                                        .color(pal.text_primary)
-                                        .strong(),
-                                );
-                                let dim_str = match natural_dims {
-                                    Some((tw, th)) => format!(" · {tw}×{th} px"),
-                                    None => String::new(),
-                                };
-                                let sub = if viewer.time.is_empty() {
-                                    format!("{}{dim_str}", viewer.sender)
-                                } else {
-                                    format!("Gửi bởi {} lúc {}{dim_str}", viewer.sender, viewer.time)
-                                };
-                                ui.label(
-                                    RichText::new(sub)
-                                        .size(11.0)
-                                        .color(pal.text_muted),
-                                );
-                            });
-
-                            // Right: Unified Zoom + Actions + Close
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-
-                                // Close button (30x28, Atom One Dark style)
-                                let (close_r, close_resp) = ui.allocate_exact_size(
-                                    Vec2::new(30.0, 28.0),
-                                    Sense::click(),
-                                );
-                                ui.painter().rect_filled(
-                                    close_r,
-                                    Rounding::same(6.0),
-                                    if close_resp.hovered() {
-                                        pal.danger
-                                    } else {
-                                        pal.bg_elevated
-                                    },
-                                );
-                                ui.painter().rect_stroke(
-                                    close_r,
-                                    Rounding::same(6.0),
-                                    Stroke::new(1.0_f32, pal.border),
-                                );
-                                draw_lucide_icon(
-                                    ui.painter(),
-                                    close_r.center(),
-                                    lucide::X,
-                                    14.5,
-                                    if close_resp.hovered() {
-                                        Color32::WHITE
-                                    } else {
-                                        pal.text_secondary
-                                    },
-                                );
-                                if close_resp
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Đóng xem ảnh (Esc)")
-                                    .clicked()
-                                {
-                                    should_close = true;
-                                }
-
-                                if can_download {
-                                    let (label, fg, tip) = match &dl_state {
-                                        None => (
-                                            format!("{ICON_DOWNLOAD} Tải về"),
-                                            Color32::WHITE,
-                                            "Tải ảnh gốc về thư mục lưu file".to_string(),
-                                        ),
-                                        Some(s @ DownloadState::InProgress { .. }) => (
-                                            match s.fraction() {
-                                                Some(f) => format!("Đang tải {:.0}%", f * 100.0),
-                                                None => "Đang tải…".to_string(),
-                                            },
-                                            pal.text_secondary,
-                                            download_progress_label(s, false),
-                                        ),
-                                        Some(DownloadState::Done(p)) => (
-                                            format!("{} Mở ảnh đã tải", lucide::CHECK),
-                                            pal.text_primary,
-                                            p.display().to_string(),
-                                        ),
-                                        Some(DownloadState::Failed(e)) => (
-                                            format!("{ICON_RETRY} Tải lại"),
-                                            pal.danger,
-                                            format!("Tải về thất bại: {e}"),
-                                        ),
-                                    };
-                                    let busy = matches!(
-                                        dl_state,
-                                        Some(DownloadState::InProgress { .. })
-                                    );
-                                    let fill = if dl_state.is_none() {
-                                        pal.primary
-                                    } else {
-                                        pal.bg_elevated
-                                    };
-                                    let dl_btn = egui::Button::new(
-                                        RichText::new(label).size(11.8).color(fg).strong(),
-                                    )
-                                    .fill(fill)
-                                    .stroke(Stroke::new(
-                                        1.0_f32,
-                                        if dl_state.is_none() { pal.primary } else { pal.border },
-                                    ))
-                                    .rounding(Rounding::same(6.0))
-                                    .min_size(Vec2::new(76.0, 28.0));
-                                    let r = ui.add_enabled(!busy, dl_btn).on_hover_text(tip);
-                                    if busy {
-                                        ui.ctx().request_repaint_after(Duration::from_millis(120));
-                                    }
-                                    if r.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                        dl_action = Some(match &dl_state {
-                                            Some(DownloadState::Done(p)) => {
-                                                BubbleAction::OpenDownloaded(p.clone())
-                                            }
-                                            _ => BubbleAction::Download {
-                                                url: viewer.full_url.clone(),
-                                                suggested_name: String::new(),
-                                            },
-                                        });
-                                    }
-                                }
-
-                                if !viewer.full_url.is_empty() {
-                                    let ext_btn = egui::Button::new(
-                                        RichText::new(format!("{} Mở gốc", lucide::EXTERNAL_LINK))
-                                            .size(11.8)
-                                            .color(pal.text_primary),
-                                    )
-                                    .fill(pal.bg_elevated)
-                                    .stroke(Stroke::new(1.0_f32, pal.border))
-                                    .rounding(Rounding::same(6.0))
-                                    .min_size(Vec2::new(72.0, 28.0));
-                                    if ui
-                                        .add(ext_btn)
-                                        .on_hover_cursor(CursorIcon::PointingHand)
-                                        .on_hover_text(&viewer.full_url)
-                                        .clicked()
-                                    {
-                                        open_external_url(&viewer.full_url);
-                                    }
-
-                                    let copy_btn = egui::Button::new(
-                                        RichText::new(format!("{} Sao chép", lucide::COPY))
-                                            .size(11.8)
-                                            .color(pal.text_secondary),
-                                    )
-                                    .fill(pal.bg_elevated)
-                                    .stroke(Stroke::new(1.0_f32, pal.border))
-                                    .rounding(Rounding::same(6.0))
-                                    .min_size(Vec2::new(78.0, 28.0));
-                                    if ui
-                                        .add(copy_btn)
-                                        .on_hover_cursor(CursorIcon::PointingHand)
-                                        .clicked()
-                                    {
-                                        ui.ctx().copy_text(viewer.full_url.clone());
-                                        self.show_toast("Đã sao chép đường dẫn ảnh vào bộ nhớ tạm");
-                                    }
-                                }
-
-                                // Zoom In (+)
-                                let zin_btn = egui::Button::new(
-                                    RichText::new(lucide::PLUS)
-                                        .size(12.5)
-                                        .color(pal.text_secondary),
-                                )
-                                .fill(pal.bg_elevated)
-                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                .rounding(Rounding::same(6.0))
-                                .min_size(Vec2::new(28.0, 28.0));
-                                if ui
-                                    .add(zin_btn)
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Phóng to (+25%)")
-                                    .clicked()
-                                {
-                                    viewer.zoom = (viewer.zoom + 0.25).min(8.0);
-                                }
-
-                                // Zoom Percentage Reset
-                                let zoom_pct = format!("{:.0}%", viewer.zoom * 100.0);
-                                let zreset_btn = egui::Button::new(
-                                    RichText::new(zoom_pct)
-                                        .size(11.8)
-                                        .color(pal.primary_hover)
-                                        .strong(),
-                                )
-                                .fill(pal.bg_input)
-                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                .rounding(Rounding::same(6.0))
-                                .min_size(Vec2::new(50.0, 28.0));
-                                if ui
-                                    .add(zreset_btn)
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Đặt lại 100% (hoặc nhấp đúp vào ảnh)")
-                                    .clicked()
-                                {
-                                    viewer.zoom = 1.0;
-                                    viewer.pan = Vec2::ZERO;
-                                }
-
-                                // Zoom Out (-)
-                                let zout_btn = egui::Button::new(
-                                    RichText::new(lucide::MINUS)
-                                        .size(12.5)
-                                        .color(pal.text_secondary),
-                                )
-                                .fill(pal.bg_elevated)
-                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                .rounding(Rounding::same(6.0))
-                                .min_size(Vec2::new(28.0, 28.0));
-                                if ui
-                                    .add(zout_btn)
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Thu nhỏ (-25%)")
-                                    .clicked()
-                                {
-                                    viewer.zoom = (viewer.zoom - 0.25).max(0.25);
-                                    if viewer.zoom <= 1.0 {
-                                        viewer.pan = Vec2::ZERO;
-                                    }
-                                }
-                            });
+                if class == egui::ViewportClass::Embedded {
+                    // Backend without multi-window support: fall back to an in-app window.
+                    let mut open = true;
+                    egui::Window::new(window_title.as_str())
+                        .open(&mut open)
+                        .default_size(win_size)
+                        .show(vctx, |ui| {
+                            toolbar(ui, &mut viewer);
+                            image_viewer_stage(ui, &mut viewer, active_tex.as_ref(), pal);
                         });
-                    });
-            });
+                    should_close |= !open;
+                } else {
+                    egui::TopBottomPanel::top("image_viewer_toolbar")
+                        .exact_height(48.0)
+                        .frame(
+                            egui::Frame::none()
+                                .fill(pal.bg_sidebar)
+                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .inner_margin(Margin::symmetric(14.0, 6.0)),
+                        )
+                        .show(vctx, |ui| toolbar(ui, &mut viewer));
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::none().fill(image_stage_bg(pal)))
+                        .show(vctx, |ui| {
+                            image_viewer_stage(ui, &mut viewer, active_tex.as_ref(), pal);
+                        });
+                }
+            },
+        );
 
+        if copied {
+            ctx.copy_text(viewer.full_url.clone());
+            self.show_toast("Đã sao chép đường dẫn ảnh vào bộ nhớ tạm");
+        }
         match dl_action {
             Some(BubbleAction::Download {
                 url,
@@ -3132,6 +2793,7 @@ impl ZaloGuiApp {
 
         if should_close {
             self.image_viewer = None;
+            self.media.image_window = None;
         } else {
             self.image_viewer = Some(viewer);
         }
@@ -3413,5 +3075,302 @@ impl ZaloGuiApp {
                     ui.end_row();
                 });
             });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Image viewer window helpers
+// ---------------------------------------------------------------------------
+
+/// Readable title for the image viewer: no icon glyph, no `[Hình ảnh]` placeholder, no
+/// ` (1280×960 · 245 KB)` suffix.
+pub(super) fn image_viewer_title(raw: &str) -> String {
+    let mut t = raw.trim().trim_start_matches(lucide::IMAGE).trim();
+    t = t.trim_start_matches("[Hình ảnh]").trim();
+    if let Some(paren_idx) = t.rfind(" (") {
+        let tail = &t[paren_idx..];
+        if tail.contains('×') || tail.contains("KB") || tail.contains("MB") {
+            t = t[..paren_idx].trim();
+        }
+    }
+    if t.is_empty() {
+        "Hình ảnh".to_string()
+    } else {
+        truncate_chars(t, 60).into_owned()
+    }
+}
+
+/// Initial size of the viewer window: the image at up to 150% (the stage's own fit limit; small
+/// images get a 640px stage), shrunk to 80% of the monitor, plus the toolbar; at least 520×380.
+fn image_window_size(ctx: &egui::Context, dims: Option<[usize; 2]>) -> [f32; 2] {
+    let monitor = ctx
+        .input(|i| i.viewport().monitor_size)
+        .filter(|m| m.x > 100.0 && m.y > 100.0)
+        .unwrap_or(Vec2::new(1366.0, 768.0));
+    let max_w = (monitor.x * 0.8).clamp(480.0, 1400.0);
+    let max_h = (monitor.y * 0.8).clamp(360.0, 1000.0);
+    let chrome_h = 48.0 + 36.0;
+    match dims {
+        Some([w, h]) if w > 0 && h > 0 => {
+            let (w, h) = (w as f32, h as f32);
+            // Small thumbnails (the HD copy may still be loading) still get a 640px stage.
+            let cap = 1.5_f32.max(640.0 / w.max(h));
+            let s = ((max_w - 48.0) / w).min((max_h - chrome_h) / h).min(cap);
+            [(w * s + 48.0).max(520.0).min(max_w), (h * s + chrome_h).max(380.0).min(max_h)]
+        }
+        _ => [900.0_f32.min(max_w), 640.0_f32.min(max_h)],
+    }
+}
+
+fn image_stage_bg(pal: &ThemePalette) -> Color32 {
+    if pal.is_dark {
+        Color32::from_rgb(24, 26, 31)
+    } else {
+        Color32::from_rgb(28, 32, 40)
+    }
+}
+
+/// Toolbar of the viewer window: title / sender line on the left; zoom, "Sao chép" and "Tải về"
+/// on the right. Returns the download action (if clicked) and whether "Sao chép" was clicked.
+fn image_viewer_toolbar(
+    ui: &mut egui::Ui,
+    viewer: &mut ImageViewerModal,
+    pal: &ThemePalette,
+    title: &str,
+    natural_dims: Option<[usize; 2]>,
+    can_download: bool,
+    dl_state: Option<&DownloadState>,
+) -> (Option<BubbleAction>, bool) {
+    let mut dl_action = None;
+    let mut copied = false;
+    ui.horizontal_centered(|ui| {
+        let (badge_r, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+        ui.painter().rect_filled(badge_r, Rounding::same(6.0), pal.bg_elevated);
+        draw_icon_image(ui.painter(), badge_r.center(), 15.0, pal.primary_hover);
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.label(
+                RichText::new(truncate_chars(title, 44))
+                    .size(13.0)
+                    .color(pal.text_primary)
+                    .strong(),
+            );
+            let dim_str = match natural_dims {
+                Some([tw, th]) => format!(" · {tw}×{th} px"),
+                None => String::new(),
+            };
+            let sub = if viewer.time.is_empty() {
+                format!("{}{dim_str}", viewer.sender)
+            } else {
+                format!("Gửi bởi {} lúc {}{dim_str}", viewer.sender, viewer.time)
+            };
+            ui.label(RichText::new(sub).size(11.0).color(pal.text_muted));
+        });
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let plain_btn = |text: String, color: Color32, min_w: f32| {
+                egui::Button::new(RichText::new(text).size(11.8).color(color))
+                    .fill(pal.bg_elevated)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding::same(6.0))
+                    .min_size(Vec2::new(min_w, 28.0))
+            };
+
+            if can_download {
+                let (label, fg, tip) = match dl_state {
+                    None => (
+                        format!("{ICON_DOWNLOAD} Tải về"),
+                        Color32::WHITE,
+                        "Tải ảnh gốc về thư mục lưu file".to_string(),
+                    ),
+                    Some(s @ DownloadState::InProgress { .. }) => (
+                        match s.fraction() {
+                            Some(f) => format!("Đang tải {:.0}%", f * 100.0),
+                            None => "Đang tải…".to_string(),
+                        },
+                        pal.text_secondary,
+                        download_progress_label(s, false),
+                    ),
+                    Some(DownloadState::Done(p)) => (
+                        format!("{} Mở ảnh đã tải", lucide::CHECK),
+                        pal.text_primary,
+                        p.display().to_string(),
+                    ),
+                    Some(DownloadState::Failed(e)) => (
+                        format!("{ICON_RETRY} Tải lại"),
+                        pal.danger,
+                        format!("Tải về thất bại: {e}"),
+                    ),
+                };
+                let busy = matches!(dl_state, Some(DownloadState::InProgress { .. }));
+                let fill = if dl_state.is_none() { pal.primary } else { pal.bg_elevated };
+                let dl_btn = egui::Button::new(RichText::new(label).size(11.8).color(fg).strong())
+                    .fill(fill)
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        if dl_state.is_none() { pal.primary } else { pal.border },
+                    ))
+                    .rounding(Rounding::same(6.0))
+                    .min_size(Vec2::new(76.0, 28.0));
+                let r = ui.add_enabled(!busy, dl_btn).on_hover_text(tip);
+                if busy {
+                    ui.ctx().request_repaint_after(Duration::from_millis(120));
+                }
+                if r.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    dl_action = Some(match dl_state {
+                        Some(DownloadState::Done(p)) => BubbleAction::OpenDownloaded(p.clone()),
+                        _ => BubbleAction::Download {
+                            url: viewer.full_url.clone(),
+                            suggested_name: String::new(),
+                        },
+                    });
+                }
+
+                if ui
+                    .add(plain_btn(format!("{} Sao chép", lucide::COPY), pal.text_secondary, 78.0))
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text("Sao chép đường dẫn ảnh")
+                    .clicked()
+                {
+                    copied = true;
+                }
+            }
+
+            if ui
+                .add(plain_btn(lucide::PLUS.to_string(), pal.text_secondary, 28.0))
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("Phóng to (+25%)")
+                .clicked()
+            {
+                viewer.zoom = (viewer.zoom + 0.25).min(8.0);
+            }
+            let zreset_btn = egui::Button::new(
+                RichText::new(format!("{:.0}%", viewer.zoom * 100.0))
+                    .size(11.8)
+                    .color(pal.primary_hover)
+                    .strong(),
+            )
+            .fill(pal.bg_input)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(6.0))
+            .min_size(Vec2::new(50.0, 28.0));
+            if ui
+                .add(zreset_btn)
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("Đặt lại 100% (hoặc nhấp đúp vào ảnh)")
+                .clicked()
+            {
+                viewer.zoom = 1.0;
+                viewer.pan = Vec2::ZERO;
+            }
+            if ui
+                .add(plain_btn(lucide::MINUS.to_string(), pal.text_secondary, 28.0))
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("Thu nhỏ (-25%)")
+                .clicked()
+            {
+                viewer.zoom = (viewer.zoom - 0.25).max(0.25);
+                if viewer.zoom <= 1.0 {
+                    viewer.pan = Vec2::ZERO;
+                }
+            }
+        });
+    });
+    (dl_action, copied)
+}
+
+/// Image stage of the viewer window: fit-to-window, wheel zoom around the cursor, drag to pan,
+/// double-click toggles 100% ↔ 200%.
+fn image_viewer_stage(
+    ui: &mut egui::Ui,
+    viewer: &mut ImageViewerModal,
+    tex: Option<&TextureHandle>,
+    pal: &ThemePalette,
+) {
+    let (stage, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+    let max_stage_w = (stage.width() - 48.0).max(160.0);
+    let max_stage_h = (stage.height() - 36.0).max(120.0);
+    let (base_w, base_h) = match tex {
+        Some(tex) => {
+            let [tw, th] = tex.size();
+            let (tw, th) = (tw.max(1) as f32, th.max(1) as f32);
+            let fit = (max_stage_w / tw).min(max_stage_h / th).min(1.5);
+            (tw * fit, th * fit)
+        }
+        None => (340.0_f32.min(max_stage_w), 220.0_f32.min(max_stage_h)),
+    };
+
+    // Mouse-wheel zoom around the cursor (only while the pointer is over the stage).
+    if tex.is_some() && ui.rect_contains_pointer(stage) {
+        let scroll_y = ui.input(|i| {
+            if i.raw_scroll_delta.y.abs() > 0.1 {
+                i.raw_scroll_delta.y
+            } else {
+                i.smooth_scroll_delta.y
+            }
+        });
+        if scroll_y.abs() > 0.1 {
+            let old_zoom = viewer.zoom;
+            let factor = if scroll_y > 0.0 { 1.15 } else { 1.0 / 1.15 };
+            let new_zoom = (old_zoom * factor).clamp(0.25, 8.0);
+            if let Some(ptr) = ui.input(|i| i.pointer.hover_pos()) {
+                let rel = ptr - (stage.center() + viewer.pan);
+                viewer.pan -= rel * (new_zoom / old_zoom - 1.0);
+            }
+            viewer.zoom = new_zoom;
+        }
+    }
+
+    let disp_w = (base_w * viewer.zoom).max(48.0);
+    let disp_h = (base_h * viewer.zoom).max(48.0);
+    // Centered while it fits; pannable within bounds when enlarged.
+    let max_pan_x = ((disp_w - stage.width() + 40.0) * 0.5).max(0.0);
+    let max_pan_y = ((disp_h - stage.height() + 40.0) * 0.5).max(0.0);
+    viewer.pan.x = viewer.pan.x.clamp(-max_pan_x, max_pan_x);
+    viewer.pan.y = viewer.pan.y.clamp(-max_pan_y, max_pan_y);
+
+    let painter = ui.painter().with_clip_rect(stage);
+    let img_rect = Rect::from_center_size(stage.center() + viewer.pan, Vec2::new(disp_w, disp_h));
+    match tex {
+        Some(tex) => {
+            painter.image(
+                tex.id(),
+                img_rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            if resp.dragged_by(egui::PointerButton::Primary) {
+                viewer.pan += resp.drag_delta();
+                viewer.pan.x = viewer.pan.x.clamp(-max_pan_x, max_pan_x);
+                viewer.pan.y = viewer.pan.y.clamp(-max_pan_y, max_pan_y);
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            } else if let Some(ptr) = resp.hover_pos() {
+                if img_rect.contains(ptr) && (max_pan_x > 1.0 || max_pan_y > 1.0) {
+                    ui.ctx().set_cursor_icon(CursorIcon::Grab);
+                }
+            }
+            if resp.double_clicked() {
+                if (viewer.zoom - 1.0).abs() < 0.05 {
+                    viewer.zoom = 2.0;
+                } else {
+                    viewer.zoom = 1.0;
+                    viewer.pan = Vec2::ZERO;
+                }
+            }
+        }
+        None => {
+            painter.rect_filled(img_rect, Rounding::same(8.0), pal.bg_elevated);
+            painter.rect_stroke(img_rect, Rounding::same(8.0), Stroke::new(1.0_f32, pal.border));
+            painter.text(
+                img_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Đang tải hình ảnh…",
+                FontId::proportional(13.0),
+                pal.text_primary,
+            );
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
     }
 }

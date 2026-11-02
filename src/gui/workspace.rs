@@ -1421,6 +1421,15 @@ impl ZaloGuiApp {
                                         thread_id.clone(),
                                     );
                                 }
+                                BubbleAction::DownloadAndOpen {
+                                    url,
+                                    suggested_name,
+                                } => {
+                                    self.download_and_open(url, suggested_name, thread_id.clone());
+                                }
+                                BubbleAction::OpenVideo { url, title } => {
+                                    self.open_video(url, title);
+                                }
                                 BubbleAction::OpenDownloaded(path) => {
                                     self.open_downloaded_path(&path);
                                 }

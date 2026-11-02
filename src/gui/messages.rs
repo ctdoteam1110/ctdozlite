@@ -1201,32 +1201,28 @@ pub(super) fn render_message_body(
             return body_action;
         }
     }
-    // Dedicated File / Video Attachment Card
-    let is_zalo_file_or_video = matches!(
-        msg.link_src.as_deref(),
-        Some("Tập tin Zalo") | Some("Video Zalo")
-    ) || trimmed_text.starts_with("[Tập tin]")
-        || trimmed_text.starts_with("[Video]")
-        || trimmed_text.starts_with("[Tin nhắn thoại]");
-    if is_zalo_file_or_video {
-        let is_vid = msg.link_src.as_deref() == Some("Video Zalo")
-            || trimmed_text.starts_with("[Video]");
-        let title_str = msg
-            .link_title
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(trimmed_text);
-        let title_str = title_str
-            .trim_start_matches("[Tập tin]")
-            .trim_start_matches("[Video]")
-            .trim();
-        let sub_str = msg
-            .link_desc
-            .as_deref()
-            .filter(|d| !d.trim().is_empty())
-            .or(msg.link_src.as_deref())
-            .unwrap_or(if is_vid { "Video đính kèm" } else { "Tập tin đính kèm" });
-        // File card: rounded icon tile + bold name + size / source line.
+    // Video with a thumbnail: photo-style card with a play button. Click → QTzalo's own player.
+    if let Some(thumb_url) = video_thumb_url(msg).filter(|_| !is_zalo_photo) {
+        return render_video_thumb_card(
+            ui,
+            msg,
+            thumb_url,
+            pal,
+            max_text_width,
+            sticker_textures,
+            loading_stickers,
+            dl_target.as_ref(),
+            dl_state,
+        );
+    }
+    // Dedicated File / Video / Voice Attachment Card
+    if is_file_or_video_message(msg) {
+        let is_vid = is_video_message(msg);
+        let is_voice = trimmed_text.starts_with("[Tin nhắn thoại]") && !is_vid;
+        let (title_owned, sub_owned) = file_card_texts(msg);
+        let title_str = title_owned.as_str();
+        let sub_str = sub_owned.as_str();
+        // File card: rounded icon tile + bold name + size line (never the URL or its domain).
         let (tile_bg, tile_fg) = if outgoing {
             (Color32::from_rgba_unmultiplied(255, 255, 255, 52), Color32::WHITE)
         } else {
@@ -1239,7 +1235,13 @@ pub(super) fn render_message_body(
             draw_lucide_icon(
                 ui.painter(),
                 tile.center(),
-                if is_vid { lucide::FILM } else { lucide::FILE },
+                if is_vid {
+                    lucide::FILM
+                } else if is_voice {
+                    lucide::MIC
+                } else {
+                    lucide::FILE
+                },
                 19.0,
                 tile_fg,
             );
@@ -1273,27 +1275,48 @@ pub(super) fn render_message_body(
         let dl_c = dl_colors(pal, outgoing);
         let mut click_rect = row.response.rect;
         if let Some(target) = dl_target.as_ref() {
-            // Keep the card's "open in browser" click off the download button.
+            // Keep the card's own click off the download button.
             click_rect.max.x = row.inner.left() - 4.0;
             let id = Id::new(("file_dl", &msg.id, msg.ts));
             if let Some(a) = attachment_action_button(ui, row.inner, id, dl_state, target, &dl_c) {
                 body_action = Some(a);
             }
         }
-        let can_open = msg.link_url.as_deref().map(|u| !u.is_empty()).unwrap_or(false);
         let resp = ui.interact(
             click_rect,
             Id::new(("file_card", &msg.id, msg.ts)),
             Sense::click(),
         );
-        if can_open {
-            let resp = resp
+        // Click: a video plays in QTzalo's own window; a file / voice note is downloaded into
+        // "Thư mục lưu file" and opened with its default app (never the web browser).
+        let card_action = if is_vid {
+            video_play_url(msg).map(|url| BubbleAction::OpenVideo {
+                url: url.to_string(),
+                title: video_title(msg),
+            })
+        } else {
+            dl_target.as_ref().and_then(|target| match dl_state {
+                Some(DownloadState::InProgress { .. }) => None,
+                Some(DownloadState::Done(path)) => Some(BubbleAction::OpenDownloaded(path.clone())),
+                None | Some(DownloadState::Failed(_)) => Some(BubbleAction::DownloadAndOpen {
+                    url: target.0.clone(),
+                    suggested_name: target.1.clone(),
+                }),
+            })
+        };
+        if card_action.is_some() {
+            let tip = match (is_vid, dl_state) {
+                (true, _) => "Bấm để xem video",
+                (false, Some(DownloadState::Done(_))) => "Bấm để mở tệp đã tải",
+                (false, _) => "Bấm để tải về và mở tệp",
+            };
+            if resp
                 .on_hover_cursor(CursorIcon::PointingHand)
-                .on_hover_text("Mở tệp trong trình duyệt");
-            if resp.clicked() {
-                if let Some(url) = msg.link_url.as_deref() {
-                    open_external_url(url);
-                }
+                .on_hover_text(tip)
+                .clicked()
+                && body_action.is_none()
+            {
+                body_action = card_action;
             }
         }
         if let (Some(target), Some(state)) = (dl_target.as_ref(), dl_state) {
@@ -1475,23 +1498,23 @@ pub(super) fn render_chat_bubble(
     downloads: &HashMap<String, DownloadState>,
     idx: usize,
 ) -> Option<BubbleAction> {
+    // Rows stored before media parsing (text = Zalo CDN URL) render as the photo / video they are.
+    let legacy_view = legacy_media_view(msg);
+    let msg = legacy_view.as_ref().unwrap_or(msg);
     let avail_w = ui.available_width();
     let max_bubble_width = (avail_w * 0.72).clamp(140.0, 520.0);
     let max_text_width = (max_bubble_width - 24.0).max(90.0);
     let has_sticker = is_sticker_message(msg).is_some();
     let call_card_opt = extract_call_card_view(msg);
     let is_call_card = call_card_opt.is_some();
-    let is_photo_card = msg.link_src.as_deref() == Some("Hình ảnh Zalo")
-        || msg.text.trim() == "[Hình ảnh]"
-        || msg.text.trim().starts_with("[Hình ảnh] ");
-    let is_file_card = matches!(
-        msg.link_src.as_deref(),
-        Some("Tập tin Zalo") | Some("Video Zalo")
-    ) || msg.text.trim().starts_with("[Tập tin]")
-        || msg.text.trim().starts_with("[Video]")
-        || msg.text.trim().starts_with("[Tin nhắn thoại]");
+    let is_photo_card = is_photo_message(msg);
+    // A video with a thumbnail is drawn like a photo (with a play button); without one it is a
+    // file-style row.
+    let is_video_thumb_card = !is_photo_card && video_thumb_url(msg).is_some();
+    let is_file_card = !is_photo_card && !is_video_thumb_card && is_file_or_video_message(msg);
     let has_link_card = extract_message_link_view(msg).is_some();
-    let has_interactive_card = is_call_card || has_link_card || is_photo_card || is_file_card;
+    let has_interactive_card =
+        is_call_card || has_link_card || is_photo_card || is_video_thumb_card || is_file_card;
 
     let show_timestamp = !msg.time.is_empty()
         && (!next_same_sender
@@ -1508,8 +1531,7 @@ pub(super) fn render_chat_bubble(
             .map(|c| !c.trim().is_empty())
             .unwrap_or(false)
             || (!msg.text.trim().starts_with("[Hình ảnh]") && !msg.text.trim().is_empty()));
-    let is_frameless_photo = is_photo_card
-        && !has_photo_caption
+    let is_frameless_photo = ((is_photo_card && !has_photo_caption) || is_video_thumb_card)
         && msg.reply_to_text.is_none()
         && (msg.is_outgoing || !is_group);
 
@@ -1562,7 +1584,31 @@ pub(super) fn render_chat_bubble(
         } else {
             photo_w
         }
-    } else if is_file_card || has_link_card {
+    } else if is_video_thumb_card {
+        let thumb = video_thumb_url(msg).unwrap_or("");
+        let tex = sticker_textures.get(&format!("thumb_{}", crate::crypto::md5_hex(thumb)));
+        visual_card_size(tex, max_text_width).x.ceil()
+    } else if is_file_card {
+        let (title, sub) = file_card_texts(msg);
+        let measure = |s: &str, sz: f32| -> f32 {
+            ui.fonts(|f| {
+                f.layout_no_wrap(truncate_chars(s, 80).into_owned(), FontId::proportional(sz), Color32::WHITE)
+                    .size()
+                    .x
+            })
+        };
+        // 40px icon tile + gap in front; downloadable cards also carry a 32px button + gap.
+        let dl_btn_w = if attachment_download_target(msg).is_some() { 42.0 } else { 0.0 };
+        let w = measure(&title, 14.0).max(measure(&sub, 12.0)) + 8.0 + 54.0 + dl_btn_w;
+        let cap = max_text_width.min(340.0);
+        let w = w.clamp(135.0_f32.min(cap), cap);
+        // Room for the progress / "Đã tải · Mở · Mở thư mục" line under a download.
+        if dl_btn_w > 0.0 {
+            w.max(cap.min(230.0)).ceil()
+        } else {
+            w.ceil()
+        }
+    } else if has_link_card {
         let has_loaded_thumb = msg
             .link_thumb
             .as_deref()
@@ -2042,6 +2088,10 @@ pub(super) enum BubbleAction {
     },
     /// "Tải về" (or "Thử lại") on a file / video / photo card.
     Download { url: String, suggested_name: String },
+    /// Click on a file / voice card: download it, then open it with its default app.
+    DownloadAndOpen { url: String, suggested_name: String },
+    /// Click on a video card: play it in QTzalo's own window (`media_view.rs`).
+    OpenVideo { url: String, title: String },
     /// "Mở" on a finished download.
     OpenDownloaded(std::path::PathBuf),
     /// "Mở thư mục" on a finished download.
@@ -2070,6 +2120,253 @@ fn is_file_or_video_message(msg: &ChatMessage) -> bool {
         || t.starts_with("[Tập tin]")
         || t.starts_with("[Video]")
         || t.starts_with("[Tin nhắn thoại]")
+}
+
+fn is_video_message(msg: &ChatMessage) -> bool {
+    msg.link_src.as_deref() == Some("Video Zalo") || msg.text.trim().starts_with("[Video]")
+}
+
+/// `u` when it is an `http(s)://` URL.
+fn web_url_str(u: Option<&str>) -> Option<&str> {
+    u.map(str::trim)
+        .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+}
+
+fn looks_like_url(s: &str) -> bool {
+    let l = s.trim().to_ascii_lowercase();
+    l.starts_with("http://") || l.starts_with("https://") || l.starts_with("www.")
+}
+
+/// Thumbnail of a video message, when it has one.
+pub(super) fn video_thumb_url(msg: &ChatMessage) -> Option<&str> {
+    if !is_video_message(msg) || is_photo_message(msg) {
+        return None;
+    }
+    web_url_str(msg.link_thumb.as_deref())
+}
+
+/// The video file of a video message.
+pub(super) fn video_play_url(msg: &ChatMessage) -> Option<&str> {
+    if !is_video_message(msg) {
+        return None;
+    }
+    web_url_str(msg.link_url.as_deref())
+}
+
+/// Player window title for a video: its file name when known, else `Video`.
+pub(super) fn video_title(msg: &ChatMessage) -> String {
+    msg.link_title
+        .as_deref()
+        .map(clean_attachment_title)
+        .filter(|t| !t.is_empty() && !looks_like_url(t))
+        .or_else(|| {
+            let t = clean_attachment_title(&msg.text);
+            (!t.is_empty() && !looks_like_url(t)).then_some(t)
+        })
+        .unwrap_or("Video")
+        .to_string()
+}
+
+/// `(title, subtitle)` of a file / video / voice card. Never a URL or a domain: the subtitle is
+/// the size / duration line (`link_desc`) or a generic label.
+pub(super) fn file_card_texts(msg: &ChatMessage) -> (String, String) {
+    let is_vid = is_video_message(msg);
+    let is_voice = !is_vid && msg.text.trim().starts_with("[Tin nhắn thoại]");
+    let title = msg
+        .link_title
+        .as_deref()
+        .map(clean_attachment_title)
+        .filter(|t| !t.is_empty() && !looks_like_url(t))
+        .or_else(|| {
+            let t = clean_attachment_title(&msg.text);
+            (!t.is_empty() && !looks_like_url(t)).then_some(t)
+        })
+        .unwrap_or(if is_vid {
+            "Video"
+        } else if is_voice {
+            "Tin nhắn thoại"
+        } else {
+            "Tập tin"
+        });
+    let sub = msg
+        .link_desc
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !looks_like_url(d))
+        .unwrap_or(if is_vid {
+            "Video đính kèm"
+        } else if is_voice {
+            "Âm thanh đính kèm"
+        } else {
+            "Tập tin đính kèm"
+        });
+    (title.to_string(), sub.to_string())
+}
+
+/// Rows stored before media messages were parsed (`text` = a Zalo CDN URL, no marker): a view
+/// of the row as the photo / video card it is, instead of a link card that opens the browser.
+/// `None` for every other message (see [`crate::chat::legacy_media_kind`]).
+pub(super) fn legacy_media_view(msg: &ChatMessage) -> Option<ChatMessage> {
+    let kind = crate::chat::legacy_media_kind(msg)?;
+    let mut m = msg.clone();
+    m.link_title = None;
+    m.link_desc = None;
+    match kind {
+        crate::chat::MediaKind::Photo => {
+            m.text = "[Hình ảnh]".into();
+            m.link_src = Some("Hình ảnh Zalo".into());
+            if web_url_str(m.link_thumb.as_deref()).is_none() {
+                m.link_thumb = m.link_url.clone();
+            }
+        }
+        crate::chat::MediaKind::Video => {
+            m.text = "[Video]".into();
+            m.link_src = Some("Video Zalo".into());
+        }
+        crate::chat::MediaKind::File | crate::chat::MediaKind::Voice => return None,
+    }
+    Some(m)
+}
+
+/// On-screen size of a photo / video thumbnail card (`tex` = the loaded thumbnail).
+fn visual_card_size(tex: Option<&TextureHandle>, max_text_width: f32) -> Vec2 {
+    let max_w = max_text_width.clamp(160.0, 270.0);
+    let max_h = 260.0_f32;
+    match tex {
+        Some(tex) => {
+            let [tw, th] = tex.size();
+            let tw_f = (tw.max(1)) as f32;
+            let th_f = (th.max(1)) as f32;
+            let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
+            Vec2::new((tw_f * scale).clamp(135.0, max_w), (th_f * scale).clamp(95.0, max_h))
+        }
+        None => Vec2::new(max_w.min(240.0), 135.0),
+    }
+}
+
+/// Lucide `play`.
+pub(super) const ICON_PLAY: &str = "\u{e13c}";
+
+/// Video bubble with a thumbnail: the frame, a play button and the duration / size pill.
+/// Click → [`BubbleAction::OpenVideo`] (QTzalo's own player window; never the browser).
+#[allow(clippy::too_many_arguments)]
+fn render_video_thumb_card(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    thumb_url: &str,
+    pal: &ThemePalette,
+    max_text_width: f32,
+    sticker_textures: &HashMap<String, TextureHandle>,
+    loading_stickers: &mut HashSet<String>,
+    dl_target: Option<&(String, String)>,
+    dl_state: Option<&DownloadState>,
+) -> Option<BubbleAction> {
+    let mut action = None;
+    let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
+    if !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
+        if let Some(tx) = WORKER_TX.get() {
+            let _ = tx.send(WorkerCmd::FetchStickerImage {
+                key: key.clone(),
+                url: thumb_url.to_string(),
+            });
+        }
+    }
+    let tex = sticker_textures.get(&key);
+    let (rect, resp) = ui.allocate_exact_size(visual_card_size(tex, max_text_width), Sense::click());
+    let resp = resp
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Bấm để xem video");
+    let hovered = resp.hovered();
+    let rounding = Rounding::same(12.0);
+    let painter = ui.painter().clone();
+    match tex {
+        Some(t) => egui::Image::new(t).rounding(rounding).paint_at(ui, rect),
+        None => {
+            painter.rect_filled(rect, rounding, Color32::from_rgb(30, 35, 46));
+        }
+    }
+    painter.rect_filled(
+        rect,
+        rounding,
+        Color32::from_rgba_premultiplied(0, 0, 0, if hovered { 72 } else { 30 }),
+    );
+    // Play button.
+    let c = rect.center();
+    let r = 23.0;
+    painter.circle_filled(
+        c,
+        r,
+        if hovered {
+            pal.primary
+        } else {
+            Color32::from_rgba_unmultiplied(15, 23, 42, 200)
+        },
+    );
+    painter.circle_stroke(c, r, Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 200)));
+    draw_lucide_icon(&painter, c + Vec2::new(1.5, 0.0), ICON_PLAY, 21.0, Color32::WHITE);
+    // Duration / size pill (bottom-left), e.g. `0:42 · 8,6 MB`.
+    let meta = msg
+        .link_desc
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !looks_like_url(d))
+        .unwrap_or("Video");
+    let galley = painter.layout_no_wrap(
+        truncate_chars(meta, 28).into_owned(),
+        FontId::proportional(11.0),
+        Color32::WHITE,
+    );
+    let pill = Rect::from_min_size(
+        Pos2::new(rect.left() + 8.0, rect.bottom() - 8.0 - 19.0),
+        Vec2::new(galley.size().x + 26.0, 19.0),
+    );
+    painter.rect_filled(pill, Rounding::same(9.5), Color32::from_rgba_unmultiplied(0, 0, 0, 150));
+    draw_lucide_icon(&painter, Pos2::new(pill.left() + 10.0, pill.center().y), lucide::VIDEO, 11.0, Color32::WHITE);
+    painter.galley(
+        Pos2::new(pill.left() + 19.0, pill.center().y - galley.size().y / 2.0),
+        galley,
+        Color32::WHITE,
+    );
+    painter.rect_stroke(
+        rect,
+        rounding,
+        Stroke::new(
+            if hovered { 1.6_f32 } else { 1.0_f32 },
+            if hovered { pal.primary } else { pal.border },
+        ),
+    );
+    // "Tải về" chip in the top-right corner, on hover or while a download exists.
+    if let Some(target) = dl_target {
+        if dl_state.is_some() || ui.rect_contains_pointer(rect) {
+            let btn = Rect::from_center_size(
+                Pos2::new(rect.right() - 20.0, rect.top() + 20.0),
+                Vec2::splat(28.0),
+            );
+            let colors = DlColors {
+                muted: Color32::from_gray(200),
+                track: Color32::from_rgba_unmultiplied(255, 255, 255, 60),
+                accent: Color32::WHITE,
+                ok: Color32::from_rgb(134, 239, 172),
+                err: Color32::from_rgb(252, 165, 165),
+                btn_bg: Color32::from_rgba_unmultiplied(15, 23, 42, 190),
+                btn_hover: Color32::from_rgba_unmultiplied(15, 23, 42, 235),
+            };
+            let id = Id::new(("video_dl", &msg.id, msg.ts));
+            action = attachment_action_button(ui, btn, id, dl_state, target, &colors);
+        }
+    }
+    if action.is_none() && resp.clicked() {
+        action = video_play_url(msg).map(|url| BubbleAction::OpenVideo {
+            url: url.to_string(),
+            title: video_title(msg),
+        });
+    }
+    if let (Some(target), Some(state)) = (dl_target, dl_state) {
+        if let Some(a) = render_photo_download_pill(ui, state, target, pal) {
+            action = Some(a);
+        }
+    }
+    action
 }
 
 /// Strip the `[Tập tin]` / `[Video]` / `[Hình ảnh]` placeholders from an attachment title.
@@ -2557,6 +2854,15 @@ pub(super) fn bubble_context_menu(
                 ui.close_menu();
             }
         }
+        if let Some(url) = video_play_url(msg) {
+            if ui.button(format!("{ICON_PLAY} Xem video")).clicked() {
+                action = Some(BubbleAction::OpenVideo {
+                    url: url.to_string(),
+                    title: video_title(msg),
+                });
+                ui.close_menu();
+            }
+        }
         if let Some((url, suggested_name)) = attachment_download_target(msg) {
             if ui.button(format!("{ICON_DOWNLOAD} Tải về")).clicked() {
                 action = Some(BubbleAction::Download {
@@ -2796,6 +3102,49 @@ mod download_target_tests {
             None
         );
         assert_eq!(attachment_download_target(&m("chào", None, None, Some("https://x.vn"))), None);
+    }
+
+    #[test]
+    fn card_texts_never_show_urls_or_domains() {
+        let mut f = m("[Tập tin] a.pdf", Some("dl.zdn.vn"), None, Some("https://dl.zdn.vn/x"));
+        assert_eq!(file_card_texts(&f), ("a.pdf".into(), "Tập tin đính kèm".into()));
+        f.link_desc = Some("24,1 MB".into());
+        assert_eq!(file_card_texts(&f).1, "24,1 MB");
+        let v = m("[Video]", Some("Video Zalo"), Some("https://v.zdn.vn/c.mp4"), Some("https://v.zdn.vn/c.mp4"));
+        assert_eq!(file_card_texts(&v), ("Video".into(), "Video đính kèm".into()));
+        assert_eq!(video_title(&v), "Video");
+        let named = m("[Video] demo.mp4", Some("Video Zalo"), None, Some("https://v.zdn.vn/c.mp4"));
+        assert_eq!(video_title(&named), "demo.mp4");
+        let voice = m("[Tin nhắn thoại]", None, Some("Tin nhắn thoại"), Some("https://a.zdn.vn/v.m4a"));
+        assert_eq!(file_card_texts(&voice).0, "Tin nhắn thoại");
+    }
+
+    #[test]
+    fn video_urls_and_legacy_rows() {
+        let mut v = m("[Video]", Some("Video Zalo"), None, Some("https://v.zdn.vn/c.mp4"));
+        assert_eq!(video_thumb_url(&v), None);
+        v.link_thumb = Some("https://v.zdn.vn/c.jpg".into());
+        assert_eq!(video_thumb_url(&v), Some("https://v.zdn.vn/c.jpg"));
+        assert_eq!(video_play_url(&v), Some("https://v.zdn.vn/c.mp4"));
+        assert_eq!(video_play_url(&m("[Tập tin] a", None, None, Some("https://x.vn/a"))), None);
+
+        // Legacy photo row: text == link_url on Zalo's photo CDN.
+        let u = "https://f21-zpc.zdn.vn/1/abc.jpg";
+        let legacy = m(u, Some("f21-zpc.zdn.vn"), None, Some(u));
+        let view = legacy_media_view(&legacy).expect("legacy photo");
+        assert_eq!(view.text, "[Hình ảnh]");
+        assert_eq!(view.link_src.as_deref(), Some("Hình ảnh Zalo"));
+        assert_eq!(view.link_thumb.as_deref(), Some(u));
+        assert!(is_photo_message(&view));
+        // Legacy video row keeps its thumbnail.
+        let vu = "https://f9-zpc.zdn.vn/v/clip.mp4";
+        let mut lv = m(vu, Some("f9-zpc.zdn.vn"), None, Some(vu));
+        lv.link_thumb = Some("https://f9-zpc.zdn.vn/v/clip.jpg".into());
+        let view = legacy_media_view(&lv).expect("legacy video");
+        assert_eq!(video_thumb_url(&view), Some("https://f9-zpc.zdn.vn/v/clip.jpg"));
+        // Ordinary links are untouched.
+        let web = "https://news.example.com/a.jpg";
+        assert!(legacy_media_view(&m(web, Some("news.example.com"), None, Some(web))).is_none());
     }
 
     #[test]

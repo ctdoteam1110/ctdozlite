@@ -18,4 +18,5 @@ pub mod timefmt;
 pub mod trace_shape;
 pub mod tui;
 pub mod ui;
+pub mod video;
 pub mod voip_log;
