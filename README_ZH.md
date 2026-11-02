@@ -72,11 +72,11 @@ cargo build --release
 
 | 贡献者 | GitHub | 核心职责 | 贡献代码量 |
 | :--- | :--- | :--- | :---: |
-| **TIPC1110** | [@TIPC1110](https://github.com/TIPC1110) | 核心协议架构、VoIP 通话引擎、egui 客户端框架、社交动态页、跨平台编译 | **> 77,000+ 行** |
-| **thanhdo1110** | [@thanhdo1110](https://github.com/thanhdo1110) | 模块化 GUI 重构、Atom One Dark 设计系统、MCP/REST API 与定时发送 | **> 20,000+ 行** |
-| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | 提交 7 项 PR：本地时区修复、数据目录沙箱、macOS 辅助组件、会话原子写入、媒体缓存、自动更新器、消息状态模型 | **> 5,950+ 行** 🏆 |
-| **ngxccc** | [@ngxccc](https://github.com/ngxccc) | 提交 5 项 PR：工程化规范设计、会话安全保护、网络域名动态解析 | **> 3,090+ 行** |
-| **GrootTheDeveloper** | [@GrootTheDeveloper](https://github.com/GrootTheDeveloper) | 提交 8 项 PR：SQLite 启动性能调优、群组/云端历史断点同步(#45)、后台轮询计时器(#46)、消息虚拟化渲染、CJK 字体按需加载 | **> 760+ 行** |
+| **TIPC1110** | [@TIPC1110](https://github.com/TIPC1110) | 核心协议架构、VoIP 通话引擎、egui 客户端框架、社交动态页、跨平台编译 | **> 73,300+ 行** |
+| **Đỗ Trung Thành (thanhdo1110)** | [@thanhdo1110](https://github.com/thanhdo1110) | 模块化 GUI 重构、Atom One Dark 设计系统、MCP/REST API、定时消息、GitHub API 自动更新、修复 20+ 项 Issue 并发布 v0.0.5 | **> 35,100+ 行** 🏆 |
+| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | 提交 7 项 PR：本地时区修复、数据目录沙箱、macOS 辅助组件、会话原子写入、媒体缓存、自动更新器、消息状态模型 | **> 6,000+ 行** 🏆 |
+| **ngxccc** | [@ngxccc](https://github.com/ngxccc) | 提交 5 项 PR：工程化规范设计、会话安全保护、网络域名动态解析 | **> 3,400+ 行** |
+| **GrootTheDeveloper** | [@GrootTheDeveloper](https://github.com/GrootTheDeveloper) | 提交 8 项 PR：SQLite 启动性能调优、群组/云端历史断点同步(#45)、后台轮询计时器(#46)、消息虚拟化渲染、CJK 字体按需加载 | **~950+ 行** |
 
 > *注: 涵盖所有报告缺陷、提出建议和提交 PR 的完整贡献者荣誉墙请查阅 [在线贡献者名录](https://ctdozlite.ctdo.net/contributors.html)。*
 

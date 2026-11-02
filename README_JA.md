@@ -72,11 +72,11 @@ cargo build --release
 
 | 貢献者 | GitHub | 主な担当領域 | コントリビューション規模 |
 | :--- | :--- | :--- | :---: |
-| **TIPC1110** | [@TIPC1110](https://github.com/TIPC1110) | コアアーキテクチャ、VoIP通話エンジン、eguiフレームワーク、ソーシャルフィード、マルチOS対応 | **> 77,000+ 行** |
-| **thanhdo1110** | [@thanhdo1110](https://github.com/thanhdo1110) | モジュラーGUIリファクタリング、Atom One Darkデザインシステム、MCP/REST API・予約送信 | **> 20,000+ 行** |
-| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | 7件のPR: OSタイムゾーン、データディレクトリ、macOSヘルパー、セッションアトミック保存、メディアキャッシュ、アップデータ、メッセージモデル | **> 5,950+ 行** 🏆 |
-| **ngxccc** | [@ngxccc](https://github.com/ngxccc) | 5件のPR: エンジニアリング基準策定、セッション安全性向上、ネットワークドメイン解決 | **> 3,090+ 行** |
-| **GrootTheDeveloper** | [@GrootTheDeveloper](https://github.com/GrootTheDeveloper) | 8件のPR: SQLite高速起動最適化、履歴同期再開(#45)、ワーカーポーリング(#46)、チャット描画仮想化、CJKフォント遅延読み込み | **> 760+ 行** |
+| **TIPC1110** | [@TIPC1110](https://github.com/TIPC1110) | コアアーキテクチャ、VoIP通話エンジン、eguiフレームワーク、ソーシャルフィード、マルチOS対応 | **> 73,300+ 行** |
+| **Đỗ Trung Thành (thanhdo1110)** | [@thanhdo1110](https://github.com/thanhdo1110) | モジュラーGUIリファクタリング、Atom One Dark、MCP/REST API、予約送信、GitHub API自動更新、20件以上のIssue修正とv0.0.5リリース | **> 35,100+ 行** 🏆 |
+| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | 7件のPR: OSタイムゾーン、データディレクトリ、macOSヘルパー、セッションアトミック保存、メディアキャッシュ、アップデータ、メッセージモデル | **> 6,000+ 行** 🏆 |
+| **ngxccc** | [@ngxccc](https://github.com/ngxccc) | 5件のPR: エンジニアリング基準策定、セッション安全性向上、ネットワークドメイン解決 | **> 3,400+ 行** |
+| **GrootTheDeveloper** | [@GrootTheDeveloper](https://github.com/GrootTheDeveloper) | 8件のPR: SQLite高速起動最適化、履歴同期再開(#45)、ワーカーポーリング(#46)、チャット描画仮想化、CJKフォント遅延読み込み | **~950+ 行** |
 
 > *注: バグ報告、機能提案、プルリクエストを含むすべての貢献者の名簿は[貢献者一覧ウォール](https://ctdozlite.ctdo.net/contributors.html)で公開されています。*
 

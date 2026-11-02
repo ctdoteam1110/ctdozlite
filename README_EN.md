@@ -72,11 +72,11 @@ Core contributors with representative code commits in the repository:
 
 | Contributor | GitHub | Key Role | Code Volume |
 | :--- | :--- | :--- | :---: |
-| **TIPC1110** | [@TIPC1110](https://github.com/TIPC1110) | Core architecture, VoIP call engine, egui framework, Social Feed, cross-platform | **> 77,000+ lines** |
-| **thanhdo1110** | [@thanhdo1110](https://github.com/thanhdo1110) | Modular GUI refactoring, Atom One Dark design system, MCP/REST API & Scheduler | **> 20,000+ lines** |
-| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | 7 PRs: OS timezone, customizable data-dir, macOS helpers, session atomic, media cache, updater, message state | **> 5,950+ lines** 🏆 |
-| **ngxccc** | [@ngxccc](https://github.com/ngxccc) | 5 PRs: Engineering standards, session safety, domain resolution | **> 3,090+ lines** |
-| **GrootTheDeveloper** | [@GrootTheDeveloper](https://github.com/GrootTheDeveloper) | 8 PRs: SQLite startup speedup, resumable history sync (#45), worker poll timer (#46), chat virtualization, CJK font lazy loading | **> 760+ lines** |
+| **TIPC1110** | [@TIPC1110](https://github.com/TIPC1110) | Core architecture, VoIP call engine, egui framework, Social Feed, cross-platform | **> 73,300+ lines** |
+| **Đỗ Trung Thành (thanhdo1110)** | [@thanhdo1110](https://github.com/thanhdo1110) | Modular GUI refactoring, Atom One Dark, MCP/REST API, Message Scheduler, GitHub API Auto-Updater, 20+ Issue fixes & v0.0.5 release | **> 35,100+ lines** 🏆 |
+| **Thuong Tin** | [@thuongtin](https://github.com/thuongtin) | 7 PRs: OS timezone, customizable data-dir, macOS helpers, session atomic, media cache, updater, message state | **> 6,000+ lines** 🏆 |
+| **ngxccc** | [@ngxccc](https://github.com/ngxccc) | 5 PRs: Engineering standards, session safety, domain resolution | **> 3,400+ lines** |
+| **GrootTheDeveloper** | [@GrootTheDeveloper](https://github.com/GrootTheDeveloper) | 8 PRs: SQLite startup speedup, resumable history sync (#45), worker poll timer (#46), chat virtualization, CJK font lazy loading | **~950+ lines** |
 
 > *Note: The complete hall of fame honoring all contributors (bug reports, feature requests, pull requests) is published at [Contributors Wall](https://ctdozlite.ctdo.net/contributors.html).*
 
