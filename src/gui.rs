@@ -25,6 +25,8 @@ use crate::session::Session;
 mod messages;
 mod modals;
 mod stickers;
+#[cfg(target_os = "linux")]
+mod tray;
 mod theme;
 mod worker;
 mod workspace;
@@ -265,6 +267,8 @@ struct AppSettings {
     language: String,
     autostart_on_boot: bool,
     remember_login: bool,
+    #[cfg(target_os = "linux")]
+    close_to_tray: bool,
     download_dir: String,
     // 2. Quyền riêng tư
     show_birthday: String,
@@ -323,6 +327,8 @@ impl Default for AppSettings {
             language: "Tiếng Việt".into(),
             autostart_on_boot: true,
             remember_login: true,
+            #[cfg(target_os = "linux")]
+            close_to_tray: false,
             download_dir: default_dl,
             show_birthday: "Không hiện".into(),
             show_online_status: true,
@@ -499,6 +505,8 @@ pub struct ZaloGuiApp {
     checking_friend_status: HashSet<String>,
     user_online_map: HashMap<String, (bool, String)>,
     allow_quit: bool,
+    #[cfg(target_os = "linux")]
+    tray_state: std::sync::Arc<tray::TrayState>,
     settings_modal_open: bool,
     settings_tab: SettingsTab,
     notification_authorization: crate::native_notifications::AuthorizationState,
@@ -705,6 +713,12 @@ impl ZaloGuiApp {
             checking_friend_status: HashSet::new(),
             user_online_map: HashMap::new(),
             allow_quit: false,
+            #[cfg(target_os = "linux")]
+            tray_state: {
+                let state = tray::start();
+                state.close_to_tray.store(loaded_settings.close_to_tray, std::sync::atomic::Ordering::Release);
+                state
+            },
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
             notification_authorization: Default::default(),
@@ -1549,9 +1563,34 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
-            || ctx.input(|i| i.viewport().close_requested())
+        let ctrl_q = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q));
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        #[cfg(target_os = "linux")]
         {
+            ctx.request_repaint_after(Duration::from_millis(250));
+            if self
+                .tray_state
+                .restore_requested
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
+            let tray_setting = self
+                .tray_state
+                .close_to_tray
+                .load(std::sync::atomic::Ordering::Acquire);
+            if tray_setting != self.settings.close_to_tray {
+                self.settings.close_to_tray = tray_setting;
+                self.settings.save();
+            }
+            if close_requested && !ctrl_q && !self.allow_quit && self.settings.close_to_tray {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let tray_setting = false;
+        if ctrl_q || (close_requested && !tray_setting) {
             self.allow_quit = true;
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::EndCall);

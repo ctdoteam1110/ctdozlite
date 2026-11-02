@@ -1006,6 +1006,17 @@ impl ZaloGuiApp {
                                                         });
                                                     });
                                                     ui.add_space(8.0);
+                                                    #[cfg(target_os = "linux")]
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new("Đóng ứng dụng vào khay hệ thống").color(pal.text_primary).size(13.2));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            if render_toggle_switch(ui, &mut self.settings.close_to_tray, pal).changed() {
+                                                                self.tray_state.close_to_tray.store(self.settings.close_to_tray, std::sync::atomic::Ordering::Release);
+                                                                self.settings.save();
+                                                            }
+                                                        });
+                                                    });
+                                                    ui.add_space(8.0);
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new("Ghi nhớ tài khoản đăng nhập lần trước").color(pal.text_primary).size(13.2));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

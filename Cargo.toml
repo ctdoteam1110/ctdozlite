@@ -36,6 +36,9 @@ cpal = "0.15"
 opus = "0.3"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.2.2", default-features = false }
+
 [lib]
 name = "zalo_rust"
 path = "src/lib.rs"
