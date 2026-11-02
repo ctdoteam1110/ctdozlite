@@ -22,6 +22,7 @@ pub(super) enum Request {
         messages: Vec<ChatMessage>,
         ticket: crate::read_receipts::VisibilityTicket,
     },
+    FlushRetained { ticket: super::history_retention::Ticket, sender: Option<super::GuiTx> },
     Load(Vec<Thread>),
     Persist(Vec<Thread>),
     Reconcile(Vec<Thread>),
@@ -109,7 +110,26 @@ pub(super) async fn execute(
                 && current.zpw_sek == captured.zpw_sek,
             "Stale history session"
         );
+        if let Request::FlushRetained {ticket,sender}=request {
+            return super::history_retention::apply(&root,&account,&ticket,sender);
+        }
         let mut store = AccountStore::open(&root, &account)?;
+        if matches!(request,Request::Clear) {
+            store.clear_local_history()?;
+            super::phone_pending::clear(&root,&account)?;
+            return Ok(Reply::Done);
+        }
+        apply(&mut store, request)
+    })
+    .await
+    .map_err(|_| "Tác vụ lịch sử đã dừng".to_owned())?
+    .map_err(|_| "Phiên lịch sử đã hết hạn".to_owned())?
+    .map_err(|_| "Chưa đọc hoặc lưu được lịch sử theo tài khoản".to_owned())
+}
+
+// The lifecycle barrier uses this same synchronous operation with its mutation guard held.
+// No caller may enter this helper on the UI thread.
+pub(super) fn apply(store: &mut AccountStore, request: Request) -> anyhow::Result<Reply> {
         match request {
             #[cfg(test)]
             Request::PauseBeforeMutation { .. } => unreachable!("fixture unwrapped above"),
@@ -119,6 +139,7 @@ pub(super) async fn execute(
                 store.read_local_visible(&thread, &messages)?;
                 Ok(Reply::VisibleRead(true))
             }
+            Request::FlushRetained { .. } => anyhow::bail!("Retained request requires its captured owner boundary"),
             Request::Load(live) => {
                 let mut threads = store.all_thread_metadata()?;
                 store.hydrate_recent(&mut threads)?;
@@ -149,6 +170,10 @@ pub(super) async fn execute(
                         is_group: incoming.is_group,
                         ..Default::default()
                     });
+                    if crate::chat::is_generic_thread_name(&target.name) && !crate::chat::is_generic_thread_name(&incoming.name) {
+                        target.name=incoming.name.clone();
+                    }
+                    if target.avatar.is_none() {target.avatar=incoming.avatar.clone();}
                     for mut message in incoming.messages {
                         if let Some(existing) = store.message_for(&target.id, &message)? {
                             // AccountStore validated the exact server/client namespace above.
@@ -287,11 +312,6 @@ pub(super) async fn execute(
                 Ok(Reply::Cursor(cursor))
             }
         }
-    })
-    .await
-    .map_err(|_| "Tác vụ lịch sử đã dừng".to_owned())?
-    .map_err(|_| "Phiên lịch sử đã hết hạn".to_owned())?
-    .map_err(|_| "Chưa đọc hoặc lưu được lịch sử theo tài khoản".to_owned())
 }
 
 /// Capture the application data root once per operation after startup selected it.

@@ -16,6 +16,18 @@ fn mailbox() -> &'static crate::latest_snapshot::LatestSnapshot<Key, Snapshot> {
         OnceLock::new();
     MAILBOX.get_or_init(|| crate::latest_snapshot::LatestSnapshot::new(32))
 }
+// Admission checks the captured UI epoch under the same mailbox lock as publication.
+fn publish_snapshot(key: Key, snapshot: Snapshot) -> Result<bool, String> {
+    mailbox().update(key, |_| {
+        if crate::runtime_scope::registry().generation() != snapshot.generation {
+            return Err("Phiên đã đổi; nháp cũ chưa được nhận".to_string());
+        }
+        Ok(snapshot)
+    }).map_err(|error| match error {
+        crate::latest_snapshot::UpdateError::Full => "Hàng đợi nháp đã đầy; nội dung vẫn ở ô soạn".to_string(),
+        crate::latest_snapshot::UpdateError::Rejected(error) => error,
+    })
+}
 // One lane orders saves, staging, recovery and acknowledgements. No UI code enters it.
 static LANE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -146,19 +158,9 @@ impl State {
         }
         if self.fingerprint != fingerprint {
             self.revision = self.revision.saturating_add(1);
-            let wake = mailbox()
-                .publish(
-                    (account.into(), thread.into()),
-                    Snapshot {
-                        revision: self.revision,
-                        draft,
-                        generation: WORKER_TX
-                            .get()
-                            .map(|tx| tx.ui_generation())
-                            .unwrap_or_else(|| crate::runtime_scope::registry().generation()),
-                    },
-                )
-                .map_err(|_| "Hàng đợi nháp đã đầy; nội dung vẫn ở ô soạn".to_string())?;
+            let generation = WORKER_TX.get().map(|tx|tx.ui_generation())
+                .unwrap_or_else(||crate::runtime_scope::registry().generation());
+            let wake = publish_snapshot((account.into(), thread.into()), Snapshot { revision: self.revision, draft, generation })?;
             if wake {
                 if let Err(error) = send(WorkerCmd::FlushComposer) {
                     mailbox().release_wake();
@@ -369,6 +371,10 @@ pub(super) async fn recover(
 
 /// Transport boundary used by the real worker and deterministic consumer tests.
 trait Transport {
+    /// Complete history persistence after the independent outbox acknowledgement.
+    fn confirmed(&self, message: ChatMessage) -> impl std::future::Future<Output = anyhow::Result<Option<ChatMessage>>> + Send {
+        async { Ok(Some(message)) }
+    }
     fn text(
         &self,
         thread: &str,
@@ -384,8 +390,34 @@ trait Transport {
         id: u64,
     ) -> impl std::future::Future<Output = anyhow::Result<ChatMessage>> + Send;
 }
-struct Live(Session);
+struct Live {
+    captured: Session,
+    history_root: Result<PathBuf, String>,
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
+    sender: GuiTx,
+    // Tickets are retained centrally before any outbox write can suspend this task.
+    tickets: std::sync::Mutex<std::collections::HashMap<String, Result<super::history_retention::Ticket, String>>>,
+}
+impl Live {
+    fn retain(&self, thread: &str, group: bool, id: u64, message: ChatMessage, permit: super::history_retention::IngressPermit) -> ChatMessage {
+        let ticket = (|| {
+            let row = super::confirmed_history::project(thread, group, id, &message.id, super::confirmed_history::Payload::Attachment(&message)).map_err(|error| error.to_string())?;
+            let account = self.captured.login.as_ref().map(|login| login.uin.clone()).unwrap_or_default();
+            super::history_retention::stage(self.history_root.clone()?, account, vec![row], super::history_retention::Origin::Network, false, permit).map_err(|error| error.to_string())
+        })();
+        self.tickets.lock().unwrap_or_else(|error| error.into_inner()).insert(id.to_string(), ticket);
+        message
+    }
+}
 impl Transport for Live {
+    async fn confirmed(&self, message: ChatMessage) -> anyhow::Result<Option<ChatMessage>> {
+        let ticket = self.tickets.lock().unwrap_or_else(|error| error.into_inner())
+            .remove(&message.client_message_id).ok_or_else(|| anyhow::anyhow!("Accepted history ticket missing"))?
+            .map_err(anyhow::Error::msg)?;
+        super::history_retention::persist(&ticket, self.session.clone(), self.captured.clone(), Some(self.sender.clone())).await.map_err(anyhow::Error::msg)?;
+        // AccountThreadsUpdated is emitted by the retention sink after durable acknowledgement.
+        Ok(None)
+    }
     async fn text(
         &self,
         thread: &str,
@@ -393,9 +425,10 @@ impl Transport for Live {
         draft: &Draft,
         id: u64,
     ) -> anyhow::Result<ChatMessage> {
+        let permit = super::history_retention::reserve().await;
         if draft.reply.is_none() && draft.mentions.is_empty() {
             if let Some(url) = crate::chat::extract_first_url(&draft.text) {
-                let meta = crate::chat::parse_link_metadata(&self.0, &url)
+                let meta = crate::chat::parse_link_metadata(&self.captured, &url)
                     .await
                     .unwrap_or_else(|_| crate::chat::LinkMetadata {
                         url: url.clone(),
@@ -405,7 +438,7 @@ impl Transport for Live {
                         src: "Liên kết".into(),
                     });
                 let response = crate::chat::send_link_message_with_client_id(
-                    &self.0,
+                    &self.captured,
                     thread,
                     &draft.text,
                     &meta,
@@ -425,12 +458,12 @@ impl Transport for Live {
                 msg.link_desc = Some(meta.desc);
                 msg.link_thumb = Some(meta.thumb);
                 msg.link_src = Some(meta.src);
-                return Ok(msg);
+                return Ok(self.retain(thread, group, id, msg, permit));
             }
         }
         let response = if let Some(quote) = &draft.reply {
             crate::chat::send_quote_message_with_mentions_and_client_id(
-                &self.0,
+                &self.captured,
                 thread,
                 &draft.text,
                 quote,
@@ -441,7 +474,7 @@ impl Transport for Live {
             .await?
         } else if group {
             crate::chat::send_group_message_with_mentions_and_client_id(
-                &self.0,
+                &self.captured,
                 thread,
                 &draft.text,
                 id,
@@ -449,15 +482,16 @@ impl Transport for Live {
             )
             .await?
         } else {
-            crate::chat::send_message_with_client_id(&self.0, thread, &draft.text, id).await?
+            crate::chat::send_message_with_client_id(&self.captured, thread, &draft.text, id).await?
         };
-        Ok(super::worker::composed_sent_message(
+        let message = super::worker::composed_sent_message(
             &draft.text,
             &draft.mentions,
             draft.reply.as_ref(),
             id,
             super::worker::extract_msg_id(&response),
-        ))
+        );
+        Ok(self.retain(thread, group, id, message, permit))
     }
     async fn attachment(
         &self,
@@ -466,9 +500,9 @@ impl Transport for Live {
         path: &std::path::Path,
         id: u64,
     ) -> anyhow::Result<ChatMessage> {
-        crate::chat::send_attachment_with_client_id(&self.0, thread, group, path, "", id)
-            .await
-            .map(|(_, msg)| msg)
+        let permit = super::history_retention::reserve().await;
+        let (_, message) = crate::chat::send_attachment_with_client_id(&self.captured, thread, group, path, "", id).await?;
+        Ok(self.retain(thread, group, id, message, permit))
     }
 }
 #[derive(Clone)]
@@ -561,18 +595,14 @@ async fn execute<T: Transport + Sync>(
     };
     match text_result {
         Ok(message) => {
-            if let Some(message) = message {
-                messages.push(message);
+            let outbox = complete(root.clone(), account.clone(), id.clone(), None, DeliveryState::ServerAccepted).await;
+            let history = if let Some(message) = message { transport.confirmed(message).await } else { Ok(None) };
+            match history {
+                Ok(Some(message)) => messages.push(message),
+                Ok(None) => {},
+                Err(error) => return Ok(Execution { messages, error: Some(format!("Máy chủ đã xác nhận; lịch sử chưa xác nhận lưu {id}: {error}; không tự gửi lại")) }),
             }
-            if let Err(error) = complete(
-                root.clone(),
-                account.clone(),
-                id.clone(),
-                None,
-                DeliveryState::ServerAccepted,
-            )
-            .await
-            {
+            if let Err(error) = outbox {
                 return Ok(Execution { messages, error: Some(format!("Máy chủ đã xác nhận nhưng chưa lưu trạng thái {id}: {error}; không tự gửi lại")) });
             }
         }
@@ -595,8 +625,13 @@ async fn execute<T: Transport + Sync>(
     for (path, attachment_id) in draft.attachments.iter().zip(&entry.attachment_client_ids) {
         match transport.attachment(&thread, group, path, attachment_id.parse().expect("Persisted decimal attachment ID")).await {
             Ok(message) => {
-                messages.push(message);
-                if let Err(error) = complete(root.clone(), account.clone(), id.clone(), Some(attachment_id.clone()), DeliveryState::ServerAccepted).await {
+                let outbox = complete(root.clone(), account.clone(), id.clone(), Some(attachment_id.clone()), DeliveryState::ServerAccepted).await;
+                match transport.confirmed(message).await {
+                    Ok(Some(message)) => messages.push(message),
+                    Ok(None) => {},
+                    Err(error) => return Ok(Execution { messages, error: Some(format!("Tệp đã được máy chủ xác nhận; lịch sử chưa xác nhận lưu {attachment_id}: {error}; không tự gửi lại")) }),
+                }
+                if let Err(error) = outbox {
                     return Ok(Execution { messages, error: Some(format!("Tệp đã được máy chủ xác nhận nhưng chưa lưu trạng thái {attachment_id}: {error}; kiểm tra lịch sử trước khi khôi phục")) });
                 }
             }
@@ -626,7 +661,7 @@ async fn complete(
     })
     .await
 }
-pub(super) async fn deliver(root: PathBuf, session: Session, sender: GuiTx, request: Request) {
+pub(super) async fn deliver(root: PathBuf, session_handle: std::sync::Arc<tokio::sync::Mutex<Session>>, session: Session, sender: GuiTx, request: Request) {
     let Request {
         account,
         thread,
@@ -637,7 +672,8 @@ pub(super) async fn deliver(root: PathBuf, session: Session, sender: GuiTx, requ
         return;
     }
     let staged_draft = draft.clone();
-    let result = execute(root.clone(), request, &Live(session), || {
+    let live = Live { captured: session, history_root: super::history::root(), session: session_handle, sender: sender.clone(), tickets: Default::default() };
+    let result = execute(root.clone(), request, &live, || {
         let _ = sender.send(GuiEvent::ComposerStaged {
             account: account.clone(),
             thread: thread.clone(),
@@ -752,6 +788,68 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+    #[tokio::test]
+    async fn durable_composer_old_ui_snapshot_cannot_reenter_after_lifecycle_flush() {
+        let _serial = crate::runtime_scope::tests::TEST_LOCK.lock().await;
+        let root = temp("old-ui-admission");
+        let old = crate::runtime_scope::transition("A").unwrap();
+        let key = ("A".into(), "late-ui-thread".into());
+        publish_snapshot(key.clone(), Snapshot { revision: 1, draft: Draft { text: "retained".into(), ..Default::default() }, generation: old.generation }).unwrap();
+        let admitted = crate::runtime_scope::registry().invalidate_if_current(old.generation).unwrap();
+        crate::runtime_scope::transition_if_current_fallible(admitted, "", || {
+            flush_pending_sync(&root)?;
+            assert!(publish_snapshot(key.clone(), Snapshot { revision: 2, draft: Draft { text: "late old edit".into(), ..Default::default() }, generation: old.generation }).is_err());
+            Ok(())
+        }).unwrap();
+        assert!(!mailbox().snapshot().contains_key(&key));
+        assert_eq!(ComposerStore::open(&root, "A").unwrap().draft("late-ui-thread").unwrap().text, "retained");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    struct RetainedFixture { transport: Fixture, live: Live }
+    impl Transport for RetainedFixture {
+        async fn text(&self, thread: &str, group: bool, draft: &Draft, id: u64) -> anyhow::Result<ChatMessage> {
+            let permit = super::super::history_retention::reserve().await;
+            let message = self.transport.text(thread, group, draft, id).await?;
+            Ok(self.live.retain(thread, group, id, message, permit))
+        }
+        async fn attachment(&self, thread: &str, group: bool, path: &std::path::Path, id: u64) -> anyhow::Result<ChatMessage> {
+            let permit = super::super::history_retention::reserve().await;
+            let message = self.transport.attachment(thread, group, path, id).await?;
+            Ok(self.live.retain(thread, group, id, message, permit))
+        }
+        async fn confirmed(&self, message: ChatMessage) -> anyhow::Result<Option<ChatMessage>> {
+            let entries = ComposerStore::open(&self.transport.root, "A")?.pending()?;
+            for entry in entries {
+                if entry.id == message.client_message_id { assert_eq!(entry.state, DeliveryState::ServerAccepted); }
+                assert!(!entry.attachment_client_ids.contains(&message.client_message_id), "Accepted attachment is removed independently before history publication");
+            }
+            self.live.confirmed(message).await
+        }
+    }
+    #[tokio::test]
+    async fn durable_composer_consumer_acknowledges_outbox_then_history_before_gui() {
+        let _serial = crate::runtime_scope::tests::TEST_LOCK.lock().await;
+        let root = temp("retained-ack"); let history_root = temp("retained-history");
+        let mut captured = Session::new(false, false, false).unwrap();
+        captured.login = Some(crate::session::LoginInfo { uin: "A".into(), ..Default::default() });
+        captured.zpw_sek = Some("fixture-key".into());
+        let session = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let (tx, rx) = channel();
+        let fixture = RetainedFixture {
+            transport: Fixture { root: root.clone(), calls: Mutex::new(Vec::new()), fail_text: false, fail_attachment: 0, break_ack_lock: false },
+            live: Live { captured, history_root: Ok(history_root.clone()), session, sender: GuiTx::for_test(tx), tickets: Default::default() },
+        };
+        let outcome = execute(root.clone(), Request { account: "A".into(), thread: "group".into(), group: true, draft: sample(), revision: 1 }, &fixture, || {}).await.unwrap();
+        assert!(outcome.error.is_none()); assert!(outcome.messages.is_empty(), "Live success comes only from durable history events");
+        assert_eq!(fixture.transport.calls.lock().unwrap().len(), 3);
+        let events: Vec<_> = rx.try_iter().collect(); assert_eq!(events.len(), 3);
+        for event in events {
+            let GuiEvent::AccountThreadsUpdated { threads, .. } = event else { panic!("Unexpected pre-ACK success event"); };
+            let store = crate::store_v2::AccountStore::open(&history_root, "A").unwrap();
+            for message in &threads[0].messages { assert!(store.get_message("group", &message.id).unwrap().is_some()); }
+        }
+        std::fs::remove_dir_all(root).unwrap(); std::fs::remove_dir_all(history_root).unwrap();
     }
     fn temp(label: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

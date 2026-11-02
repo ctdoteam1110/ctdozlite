@@ -6,6 +6,10 @@ struct Pending<K, V> {
     awake: bool,
     token: u64,
 }
+/// An atomic update failed before changing the retained value or its wake token.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpdateError<E> { Full, Rejected(E) }
+
 /// Coalesce replaceable snapshots without retaining a payload in an unbounded event queue.
 pub struct LatestSnapshot<K, V> {
     capacity: usize,
@@ -37,6 +41,22 @@ impl<K: Ord, V> LatestSnapshot<K, V> {
         if wake {
             pending.token = pending.token.wrapping_add(1);
         }
+        pending.awake = true;
+        Ok(wake)
+    }
+    /// Atomically transform one bounded value without acknowledging any retained payload.
+    /// The closure must perform only short bounded in-memory work, never I/O.
+    ///
+    /// # Errors
+    /// Returns Full before invoking the closure when a new key exceeds capacity.
+    /// A rejected transform leaves the previous value and wake token unchanged.
+    pub fn update<E>(&self, key: K, update: impl FnOnce(Option<&V>) -> Result<V,E>) -> Result<bool, UpdateError<E>> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if !pending.values.contains_key(&key) && pending.values.len() >= self.capacity { return Err(UpdateError::Full); }
+        let value = update(pending.values.get(&key)).map_err(UpdateError::Rejected)?;
+        pending.values.insert(key,value);
+        let wake = !pending.awake;
+        if wake { pending.token = pending.token.wrapping_add(1); }
         pending.awake = true;
         Ok(wake)
     }
@@ -100,4 +120,16 @@ mod tests {
         assert_eq!(batch.len(), 2);
         assert_eq!(queue.publish("C", 1), Ok(true));
     }
+    #[test]
+    fn atomic_update_retains_old_values_and_tokens_on_failure() {
+        let queue=LatestSnapshot::new(1);
+        assert_eq!(queue.update("A", |_| Ok::<_,()>(vec![1])),Ok(true));
+        let token=queue.wake_token();
+        assert_eq!(queue.update("A", |_| Err::<Vec<i32>,_>("rejected")),Err(UpdateError::Rejected("rejected")));
+        assert_eq!(queue.update("B", |_| panic!("full closure must not run")),Err::<bool,UpdateError<()>>(UpdateError::Full));
+        assert_eq!(queue.snapshot()["A"],vec![1]);assert_eq!(queue.wake_token(),token);
+        assert_eq!(queue.update("A", |old| {let mut value=old.unwrap().clone();value.push(2);Ok::<_,()>(value)}),Ok(false));
+        assert_eq!(queue.snapshot()["A"],vec![1,2]);
+    }
+
 }

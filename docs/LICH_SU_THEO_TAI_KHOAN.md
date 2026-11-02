@@ -2,7 +2,7 @@
 
 Kho lịch sử mới lưu riêng từng tài khoản tại
 `accounts/<sha256(account_id)>/history-v2.sqlite3`. Tệp cũ và các bảng lịch đồng bộ,
-hẹn giờ, API vẫn giữ nguyên. GUI dùng kho mới qua worker cho tải, lưu, phân trang,
+hẹn giờ và API độc lập vẫn giữ nguyên. GUI dùng kho mới qua worker cho tải, lưu, phân trang,
 tìm kiếm và mở trích dẫn ngoài phần tin nhắn đã tải. GUI không tự nhập tệp cũ hoặc
 cache của tài khoản khác khi đăng nhập.
 
@@ -45,16 +45,42 @@ không khôi phục chúng. Một tin mới có ID khác vẫn được phép xu
 Xóa dữ liệu cục bộ chỉ tác động kho của tài khoản hiện tại, không xóa tệp legacy,
 bảng hẹn giờ hoặc phiên đăng nhập. Đăng xuất giữ nguyên lịch sử theo tài khoản.
 
-### Phần tích hợp còn lại
+### Ghi chờ, thử lại và chuyển phiên
 
-- API HTTP/MCP và TUI vẫn đọc kho legacy, chưa phản chiếu đầy đủ lịch sử GUI mới.
-- Snapshot lưu từ GUI cần bước coalescing dùng LatestSnapshot chung với composer.
+Worker giữ trang đã nhận trong mailbox có tối đa 8 lượt được đặt chỗ trước khi đọc
+nguồn tiếp theo. Toàn bộ trang mạng tối đa 128 MiB được giữ trước lần chờ ghi đầu
+tiên, kể cả phần chưa ghi; mỗi phần ghi SQLite tối đa 32 MiB. Chỉ sau xác nhận ghi
+thành công mới tiến con trỏ phần và công bố kết quả lên GUI. Một tin hoặc metadata
+riêng vượt 32 MiB, hoặc một trang vượt 128 MiB, bị từ chối rõ ràng, không được xác
+nhận đã lưu. Snapshot thay thế từ GUI giới hạn 1 MiB và dùng `LatestSnapshot` chung
+với composer; snapshot của phiên cũ bị từ chối sau chuyển phiên.
+
+Lượt ghi hợp lệ thất bại vẫn nằm trong mailbox để thử lại, không gửi lại tin lên
+máy chủ. Chuyển tài khoản, đăng xuất và đóng ứng dụng flush cả lịch sử lẫn nháp qua
+cùng hàng rào vòng đời; lỗi ghi chặn xác nhận hoàn tất. Mailbox trong bộ nhớ không
+thay cho bảo đảm sống sót qua crash trước khi ghi đĩa.
+
+Trang điện thoại có sender chưa phân giải được lưu nguyên bản, ràng buộc tài khoản,
+trong thư mục riêng `phone-pending-v1` với quyền 0600/0700 trước khi tra UID. Tệp chờ
+chỉ được tiếp tục khi người dùng bắt đầu đồng bộ rõ ràng; sau khi toàn bộ tin đã vào
+kho mới thì tệp mới bị xóa. Giới hạn là 8 tệp, tổng 256 MiB và 128 MiB mỗi trang.
+Xóa dữ liệu cục bộ cũng xóa các tệp chờ đúng tài khoản, không để chúng tự phục hồi
+lịch sử vừa xóa. Tài khoản khác, phiên đăng nhập và tệp legacy được giữ nguyên.
+
+Kết quả gửi thành công từ GUI chỉ được công bố sau khi hàng lịch sử đã ghi bền vững.
+Composer có outbox bền vững trước transport. Các nút gửi legacy và scheduler chỉ
+đặt chỗ bộ nhớ, không có cùng bảo đảm durable intent trước transport hoặc exactly
+once. Phản hồi hết phiên hoặc chưa xác nhận lưu được báo trạng thái chưa rõ, không
+công bố thành công và không tự gửi lại.
+
+### Ranh giới tích hợp và nghiệm thu
+
+- API HTTP/MCP nhúng trong GUI dùng kho theo tài khoản; CLI/TUI, API độc lập và
+  bảng scheduler vẫn dùng đường legacy tương ứng.
 - Adapter dùng runtime epoch fence, kiểm tra lại phiên dưới mutation guard trước I/O.
   Test consumer chặn A/B/A cùng khóa phiên và tác vụ blocking còn lại sau hủy.
-- Lượt ghi thất bại hiện báo lỗi và chặn kết quả chiếu lên GUI; cơ chế giữ delta để
-  thử lại và flush khi chuyển phiên hoặc đóng ứng dụng thuộc bước A4 tiếp theo.
-- Các test consumer chứng minh luồng worker thực tế với dữ liệu disposable, không
-  thay cho nghiệm thu thao tác GUI với tài khoản thật.
+- Test consumer chạy luồng worker thực tế với dữ liệu disposable, không thay cho
+  nghiệm thu thao tác GUI hoặc transport với tài khoản thật.
 
 ### Dấu xóa có định danh máy chủ
 

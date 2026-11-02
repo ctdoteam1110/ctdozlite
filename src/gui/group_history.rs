@@ -26,6 +26,11 @@ pub(super) struct GroupHistoryPage {
     next_cursor: Option<String>,
 }
 
+pub(super) struct GroupHistoryReceipt { messages:usize,next_cursor:Option<String> }
+impl GroupHistoryPage {
+    /// Carry only pagination metadata while a retained page waits for durable acknowledgement.
+    pub fn receipt(&self)->GroupHistoryReceipt {GroupHistoryReceipt{messages:self.messages.len(),next_cursor:self.next_cursor.clone()}}
+}
 impl GroupHistoryPage {
     /// Decode supported envelopes without accepting malformed errors or message rows.
     ///
@@ -142,7 +147,9 @@ impl GroupHistorySync {
     }
 
     /// Advance only an owned request; late pages never advance an idle cursor.
-    pub fn accept_page(&mut self, page: &GroupHistoryPage, now: Instant) -> GroupHistoryUpdate {
+    #[cfg(test)]
+    pub fn accept_page(&mut self,page:&GroupHistoryPage,now:Instant)->GroupHistoryUpdate {self.accept_receipt(&page.receipt(),now)}
+    pub fn accept_receipt(&mut self, page: &GroupHistoryReceipt, now: Instant) -> GroupHistoryUpdate {
         // Late/duplicate frames may still be merged but must not advance an idle cursor.
         if self.in_flight.take().is_none() {
             return GroupHistoryUpdate {
@@ -151,10 +158,10 @@ impl GroupHistorySync {
             };
         }
         self.pages += 1;
-        self.messages += page.messages.len();
+        self.messages += page.messages;
         self.remaining = self.remaining.saturating_sub(1);
         let mut next_request = None;
-        if page.messages.is_empty() {
+        if page.messages == 0 {
             self.exhausted = true;
             self.status_text = format!(
                 "Đã tải lịch sử nhóm hiện có trên máy chủ · {} tin qua {} trang",

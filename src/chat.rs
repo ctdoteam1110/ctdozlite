@@ -4392,7 +4392,7 @@ pub async fn poll_new_messages(
     state: &mut PollState,
     threads: &mut Vec<Thread>,
 ) -> Result<()> {
-    poll_new_messages_with_storage(s, state, threads, true).await
+    poll_new_messages_with_storage(s, state, threads, true, None).await
 }
 
 /// Poll and reduce network messages without legacy persistence or inferred thread aliases.
@@ -4400,10 +4400,21 @@ pub async fn poll_new_messages(
 /// # Errors
 /// Returns an error when the session is not authenticated or a required operation fails.
 pub async fn poll_new_messages_network(s: &Session, state: &mut PollState, threads: &mut Vec<Thread>) -> Result<()> {
-    poll_new_messages_with_storage(s, state, threads, false).await
+    poll_new_messages_with_storage(s, state, threads, false, None).await
 }
 
-async fn poll_new_messages_with_storage(s: &Session, state: &mut PollState, threads: &mut Vec<Thread>, persist_legacy: bool) -> Result<()> {
+/// Retain each parsed network response synchronously before the next network await.
+///
+/// # Errors
+/// Returns a network or retention error; callers must keep their committed poll cursor unchanged.
+pub async fn poll_new_messages_network_retained(
+    s:&Session,state:&mut PollState,threads:&mut Vec<Thread>,
+    retained:&mut (dyn FnMut(&[Thread])->Result<()> + Send),
+)->Result<()> {
+    poll_new_messages_with_storage(s,state,threads,false,Some(retained)).await
+}
+
+async fn poll_new_messages_with_storage(s: &Session, state: &mut PollState, threads: &mut Vec<Thread>, persist_legacy: bool, mut retained: Option<&mut (dyn FnMut(&[Thread])->Result<()> + Send)>) -> Result<()> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -4413,6 +4424,7 @@ async fn poll_new_messages_with_storage(s: &Session, state: &mut PollState, thre
             break;
         };
         merge_previews(threads, &lp_resp);
+        if let Some(retain)=retained.as_mut() { retain(threads)?; }
         let data_node = lp_resp.get("data").unwrap_or(&lp_resp);
         let more = data_node.get("more").and_then(Value::as_i64).unwrap_or(0);
         let has_reset = pick_str(data_node, &["resetLastActionId"])
@@ -4425,6 +4437,7 @@ async fn poll_new_messages_with_storage(s: &Session, state: &mut PollState, thre
     // 2. Poll conversation previews via `get-last-msgs` (both empty map and populated known thread IDs)
     if let Ok(preview_resp) = get_last_msgs(s, &[]).await {
         merge_previews(threads, &preview_resp);
+        if let Some(retain)=retained.as_mut() { retain(threads)?; }
     }
     let known_ids: Vec<String> = threads
         .iter()
@@ -4440,6 +4453,7 @@ async fn poll_new_messages_with_storage(s: &Session, state: &mut PollState, thre
     for chunk in known_ids.chunks(25) {
         if let Ok(preview_resp) = get_last_msgs(s, chunk).await {
             merge_previews(threads, &preview_resp);
+        if let Some(retain)=retained.as_mut() { retain(threads)?; }
         }
     }
     // 2b. Sync Cloud của tôi (`send2me_id`) and group conversations via `/api/cm/getrecentv2`
@@ -4455,6 +4469,7 @@ async fn poll_new_messages_with_storage(s: &Session, state: &mut PollState, thre
             } else {
                 merge_previews(threads, &cm_resp);
             }
+            if let Some(retain)=retained.as_mut() { retain(threads)?; }
         }
     }
     let group_ids: Vec<String> = threads
@@ -4467,6 +4482,7 @@ async fn poll_new_messages_with_storage(s: &Session, state: &mut PollState, thre
             if let Some(t) = threads.iter_mut().find(|t| t.id == gid) {
                 merge_group_history(t, &cm_resp);
             }
+            if let Some(retain)=retained.as_mut() { retain(threads)?; }
         }
     }
     // 3. Resolve display names for any newly discovered threads

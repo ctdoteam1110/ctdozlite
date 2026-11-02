@@ -834,12 +834,7 @@ fn apply_cached_sidebar_sender(
     }
 }
 
-#[derive(Clone, Default)]
-struct GroupArchiveIdentity {
-    id: String,
-    name: String,
-    avatar: Option<String>,
-}
+type GroupArchiveIdentity = super::phone_pending::GroupIdentity;
 
 fn collect_group_identities(data: &Value, groups: &mut HashMap<String, GroupArchiveIdentity>) {
     let data = data.get("data").unwrap_or(data);
@@ -1222,6 +1217,18 @@ async fn run_inner(
         generation,
         account,
     );
+    let pending_root = super::history::root().map_err(anyhow::Error::msg)?;
+    if let Some(restored) = resume_pending(
+        pending_root,
+        live.clone(),
+        s.clone(),
+        ReplayOutput { tx, generation },
+    )
+    .await?
+    {
+        status(tx, ctx, format!("Đã tiếp tục lưu {restored} tin lịch sử đang chờ; chưa gửi yêu cầu mới tới điện thoại"), false, generation, account);
+        return Ok(());
+    }
     let mut codec = Codec::start(live.clone(), &s).await?;
     let mut active = ActiveSessions {
         commands,
@@ -1301,7 +1308,6 @@ async fn run_inner(
     let own = s.login.as_ref().context("Phiên đã đăng xuất")?.uin.clone();
     let mut count = 0;
     let mut history_bytes = 0usize;
-    let mut unresolved_groups = HashSet::new();
     for (index, shard) in queries.chunks(30).enumerate() {
         status(
             tx,
@@ -1319,6 +1325,9 @@ async fn run_inner(
             .iter()
             .filter_map(|q| q["partition"].as_str().map(str::to_owned))
             .collect();
+        // Reserve before requesting another shard, not after accepting its payload.
+        let permit = super::history_retention::reserve().await;
+        let root = super::history::root().map_err(anyhow::Error::msg)?;
         let id = request_round(&mut codec, &mut active, "message", shard.to_vec()).await?;
         let round = wait_round(
             events,
@@ -1335,60 +1344,228 @@ async fn run_inner(
         let objects = decode_round(&mut codec, &id, "message", round).await?;
         active.dispose(&id);
         history_bytes = history_bytes.saturating_add(serde_json::to_vec(&objects)?.len());
+        // Retain the decoded owner-bound page before sender lookup or any other enrichment.
+        let raw = super::phone_pending::Page {
+            owner: account.into(),
+            objects,
+            mapping: mapping.clone(),
+            groups: groups.clone(),
+            own: own.clone(),
+        };
+        let raw_ticket =
+            super::history_retention::stage_raw(root.clone(), account.into(), raw.clone(), permit)
+                .map_err(anyhow::Error::msg)?;
         if history_bytes > MAX_ROUND_BYTES * 2 {
             bail!("Phiên đồng bộ vượt giới hạn tổng kích thước; lịch sử đã nhận vẫn được giữ");
         }
-        let senders = objects
-            .iter()
-            .flat_map(|o| o["partitionsList"].as_array().into_iter().flatten())
-            .flat_map(|p| p["messagesList"].as_array().into_iter().flatten())
-            .filter_map(|m| text_id(&m["senderId"]));
-        resolve_ids(&s, senders, &mut mapping).await?;
-        let converted = convert_objects(&objects, &mapping, &groups, &own)?;
-        unresolved_groups.extend(converted.unresolved_groups);
-        let mut threads = converted.threads;
-        for thread in &mut threads {
-            if enrich_archive_mentions(&s, &mut thread.messages)
-                .await
-                .is_err()
-            {
-                status(
-                    tx,
-                    ctx,
-                    "Chưa phân giải được một số nhắc tên; lịch sử đã nhận vẫn được giữ",
-                    true,
-                    generation,
-                    account,
-                );
-            }
-        }
-        count += threads.iter().map(|t| t.messages.len()).sum::<usize>();
+        persist_transfer_ticket(&raw_ticket, &live, &s).await;
+        let raw_id = raw_ticket
+            .raw_id()
+            .context("Thiếu định danh trang lịch sử đang chờ")?
+            .to_owned();
+        let resolver = s.clone();
+        count += replay_raw_page(
+            root,
+            live.clone(),
+            s.clone(),
+            raw_id,
+            raw,
+            ReplayOutput { tx, generation },
+            move |page| resolve_raw_page(resolver, page),
+        )
+        .await?;
         if count > MAX_RECORDS {
             bail!("Phiên đồng bộ vượt giới hạn số tin; hãy đồng bộ tiếp trong lần sau");
         }
-        crate::chat::resolve_thread_names(&s, &mut threads).await;
-        let threads =
-            super::worker::persist_cached_transfer(live.clone(), s.clone(), account, threads).await;
-        let _ = tx.send(GuiEvent::PhoneHistoryThreads {
-            generation,
-            account: account.into(),
-            threads,
-        });
         ctx.request_repaint();
         codec.call(json!({"op":"releaseSession","id":id})).await?;
     }
-    let summary = if unresolved_groups.is_empty() {
-        format!(
-            "Đã nhận {count} tin lịch sử nhóm và 1-1 từ {} hội thoại trên điện thoại",
-            conversations.len()
-        )
-    } else {
-        let mut missing: Vec<_> = unresolved_groups.into_iter().collect();
-        missing.sort();
-        format!("Đã giữ {count} tin lịch sử; chưa nhập nhóm thiếu ánh xạ định danh: {}. Tải lại metadata nhóm rồi thử đồng bộ lại", missing.join(", "))
-    };
+    let summary = format!(
+        "Đã nhận {count} tin lịch sử nhóm và 1-1 từ {} hội thoại trên điện thoại",
+        conversations.len()
+    );
     status(tx, ctx, summary, false, generation, account);
     Ok(())
+}
+
+/// Explicit Start checks the known spool before opening a codec or issuing another phone request.
+async fn resume_pending(
+    root: PathBuf,
+    live: SharedSession,
+    captured: Session,
+    output: ReplayOutput<'_>,
+) -> Result<Option<usize>> {
+    let pending = pending_io(
+        root.clone(),
+        live.clone(),
+        captured.clone(),
+        super::phone_pending::load,
+    )
+    .await?;
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    let mut count = 0;
+    for (id, page) in pending {
+        let resolver = captured.clone();
+        count += replay_raw_page(
+            root.clone(),
+            live.clone(),
+            captured.clone(),
+            id,
+            page,
+            ReplayOutput {
+                tx: output.tx,
+                generation: output.generation,
+            },
+            move |page| resolve_raw_page(resolver, page),
+        )
+        .await?;
+    }
+    Ok(Some(count))
+}
+
+struct ReplayOutput<'a> {
+    tx: &'a super::GuiTx,
+    generation: u64,
+}
+
+async fn resolve_raw_page(
+    s: Session,
+    mut page: super::phone_pending::Page,
+) -> Result<super::phone_pending::Page> {
+    let senders = page
+        .objects
+        .iter()
+        .flat_map(|object| object["partitionsList"].as_array().into_iter().flatten())
+        .flat_map(|part| part["messagesList"].as_array().into_iter().flatten())
+        .filter_map(|message| text_id(&message["senderId"]));
+    resolve_ids(&s, senders, &mut page.mapping).await?;
+    let missing_group = page
+        .objects
+        .iter()
+        .flat_map(|object| object["partitionsList"].as_array().into_iter().flatten())
+        .filter_map(|part| part["id"].as_str()?.strip_prefix("group/"))
+        .any(|id| !page.groups.contains_key(id));
+    if missing_group {
+        page.groups.extend(group_archive_identities(&s).await?);
+    }
+    Ok(page)
+}
+
+/// Resume one durable raw page. The resolver is injected so cancellation is testable without traffic.
+async fn replay_raw_page<F, Fut>(
+    root: PathBuf,
+    live: SharedSession,
+    captured: Session,
+    raw_id: String,
+    page: super::phone_pending::Page,
+    output: ReplayOutput<'_>,
+    resolver: F,
+) -> Result<usize>
+where
+    F: FnOnce(super::phone_pending::Page) -> Fut,
+    Fut: std::future::Future<Output = Result<super::phone_pending::Page>>,
+{
+    let account = page.owner.clone();
+    let permit = super::history_retention::reserve().await;
+    let page = resolver(page).await?;
+    let converted = convert_objects(&page.objects, &page.mapping, &page.groups, &page.own)?;
+    anyhow::ensure!(
+        converted.unresolved_groups.is_empty(),
+        "Chưa phân giải được nhóm; trang gốc vẫn được giữ để tiếp tục"
+    );
+    let mut threads = converted.threads;
+    let count = threads.iter().map(|thread| thread.messages.len()).sum();
+    let projection = super::history_retention::persist_page(
+        (root.clone(),live.clone(),captured.clone(),account.clone()),
+        threads.clone(),
+        super::history_retention::Origin::Cached,
+        false,
+        permit,
+        None,
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    let _ = output.tx.send(GuiEvent::PhoneHistoryThreads {
+        generation: output.generation,
+        account: account.clone(),
+        threads: projection,
+    });
+    let remove_id = raw_id;
+    pending_io(
+        root.clone(),
+        live.clone(),
+        captured.clone(),
+        move |root, account| super::phone_pending::remove(root, account, &remove_id),
+    )
+    .await?;
+
+    // Cache-only enrichment follows the original page's durable acknowledgement.
+    let enrichment_permit = super::history_retention::reserve().await;
+    for thread in &mut threads {
+        let _ = enrich_archive_mentions(&captured, &mut thread.messages).await;
+    }
+    crate::chat::resolve_thread_names(&captured, &mut threads).await;
+    let projection = super::history_retention::persist_page(
+        (root,live,captured,account.clone()),
+        threads,
+        super::history_retention::Origin::Cached,
+        false,
+        enrichment_permit,
+        None,
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    let _ = output.tx.send(GuiEvent::PhoneHistoryThreads {
+        generation: output.generation,
+        account,
+        threads: projection,
+    });
+    Ok(count)
+}
+
+/// Run spool I/O behind the same captured session and runtime mutation admission as history.
+async fn pending_io<T: Send + 'static>(
+    root: PathBuf,
+    live: SharedSession,
+    captured: Session,
+    operation: impl FnOnce(&std::path::Path, &str) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    crate::runtime_scope::spawn_blocking(move || {
+        let current = live.blocking_lock();
+        let _mutation = crate::runtime_scope::mutation()?;
+        let account = captured
+            .login
+            .as_ref()
+            .context("Phiên đồng bộ đã thay đổi")?
+            .uin
+            .as_str();
+        anyhow::ensure!(
+            current.login.as_ref().map(|login| login.uin.as_str()) == Some(account)
+                && current.zpw_sek == captured.zpw_sek,
+            "Phiên đồng bộ đã thay đổi"
+        );
+        operation(&root, account)
+    })
+    .await??
+}
+
+/// Retry a centrally retained ticket without taking ownership of its immutable payload.
+/// Coordinator cancellation drops this waiter, not the accepted account-bound page.
+async fn persist_transfer_ticket(
+    ticket: &super::history_retention::Ticket,
+    live: &SharedSession,
+    captured: &Session,
+) -> Vec<Thread> {
+    loop {
+        if let Ok(projection) =
+            super::history_retention::persist(ticket, live.clone(), captured.clone(), None).await
+        {
+            return projection;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Gate historical UI deltas by login, exact account and explicit run generation.
@@ -2756,5 +2933,200 @@ mod epoch_tests {
             dead,
             "epoch cancellation must still kill the owned codec subprocess"
         );
+    }
+}
+
+#[cfg(test)]
+mod raw_pending_replay_tests {
+    use super::*;
+    struct Root(PathBuf);
+    impl Root {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "zl-phone-raw-replay-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn session() -> Session {
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo {
+            uin: "100".into(),
+            ..Default::default()
+        });
+        session.zpw_sek = Some("synthetic-fixture-key".into());
+        // Relative profile URLs fail locally; fixtures never contact a service host.
+        session.domains.profile.clear();
+        session
+    }
+    fn page(resolved: bool) -> super::super::phone_pending::Page {
+        let mut mapping = HashMap::from([("opaque-peer".into(), "123".into())]);
+        if resolved {
+            mapping.insert("opaque-own".into(), "100".into());
+        }
+        super::super::phone_pending::Page {
+            owner: "100".into(),
+            own: "100".into(),
+            mapping,
+            groups: HashMap::new(),
+            objects: vec![
+                json!({"partitionsList":[{"id":"oneone/opaque-peer","messagesList":[{"globalId":"901","clientId":"902","senderId":"opaque-own","content":"Synthetic durable raw body","msgType":0,"timestamp":1700000000000i64}]}]}),
+            ],
+        }
+    }
+    #[tokio::test]
+    async fn cancel_during_sender_lookup_keeps_raw_page_for_flush_reopen_and_exact_resume() {
+        let _serial = crate::runtime_scope::tests::TEST_LOCK.lock().await;
+        let scope = crate::runtime_scope::transition("100").unwrap();
+        let root = Root::new();
+        let captured = session();
+        let live = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sender = super::super::GuiTx::for_test(tx);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let path = root.0.clone();
+        let task_live = live.clone();
+        let task_session = captured.clone();
+        let task_scope = scope.clone();
+        let task = tokio::spawn(async move {
+            crate::runtime_scope::run(task_scope, async {
+                let raw = page(false);
+                let permit = super::super::history_retention::reserve().await;
+                let ticket = super::super::history_retention::stage_raw(
+                    path.clone(),
+                    "100".into(),
+                    raw.clone(),
+                    permit,
+                )
+                .unwrap();
+                persist_transfer_ticket(&ticket, &task_live, &task_session).await;
+                replay_raw_page(
+                    path,
+                    task_live,
+                    task_session,
+                    ticket.raw_id().unwrap().into(),
+                    raw,
+                    ReplayOutput {
+                        tx: &sender,
+                        generation: 7,
+                    },
+                    move |page| async move {
+                        entered_tx.send(()).unwrap();
+                        std::future::pending::<()>().await;
+                        Ok(page)
+                    },
+                )
+                .await
+            })
+            .await
+        });
+        entered_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        super::super::history_retention::flush_pending_sync().unwrap();
+        let reopened = super::super::phone_pending::load(&root.0, "100").unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert!(!reopened[0].1.mapping.contains_key("opaque-own"));
+        let store = crate::store_v2::AccountStore::open(&root.0, "100").unwrap();
+        assert!(store.get_message("123", "901").unwrap().is_none());
+        drop(store);
+        let (id, raw) = reopened.into_iter().next().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = super::super::GuiTx::for_test(tx);
+        let count = crate::runtime_scope::run(
+            scope,
+            replay_raw_page(
+                root.0.clone(),
+                live,
+                captured,
+                id,
+                raw,
+                ReplayOutput {
+                    tx: &sender,
+                    generation: 8,
+                },
+                |mut page| async move {
+                    page.mapping.insert("opaque-own".into(), "100".into());
+                    Ok(page)
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 1);
+        assert!(rx.try_recv().is_ok());
+        let message = crate::store_v2::AccountStore::open(&root.0, "100")
+            .unwrap()
+            .get_message("123", "901")
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.text, "Synthetic durable raw body");
+        assert!(message.is_outgoing);
+        assert!(super::super::phone_pending::load(&root.0, "100")
+            .unwrap()
+            .is_empty());
+        crate::runtime_scope::transition("").unwrap();
+    }
+    #[tokio::test]
+    async fn known_spool_is_inert_until_explicit_start_resume_and_needs_no_phone_request() {
+        let _serial = crate::runtime_scope::tests::TEST_LOCK.lock().await;
+        let scope = crate::runtime_scope::transition("100").unwrap();
+        let root = Root::new();
+        super::super::phone_pending::persist(&root.0, "100", "explicit-resume", &page(true))
+            .unwrap();
+        let captured = session();
+        let live = std::sync::Arc::new(tokio::sync::Mutex::new(captured.clone()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = super::super::GuiTx::for_test(tx);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            super::super::phone_pending::load(&root.0, "100")
+                .unwrap()
+                .len(),
+            1
+        );
+        // This is the same explicit Start branch called before Codec::start/request_round.
+        let resumed = crate::runtime_scope::run(
+            scope,
+            resume_pending(
+                root.0.clone(),
+                live,
+                captured,
+                ReplayOutput {
+                    tx: &sender,
+                    generation: 9,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed, Some(1));
+        assert!(rx.try_recv().is_ok());
+        assert!(super::super::phone_pending::load(&root.0, "100")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            crate::store_v2::AccountStore::open(&root.0, "100")
+                .unwrap()
+                .get_message("123", "901")
+                .unwrap()
+                .unwrap()
+                .text,
+            "Synthetic durable raw body"
+        );
+        crate::runtime_scope::transition("").unwrap();
     }
 }

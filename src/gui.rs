@@ -22,8 +22,10 @@ use crate::qr::QrLogin;
 use crate::session::Session;
 
 mod history;
+mod history_retention;
 mod group_history;
 mod phone_history;
+mod phone_pending;
 mod media_preview;
 mod native_photo_viewer;
 mod messages;
@@ -1133,11 +1135,14 @@ impl ZaloGuiApp {
         }
     }
 
-    fn persist_threads_async(&self) {
+    fn persist_threads_async(&mut self) {
         self.publish_known_threads();
-        let snapshot = self.threads.clone();
         if let Some(wtx) = WORKER_TX.get() {
-            let _ = wtx.send(WorkerCmd::PersistThreads { account: self.user_uin.clone(), threads: snapshot });
+            match history_retention::stage_gui(self.user_uin.clone(),wtx.ui_generation(),self.threads.clone()) {
+                Ok(true) => { if wtx.send(WorkerCmd::FlushHistory).is_err() { self.status_msg="Bộ xử lý đã đóng; lịch sử vẫn chờ lưu".into(); } }
+                Ok(false) => {}
+                Err(error) => {self.status_msg=error;}
+            }
         }
     }
 

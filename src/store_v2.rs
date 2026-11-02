@@ -146,11 +146,7 @@ fn private(path: &Path, directory: bool) -> Result<()> {
     Ok(())
 }
 fn account_mutation(account: &str) -> Result<crate::runtime_scope::MutationGuard> {
-    let guard = crate::runtime_scope::mutation()?;
-    if let Some(scope) = crate::runtime_scope::execution_scope() {
-        ensure!(scope.account == account, "History account scope mismatch");
-    }
-    Ok(guard)
+    Ok(crate::runtime_scope::owner_bound_mutation(account)?)
 }
 impl AccountStore {
     /// Open a private account-specific file and apply forward-only schema upgrades.

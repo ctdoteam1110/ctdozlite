@@ -147,6 +147,19 @@ pub fn mutation() -> Result<MutationGuard, StaleScope> {
     MUTATION_DEPTH.with(|depth| depth.set(depth.get() + 1));
     Ok(MutationGuard { _guard: guard })
 }
+/// Authorize immutable owner-bound persistence during an intent-checked lifecycle flush.
+/// Normal scoped operations still require an exact account; this does not authorize network work.
+///
+/// # Errors
+/// Returns StaleScope for an empty owner, stale epoch or ordinary cross-account access.
+pub(crate) fn owner_bound_mutation(account:&str)->Result<MutationGuard,StaleScope> {
+    let guard=mutation()?;
+    if account.is_empty() {return Err(StaleScope);}
+    if !LIFECYCLE_CLEANUP.with(Cell::get) {
+        if let Some(scope)=execution_scope() {if scope.account!=account {return Err(StaleScope);}}
+    }
+    Ok(guard)
+}
 /// Publish a new auth incarnation under the disk barrier, updating the caller's ticket.
 ///
 /// # Errors
