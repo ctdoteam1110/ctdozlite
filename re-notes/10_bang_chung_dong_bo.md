@@ -157,6 +157,29 @@ Từ 23:57 đến 00:06 QTzalo tắt hẳn. Người dùng nhận/gửi tin 1-1 
 - **[I]** Máy chủ không giao tin nhóm cho phiên QTzalo trên thiết bị này. Giả thiết mạnh nhất: các nhóm này dùng mã hoá đầu cuối (SenderKey); phiên QTzalo được xếp vào nhóm web (queue E2EE `515/517`) nhưng chưa đăng ký thiết bị E2EE, nên tin bị lọc (`isFiltered`). Cần kiểm chứng: so với Zalo Web trên trình duyệt, xem nhóm có hiện "tin nhắn được mã hoá đầu cuối" trên điện thoại không, và thử khi QTzalo đang mở (tin đẩy trực tiếp `521`).
 - Hệ quả: không thể sửa trong v0.1.2. Hai hướng là hỗ trợ E2EE (Signal, đăng ký thiết bị) hoặc đồng bộ từ điện thoại (Phần B). Snapshot Sync V1 được xuất từ DB của điện thoại, nên có thể chứa tin nhóm.
 
+## Ngày 02/11 — một ngày nhiều tin 1-1 và tin nhóm (19:32–19:57)
+
+Người dùng nhận nhiều tin 1-1 và tin nhóm suốt ngày 02/11 trong lúc QTzalo tắt. Mở lại bằng bản `c543f72` (rồi các bản sửa tới `58ea93f`).
+
+### 14. Tin nhóm có về qua `511_1`; giả thiết E2EE bị bác bỏ [O]
+
+- Socket kéo đúng từ con trỏ đã lưu và **phân trang đủ**: `510_1` trả 49 + 49 + 30 tin (`more = 1, 1, 0`); `511_1` trả **50 + 50 + 38 tin nhóm** (`more = 1, 1, 0`). Loại tin: `webchat`, `chat.photo`, `chat.video.msg`, `share.file`, `chat.sticker`, `chat.recommended`, `chat.voice`, `chat.location.new`, `chat.undo`.
+- DB sau lần mở: 349 tin trong 36 hội thoại, có cả nhóm.
+- `getmg-v2` trả `e2ee = 0` cho **cả 61 nhóm**. → Bác bỏ giả thiết ở §13 (tin nhóm bị lọc vì mã hoá đầu cuối).
+- Tin nhóm gửi lúc 00:00–00:06 (A7) không có trong `511_1` hôm nay: trang đầu bắt đầu từ khoảng 09:51 ngày 02/11. Vì sao hàng đợi nhóm không giao tin trong những giờ đầu sau lần đăng nhập đầu tiên **[U]**. Có thể máy chủ chỉ bắt đầu giao tin nhóm cho thiết bị mới sau một khoảng thời gian, hoặc sau các sự kiện điều khiển `join`/`leave` nhóm thấy trong `603_1` hôm nay.
+- `getrecentv2` của nhóm vẫn trả 0 tin, với cùng phân bố cờ `isFiltered` như trước.
+
+### 15. Long-poll kẹt ở queue nhóm `16` [O]
+
+- Long-poll trả `groupMsgs: 100, more: 1` với **cùng `lastActionId`**, lặp lại 1799 lần trong 3 phút. `queueStatus["16"]` (= `511_1`) có `ids` và `lastId`, nhưng client chỉ gửi con trỏ cho queue `1, 2, 3`, nên máy chủ không thể tiến.
+- Thử với `QTZALO_LP_QUEUES=1,2,3,15,16`: máy chủ **chấp nhận**, trả 100 rồi 38 tin (`more = 0`), sau đó long-poll chờ 12 giây như bình thường. Chú thích cũ trong mã ("thêm 15/16 thì `lp_chat` từ chối") không đúng với phiên này.
+- Sửa (`58ea93f`): theo dõi queue tin nhắn `6/15/16` mà máy chủ báo trong `queueStatus`, bắt đầu từ `lastId: 1`; dừng kéo bù khi con trỏ không tiến. Kiểm chứng lại: 8 yêu cầu long-poll trong 90 giây.
+
+### 16. Tên nhóm hiện thành số [O]
+
+- `getmg-v2` được gửi kèm `gridVerMap` lấy nguyên từ `getlg/v4` (phiên bản hiện tại của từng nhóm). Máy chủ trả `gridInfoMap: {}` và `unchangedsGroup: [61 nhóm]`: nó chỉ gửi thông tin cho nhóm có phiên bản khác với phiên bản client gửi. Gửi phiên bản `0` thì máy chủ trả tên và ảnh của cả 61 nhóm (50 + 11).
+- 6 nhóm có tên thật bắt đầu bằng "Nhóm ". `is_generic_thread_name` coi mọi tên bắt đầu bằng "Nhóm " là tên tạm, nên bản ghi tạm "Nhóm <id>" do tin đến tạo ra đã ghi đè tên thật. Đã sửa (`58ea93f`). Kiểm chứng: 61/61 nhóm có tên đúng.
+
 ## Kết luận theo giả thiết
 
 | Giả thiết (nguồn) | Kết luận |
@@ -167,7 +190,8 @@ Từ 23:57 đến 00:06 QTzalo tắt hẳn. Người dùng nhận/gửi tin 1-1 
 | Nhóm đủ lịch sử nhờ `getrecentv2` (09 §1 B) | **Bác bỏ** với thiết bị mới: 0 tin, có cờ lọc |
 | Có `resetLastActionId` / `evict = true` | Chưa gặp (ba lượt đều `evict = 0`, không có `resetLastActionId`); trường `evict` có thật trong `queueStatus` |
 | Hàng đợi 1-1 giữ tin trong lúc app tắt; `lastId: 1` lấy lại được (10 phút) | **Xác nhận**. Kéo về không xoá khỏi hàng đợi: mỗi lần mở app tải lại toàn bộ từ lúc đăng nhập |
-| Tin nhóm về qua hàng đợi offline `511_x` | **Bác bỏ** trên thiết bị này (A7): người dùng nhắn trong nhóm, nhưng `511_1`, long-poll và `getrecentv2` đều không có tin. [I] Bị lọc vì mã hoá đầu cuối |
+| Tin nhóm về qua hàng đợi offline `511_x` | **Xác nhận** từ 02/11: `511_1` phân trang 50 + 50 + 38 tin. Lúc A7 (vài giờ sau lần đăng nhập đầu tiên) thì chưa có, lý do [U]; không phải do E2EE (`e2ee = 0` ở cả 61 nhóm) |
+| Long-poll chỉ cần queue `1, 2, 3` | **Bác bỏ**: phải theo dõi cả `15/16` nếu máy chủ báo, nếu không sẽ lặp mãi cùng một trang |
 | Lịch sử nhóm từ `getrecentv2` nối được khoảng thiếu (A4) | **Bác bỏ** trên thiết bị này: 0 tin ở cả 60 nhóm, có cờ `isFiltered` |
 | Tin E2EE đến qua `513/713` | **Bác bỏ** queue: phiên này dùng `515/517`. Có tin E2EE thật hay không: chưa rõ |
 | PC nhận `temp_key` sau đăng nhập QR (Phần B) | **Xác nhận**: `transfer_after_login` / `transfer_sync2` trong `603_1` |
