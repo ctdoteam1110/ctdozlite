@@ -63,6 +63,9 @@ impl ZaloGuiApp {
                             .iter()
                             .rev()
                             .filter_map(|m| {
+                                // Rows saved before v0.1.2 hold a Zalo-CDN URL as text.
+                                let legacy = legacy_media_view(m);
+                                let m = legacy.as_ref().unwrap_or(m);
                                 let is_photo = m.link_src.as_deref() == Some("Hình ảnh Zalo")
                                     || m.text.trim() == "[Hình ảnh]"
                                     || m.text.trim().starts_with("[Hình ảnh] ");

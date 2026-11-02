@@ -1174,7 +1174,16 @@ impl ZaloGuiApp {
 
     fn thread_preview_text(&self, t: &Thread) -> String {
         let last_outgoing = t.messages.last().map(|m| m.is_outgoing).unwrap_or(false);
-        let base = if t.preview.is_empty() {
+        // A photo / video saved before v0.1.2 as a bare Zalo-CDN URL previews as its label.
+        let legacy_label = t
+            .messages
+            .last()
+            .filter(|m| t.preview.is_empty() || t.preview == m.text.replace('\n', " "))
+            .and_then(legacy_media_view)
+            .map(|m| m.text);
+        let base = if let Some(label) = legacy_label {
+            label
+        } else if t.preview.is_empty() {
             t.messages.last().map(|m| m.text.clone()).unwrap_or_else(|| "Chưa có tin nhắn".into())
         } else {
             t.preview.clone()
