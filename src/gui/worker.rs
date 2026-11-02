@@ -1057,15 +1057,27 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                     for _ in 0..crate::chat::LP_CATCHUP_MAX_BATCHES {
                                         let poll_res = {
                                             let mut ps = poll_clone.lock().await;
-                                            crate::chat::get_chat_from_polling(&s, &mut ps).await
+                                            let before = ps.clone();
+                                            crate::chat::get_chat_from_polling(&s, &mut ps)
+                                                .await
+                                                .map(|r| {
+                                                    let go_on =
+                                                        crate::chat::lp_should_continue(&before, &ps, &r);
+                                                    (r, go_on)
+                                                })
                                         };
                                         match poll_res {
-                                            Ok(lp_resp) => {
+                                            Ok((lp_resp, go_on)) => {
                                                 crate::chat::merge_previews(
                                                     &mut temp_threads,
                                                     &lp_resp,
                                                 );
-                                                if !crate::chat::lp_reply_wants_more(&lp_resp) {
+                                                if !go_on {
+                                                    // Stuck on a queue we do not track: wait
+                                                    // before asking again instead of spinning.
+                                                    if crate::chat::lp_reply_wants_more(&lp_resp) {
+                                                        tokio::time::sleep(Duration::from_secs(10)).await;
+                                                    }
                                                     break;
                                                 }
                                             }
