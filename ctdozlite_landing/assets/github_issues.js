@@ -1,9 +1,23 @@
 window.CTD_GITHUB = {
-  "fetchedAt": "2026-11-01T19:09:23.439Z",
+  "fetchedAt": "2026-11-02T03:06:52.066Z",
   "repo": "ctdoteam1110/ctdozlite",
-  "totalIssues": 31,
-  "totalPrs": 26,
+  "totalIssues": 32,
+  "totalPrs": 30,
   "issues": [
+    {
+      "author": {
+        "login": "buildertv",
+        "name": "BuilderTV"
+      },
+      "body": "> **Trước khi mở issue:** Vui lòng kiểm tra bảng **[Tính năng & giới hạn (`docs/TINH_NANG.md`)](https://github.com/ctdoteam1110/ctdozlite/blob/main/docs/TINH_NANG.md)** và **[Lỗi đã biết (`docs/DA_BIET.md`)](https://github.com/ctdoteam1110/ctdozlite/blob/main/docs/DA_BIET.md)** để xem vấn đề đã được ghi nhận chưa.\n\n## Môi trường\n- **Hệ điều hành:** Windows 11 25H2\n- **Phiên bản `ctdozlite`:** 0.0.4\n- **Chế độ chạy:** GUI\n\n## Các bước tái hiện\n1. ấn vào tên 1 người vừa nhận tin nhắn\n2. tự động nh",
+      "createdAt": "2026-11-02T02:19:49Z",
+      "labels": [
+        "bug"
+      ],
+      "number": 63,
+      "state": "CLOSED",
+      "title": "bug: lỗi khi tên zalo trùng nhau"
+    },
     {
       "author": {
         "login": "thedtvn",
@@ -378,6 +392,54 @@ window.CTD_GITHUB = {
     }
   ],
   "prs": [
+    {
+      "author": {
+        "login": "thuongtin",
+        "name": "Ethan"
+      },
+      "body": "## Nội dung và mục tiêu\n\nPR này khôi phục các phần tính năng còn lại từ nhánh phát triển cũ lên upstream v0.0.4, lấy `20e742c` làm nền. Mục tiêu là giữ lại tính năng đã xây dựng nhưng nối chúng vào kiến trúc worker, mô hình tin nhắn và vòng đời hiện tại của upstream, thay vì chép đè nguyên GUI archive.\n\nThay đổi có cả phần người dùng nhìn thấy như **emoji, reaction, mention, ảnh và điều hướng lịch sử**, lẫn nền tảng cần thiết để các phần đó giữ đúng dữ liệu khi tải lại, đổi tài khoản, gửi lỗi ho",
+      "createdAt": "2026-11-02T00:38:31Z",
+      "labels": [],
+      "number": 62,
+      "state": "OPEN",
+      "title": "feat(chat): khôi phục bộ tính năng chat trên upstream v0.0.4"
+    },
+    {
+      "author": {
+        "login": "thuongtin",
+        "name": "Ethan"
+      },
+      "body": "## Thay đổi\n- Hợp nhất tin nhắn bằng định danh chính xác trong thread, preview và lịch sử nhóm; giữ các tin khác nhau dù trùng nội dung và thời gian.\n- Giữ client ID xuyên suốt thao tác gửi và phản hồi worker, tránh nhân đôi khi server push đến trước acknowledgement.\n- Giữ thời gian server khi acknowledgement cục bộ đến muộn, không đảo thứ tự cuộc trò chuyện.\n\n## Lý do\n- So khớp theo nội dung hoặc thời gian có thể làm mất tin hợp lệ; chỉ thêm tin cục bộ sau phản hồi cũng có thể tạo bản sao.\n- Đâ",
+      "createdAt": "2026-11-01T22:29:16Z",
+      "labels": [],
+      "number": 61,
+      "state": "OPEN",
+      "title": "fix(chat): hợp nhất tin nhắn theo định danh chính xác"
+    },
+    {
+      "author": {
+        "login": "thuongtin",
+        "name": "Ethan"
+      },
+      "body": "## Thay đổi\n- Nhấn phần trích dẫn để cuộn tới và làm nổi bật tin nhắn gốc đã nạp trong cuộc trò chuyện.\n- Định vị theo định danh chính xác, không đoán theo nội dung hay thời gian. Báo rõ khi chưa nạp hoặc định danh không duy nhất.\n\n## Lý do\n- Upstream đã hiển thị trích dẫn nhưng chưa có thao tác quay về tin gốc. Đây là phần được tách từ nhánh tính năng đã xây, không gửi lại nền dữ liệu đã được nhận.\n\n## Cách thực hiện\n- Phân giải tham chiếu server/client theo namespace và từ chối kết quả mơ hồ.\n",
+      "createdAt": "2026-11-01T22:28:26Z",
+      "labels": [],
+      "number": 60,
+      "state": "OPEN",
+      "title": "feat(ui): điều hướng tới tin nhắn trích dẫn đã nạp"
+    },
+    {
+      "author": {
+        "login": "thuongtin",
+        "name": "Ethan"
+      },
+      "body": "## Thay đổi\n- Thêm phần hiển thị trạng thái quyền thông báo macOS và nút yêu cầu quyền riêng trong Cài đặt.\n- Chỉ bổ sung phần quản lý quyền của cầu nối thông báo native đã có trong bản tùy biến. Chưa gửi thông báo native, để không bỏ qua kiểm tra tài khoản, tắt tiếng và trạng thái cửa sổ.\n\n## Lý do\n- Helper `DailyNotifier.app` đã được đóng gói, nhưng công tắc thông báo của ứng dụng chưa thể hiện quyền do hệ điều hành cấp.\n- Không tự xin quyền khi khởi động hoặc đăng nhập; bật công tắc thông báo",
+      "createdAt": "2026-11-01T22:16:31Z",
+      "labels": [],
+      "number": 59,
+      "state": "OPEN",
+      "title": "feat(ui): hiển thị trạng thái quyền thông báo macOS"
+    },
     {
       "author": {
         "login": "thuongtin",

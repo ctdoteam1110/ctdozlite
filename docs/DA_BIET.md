@@ -3,14 +3,21 @@
 Trang này được **sinh tự động** từ GitHub Issues — đừng sửa tay.
 Chạy `scripts/gen-known-issues.sh` để cập nhật.
 
-> Nguồn: [ctdoteam1110/ctdozlite/issues](https://github.com/ctdoteam1110/ctdozlite/issues) · cập nhật 2026-11-01 19:09 UTC
+> Nguồn: [ctdoteam1110/ctdozlite/issues](https://github.com/ctdoteam1110/ctdozlite/issues) · cập nhật 2026-11-02 03:06 UTC
 
-Đang mở: **0** mục, trong đó **0** là lỗi và **0** là đề xuất.
+Đang mở: **1** mục, trong đó **1** là lỗi và **0** là đề xuất.
+
+## Lỗi đã biết
+
+| Issue | Mô tả |
+|---|---|
+| [#63](https://github.com/ctdoteam1110/ctdozlite/issues/63) | bug: lỗi khi tên zalo trùng nhau |
 
 ## Tất cả mục đang mở
 
 | Issue | Mô tả |
 |---|---|
+| [#63](https://github.com/ctdoteam1110/ctdozlite/issues/63) | bug: lỗi khi tên zalo trùng nhau |
 
 ---
 
