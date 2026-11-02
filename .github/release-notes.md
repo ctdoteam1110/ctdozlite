@@ -16,18 +16,20 @@ Kiểm tra file bằng `SHA256SUMS.txt`. Bộ cài Windows chưa ký số: nếu
 
 ### Điểm mới
 
-![Tải tệp trong QTzalo](https://raw.githubusercontent.com/quangthoai1985/QTzalo/v{{VERSION}}/docs/assets/qtzalo-download.png)
+![Đồng bộ tin nhắn khi mở QTzalo](https://raw.githubusercontent.com/quangthoai1985/QTzalo/v{{VERSION}}/docs/assets/qtzalo-sync.png)
 
-- **Tải tệp, video và ảnh gốc về máy** vào "Thư mục lưu file" (Cài đặt): nút tải trên từng thẻ tệp/video/ảnh và trong trình xem ảnh, có tiến trình phần trăm, nút **Mở** / **Mở thư mục** khi xong và **Thử lại** khi lỗi.
-- **An toàn khi tải:** chỉ qua `https`, làm sạch tên file, không ghi đè file có sẵn, gắn Mark-of-the-Web trên Windows, không tự mở file thực thi (`.exe`, `.bat`, `.ps1`, `.lnk`…).
-- **Quản lý cache ảnh** trong *Cài đặt → Dữ liệu & làm mới*: xem dung lượng, xoá cache ảnh (không đụng tới đăng nhập, lịch sử và cài đặt), mở thư mục dữ liệu.
-- **Số thành viên nhóm** hiện ở header chat khi máy chủ Zalo cung cấp.
-- Chọn "Thư mục lưu file" bằng hộp chọn thư mục của hệ điều hành; ảnh dán từ clipboard không còn rơi vào thư mục đang chạy app.
-- Nâng `ratatui`/`crossterm`, loại bỏ cảnh báo `lru` unsound.
+- **Tự bắt kịp tin nhắn khi mở app.** App nhớ vị trí đã đồng bộ của từng tài khoản, nên tắt máy một ngày rồi mở lại vẫn về đủ tin 1-1 và tin nhóm, chỉ lấy phần mới, có dải tiến trình "Đang đồng bộ tin nhắn… N tin". Khởi động lúc chưa có mạng thì tự thử lại.
+- **Báo thiếu tin:** nếu máy chủ đã bỏ bớt tin trong lúc tắt máy, app hiện banner kèm khoảng thời gian có thể thiếu.
+- **Danh sách hội thoại giống điện thoại:** chỉ hiện hội thoại có hoạt động, xếp theo thời điểm hoạt động cuối; ô tìm kiếm vẫn tìm được mọi bạn bè.
+- **Ảnh, video, tệp không còn hiện link.** Bấm ảnh mở cửa sổ xem ảnh riêng; bấm video phát trong cửa sổ của QTzalo (cần `ffmpeg`, nếu không có thì mở bằng trình phát mặc định); bấm tệp thì tải về rồi mở. Không còn mở trình duyệt.
+- **Sửa tên nhóm** hiện thành "Nhóm <số>"; sửa lỗi long-poll lặp liên tục khi có tin nhóm chờ.
+
+![Ảnh, video, tệp trong tin nhắn](https://raw.githubusercontent.com/quangthoai1985/QTzalo/v{{VERSION}}/docs/assets/qtzalo-media-cards.png)
 
 Xem đầy đủ: [CHANGELOG.md](https://github.com/quangthoai1985/QTzalo/blob/v{{VERSION}}/CHANGELOG.md).
 
 ### Lưu ý
 
 - Dữ liệu người dùng nằm ở `%APPDATA%\QTzalo` (Windows) / `~/.local/share/qtzalo` (Linux). Lần đầu chạy, dữ liệu cũ trong thư mục làm việc được tự động chuyển vào đây.
+- Trên một máy vừa đăng nhập lần đầu, máy chủ Zalo chỉ gửi tin từ sau lần đăng nhập đó; lịch sử cũ (nhất là của nhóm) chưa lấy được. Tính năng "đồng bộ từ điện thoại" đang được nghiên cứu.
 - QTzalo không liên kết với VNG / Zalo. Dùng client bên thứ ba có thể vi phạm điều khoản dịch vụ của Zalo.

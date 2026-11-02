@@ -4,6 +4,52 @@ Mọi thay đổi đáng chú ý của QTzalo được ghi tại đây. Định 
 
 QTzalo là bản fork của [ctdozlite](https://github.com/ctdoteam1110/ctdozlite), tách ra từ commit `73849bd` (tag `v0.0.2` của upstream).
 
+## [0.1.2] - 2026-11-02
+
+Trọng tâm: mở QTzalo sau một thời gian tắt máy thì tin nhắn tự đồng bộ đủ như trên điện thoại. Mọi thay đổi dựa trên bằng chứng thu với tài khoản thật (`re-notes/10_bang_chung_dong_bo.md`).
+
+### Thêm mới
+
+- **Tự bắt kịp tin nhắn khi mở app**
+  - Nhớ vị trí đã đồng bộ của từng hàng đợi tin nhắn, theo từng tài khoản (`sync_state_<uin>.json`). Lần mở sau chỉ lấy phần mới; trước đây app tải lại mọi thứ từ lúc đăng nhập.
+  - Kéo bù tới khi máy chủ báo hết (trước đây tối đa 3 đợt), cho cả tin 1-1 và tin nhóm.
+  - Dải "Đang đồng bộ tin nhắn… N tin" dưới đầu danh sách hội thoại, sau đó hiện "Đã đồng bộ N tin nhắn".
+  - Khởi động lúc chưa có mạng thì tự thử lại sau 5/15/30/60 giây, thay vì bỏ qua.
+- **Báo thiếu tin**: khi máy chủ báo đã bỏ bớt một phần hàng đợi, app hiện banner "Tin nhắn chưa được đồng bộ đủ" kèm khoảng thời gian có thể thiếu và lời nhắc xem trên điện thoại. Có nút đóng.
+- **Danh sách hội thoại giống điện thoại**: tab Tin nhắn chỉ hiện hội thoại có hoạt động, sắp theo thời điểm hoạt động cuối (lấy từ máy chủ, kể cả trên máy mới chưa có tin). Ô tìm kiếm vẫn tìm được mọi bạn bè và nhóm.
+- **Lịch sử "Cloud của tôi"/nhóm liền mạch**: khi trang tin mới nhất chưa chạm tới tin đã có trên máy, app tải thêm các trang cũ hơn.
+- **Ảnh, video, tệp trong tin nhắn**
+  - Không còn hiện đường link: ảnh hiện thành ảnh; video có ảnh xem trước, nút ▶, thời lượng và dung lượng; tệp có tên và dung lượng; tin thoại có thẻ riêng. Tin cũ đã lưu dạng link cũng được nhận ra.
+  - Bấm ảnh → cửa sổ "Xem ảnh" riêng của app (phóng to, kéo, tải về).
+  - Bấm video → tải vào cache rồi phát trong cửa sổ "Video" của QTzalo: có tiếng, tạm dừng, tua, tắt tiếng, phím tắt. Cần `ffmpeg` trên máy; không có thì mở bằng trình phát mặc định của Windows.
+  - Bấm tệp → tải về "Thư mục lưu file" rồi mở bằng ứng dụng mặc định.
+  - Không chỗ nào còn mở trình duyệt.
+
+### Sửa lỗi
+
+- **Tên nhóm hiện thành "Nhóm <số>"**: app hỏi thông tin nhóm kèm đúng phiên bản máy chủ vừa đưa, nên máy chủ không trả tên nào. Ngoài ra, tên thật bắt đầu bằng chữ "Nhóm …" bị coi là tên tạm và bị ghi đè khi có tin mới. Hai nhóm khác nhau cũng không còn bị gộp chỉ vì trùng tên hoặc trùng ảnh mặc định.
+- **Long-poll lặp liên tục khi có tin nhóm chờ**: máy chủ giữ tin nhóm ở một hàng đợi mà app không theo dõi, nên trả mãi cùng một trang. App nay theo dõi mọi hàng đợi tin nhắn máy chủ báo, và dừng khi con trỏ không tiến.
+- Lần làm mới lúc khởi động có thể bị kẹt và không bao giờ tải lịch sử nhóm.
+
+### Bảo mật
+
+- `sync_state_<uin>.json` chỉ chứa con trỏ hàng đợi (không có khoá, không có nội dung). File được ghi nguyên tử với quyền chủ sở hữu, `uin` được kiểm tra chỉ gồm chữ số, và file bị xoá khi đăng xuất (S17).
+- Phát video bằng `ffmpeg` (S18):
+  - chỉ chạy `ffmpeg.exe` thật (không chạy `.cmd`/`.bat`);
+  - tham số truyền thẳng, không qua shell;
+  - `-protocol_whitelist file` và danh sách định dạng cho phép;
+  - chỉ phát tệp trong thư mục cache của QTzalo;
+  - khung hình tối đa 1280 px;
+  - đóng cửa sổ thì dừng mọi tiến trình con.
+- Trace gỡ lỗi `ZCALL_WS_TRACE=1` chỉ ghi cấu trúc (tên trường, số lượng, con trỏ); nội dung tin chỉ còn độ dài (S19).
+
+### Phát triển
+
+- Module mới: `src/sync_state.rs` (con trỏ bền, tín hiệu thiếu tin, đồng hồ `msgId` → thời gian), `src/trace_shape.rs`, `src/video.rs`, `src/gui/media_view.rs`.
+- Bảng SQLite mới `missing_ranges`, `thread_activity`.
+- Biến demo mới: `QTZALO_DEMO_SYNC=1|done`, `QTZALO_DEMO_MISSING=1`, `QTZALO_DEMO_VIDEO=<mp4>`, `QTZALO_DEMO_IMAGE=1`, `QTZALO_DEMO_VIDEO_PENDING=1`.
+- `QTZALO_FFMPEG=<đường dẫn ffmpeg.exe>` chỉ định `ffmpeg` dùng để phát video. Biến thử nghiệm `QTZALO_LP_QUEUES` (chỉ khi `--dev`).
+
 ## [0.1.1] - 2026-11-01
 
 ### Thêm mới
@@ -148,5 +194,6 @@ Phiên bản đầu tiên của QTzalo.
 - Thêm `docs/CAI_DAT.md` (hướng dẫn cài đặt, xử lý SmartScreen), `docs/SECURITY_AUDIT.md` (kết quả rà soát), `SECURITY.md`.
 - Bổ sung `docs/KHAC_PHUC_SU_CO.md`: font, phiên đăng nhập, giờ hiển thị.
 
+[0.1.2]: https://github.com/quangthoai1985/QTzalo/releases/tag/v0.1.2
 [0.1.1]: https://github.com/quangthoai1985/QTzalo/releases/tag/v0.1.1
 [0.1.0]: https://github.com/quangthoai1985/QTzalo/releases/tag/v0.1.0

@@ -1,6 +1,7 @@
 # Kế hoạch công việc tiếp theo — v0.1.2 và nghiên cứu Sync V1
 
 > Viết ngày 2026-11-01, sau khi phát hành v0.1.1 (`main` = `d8ba11c`, nghiên cứu ở `adc597f`).
+> **Cập nhật 2026-11-02: Phần A đã làm xong trong v0.1.2** (xem "Thiết kế đã chốt sau A0" ở §1, `CHANGELOG.md`, `re-notes/10`). Đã nghiệm thu với tài khoản thật. **Việc tiếp theo là Phần B**, chỉ làm khi người dùng đồng ý; đọc thêm `re-notes/09` §9 (đánh giá lại Sync V1 sau tài liệu phía Android).
 > Đọc kèm: `docs/dev/BAN_GIAO.md` (trạng thái, quy trình, bài học) và `re-notes/09_dong_bo_tin_nhan.md` (cơ chế đồng bộ của Zalo PC, có nhãn [O]/[I]/[U]).
 > Phiên tiếp theo chạy **trên PC Windows của người dùng**: có Zalo PC thật, tài khoản Zalo thật, điện thoại thật. Xem §3 để chuẩn bị môi trường.
 
@@ -162,7 +163,8 @@ Dọn: GET /api/message/delete_snapshot_mobile_msg (12003) {public_key, imei}
    - `dumpbin /exports <file>.node` + `strings` để tìm tên hàm, thư viện nén (zstd/lz4/zlib/brotli), thuật toán (AES-CBC/GCM, ChaCha, PBKDF2/SHA), dấu hiệu SQLCipher.
    - **Dùng module làm "hộp đen" (oracle):** chạy chính `.node` bằng Node cùng ABI với Electron của Zalo. Thử `ELECTRON_RUN_AS_NODE=1 Zalo.exe script.js`; fuse `RunAsNode` có thể đã tắt, khi đó tải đúng phiên bản Electron. Đưa vào một file backup thật (từ B4) để ra DB giải mã, rồi xem schema bằng `sqlite3`.
    - Mục tiêu: mô tả định dạng đủ để **viết lại bằng Rust**. Nếu không viết lại được thì ghi rõ và dừng; **không** đóng gói hay gọi module native của Zalo trong QTzalo.
-4. **Schema DB của điện thoại sau giải mã**: bảng hội thoại/tin nhắn, cột thời gian, `msgId`/`globalMsgId`/`cliMsgId`, cách mã hoá cột (`message` có thể bị mã hoá thêm — tài liệu nhắc `BasicEncryption`/`AESCBCEncryption`), `noise id ↔ plain id`.
+4. **Schema DB của điện thoại sau giải mã**: bảng hội thoại/tin nhắn, cột thời gian, `msgId`/`globalMsgId`/`cliMsgId`, cách mã hoá cột (`message` có thể bị mã hoá thêm — tài liệu nhắc `BasicEncryption`/`AESCBCEncryption`), `noise id ↔ plain id`. Theo tài liệu Android, đích có lẽ là Cross DB (`chats`/`threads`, `re-notes/09` §9.1).
+5. **(Thêm sau tài liệu Android)** Phân tích phía mã hoá trong APK Zalo Android của chính người dùng: kéo APK bằng `adb`, để ngoài repo, đọc bằng jadx các lớp `cf1.*`, `ve1.g`, `xe1.g`, `BackupRestoreUtils`. Nếu bước COMPRESS/ENCRYPT viết bằng Java thì từ đó suy ra định dạng mà `db-cross-v4` giải mã. Làm song song với bước 3.
 
 ### B4. Probe thử nghiệm trong QTzalo (chỉ chế độ `--dev`, sau B3 bước 1–2)
 
@@ -188,6 +190,8 @@ Dọn: GET /api/message/delete_snapshot_mobile_msg (12003) {public_key, imei}
 3. Định dạng `db-cross-v4` có viết lại được bằng Rust không (nén gì, mã hoá gì, khoá từ đâu: `privateKey` sau RSA, hay `uin`)?
 4. Có cần `temp_key` hay liên kết thiết bị tin cậy không?
 5. Có rủi ro khoá tài khoản không? Quan sát sau probe: thông báo bảo mật trên điện thoại, đăng xuất bất thường.
+6. `temp_key` của `transfer_after_login` (đã thấy thật, `re-notes/10` §5) dùng được cho `pull_mobile_msg` không, và hạn dùng bao lâu?
+7. Snapshot có chứa tin nhóm và lịch sử trước lần đăng nhập đầu tiên không? Đây là giá trị chính của V1 sau v0.1.2.
 
 ---
 
@@ -227,6 +231,13 @@ cargo test --locked
 | Việc | Ghi chú |
 |---|---|
 | Kiểm chứng tính năng 0.1.1 trên Windows thật | MotW (`Get-Content <file> -Stream Zone.Identifier`), "Mở thư mục" (`explorer /select`), hộp chọn thư mục, xoá cache, số thành viên nhóm (`totalMember`) |
+| (0.1.2) TUI/CLI chưa dùng con trỏ bền | `src/main.rs`, `src/tui.rs` vẫn dùng `PollState::default()`; GUI đã có `sync_state` |
+| (0.1.2) Hàng đợi phình vì không ACK | Kéo về không xoá tin khỏi hàng đợi (`re-notes/10` §7); không ACK thì có thể bị `evict` sớm. Cân nhắc `DELETE_QUEUE_ACK_*` khi có thêm bằng chứng |
+| (0.1.2) Queue long-poll `7` từng báo `evict = 1` | Ý nghĩa chưa rõ; hiện không hiện banner cho nó |
+| (0.1.2) Tin nhóm không về trong những giờ đầu sau lần đăng nhập đầu tiên | `re-notes/10` §13–14; lý do chưa rõ |
+| (0.1.2) Chỉ báo "đang nhập" | Đã có bằng chứng giao thức: socket `602`, `lp_control` `act = "typing"` (`re-notes/10` §10) |
+| (0.1.2) Camera cuộc gọi tìm `ffmpeg` bằng `Command::new("ffmpeg")` | Không thấy shim `.cmd` (WinGet). Có thể dùng lại `video::find_ffmpeg` |
+| (0.1.2) Phát video: đồng bộ tiếng theo đồng hồ, tua mất 0,3–1 s, cửa sổ chính vẽ lại theo fps khi đang phát | `src/gui/media_view.rs` |
 | Nút huỷ khi đang tải tệp; macOS gắn `com.apple.quarantine` | `src/download.rs`, `src/gui/messages.rs` |
 | Lưu `member_count` vào `Thread` | Cần sửa struct literal ở `demo.rs`, `modals.rs`, `worker.rs`, `src/bin/test_fetch.rs` |
 | Chỉ báo "đang nhập" thật | Cần trace frame 601/602 lúc đối phương gõ |

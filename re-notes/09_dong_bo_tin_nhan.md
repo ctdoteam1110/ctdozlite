@@ -158,3 +158,40 @@ Người dùng cung cấp ngày 2026-11-01 một tài liệu phân tích Zalo PC
   - PC giải `encrypted_key` bằng RSA PKCS#1, rồi giải nén và giải mã bằng native `db-cross-v4 decompressAndDecryptDb(input, output, password)`. Bước khôi phục dùng `password: uin`.
   - Phần RSA là chuẩn. **Ẩn số còn lại là định dạng của `db-cross-v4`** (module native). Đây là hướng khả thi nhất nếu có module native (`resources/` trong thư mục cài Zalo PC) để phân tích.
   - Hạn chế: điện thoại phải mở Zalo và người dùng phải xác nhận; có thể bị từ chối nếu client không được nhận diện là Zalo PC.
+
+## 9. Đối chiếu với tài liệu phía điện thoại (Zalo Android 26.10.02) và bằng chứng thật
+
+Người dùng cung cấp ngày 2026-11-01 tài liệu "Đồng bộ giữa Zalo PC và ứng dụng Android" (phân tích Zalo Android `26.10.02`, đối chiếu PC `26.10.20`). Tài liệu không được commit. Bằng chứng với tài khoản thật nằm ở `re-notes/10_bang_chung_dong_bo.md`.
+
+### 9.1 Điểm mới từ phía điện thoại
+
+- PC và điện thoại không nói chuyện trực tiếp; mọi thứ đi qua máy chủ.
+- **Sync v2:**
+  - PC gửi WS `590`, máy chủ đẩy `init_session` xuống điện thoại.
+  - Điện thoại báo trạng thái và upload từng gói lên `transfersync.zaloapp.com/api/transfer-sync-v2/{status,error,upload}`; xác nhận bằng `/confirmsync`.
+  - PC đã được người dùng xác nhận một lần thì được "tin" 1 năm (bản ghi theo `uid + deviceId`, tra theo `ik`): các lần sau `BYPASS_CONFIRM`, không hỏi lại.
+- **Sync v1 (transfer):**
+  - Điện thoại nhận `{publicKey, fromSeqId, min_seq_id, temp_key, pc-name}` và hiện `PcRequestTransferView`.
+  - Người dùng xác nhận qua `POST trans-bin.zaloapp.com/upload/confirmtransfer` (`user_action`: 1 đồng ý, 0 bỏ qua, 2 tự huỷ vì đang bận sync v2 hoặc khôi phục).
+  - Pipeline của điện thoại: `EXPORT → COMPRESS → ENCRYPT → UPLOAD`.
+  - Không có bypass như v2: mỗi lần đều cần xác nhận, trừ luồng ngay sau đăng nhập dùng `temp_key`.
+- **Khoá transfer 32 byte** được điện thoại sinh đúng lúc người dùng xác nhận đăng nhập PC bằng QR (`KEY_VALIDATE_TRANSFER_MSG_FROM_CONFIRM_LOGIN_PCWEB_<uid>`).
+- **Định dạng trung gian "Cross DB":** bảng `chats(userId, ownerId, ownerType, fromId, fromName, cliMsgId, globalMsgId, ts, ttl, type, msg, attach, sequenseId)` và `threads` (+ `offset`, `sync_status`). Điện thoại tạo bằng `BackupRestoreUtils.convertAndroidDbToCross`; PC mở bằng `db-cross-v4`.
+- Sao lưu PC → điện thoại (`bkpc2mb.zaloapp.com`) và sao lưu Drive của điện thoại ("SMLBackup") là chiều khác, không liên quan tới việc lấy tin về PC.
+
+### 9.2 Bằng chứng thật liên quan (`re-notes/10`)
+
+- **[O]** Ngay sau khi quét QR, queue điều khiển `603_1` có `act: "transfer_after_login"`, `act_type: "transfer_sync2"`, `data: {imei, pc, temp_key (64 ký tự hex = 32 byte)}`. Khớp với khoá transfer ở trên; `act_type` cho thấy nó dành cho Sync v2 trước hết.
+- **[O]** Tin 1-1 và tin nhóm sau lần đăng nhập đều về qua hàng đợi (`510_1`, `511_1`). Trên máy mới, lịch sử **trước** lần đăng nhập đầu tiên không lấy được: `getrecentv2` của nhóm trả 0 tin (cờ `isFiltered`). Cả 61 nhóm đều có `e2ee = 0`.
+
+### 9.3 Đánh giá lại hướng Sync V1
+
+Giữ **Sync V1** làm hướng chính cho Phần B, với các điều chỉnh sau:
+
+1. **Thu hẹp ẩn số.** Dữ liệu sau giải mã gần như đã biết cấu trúc (Cross DB `chats`/`threads`), nên chỉ còn lớp nén + mã hoá của `db-cross-v4`.
+2. **Thêm nguồn phân tích thứ hai.** Phân tích phía mã hoá trong APK Android: các lớp Java `cf1.*`, `ve1.g`, `xe1.g`, `BackupRestoreUtils`. Nếu bước nén/mã hoá viết bằng Java thì đọc bằng jadx nhanh hơn nhiều so với Ghidra trên `.node`.
+3. **Tận dụng `temp_key`.** Lưu `temp_key` trong RAM ngay sau đăng nhập QR để thử luồng "transfer after login" mà không cần xác nhận thêm (hạn dùng **[U]**).
+4. **Giá trị thực của V1:** lấy lịch sử **trước** lần đăng nhập đầu tiên trên máy mới, cả 1-1 lẫn nhóm, vì snapshot được xuất từ DB của điện thoại. Việc bắt kịp sau khi tắt máy đã do Phần A (v0.1.2) giải quyết.
+5. **Sync v2 vẫn để sau.** Ưu điểm của v2 là bypass xác nhận và đồng bộ tăng dần theo khoảng. Nhược điểm: cần cài lại mật mã Sync2 (curve25519/Ed25519 + ChaCha20, phiên kiểu Signal, AEAD/KDF chưa rõ) và cần định danh E2EE của PC.
+
+**Phương án dự phòng:** nhập thẳng từ DB của Zalo PC trên cùng máy (`%APPDATA%\ZaloData`, SQLCipher với khoá suy ra từ UIN, cộng một lớp mã hoá cột AES-CBC). Không cần gọi máy chủ, nhưng chỉ dùng được khi máy đã có Zalo PC, và cách suy ra khoá **[U]**.

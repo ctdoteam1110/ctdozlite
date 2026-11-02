@@ -1,9 +1,44 @@
-# Bàn giao dự án QTzalo — từ v0.1.1 sang bản tiếp theo
+# Bàn giao dự án QTzalo — từ v0.1.2 sang bản tiếp theo
 
 > Tài liệu này dành cho phiên làm việc (người hoặc AI) tiếp theo. Đọc hết trước khi sửa code.
-> Cập nhật lần cuối: 2026-11-01, khi phát hành v0.1.1. (Bản bàn giao v0.1.0 → v0.1.1 xem lịch sử git của file này, commit `b0d328b`.)
+> Cập nhật lần cuối: 2026-11-02, khi phát hành v0.1.2. Mục 0 là phần mới; mục 1 trở đi giữ nội dung bàn giao của 0.1.1 và được sửa ở những chỗ đã thay đổi. Bản bàn giao trước xem lịch sử git của file này.
 
-## 1. Trạng thái hiện tại
+## 0. v0.1.2 (2026-11-02) — tóm tắt cho phiên sau
+
+- **Phiên này chạy trên PC Windows của người dùng**, với tài khoản Zalo thật và điện thoại thật.
+- **Nhánh `claude/v0.1.2`** được fast-forward vào `main`; Release `v0.1.2` do CI build.
+- **Đã làm:**
+  - Phần A của `docs/dev/KE_HOACH_TIEP_THEO.md`: con trỏ hàng đợi bền theo tài khoản, kéo bù tới khi hết, banner thiếu tin, nối lịch sử Cloud/nhóm.
+  - Danh sách hội thoại giống điện thoại (A9).
+  - Ảnh/video/tệp không còn hiện link; cửa sổ xem ảnh và cửa sổ phát video riêng (A8, do agent làm).
+  - Sửa tên nhóm hiện thành "Nhóm <số>"; sửa lỗi long-poll lặp ở queue `16`.
+  - Chi tiết: `CHANGELOG.md` `[0.1.2]`.
+- **Bằng chứng thật:** `re-notes/10_bang_chung_dong_bo.md`, gồm các lượt A0, A7 và ngày 02/11. Trace thô nằm ở `%USERPROFILE%\qtzalo-trace\`, **không commit**.
+- **Kiểm chứng của 0.1.2:**
+  - `cargo test --locked`: 191 qua, 1 bỏ qua.
+  - Build MSVC trên PC sạch; `cargo +1.88 check --locked --all-targets` sạch.
+  - `cargo audit`: 0 lỗ hổng, 2 cảnh báo hết bảo trì.
+  - Kịch bản thật:
+    - con trỏ đã lưu: không có tin mới → 0 tin, có 3 tin mới → đúng 3;
+    - một ngày nhiều tin 1-1 và nhóm: kéo đủ theo trang;
+    - 61/61 nhóm đúng tên;
+    - người dùng thử và xác nhận ảnh, video (kể cả video cũ trên `dlmd.me`) và tệp mở trong app.
+  - Ảnh `--demo` đã xem: `docs/assets/qtzalo-sync.png` (sáng), bản tối trong scratchpad, `qtzalo-media-cards.png`, `qtzalo-image-window.png`, `qtzalo-video-window.png`.
+- **Chưa kiểm chứng:**
+  - Banner thiếu tin với `evict` thật (chưa gặp);
+  - tắt máy lâu hơn một ngày;
+  - Linux/macOS;
+  - tiếng video chỉ được người dùng xác nhận gián tiếp ("Chạy tốt").
+- **Phát hiện quan trọng:**
+  1. Phiên QTzalo nhận queue `510_1, 511_1, 515_0, 517_0, 518_0` (không phải `510_0/513_0`).
+  2. Kéo về không xoá tin khỏi hàng đợi.
+  3. Long-poll phải theo dõi `15/16` nếu máy chủ báo.
+  4. Thiết bị mới không lấy được lịch sử nhóm trước lần đăng nhập đầu tiên.
+  5. Không nhóm nào E2EE.
+  6. Có sự kiện `transfer_after_login` mang `temp_key` (liên quan Phần B).
+- **Việc tiếp theo:** Phần B (đồng bộ từ điện thoại, hướng Sync V1), chỉ khi người dùng đồng ý. Đọc `re-notes/09` §9 và `KE_HOACH_TIEP_THEO.md` §2 (đã thêm bước phân tích APK Android và câu hỏi B6.6–B6.7).
+
+## 1. Trạng thái của v0.1.1 (giữ lại để tham chiếu)
 
 - **Repo:** `quangthoai1985/QTzalo`, bản fork của `ctdoteam1110/ctdozlite` (tách từ commit `73849bd` = tag upstream `v0.0.2`).
 - **`main` = commit phát hành 0.1.1** (fast-forward từ nhánh `claude/release-0.1.1`). Release [QTzalo v0.1.1](https://github.com/quangthoai1985/QTzalo/releases/tag/v0.1.1) do CI build (bộ cài + portable Windows, `.deb`, `.tar.gz`, `.dmg`, `SHA256SUMS.txt`). v0.1.0 vẫn còn trên trang Releases.
@@ -40,7 +75,10 @@
 | Phiên & HTTP | `src/session.rs` | `SessionStatus {Valid, Expired, Unreachable}`, `check_session()`, domain đã kiểm chứng thắng `zpw_service_map_v3`, chỉ gửi cookie tới host https của Zalo |
 | Đăng nhập | `src/login.rs`, `src/qr.rs`, `src/param_cipher.rs`, `src/crypto.rs` | ParamCipher v2, sinh số ngẫu nhiên bằng `getrandom` |
 | Tin nhắn / API | `src/chat.rs` (lớn, khoảng 4,6k dòng) | `get_friends`, `get_groups` (`/api/group/getmg-v2`), `get_group_history`, upload ảnh/tệp, `parse_link_metadata(s, url, allow_direct_fetch)` |
-| WebSocket | `src/socket.rs` | chỉ dùng `wss://` của Zalo; giải nén giới hạn 32 MiB |
+| WebSocket | `src/socket.rs` | chỉ dùng `wss://` của Zalo; giải nén giới hạn 32 MiB; `spawn_with_cursors` kéo queue từ con trỏ đã lưu (`WsCursors`) |
+| Đồng bộ (0.1.2) | `src/sync_state.rs` | `SyncState` (`sync_state_<uin>.json`), `merge_ws_queue_status`, `gap_signals`/`record_gaps_from` (bảng `missing_ranges`), `MsgIdClock` + `load_conversation_activity` (bảng `thread_activity`) |
+| Trace (0.1.2) | `src/trace_shape.rs` | `ZCALL_WS_TRACE=1`: in cấu trúc payload, không in nội dung |
+| Video (0.1.2) | `src/video.rs`, `src/gui/media_view.rs` | tìm `ffmpeg.exe`, tham số đã khoá chặt, cửa sổ phát video; `WorkerCmd::PrepareVideo` tải vào `stickers_cache/videos/` |
 | Cuộc gọi | `src/call.rs`, `src/media.rs`, `src/voip_log.rs`, `src/audio.rs` | log chỉ ghi khi `--dev` / `ZALO_CALL_TRACE=1` / `ZALO_VOIP_LOG` |
 | Lưu lịch sử | `src/store.rs` | SQLite với truy vấn tham số hoá |
 | GUI — vòng lặp & sự kiện | `src/gui.rs` | `enum GuiEvent`, `AppSettings` (gồm `download_dir`), `ZaloGuiApp`, `is_demo_mode()` |
@@ -111,13 +149,23 @@ Người dùng đã chọn hướng (2026-11-01): **v0.1.2 = tự bắt kịp ti
 - **Không ghi model identifier** vào commit, PR hay mã nguồn.
 - **(0.1.1) Worktree của agent được tạo từ `73849bd` (commit upstream cũ), không phải `main`.** Cách nhắn agent `git merge --ff-only <commit nền>` vẫn hiệu quả; ghi luôn lệnh này vào đầu prompt giao việc.
 - **(0.1.1) Dùng chung `CARGO_TARGET_DIR` giữa các worktree tiết kiệm đĩa nhưng có thể khiến binary là bản build của agent khác** (cùng metadata package). Agent phải `touch` file của mình trước khi build để chụp ảnh và copy binary ngay sau khi build. Đặt tên file chụp/script riêng cho từng agent (scratchpad dùng chung).
+- **(0.1.2, PC Windows)** Một số lưu ý khi làm trên máy người dùng:
+  - Nút X của QTzalo chỉ **thu nhỏ** cửa sổ; muốn thoát hẳn phải bấm Ctrl+Q. Khi đo "tắt máy", phải kiểm tra tiến trình đã thoát thật.
+  - Để không phải nhờ người dùng thao tác, chạy app có hẹn giờ: `timeout 180 ./bin/zalo-rust-xxx.exe --gui --dev` trong Git Bash.
+  - Chạy **bản sao** của file exe ở `%USERPROFILE%\qtzalo-trace\bin\`, để `target` vẫn build tiếp được trong lúc app đang chạy.
+  - Không chạy hai bản QTzalo cùng lúc với cùng một tài khoản: cả hai cùng ghi `sync_state` và DB.
+- **(0.1.2)** `Get-Content`/`Set-Content` của PowerShell 5.1 đọc/ghi theo ANSI và thêm BOM, đã làm hỏng `Cargo.toml` một lần. Sửa file bằng công cụ Edit, không dùng `-replace` + `Set-Content`.
+- **(0.1.2)** Git trên PC chưa cấu hình tên/email: commit bằng `git -c user.name=Claude -c user.email=noreply@anthropic.com commit …`. Message nhiều dòng thì truyền qua file (`-F`).
+- **(0.1.2)** Scratchpad dùng chung với agent: agent đã ghi đè script chụp ảnh của coordinator. Đặt tiền tố riêng cho từng agent (`a8_…`).
+- **(0.1.2)** Bỏ một giới hạn an toàn có thể làm lộ ra lỗi có sẵn. Bỏ giới hạn 3 đợt long-poll đã biến lỗi "không theo dõi queue 16" thành khoảng 10 yêu cầu/giây. Luôn có điều kiện "con trỏ phải tiến" khi lặp, và đếm số yêu cầu trong trace sau mỗi thay đổi vòng lặp.
+- **(0.1.2)** Agent bị dừng khi tiến trình cha thoát vẫn giữ nguyên worktree và transcript: `SendMessage` cho nó làm tiếp được, kể cả gộp nhánh coordinator vào.
 - **(0.1.1) Mẫu chia việc hiệu quả:** coordinator tự viết toàn bộ backend + biến thể enum + xử lý sự kiện trong `gui.rs`, agent chỉ làm UI theo vùng file (messages/modals-viewer vs modals-settings vs chat/deps). Chỉ có 1 xung đột nhỏ ở khối biến demo trong `src/gui.rs`.
 
 ## 8. Tồn đọng đã biết
 
 - **Chưa thử trên Windows thật và tài khoản Zalo thật** cho các tính năng 0.1.1 (và các sửa lỗi lõi #21/#22 của 0.1.0).
-- **Chỉ báo đang nhập** chỉ có ở demo (thiếu bằng chứng giao thức).
-- **Không tự bắt kịp tin offline:** con trỏ hàng đợi không được lưu, chỉ kéo 3 đợt; tin E2EE (queue 513/713) không đọc được. Kế hoạch sửa ở `KE_HOACH_TIEP_THEO.md` Phần A.
+- **Chỉ báo đang nhập** chỉ có ở demo. Từ 0.1.2 đã có bằng chứng giao thức (socket `602`, `lp_control` `act = "typing"`), chưa làm.
+- ~~Không tự bắt kịp tin offline~~ → đã làm trong 0.1.2. Còn lại: TUI/CLI chưa dùng con trỏ bền; chưa ACK hàng đợi; lịch sử trước lần đăng nhập đầu tiên chỉ lấy được qua "đồng bộ từ điện thoại" (Phần B). Danh sách đầy đủ ở `KE_HOACH_TIEP_THEO.md` §4.
 - **Số thành viên nhóm** dựa trên `totalMember` suy ra từ entity `Group` của web bundle cũ (đã xoá ở `54314e0`); chưa thấy trong payload thật. Thiếu thì header vẫn hiện "Nhóm".
 - **S6:** media cuộc gọi chưa lọc nguồn gói UDP; client khai `srtpMode: 0`.
 - **#19:** chưa đồng bộ toàn bộ lịch sử.

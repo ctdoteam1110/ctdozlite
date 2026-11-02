@@ -21,9 +21,11 @@ QTzalo là bản fork của dự án mã nguồn mở [ctdozlite](https://github
 
 - **Đăng nhập** bằng mã QR (quét và xác nhận trên điện thoại). Phiên đăng nhập được lưu trong thư mục dữ liệu riêng của người dùng, quyền chỉ chủ sở hữu đọc được.
 - **Nhắn tin thời gian thực** qua WebSocket (`zpw_ws`), dự phòng bằng HTTP polling: chat 1-1, nhóm, Cloud của tôi, trả lời trích dẫn, thả cảm xúc, ghim, thu hồi, xoá phía tôi.
+- **Tự bắt kịp tin nhắn khi mở app**: nhớ vị trí đã đồng bộ theo từng tài khoản, kéo đủ tin 1-1 và tin nhóm nhận trong lúc tắt máy, báo khi máy chủ đã bỏ bớt tin; danh sách hội thoại xếp theo hoạt động như trên điện thoại.
 - **Gửi/nhận** văn bản, hình ảnh (dán trực tiếp từ clipboard), tệp đính kèm, nhãn dán, xem trước liên kết.
 - **Gợi ý nhãn dán** theo từ khoá tiếng Việt khi đang gõ.
 - **Tải tệp/ảnh/video** từ tin nhắn về "Thư mục lưu file" (chỉ `https`, làm sạch tên file, không ghi đè, Mark-of-the-Web trên Windows, không tự mở file thực thi).
+- **Xem ảnh và phát video ngay trong app** (cửa sổ riêng; phát video cần `ffmpeg`, không có thì mở bằng trình phát mặc định).
 - **Lưu trữ cục bộ**: lịch sử tin nhắn trong SQLite, danh sách hội thoại được cache để mở app nhanh.
 - **Gọi thoại và gọi video 1-1** (cần `ffmpeg` trong `PATH` cho video).
 - **Hai chế độ giao diện**: GUI desktop (mặc định) và TUI cho terminal.
@@ -71,7 +73,7 @@ Bên trong gồm `session.json` (phiên đăng nhập — **không chia sẻ fil
 
 - **Rust ≥ 1.88** (khuyến nghị bản stable mới nhất qua [rustup](https://rustup.rs/)). Đã kiểm chứng: Rust 1.87 không build được vì một số dependency trong `Cargo.lock` yêu cầu 1.88.
 - **CMake**, `pkg-config` và trình biên dịch C/C++ (để build tĩnh `libopus` và `sqlite3`).
-- **FFmpeg** trong `PATH` (tuỳ chọn, chỉ cần cho gọi video).
+- **FFmpeg** (tuỳ chọn): cần cho gọi video (phải có trong `PATH`) và để phát video trong app (tìm `ffmpeg.exe` trong `PATH` hoặc bản cài bằng WinGet; đặt `QTZALO_FFMPEG` để chỉ đường dẫn khác).
 - Với **CMake 4.x**, đặt biến môi trường `CMAKE_POLICY_VERSION_MINIMUM=3.5` khi build.
 
 ### Windows (MSVC)
