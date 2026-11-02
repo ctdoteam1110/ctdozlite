@@ -1,6 +1,36 @@
 use super::*;
 
 impl ZaloGuiApp {
+    fn observe_workspace_read(&mut self, ctx: &egui::Context, thread_id: &str, is_group: bool, at_bottom: bool, visible: Vec<ChatMessage>) {
+        let (logical, minimized, now) = ctx.input(|input| (input.focused, input.viewport().minimized.unwrap_or(false), (input.time * 1000.0).max(0.0) as u64));
+        let unobscured = !self.settings_modal_open && !self.feed_modal_open && self.image_viewer.is_none() && self.forward_msg.is_none() && !self.phone_modal_open && !self.wipe_confirm_open && !self.update_modal_open && !self.schedule_modal_open && !self.dev_panel_open && !self.profile_menu_open && self.active_call.is_none() && !ctx.memory(|memory| memory.any_popup_open());
+        let foreground = self.is_logged_in && logical && unobscured && crate::read_receipts::native_visible_window_foreground();
+        let key = serde_json::to_string(&(&self.user_uin, thread_id, visible.iter().map(|message| (&message.id, &message.wire_ref.server_id)).collect::<Vec<_>>())).unwrap_or_default();
+        let bottom = at_bottom && !visible.is_empty() && !self.in_chat_search_open && !self.filter_starred_only;
+        let eligible = self.read_visibility.observe(&key, foreground, minimized, bottom, now);
+        if foreground && !minimized && bottom && !eligible { ctx.request_repaint_after(Duration::from_millis(100)); }
+        if self.visible_read_pending { ctx.request_repaint_after(Duration::from_millis(100)); }
+        if !eligible || self.visible_read_pending { return; }
+        let local_needed = self.threads.iter().find(|thread| thread.id == thread_id).is_some_and(|thread| thread.unread.marked_unread || visible.iter().any(|message| {
+            crate::unread::compare_ids(&message.id, "0").is_some() && thread.unread.last_seen_id.as_ref().is_none_or(|point| crate::unread::compare_ids(&message.id, point).is_some_and(|order| order.is_gt()))
+        }));
+        if self.read_last_attempt_ms != 0 && now.saturating_sub(self.read_last_attempt_ms) < 1000 { ctx.request_repaint_after(Duration::from_millis(100)); return; }
+        let Some(ticket) = self.read_visibility.ticket() else { return; };
+        let receipts = self.live_read_ledger.claim(thread_id, is_group, &visible);
+        if self.live_read_ledger.take_capacity_notice() { self.show_toast("Đã đạt giới hạn 4096 xác nhận xem của phiên. Trạng thái đọc local vẫn được lưu; xác nhận mới sẽ tiếp tục ở phiên đăng nhập sau."); }
+        if !local_needed && receipts.is_empty() { return; }
+        self.read_last_attempt_ms = now;
+        let command = WorkerCmd::AcknowledgeVisibleRead { account: self.user_uin.clone(), thread_id: thread_id.into(), is_group, visible, receipts, ticket };
+        self.visible_read_pending = match WORKER_TX.get() {
+            Some(tx) => match tx.send(command) {
+                Ok(()) => true,
+                Err(error) => { if let WorkerCmd::AcknowledgeVisibleRead { receipts, .. } = error.0.1 { self.live_read_ledger.release_unsent(thread_id, &receipts); } false }
+            },
+            None => { if let WorkerCmd::AcknowledgeVisibleRead { receipts, .. } = command { self.live_read_ledger.release_unsent(thread_id, &receipts); } false }
+        };
+        if !self.visible_read_pending { self.show_toast("Lỗi chuyển trạng thái đọc sang xử lý nền."); }
+    }
+
     /// Start loading the full-resolution texture the image viewer shows. Message bubbles and
     /// the media grid keep a 480 px copy; the `hd_` key keeps this one (and its disk cache) apart.
     pub(super) fn request_hd_texture(&mut self, full_url: &str) -> Option<String> {
@@ -1644,15 +1674,6 @@ impl ZaloGuiApp {
                         self.filter_starred_only = false;
                     }
                     self.selected_thread_index = idx;
-                    if self.unread_counts.remove(&tid).is_some() {
-                        let total_unread: usize = self.unread_counts.values().sum();
-                        let title = if total_unread > 0 {
-                            format!("({total_unread}) Zalo Lite — Native Rust Client")
-                        } else {
-                            "Zalo Lite — Native Rust Client".to_string()
-                        };
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
-                    }
                     let is_cloud = self
                         .threads
                         .get(idx)
@@ -1785,22 +1806,8 @@ impl ZaloGuiApp {
                             self.selected_thread_index = idx;
                             self.schedule_modal_open = true;
                         }
-                        ThreadCtxAction::DeleteConv(idx, tid, tname, is_group, last_msg_id) => {
-                            if let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") {
-                                let _ = store.delete_thread(&tid);
-                            }
-                            if idx < self.threads.len() && self.threads[idx].id == tid {
-                                self.threads.remove(idx);
-                                if self.selected_thread_index >= self.threads.len() {
-                                    self.selected_thread_index =
-                                        self.threads.len().saturating_sub(1);
-                                }
-                                self.unread_counts.remove(&tid);
-                                self.settings.pinned_threads.retain(|x| x != &tid);
-                                self.settings.save();
-                                self.persist_threads_async();
-                            }
-                            self.show_toast(format!("🗑️ Đã xóa hội thoại \"{tname}\""));
+                        ThreadCtxAction::DeleteConv(_idx, tid, _tname, is_group, last_msg_id) => {
+                            // The worker confirms both server success and durable exact deletion.
                             if let Some(tx) = WORKER_TX.get() {
                                 let _ = tx.send(WorkerCmd::DeleteThread {
                                     thread_id: tid,
@@ -1817,6 +1824,14 @@ impl ZaloGuiApp {
                     }
                 }
             });
+
+        if let Some(thread_id) = self.threads.get(self.selected_thread_index).map(|thread| thread.id.clone()) {
+            self.composer_mentions.switch_thread(&thread_id, &mut self.input_message, &mut self.replying_to);
+            if self.durable_composer.switching(&self.user_uin, &thread_id) {
+                if let Some((path, _, _, _)) = self.pending_clipboard_image.take() { self.durable_composer.attachments.push(path); }
+            }
+            self.durable_composer.activate(&self.user_uin, &thread_id);
+        }
 
         // Extract lightweight metadata for Header, Right Info Drawer, and Central Chat Stream
         let thread_meta = self.threads.get(self.selected_thread_index).map(|t| {
@@ -2040,11 +2055,7 @@ impl ZaloGuiApp {
                                             self.feed_loading_profile = true;
                                             self.feed_profile_error = None;
                                             self.trigger_feed_timeline_load();
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::FetchSocialProfile {
-                                                    target_uid: d_id.clone(),
-                                                });
-                                            }
+                                            self.request_social_profile(d_id.clone());
                                         }
                                     }
                                 });
@@ -2138,6 +2149,7 @@ impl ZaloGuiApp {
                                                 .clicked()
                                             {
                                                 self.image_viewer = Some(ImageViewerModal {
+                                                    native_photo: None,
                                                     tex_key: tkey.clone(),
                                                     hd_tex_key: self.request_hd_texture(full_u),
                                                     full_url: full_u.clone(),
@@ -3194,6 +3206,17 @@ impl ZaloGuiApp {
                             });
                     }
 
+                    if self.in_chat_search_open {
+                        let query = self.in_chat_search_query.trim().to_owned();
+                        let key = (thread_id.clone(), query.clone());
+                        if !query.is_empty() && self.archive_search_request != key {
+                            self.archive_search_request = key;
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(WorkerCmd::SearchHistory { account: self.user_uin.clone(), thread_id: thread_id.clone(), query, revision: *self.history_revisions.get(&thread_id).unwrap_or(&0) });
+                            }
+                        }
+                    }
+
                     // 2. Scrollable Messages Area
                     let contextual_stickers = self.resolve_contextual_sticker_suggestions(ctx);
                     let composer_link_preview = self.resolve_composer_link_preview(ctx);
@@ -3216,6 +3239,32 @@ impl ZaloGuiApp {
                     if self.chat_render_window.0 != thread_id {
                         self.chat_render_window = (thread_id.clone(), CHAT_RENDER_STEP);
                     }
+                    let jump_index = self.quote_jump.as_ref().and_then(|jump| {
+                        self.threads
+                            .get(self.selected_thread_index)
+                            .and_then(|thread| jump.target_index(&thread_id, &thread.messages))
+                    });
+                    if jump_index.is_none() {
+                        self.quote_jump = None;
+                    }
+                    let jump_scroll_pending = self
+                        .quote_jump
+                        .as_ref()
+                        .map(|jump| jump.scroll_pending)
+                        .unwrap_or(false);
+                    let mut jump_scrolled = false;
+                    if let Some(index) = jump_index {
+                        let count = self
+                            .threads
+                            .get(self.selected_thread_index)
+                            .map(|thread| thread.messages.len())
+                            .unwrap_or(0);
+                        self.chat_render_window.1 = crate::message_navigation::render_limit_for_target(
+                            self.chat_render_window.1,
+                            count,
+                            index,
+                        );
+                    }
                     let render_limit = self.chat_render_window.1;
                     let mut widen_window = false;
                     // Group sender -> avatar, built once per frame instead of a scan per bubble.
@@ -3231,11 +3280,12 @@ impl ZaloGuiApp {
                     let msg_area_height =
                         (ui.available_height() - 66.0 - picker_reserve).max(100.0);
 
-                    egui::ScrollArea::vertical()
+                    let mut visible_read = Vec::new();
+                    let read_scroll = egui::ScrollArea::vertical()
                         .id_salt(Id::new(("chat_scroll", &thread_id)))
                         .max_height(msg_area_height)
                         .auto_shrink([false, false])
-                        .stick_to_bottom(true)
+                        .stick_to_bottom(jump_index.is_none())
                         .show(ui, |ui| {
                             egui::Frame::none()
                                 .inner_margin(Margin::symmetric(18.0, 12.0))
@@ -3274,7 +3324,7 @@ impl ZaloGuiApp {
                                                         .add(hist_btn)
                                                         .on_hover_cursor(CursorIcon::PointingHand)
                                                         .on_hover_text(
-                                                            "Đồng bộ thêm lịch sử tin nhắn cũ từ máy chủ Zalo",
+                                                            "Tải tối đa 200 tin nhắn cũ từ lịch sử tài khoản đã lưu",
                                                         )
                                                         .clicked()
                                                     {
@@ -3283,10 +3333,11 @@ impl ZaloGuiApp {
                                                         } else {
                                                             if let Some(tx) = WORKER_TX.get() {
                                                                 let _ = tx.send(
-                                                                    WorkerCmd::LoadGroupHistory {
-                                                                        group_id: thread_id.clone(),
-                                                                        is_group,
-                                                                        have: thread.messages.len(),
+                                                                    WorkerCmd::LoadHistoryPage {
+                                                                        account: self.user_uin.clone(),
+                                                                        thread_id: thread_id.clone(),
+                                                                        revision: *self.history_revisions.get(&thread_id).unwrap_or(&0),
+                                                                        before: thread.messages.first().map(|message| crate::store_v2::HistoryCursor { ts: message.ts, msg_id: message.id.clone() }),
                                                                     },
                                                                 );
                                                             }
@@ -3374,53 +3425,77 @@ impl ZaloGuiApp {
                                                     ui.add_space(6.0);
                                                 }
 
-                                                if is_system_notice_message(msg) {
-                                                    render_system_notice_pill(ui, msg, pal);
-                                                    ui.add_space(6.0);
-                                                    continue;
-                                                }
+                                                let row = ui.scope(|ui| {
+                                                    if is_system_notice_message(msg) {
+                                                        render_system_notice_pill(ui, msg, pal);
+                                                        ui.add_space(6.0);
+                                                        return;
+                                                    }
 
-                                                let prev_same_sender = prev_msg
-                                                    .map(|pm| same_message_cluster(pm, msg))
-                                                    .unwrap_or(false);
-                                                let next_same_sender = next_msg
-                                                    .map(|nm| same_message_cluster(msg, nm))
-                                                    .unwrap_or(false);
-                                                let is_latest_outgoing =
-                                                    last_outgoing_idx == Some(idx);
+                                                    let prev_same_sender = prev_msg
+                                                        .map(|pm| same_message_cluster(pm, msg))
+                                                        .unwrap_or(false);
+                                                    let next_same_sender = next_msg
+                                                        .map(|nm| same_message_cluster(msg, nm))
+                                                        .unwrap_or(false);
+                                                    let is_latest_outgoing =
+                                                        last_outgoing_idx == Some(idx);
 
-                                                let sender_ava_opt = if !is_group {
-                                                    thread_avatar.as_deref()
-                                                } else {
-                                                    avatar_by_name.get(msg.sender.as_str()).copied()
-                                                };
-                                                if let Some(action) = render_chat_bubble(
-                                                    ui,
-                                                    msg,
-                                                    prev_same_sender,
-                                                    next_same_sender,
-                                                    is_latest_outgoing,
-                                                    is_group,
-                                                    &thread_name,
-                                                    sender_ava_opt,
-                                                    pal,
-                                                    &self.sticker_textures,
-                                                    &mut self.loading_stickers,
-                                                    &self.emoji_textures,
-                                                    idx,
-                                                ) {
-                                                    pending_action = Some((idx, action));
-                                                }
-                                                ui.add_space(if next_same_sender {
-                                                    2.5
-                                                } else {
-                                                    9.0
+                                                    let sender_ava_opt = if !is_group {
+                                                        thread_avatar.as_deref()
+                                                    } else {
+                                                        avatar_by_name.get(msg.sender.as_str()).copied()
+                                                    };
+                                                    if let Some(action) = render_chat_bubble(
+                                                        ui,
+                                                        msg,
+                                                        prev_same_sender,
+                                                        next_same_sender,
+                                                        is_latest_outgoing,
+                                                        is_group,
+                                                        &thread_name,
+                                                        &self.user_uin,
+                                                        &thread_id,
+                                                        &mut self.failed_photo_previews,
+                                                        sender_ava_opt,
+                                                        pal,
+                                                        &self.sticker_textures,
+                                                        &mut self.loading_stickers,
+                                                        &self.emoji_textures,
+                                                        idx,
+                                                    ) {
+                                                        pending_action = Some((idx, action));
+                                                    }
+                                                    ui.add_space(if next_same_sender {
+                                                        2.5
+                                                    } else {
+                                                        9.0
+                                                    });
                                                 });
+                                                if visible_read_candidate(msg, row.response.rect, ui.clip_rect()) {
+                                                    visible_read.push(msg.clone());
+                                                }
+                                                if jump_index == Some(idx) {
+                                                    render_quote_target(
+                                                        ui,
+                                                        row.response.rect,
+                                                        jump_scroll_pending,
+                                                        pal.primary,
+                                                    );
+                                                    jump_scrolled |= jump_scroll_pending;
+                                                }
                                             }
                                         }
                                     }
                                 });
                         });
+                    let at_bottom = read_scroll.state.offset.y + read_scroll.inner_rect.height() >= read_scroll.content_size.y - 1.0;
+                    self.observe_workspace_read(ctx, &thread_id, is_group, at_bottom, visible_read);
+                    if jump_scrolled {
+                        if let Some(jump) = &mut self.quote_jump {
+                            jump.scroll_pending = false;
+                        }
+                    }
                     if widen_window {
                         self.chat_render_window.1 += CHAT_RENDER_STEP;
                     }
@@ -3437,6 +3512,35 @@ impl ZaloGuiApp {
                         if let Some(m) = target {
                             match action {
                                 BubbleAction::Reply => self.replying_to = Some(m),
+                                BubbleAction::OpenMention { user_id, display_name: _ } => {
+                                    self.feed_items.clear();
+                                    self.feed_modal_tab = FeedModalTab::Profile;
+                                    self.feed_modal_open = true;
+                                    self.request_social_profile(user_id);
+                                }
+                                BubbleAction::JumpToQuoted(reference) => {
+                                    self.quote_lookup_generation = self.quote_lookup_generation.wrapping_add(1);
+                                    let index = self
+                                        .threads
+                                        .get(self.selected_thread_index)
+                                        .and_then(|thread| {
+                                            crate::message_navigation::unique_reference_index(&thread.messages, &reference)
+                                        });
+                                    if index.is_some() {
+                                        self.filter_starred_only = false;
+                                        self.in_chat_search_open = false;
+                                        self.in_chat_search_query.clear();
+                                        self.quote_jump = Some(QuoteJump {
+                                            thread_id: thread_id.clone(),
+                                            reference,
+                                            highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(3),
+                                            scroll_pending: true,
+                                        });
+                                        ctx.request_repaint();
+                                    } else if let Some(tx) = WORKER_TX.get() {
+                                        let _ = tx.send(WorkerCmd::NavigateHistory { account: self.user_uin.clone(), thread_id: thread_id.clone(), reference, request_id: self.quote_lookup_generation, revision: *self.history_revisions.get(&thread_id).unwrap_or(&0) });
+                                    }
+                                }
                                 BubbleAction::Forward => {
                                     self.forward_msg = Some(m);
                                     self.forward_filter.clear();
@@ -3553,8 +3657,24 @@ impl ZaloGuiApp {
                                     sender,
                                     time,
                                 } => {
-                                    let hd_tex_key = self.request_hd_texture(&full_url);
+                                    let native_photo = if tex_key.starts_with("photo_") {
+                                        let mut key = super::media_preview::photo_key_for_message(&self.user_uin, &thread_id, &m);
+                                        key.quality = crate::media_resources::MediaQuality::Original;
+                                        Some(key)
+                                    } else { None };
+                                    let hd_tex_key = if tex_key.starts_with("photo_") {
+                                        let mut key = super::media_preview::photo_key_for_message(&self.user_uin, &thread_id, &m);
+                                        key.quality = crate::media_resources::MediaQuality::Original;
+                                        let texture = format!("photo_{}", key.cache_id());
+                                        if !self.sticker_textures.contains_key(&texture) && self.loading_stickers.insert(texture.clone()) {
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                let _ = tx.send(WorkerCmd::FetchPhotoPreview { key, thumbnail: full_url.clone(), source: None });
+                                            }
+                                        }
+                                        Some(texture)
+                                    } else { self.request_hd_texture(&full_url) };
                                     self.image_viewer = Some(ImageViewerModal {
+                                        native_photo,
                                         tex_key,
                                         hd_tex_key,
                                         full_url,
@@ -3768,6 +3888,33 @@ impl ZaloGuiApp {
                         .inner_margin(Margin::symmetric(14.0, 10.0))
                         .stroke(Stroke::new(1.0_f32, pal.border))
                         .show(ui, |ui| {
+                            let mut remove_attachment = None;
+                            for (index, path) in self.durable_composer.attachments.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("Tệp trong nháp: {}", path.display()));
+                                    if ui.small_button("Bỏ tệp").clicked() { remove_attachment = Some(index); }
+                                });
+                            }
+                            if let Some(index) = remove_attachment { self.durable_composer.attachments.remove(index); }
+                            if !self.durable_composer.attachments.is_empty() {
+                                ui.label("Văn bản/nhắc tên/trả lời được gửi trước tệp; phần đã xác nhận sẽ không gửi lại.");
+                            }
+                            let recoveries: Vec<_> = self.durable_composer.recovery.iter()
+                                .filter(|entry| entry.thread_id == thread_id).cloned().collect();
+                            for entry in recoveries {
+                                let state = match entry.state {
+                                    crate::message_model::DeliveryState::Pending => "đang xử lý",
+                                    crate::message_model::DeliveryState::Failed => "gửi lỗi",
+                                    crate::message_model::DeliveryState::DeliveryUnknown => "chưa rõ kết quả",
+                                    _ => "văn bản đã xác nhận, còn tệp chưa xác nhận",
+                                };
+                                ui.label(format!("Lượt {}: {state}. Kiểm tra lịch sử trước khi khôi phục; không tự gửi lại.", entry.id));
+                                if ui.button("Mở phần chưa xác nhận để sửa").clicked() {
+                                    if self.input_message.is_empty() && self.replying_to.is_none() && self.durable_composer.attachments.is_empty() {
+                                        if let Some(tx) = WORKER_TX.get() { let _ = tx.send(WorkerCmd::RecoverComposer { account: self.user_uin.clone(), id: entry.id, revision: self.durable_composer.revision() }); }
+                                    } else { self.show_toast("Giữ nguyên nháp đang sửa; hãy gửi hoặc xóa nháp trước khi khôi phục"); }
+                                }
+                            }
                             // Handle drag-and-drop files onto the chat window
                             let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| {
                                 i.raw
@@ -3776,17 +3923,7 @@ impl ZaloGuiApp {
                                     .filter_map(|df| df.path.clone())
                                     .collect()
                             });
-                            for dpath in dropped {
-                                if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                        to_id: thread_id.clone(),
-                                        is_group,
-                                        images_only: false,
-                                        caption: String::new(),
-                                        preset_path: Some(dpath),
-                                    });
-                                }
-                            }
+                            self.durable_composer.attachments.extend(dropped);
 
                             egui::Frame::none()
                                 .fill(pal.bg_input)
@@ -3854,16 +3991,8 @@ impl ZaloGuiApp {
                                             .on_hover_text("Gửi hình ảnh")
                                             .clicked()
                                         {
-                                            let cap = self.input_message.trim().to_string();
-                                            self.input_message.clear();
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                                    to_id: thread_id.clone(),
-                                                    is_group,
-                                                    images_only: true,
-                                                    caption: cap,
-                                                    preset_path: None,
-                                                });
+                                                let _ = tx.send(WorkerCmd::PickComposerAttachment { account: self.user_uin.clone(), thread: thread_id.clone(), images_only: true });
                                             }
                                         }
 
@@ -3894,16 +4023,8 @@ impl ZaloGuiApp {
                                             .on_hover_text("Đính kèm File / Video")
                                             .clicked()
                                         {
-                                            let cap = self.input_message.trim().to_string();
-                                            self.input_message.clear();
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                                    to_id: thread_id.clone(),
-                                                    is_group,
-                                                    images_only: false,
-                                                    caption: cap,
-                                                    preset_path: None,
-                                                });
+                                                let _ = tx.send(WorkerCmd::PickComposerAttachment { account: self.user_uin.clone(), thread: thread_id.clone(), images_only: false });
                                             }
                                         }
 
@@ -3922,6 +4043,7 @@ impl ZaloGuiApp {
                                         let input_w = (ui.available_width()
                                             - send_btn_w
                                             - sched_btn_w
+                                            - if is_group { 28.0 } else { 0.0 }
                                             - 16.0)
                                             .max(50.0);
                                         let text_edit =
@@ -3935,7 +4057,22 @@ impl ZaloGuiApp {
                                                 .margin(Margin::symmetric(6.0, 7.0))
                                                 .desired_width(input_w);
 
-                                        let response = ui.add(text_edit);
+                                        let mut text_output = text_edit.show(ui);
+                                        let response = text_output.response;
+                                        self.composer_mentions.reconcile(&self.input_message);
+                                        if is_group {
+                                            let selection = text_output.cursor_range.map(|range| range.as_sorted_char_range())
+                                                .unwrap_or_else(|| { let end = self.input_message.chars().count(); end..end });
+                                            if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                                                if let Some(cursor) = super::composer::member_picker(ui, &thread.presentation.members,
+                                                    &mut self.input_message, &mut self.composer_mentions, selection) {
+                                                    text_output.state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(cursor))));
+                                                    text_output.state.store(ui.ctx(), response.id);
+                                                    response.request_focus();
+                                                }
+                                            }
+                                        }
+
                                         if response.changed() {
                                             ensure_cjk_font(
                                                 ui.ctx(),
@@ -4054,8 +4191,8 @@ impl ZaloGuiApp {
                                         }
 
                                         // Responsive Padded Send Button (shows icon-only on very tight widths)
-                                        let can_send = !self.input_message.trim().is_empty()
-                                            || self.pending_clipboard_image.is_some();
+                                        let can_send = (!self.durable_composer.attachments.is_empty() || !self.input_message.trim().is_empty()
+                                            || self.pending_clipboard_image.is_some()) && !self.durable_composer.staging.contains(&thread_id);
                                         let (send_rect, send_resp) = ui.allocate_exact_size(
                                             Vec2::new(send_btn_w, 34.0),
                                             Sense::click(),
@@ -4127,52 +4264,26 @@ impl ZaloGuiApp {
                                                     is_group,
                                                 });
                                             }
-                                        } else if (send_clicked || enter_pressed)
-                                            && self.pending_clipboard_image.is_some()
-                                        {
-                                            if let Some((clip_path, _, _, _)) =
-                                                self.pending_clipboard_image.take()
-                                            {
-                                                let cap =
-                                                    self.input_message.trim().to_string();
-                                                self.input_message.clear();
-                                                self.dismissed_sticker_suggest_for.clear();
-                                                self.composer_sticker_selected = None;
-                                                response.request_focus();
-                                                if let Some(tx) = WORKER_TX.get() {
-                                                    let _ = tx.send(
-                                                        WorkerCmd::PickAndSendAttachment {
-                                                            to_id: thread_id.clone(),
-                                                            is_group,
-                                                            images_only: true,
-                                                            caption: cap,
-                                                            preset_path: Some(clip_path),
-                                                        },
-                                                    );
-                                                }
-                                            }
                                         } else if (send_clicked || enter_pressed) && can_send {
-                                            let text = self.input_message.trim().to_string();
-                                            self.input_message.clear();
-                                            self.dismissed_sticker_suggest_for.clear();
-                                            self.composer_sticker_selected = None;
-                                            response.request_focus();
-                                            let quoted = self.replying_to.take();
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                if let Some(quoted) = quoted {
-                                                    let _ = tx.send(WorkerCmd::SendQuote {
-                                                        to_id: thread_id.clone(),
-                                                        text,
-                                                        quoted,
-                                                        is_group,
-                                                    });
-                                                } else {
-                                                    let _ = tx.send(WorkerCmd::SendMessage {
-                                                        to_id: thread_id.clone(),
-                                                        text,
-                                                        is_group,
-                                                    });
+                                            if let Some((path, _, _, _)) = self.pending_clipboard_image.take() { self.durable_composer.attachments.push(path); }
+                                            let mentions = self.composer_mentions.outgoing(&self.input_message);
+                                            let text = self.input_message.clone();
+                                            let quoted = self.replying_to.clone();
+                                            let draft = crate::composer_store::Draft { text, mentions, reply: quoted, attachments: self.durable_composer.attachments.clone() };
+                                            if let Err(error) = self.durable_composer.observe(&self.user_uin, &thread_id, draft.clone()) { self.show_toast(error); }
+                                            let command = super::composer::send_command(self.user_uin.clone(), thread_id.clone(), is_group, draft, self.durable_composer.revision());
+                                            match command {
+                                                Ok(command) => {
+                                                    if WORKER_TX.get().is_some_and(|tx| tx.send(command).is_ok()) {
+                                                        self.durable_composer.staging.insert(thread_id.clone());
+                                                        self.dismissed_sticker_suggest_for.clear();
+                                                        self.composer_sticker_selected = None;
+                                                        response.request_focus();
+                                                    } else {
+                                                        self.show_toast("Bộ xử lý gửi chưa sẵn sàng; bản nháp được giữ nguyên");
+                                                    }
                                                 }
+                                                Err(error) => self.show_toast(error.to_string()),
                                             }
                                         } else if enter_pressed {
                                             response.request_focus();
@@ -4180,6 +4291,15 @@ impl ZaloGuiApp {
                                     });
                                 });
                         });
+
+                    let mut paths = self.durable_composer.attachments.clone();
+                    if let Some((path, _, _, _)) = &self.pending_clipboard_image { paths.push(path.clone()); }
+                    let draft = crate::composer_store::Draft {
+                        text: self.input_message.clone(), reply: self.replying_to.clone(),
+                        mentions: self.composer_mentions.outgoing(&self.input_message),
+                        attachments: paths,
+                    };
+                    if let Err(error) = self.durable_composer.observe(&self.user_uin, &thread_id, draft) { self.show_toast(error); }
 
                     // 4b. Floating Contextual Sticker Suggestion Popover (`egui::Area`, rendered AFTER composer bar)
                     if !contextual_stickers.is_empty() && !self.sticker_picker_open {
@@ -4225,4 +4345,166 @@ impl ZaloGuiApp {
         self.render_settings_modal(ctx, pal);
     }
 
+}
+
+/// Highlight the exact resolved row and optionally center it in the message viewport.
+fn render_quote_target(ui: &egui::Ui, rect: egui::Rect, scroll_pending: bool, color: Color32) {
+    ui.painter().rect_stroke(
+        rect.expand(2.0),
+        Rounding::same(8.0),
+        Stroke::new(2.0, color),
+    );
+    if scroll_pending {
+        ui.scroll_to_rect(rect, Some(Align::Center));
+    }
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(100));
+}
+
+#[cfg(test)]
+mod quote_navigation_tests {
+    use super::*;
+
+    #[test]
+    fn quote_navigation_invalidates_when_thread_changes_or_highlight_expires() {
+        let messages = [ChatMessage {
+            id: "original".into(),
+            ..Default::default()
+        }];
+        let mut jump = QuoteJump {
+            thread_id: "thread-1".into(),
+            reference: "original".into(),
+            highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(3),
+            scroll_pending: true,
+        };
+        assert_eq!(jump.target_index("thread-1", &messages), Some(0));
+        assert_eq!(jump.target_index("thread-2", &messages), None);
+        jump.highlight_until = std::time::Instant::now();
+        assert_eq!(jump.target_index("thread-1", &messages), None);
+    }
+
+    #[test]
+    fn quote_navigation_keeps_animated_jump_visible_after_highlight_expires() {
+        for (count, target) in [(1000, 12), (1000, 900), (150, 12)] {
+            let ctx = egui::Context::default();
+            let color = Color32::from_rgb(1, 2, 3);
+            let mut before = 0.0;
+            let mut after = 0.0;
+            let mut highlighted = false;
+            let mut target_visible = false;
+            for frame in 0..10 {
+                let jumping = frame > 0;
+                let highlighting = jumping && frame < 7;
+                let limit = if jumping {
+                    crate::message_navigation::render_limit_for_target(150, count, target)
+                } else {
+                    150
+                };
+                if count == 1000 && target == 12 {
+                    assert!(jumping || count - limit > target);
+                }
+                let output = ctx.run(
+                    egui::RawInput {
+                        time: Some(frame as f64 * 0.5),
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(400.0, 300.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let scroll = egui::ScrollArea::vertical()
+                                .id_salt("quote_jump_test")
+                                .max_height(200.0)
+                                .stick_to_bottom(!highlighting)
+                                .show(ui, |ui| {
+                                    for index in count - limit..count {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            Vec2::new(200.0, 30.0),
+                                            Sense::hover(),
+                                        );
+                                        if jumping && index == target {
+                                            if highlighting {
+                                                render_quote_target(ui, rect, frame == 1, color);
+                                                highlighted = true;
+                                            }
+                                            if frame == 9 {
+                                                target_visible =
+                                                    ui.clip_rect().contains(rect.center());
+                                            }
+                                        }
+                                    }
+                                });
+                            if jumping {
+                                after = scroll.state.offset.y;
+                            } else {
+                                before = scroll.state.offset.y;
+                            }
+                        });
+                    },
+                );
+                if frame == 4 {
+                    assert!(output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Rect(rect) if rect.stroke.color == color)
+                }), "Exact target must have a visible highlight shape");
+                }
+            }
+            assert!(highlighted);
+            assert!(
+                before > 1000.0,
+                "Initial viewport must start at the newest messages"
+            );
+            assert!(
+                after < before && target_visible,
+                "Jump must center the older target, not remain at the bottom: {after}"
+            );
+        }
+    }
+}
+
+fn visible_read_candidate(message: &ChatMessage, row: Rect, clip: Rect) -> bool {
+    !message.is_outgoing && message.kind != crate::message_model::MessageKind::System && row.intersect(clip).is_positive()
+}
+
+#[cfg(test)]
+mod visible_read_tests {
+    use super::*;
+    #[test]
+    fn visible_read_scroll_collects_only_real_bottom_viewport_rows() {
+        let ctx = egui::Context::default();
+        let mut visible = Vec::new();
+        let mut bottom = false;
+        for frame in 0..3 {
+            visible.clear();
+            let _ = ctx.run(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0,200.0))), time: Some(frame as f64 * 0.1), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let scroll = egui::ScrollArea::vertical().id_salt("read_fixture").max_height(100.0).stick_to_bottom(true).show(ui, |ui| {
+                        for index in 0..30 {
+                            let message = ChatMessage { id: index.to_string(), kind: crate::message_model::MessageKind::Text, ..Default::default() };
+                            let (rect, _) = ui.allocate_exact_size(Vec2::new(200.0,30.0), Sense::hover());
+                            if visible_read_candidate(&message, rect, ui.clip_rect()) { visible.push(index); }
+                        }
+                    });
+                    bottom = scroll.state.offset.y + scroll.inner_rect.height() >= scroll.content_size.y - 1.0;
+                });
+            });
+        }
+        assert!(bottom);
+        assert_eq!(visible.last(), Some(&29));
+        assert!(visible.len() < 10 && !visible.contains(&0));
+    }
+    #[test]
+    fn visible_read_rows_require_actual_clip_intersection_and_incoming_content() {
+        let clip = Rect::from_min_max(Pos2::new(0.0, 10.0), Pos2::new(100.0, 100.0));
+        let row = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 20.0));
+        let mut message = ChatMessage { kind: crate::message_model::MessageKind::Text, ..Default::default() };
+        assert!(visible_read_candidate(&message, row, clip));
+        assert!(!visible_read_candidate(&message, row.translate(Vec2::new(0.0, -20.0)), clip));
+        message.is_outgoing = true;
+        assert!(!visible_read_candidate(&message, row, clip));
+        message.is_outgoing = false;
+        message.kind = crate::message_model::MessageKind::System;
+        assert!(!visible_read_candidate(&message, row, clip));
+    }
 }

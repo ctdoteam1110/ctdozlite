@@ -47,7 +47,7 @@ Ubiquitous language for `ctdozlite`. Use these terms verbatim in issues, ADRs, t
 
 Domain invariants are tagged `INV-N` here and referenced verbatim from code and tests.
 
-- **INV-1** — No request leaves the process without `ParamCipher v2` encoding and a valid `signkey`.
+- **INV-1** — Outbound requests use `ParamCipher v2` encoding and a valid `signkey`, except the two evidence-bound seen-v2 endpoints proposed in ADR-0006, which use the verified session AES/cookie contract. This exception requires maintainer protocol review.
 - **INV-2** — `session.json` is never logged, committed or transmitted outside Zalo endpoints.
 - **INV-3** — The UI thread never performs blocking I/O; all such work runs in the worker.
 - **INV-4** — A message row is idempotent by `msg_id`; re-delivery never duplicates history.

@@ -32,29 +32,79 @@ pub static RUNNING: AtomicBool = AtomicBool::new(false);
 /// Returns how many messages were new to the database.
 pub async fn sync_thread(s: &Session, t: &mut Thread) -> Result<usize> {
     let id = t.id.clone();
-    let mut cursor =
-        tokio::task::spawn_blocking(move || MessageStore::open(DB_PATH).ok()?.oldest_msg_id(&id))
-            .await?
-            .unwrap_or_default();
+    let cursor = crate::runtime_scope::spawn_blocking(move || {
+        MessageStore::open(DB_PATH).ok()?.oldest_msg_id(&id)
+    })
+    .await??
+    .unwrap_or_default();
+    sync_thread_network(s, t, cursor, |snapshot| async move {
+        crate::runtime_scope::spawn_blocking(move || {
+            store::persist_threads(
+                &mut MessageStore::open(DB_PATH)?,
+                std::slice::from_ref(&snapshot),
+            )
+        })
+        .await??
+    })
+    .await
+}
+
+/// Fetch the existing bounded protocol pages and hand snapshots to an explicit storage sink.
+/// No legacy database or cache is opened by this network-only path.
+///
+/// # Errors
+/// Returns network, sink, or blocking-task errors; committed pages remain durable.
+pub async fn sync_thread_network<F, Fut>(
+    s: &Session,
+    t: &mut Thread,
+    cursor: String,
+    mut persist: F,
+) -> Result<usize>
+where
+    F: FnMut(Thread) -> Fut,
+    Fut: std::future::Future<Output = Result<usize>>,
+{
+    sync_thread_network_retained(
+        s,
+        t,
+        cursor,
+        || std::future::ready(()),
+        move |snapshot, ()| persist(snapshot),
+    )
+    .await
+}
+
+/// Reserve before each fetch and synchronously capture each parsed snapshot before awaiting its sink.
+/// Protocol pagination, cancellation and CLI storage behavior remain unchanged.
+///
+/// # Errors
+/// Returns network or sink errors without advancing the failed page cursor.
+pub async fn sync_thread_network_retained<P, Prepare, Prepared, F, Fut>(
+    s: &Session,
+    t: &mut Thread,
+    mut cursor: String,
+    mut prepare: Prepare,
+    mut persist: F,
+) -> Result<usize>
+where
+    Prepare: FnMut() -> Prepared,
+    Prepared: std::future::Future<Output = P>,
+    F: FnMut(Thread, P) -> Fut,
+    Fut: std::future::Future<Output = Result<usize>>,
+{
     let mut added = 0;
     for _ in 0..MAX_PAGES {
         if CANCEL.load(Ordering::Relaxed) {
             break;
         }
+        let permit = prepare().await;
         let resp = chat::get_cloud_messages(s, &t.id, &cursor, true, PAGE).await?;
         let before = t.messages.len();
         chat::merge_group_history(t, &resp);
         if t.messages.len() == before {
             break; // nothing older on the server
         }
-        let snapshot = t.clone();
-        added += tokio::task::spawn_blocking(move || {
-            store::persist_threads(
-                &mut MessageStore::open(DB_PATH)?,
-                std::slice::from_ref(&snapshot),
-            )
-        })
-        .await??;
+        added += persist(t.clone(), permit).await?;
         match next_cursor(t, &cursor) {
             Some(c) => cursor = c,
             None => break,

@@ -42,3 +42,20 @@ pub fn service(key: &str) -> Option<&'static str> {
         .find(|(k, _)| *k == key)
         .map(|(_, v)| *v)
 }
+
+/// Archived transfer-sync-v2 blob CDN suffixes, not authenticated API service hosts.
+const HISTORY_BLOB_SUFFIXES: &[&str] = &["zdn.vn", "zalo.me", "zaloapp.com"];
+
+/// Permit only HTTPS capability downloads from the archived history CDN namespace.
+/// Never attach session cookies or tokens to these URLs, including redirects.
+pub fn is_history_blob_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port_or_known_default() == Some(443)
+        && url.host_str().is_some_and(|host| {
+            HISTORY_BLOB_SUFFIXES
+                .iter()
+                .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+        })
+}

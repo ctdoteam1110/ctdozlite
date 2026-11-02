@@ -425,6 +425,7 @@ pub fn trace_line(tag: &str, body: impl AsRef<str>) {
 /// Execute the exact Zalo signaling HTTP endpoint for a native `sendSignal` command (`handleSendSignal`).
 /// Every request/response pair is mirrored into `call_trace.log`.
 pub async fn dispatch_send_signal(s: &Session, command: i64, n: &Value) -> Result<Value> {
+    crate::runtime_scope::check()?;
     trace_line("SIG>", format!("cmd={command} {}", n));
     let result = dispatch_send_signal_inner(s, command, n).await;
     match &result {
@@ -1658,7 +1659,7 @@ pub async fn start_zrtp_udp_relay_session_with_probe(
     let sess_owned = sess_id.to_string();
     let active_token = probe.token;
 
-    tokio::spawn(async move {
+    crate::runtime_scope::spawn_inherited(async move {
         let mut seq: u32 = echo_seq;
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(400));
         let mut buf_rtp = [0u8; 1500];
@@ -2140,6 +2141,7 @@ pub fn build_callee_extend_data(
 }
 
 enum CallEngineCmd {
+    Shutdown { completed: tokio::sync::oneshot::Sender<()> },
     MakeCall {
         partner_id: String,
         partner_name: String,
@@ -2157,8 +2159,27 @@ enum CallEngineCmd {
     ControlEvent(Value),
 }
 
+#[derive(Clone)]
+struct CallSender(mpsc::UnboundedSender<(crate::runtime_scope::SessionScope, CallEngineCmd)>);
+impl CallSender {
+    fn send(&self, command: CallEngineCmd) -> Result<(), mpsc::error::SendError<(crate::runtime_scope::SessionScope, CallEngineCmd)>> {
+        let scope = crate::runtime_scope::execution_scope().unwrap_or_else(|| crate::runtime_scope::registry().current());
+        self.0.send((scope, command))
+    }
+}
+
 pub struct CallBridge {
-    cmd_tx: mpsc::UnboundedSender<CallEngineCmd>,
+    cmd_tx: CallSender,
+    engine: tokio::task::AbortHandle,
+    #[cfg(test)]
+    active_call: Arc<Mutex<Option<PureRustCallState>>>,
+}
+impl Drop for CallBridge {
+    fn drop(&mut self) {
+        // Shutdown cancels descendants; dropping call state stops owned audio/media and UDP loops.
+        crate::runtime_scope::registry().invalidate_now();
+        self.engine.abort();
+    }
 }
 
 impl CallBridge {
@@ -2168,13 +2189,46 @@ impl CallBridge {
         gui_tx: crate::gui::GuiTx,
         egui_ctx: eframe::egui::Context,
     ) -> Self {
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<CallEngineCmd>();
+        let (raw_tx, mut cmd_rx) = mpsc::unbounded_channel::<(crate::runtime_scope::SessionScope, CallEngineCmd)>();
+        let cmd_tx = CallSender(raw_tx);
         let active_call: Arc<Mutex<Option<PureRustCallState>>> = Arc::new(Mutex::new(None));
         let cmd_tx_inner = cmd_tx.clone();
+        #[cfg(test)]
+        let test_active_call = active_call.clone();
 
-        tokio::spawn(async move {
-            while let Some(cmd) = cmd_rx.recv().await {
+        let engine = tokio::spawn(async move {
+            let mut observed = crate::runtime_scope::registry().current();
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    _ = crate::runtime_scope::registry().cancelled(&observed) => {
+                        let taken = active_call.lock().await.take();
+                        // Joining native audio/media threads runs off the async executor.
+                        let _ = tokio::task::spawn_blocking(move || drop(taken)).await;
+                        observed = crate::runtime_scope::registry().current();
+                        let _ = gui_tx.send(GuiEvent::Scoped {
+                            scope: observed.clone(), event: Box::new(GuiEvent::CallStateChanged("free".into())),
+                        });
+                        None
+                    }
+                    command = cmd_rx.recv() => command,
+                };
+                let Some((scope, cmd)) = next else {
+                    if cmd_rx.is_closed() { break; }
+                    continue;
+                };
+                if let CallEngineCmd::Shutdown { completed } = cmd {
+                    let taken = active_call.lock().await.take();
+                    let _ = tokio::task::spawn_blocking(move || drop(taken)).await;
+                    let _ = completed.send(());
+                    break;
+                }
+                if scope.account.is_empty() || !crate::runtime_scope::registry().accepts(&scope) { continue; }
+                crate::runtime_scope::run(scope, async {
+                // One iteration preserves the existing command-level continue semantics.
+                for cmd in std::iter::once(cmd) {
                 match cmd {
+                    CallEngineCmd::Shutdown { .. } => return,
                     CallEngineCmd::MakeCall {
                         partner_id,
                         partner_name,
@@ -2222,7 +2276,7 @@ impl CallBridge {
                         let ctx_clone = egui_ctx.clone();
                         let active_clone = active_call.clone();
 
-                        tokio::spawn(async move {
+                        crate::runtime_scope::spawn_inherited(async move {
                             let mut group_candidates: Vec<String> = Vec::new();
                             if is_group {
                                 let clean_gid = partner_id
@@ -2560,7 +2614,10 @@ impl CallBridge {
                                                 Some(ctx_clone.clone()),
                                             )
                                             .ok();
-                                        *active_clone.lock().await = Some(PureRustCallState {
+                                        {
+                                let mut active = active_clone.lock().await;
+                                if crate::runtime_scope::check().is_err() { return; }
+                                *active = Some(PureRustCallState {
                                             call_id: real_call_id,
                                             thread_id: partner_id.clone(),
                                             partner_id,
@@ -2590,6 +2647,7 @@ impl CallBridge {
                                             media: media_handle,
                                             extra_legs: Vec::new(),
                                         });
+                            }
                                         let _ = gui_tx_clone
                                             .send(GuiEvent::CallStateChanged("calling".into()));
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
@@ -2799,6 +2857,7 @@ impl CallBridge {
                                     reason: last_err_reason.clone(),
                                 });
                                 let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                    client_message_id: String::new(),
                                     thread_id: partner_id,
                                     text: if is_video {
                                         format!(
@@ -2818,7 +2877,10 @@ impl CallBridge {
                             let n_ringing = dialed_legs.len();
                             let mut primary = dialed_legs.remove(0);
                             let primary_cid = primary.call_id;
-                            *active_clone.lock().await = Some(PureRustCallState {
+                            {
+                                let mut active = active_clone.lock().await;
+                                if crate::runtime_scope::check().is_err() { return; }
+                                *active = Some(PureRustCallState {
                                 call_id: primary.call_id,
                                 thread_id: partner_id.clone(),
                                 partner_id: primary.partner_id.clone(),
@@ -2848,6 +2910,7 @@ impl CallBridge {
                                 media: None,
                                 extra_legs: dialed_legs,
                             });
+                            }
                             let _ = gui_tx_clone
                                 .send(GuiEvent::CallStateChanged("calling".into()));
                             let status_txt = if n_ringing > 1 {
@@ -2869,7 +2932,7 @@ impl CallBridge {
                         let active_clone = active_call.clone();
                         let gui_tx_clone = gui_tx.clone();
                         let ctx_clone = egui_ctx.clone();
-                        tokio::spawn(async move {
+                        crate::runtime_scope::spawn_inherited(async move {
                             if accept {
                                 // Wait up to 350ms if the incoming ZRTP UDP probe is still finishing
                                 for _ in 0..14 {
@@ -2886,6 +2949,7 @@ impl CallBridge {
                                 }
                             }
                             let mut guard = active_clone.lock().await;
+                            if crate::runtime_scope::check().is_err() { return; }
                             if let Some(ref mut st) = *guard {
                                 let call_id = st.call_id;
                                 let caller_id = st.partner_id.clone();
@@ -2946,6 +3010,7 @@ impl CallBridge {
                                     let _ = gui_tx_clone
                                         .send(GuiEvent::CallStateChanged("free".into()));
                                     let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                        client_message_id: String::new(),
                                         thread_id: partner_id,
                                         text: if was_video {
                                             "📹 Cuộc gọi video đến (Đã từ chối)".into()
@@ -2985,6 +3050,7 @@ impl CallBridge {
                     } => {
                         let s_snap = session.lock().await.clone();
                         let mut guard = active_call.lock().await;
+                        if crate::runtime_scope::check().is_err() { return; }
                         if let Some(ref mut st) = *guard {
                             st.is_video = st.is_video || is_on_cam;
                             if st.media.is_none() && is_on_cam {
@@ -3018,7 +3084,7 @@ impl CallBridge {
                             for leg in &st.extra_legs {
                                 targets.push((leg.partner_id.clone(), leg.call_id));
                             }
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_inherited(async move {
                                 for (pid, cid) in targets {
                                     let req_12006 = json!({
                                         "calleeId": pid,
@@ -3073,6 +3139,7 @@ impl CallBridge {
                                     (false, false) => format!("📞 Cuộc gọi đến ({duration_sec}s)"),
                                 };
                                 let _ = gui_tx.send(GuiEvent::MessageSent {
+                                    client_message_id: String::new(),
                                     thread_id: thread_id.clone(),
                                     text: label,
                                     msg_id: format!("call_{}", crate::login::unix_now()),
@@ -3081,7 +3148,7 @@ impl CallBridge {
                             let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
                             egui_ctx.request_repaint();
 
-                            tokio::spawn(async move {
+                            crate::runtime_scope::spawn_inherited(async move {
                                 if is_group {
                                     let clean_gid = thread_id
                                         .trim_start_matches("group_")
@@ -3187,6 +3254,7 @@ impl CallBridge {
                         match act {
                             "ring_ring" | "group_ring_ring" => {
                                 let mut guard = active_call.lock().await;
+                                if crate::runtime_scope::check().is_err() { return; }
                                 let Some(st) = guard.as_mut() else {
                                     continue;
                                 };
@@ -3216,6 +3284,7 @@ impl CallBridge {
                                     })
                                     .unwrap_or(0);
                                 let mut guard = active_call.lock().await;
+                                if crate::runtime_scope::check().is_err() { return; }
                                 if guard.is_none() {
                                     let self_uin = s_snap
                                         .login
@@ -3402,7 +3471,7 @@ impl CallBridge {
                                                 let l_cid = leg.call_id;
                                                 let l_pid = leg.partner_id.clone();
                                                 let s_cl = s_snap.clone();
-                                                tokio::spawn(async move {
+                                                crate::runtime_scope::spawn_inherited(async move {
                                                     let req_408 = json!({
                                                         "calleeId": l_pid,
                                                         "callId": l_cid
@@ -3528,7 +3597,7 @@ impl CallBridge {
                                         let call_id = st.call_id;
                                         let callee_id = st.partner_id.clone();
                                         if !is_group_call {
-                                            tokio::spawn(async move {
+                                            crate::runtime_scope::spawn_inherited(async move {
                                                 let req_408 = json!({
                                                     "calleeId": callee_id,
                                                     "callId": call_id
@@ -3603,6 +3672,7 @@ impl CallBridge {
                                     });
                                     if let Some(st) = taken {
                                         let _ = gui_tx.send(GuiEvent::MessageSent {
+                                            client_message_id: String::new(),
                                             thread_id: st.thread_id.clone(),
                                             text: if st.is_video {
                                                 format!("📹 Cuộc gọi video đi (0s) — {reason}")
@@ -3617,6 +3687,7 @@ impl CallBridge {
                             }
                             "group_broadcast" => {
                                 let mut guard = active_call.lock().await;
+                                if crate::runtime_scope::check().is_err() { return; }
                                 let Some(st) = guard.as_mut() else {
                                     continue;
                                 };
@@ -3673,6 +3744,7 @@ impl CallBridge {
                             }
                             "end_call" | "cancel" | "group_end_call" | "group_cancel" => {
                                 let mut guard = active_call.lock().await;
+                                if crate::runtime_scope::check().is_err() { return; }
                                 let Some(ref st_check) = *guard else {
                                     continue;
                                 };
@@ -3758,6 +3830,7 @@ impl CallBridge {
                                         (false, false, false) => "📞 Cuộc gọi nhỡ".to_string(),
                                     };
                                     let _ = gui_tx.send(GuiEvent::MessageSent {
+                                        client_message_id: String::new(),
                                         thread_id: st.thread_id.clone(),
                                         text: label,
                                         msg_id: format!("call_{}", crate::login::unix_now()),
@@ -3909,6 +3982,7 @@ impl CallBridge {
                                     .unwrap_or_default();
                                 {
                                     let mut g = active_call.lock().await;
+                                    if crate::runtime_scope::check().is_err() { return; }
                                     if g.is_none() {
                                         *g = Some(PureRustCallState {
                                             call_id,
@@ -3955,7 +4029,7 @@ impl CallBridge {
                                     ctx_clone.request_repaint();
                                 }
 
-                                tokio::spawn(async move {
+                                crate::runtime_scope::spawn_inherited(async move {
                                     if !is_upgrade {
                                         // Notify caller that our client is ringing (`407`) right away
                                         let req_407 = json!({
@@ -4006,6 +4080,8 @@ impl CallBridge {
                                     );
 
                                     let mut g = active_clone.lock().await;
+
+                                    if crate::runtime_scope::check().is_err() { return; }
                                     if let Some(st) = g.as_mut() {
                                         if st.call_id == call_id {
                                             st.is_video = is_video;
@@ -4028,10 +4104,45 @@ impl CallBridge {
                         }
                     }
                 }
+                }
+                }).await;
             }
+            let taken = active_call.lock().await.take();
+            let _ = tokio::task::spawn_blocking(move || drop(taken)).await;
         });
 
-        Self { cmd_tx }
+        Self {
+            cmd_tx, engine: engine.abort_handle(),
+            #[cfg(test)]
+            active_call: test_active_call,
+        }
+    }
+
+    /// Install a transport-free state whose actual destructor signals keepalive cancellation.
+    #[cfg(test)]
+    pub(crate) async fn install_test_call(&self) -> tokio::sync::watch::Receiver<bool> {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        *self.active_call.lock().await = Some(PureRustCallState {
+            call_id: 1, thread_id: String::new(), partner_id: String::new(),
+            partner_name: String::new(), is_video: false, is_group: false,
+            is_caller: false, is_connected: false, started_at: std::time::Instant::now(),
+            sess_id: String::new(), rtp_ip: String::new(), rtcp_ip: String::new(),
+            extend_data: String::new(), from_uid_u32: 0, partner_uid_u32: 0,
+            relay_token: 0, group_id_u32: 0, group_host_call: String::new(),
+            group_partners_str: String::new(), group_pending_uids: Vec::new(),
+            group_active_uids: Vec::new(), server_tokens: BTreeMap::new(),
+            udp_rtp_sock: None, udp_rtcp_sock: None, keepalive_abort: Some(sender),
+            audio: None, media: None, extra_legs: Vec::new(),
+        });
+        receiver
+    }
+
+    /// Stop the engine and join owned native media teardown before acknowledging shutdown.
+    pub(crate) async fn shutdown(&self) -> Result<()> {
+        let (completed, receiver) = tokio::sync::oneshot::channel();
+        self.cmd_tx.send(CallEngineCmd::Shutdown { completed }).map_err(|_| anyhow::anyhow!("Call engine stopped"))?;
+        receiver.await.map_err(|_| anyhow::anyhow!("Call engine shutdown interrupted"))?;
+        Ok(())
     }
 
     /// Initiate an outgoing voice or video call (1-on-1 or Group) 100% in pure Rust.
@@ -4388,7 +4499,7 @@ mod tests {
         let rtcp_c = rtcp_sock.clone();
         let servers_c = servers.clone();
         let sess_c = sess_id_raw.clone();
-        let udp_task = tokio::spawn(async move {
+        let udp_task = crate::runtime_scope::spawn_inherited(async move {
             let mut b1 = [0u8; 1500];
             let mut b2 = [0u8; 1500];
             let mut iv = tokio::time::interval(std::time::Duration::from_millis(300));

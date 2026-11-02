@@ -205,7 +205,7 @@ impl ZaloGuiApp {
                                 .rounding(Rounding::same(7.0)),
                             )
                             .on_hover_text(
-                                "Xoá zalo_history.db và threads_cache.json. Phiên đăng nhập giữ nguyên.",
+                                "Xóa lịch sử cục bộ của tài khoản hiện tại. Phiên đăng nhập và dữ liệu legacy giữ nguyên.",
                             )
                             .on_hover_cursor(CursorIcon::PointingHand)
                             .clicked()
@@ -285,7 +285,6 @@ impl ZaloGuiApp {
             // `threads_cache.json` but keeps `zalo_history.db` (#21).
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::Logout);
-                let _ = tx.send(WorkerCmd::RequestQr);
             }
         }
         if do_wipe {
@@ -756,6 +755,7 @@ impl ZaloGuiApp {
         let mut pick_dl_dir = false;
         let mut open_dl_dir = false;
         let mut pick_migrate_file = false;
+        let mut import_original_reactions = false;
         let mut export_theme_tpl = false;
         let mut reload_theme_json = false;
         let mut export_sticker_tpl = false;
@@ -1215,7 +1215,7 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::same(14.0))
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Tải lịch sử cũ của các nhóm và Cloud của tôi từ máy chủ Zalo về zalo_history.db, mỗi lần tối đa 1.000 tin/hội thoại; bấm lần nữa để lùi xa hơn.").color(pal.text_primary).size(13.0));
+                                                        ui.label(RichText::new("Tải lịch sử cũ của các nhóm và Cloud của tôi vào kho riêng của tài khoản, mỗi lần tối đa 1.000 tin/hội thoại; bấm lần nữa để lùi xa hơn.").color(pal.text_primary).size(13.0));
                                                         ui.add_space(4.0);
                                                         ui.label(RichText::new("Zalo không cho tải lịch sử cũ của chat 1-1 qua máy chủ; tin 1-1 chỉ có từ lúc đăng nhập app.").color(pal.text_secondary).size(12.2));
                                                         if ui
@@ -1250,6 +1250,36 @@ impl ZaloGuiApp {
                                                     });
                                                 });
                                             ui.add_space(16.0);
+                                            ui.label(RichText::new("Lịch sử từ điện thoại và luồng nhóm").strong());
+                                            ui.label(&self.phone_history_status);
+                                            ui.horizontal(|ui| {
+                                                if self.phone_history_active {
+                                                    if ui.button("Thông báo lại trên điện thoại").clicked() {
+                                                        if let Some(tx) = WORKER_TX.get() { let _ = tx.send(WorkerCmd::PhoneHistory(super::PhoneAction::Wakeup(self.phone_history_generation))); }
+                                                    }
+                                                    if ui.button("Dừng đồng bộ điện thoại").clicked() {
+                                                        let generation = self.phone_history_generation;
+                                                        // Invalidate queued old-run deltas immediately, before worker cancellation is delivered.
+                                                        self.phone_history_generation = generation.wrapping_add(1);
+                                                        self.phone_history_active = false;
+                                                        self.phone_history_status = "Đã yêu cầu dừng; lịch sử đã nhận vẫn được giữ".into();
+                                                        if let Some(tx) = WORKER_TX.get() { let _ = tx.send(WorkerCmd::PhoneHistory(super::PhoneAction::Cancel(generation))); }
+                                                    }
+                                                } else if ui.button("Đồng bộ từ điện thoại").clicked() {
+                                                    self.phone_history_generation = self.phone_history_generation.wrapping_add(1);
+                                                    if let Some(tx) = WORKER_TX.get() {
+                                                        if tx.send(WorkerCmd::PhoneHistory(super::PhoneAction::Start(self.phone_history_generation))).is_ok() {
+                                                            self.phone_history_active = true;
+                                                            self.phone_history_status = "Đang yêu cầu đồng bộ; mở Zalo trên điện thoại để xác nhận".into();
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                            ui.label(&self.group_history_status);
+                                            if ui.button("Tải thêm lịch sử nhóm qua kết nối hiện tại").clicked() {
+                                                if let Some(tx) = WORKER_TX.get() { let _ = tx.send(WorkerCmd::LoadGroupHistoryStream); }
+                                            }
+                                            ui.add_space(16.0);
                                             ui.label(RichText::new("Di chuyển / Nhập lịch sử tin nhắn có sẵn (Migrate)").color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(6.0);
                                             egui::Frame::none()
@@ -1259,13 +1289,20 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::same(14.0))
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Nhập lịch sử tin nhắn từ bản sao lưu SQLite (.db / .sqlite) hoặc JSON (threads_cache.json / bản xuất lịch sử) vào zalo_history.db hiện tại mà không làm mất tin nhắn đang có.").color(pal.text_secondary).size(12.2));
+                                                        ui.label(RichText::new("Nhập lịch sử tin nhắn từ bản sao lưu SQLite (.db / .sqlite) hoặc JSON (threads_cache.json / bản xuất lịch sử) vào kho riêng của tài khoản hiện tại mà không sửa tệp nguồn hoặc làm mất tin nhắn đang có.").color(pal.text_secondary).size(12.2));
                                                         ui.add_space(8.0);
                                                         if ui.button(RichText::new("Chọn file lịch sử (.db / .sqlite / .json) để nhập…").size(12.8).strong()).clicked() {
                                                             pick_migrate_file = true;
                                                         }
                                                     });
                                                 });
+                                            ui.add_space(16.0);
+                                            ui.label(RichText::new("Nhập cache cảm xúc đã chuẩn hóa").color(pal.text_primary).size(13.5).strong());
+                                            ui.label(RichText::new("Chỉ nhận tệp JSON schema 1 đúng tài khoản và nhãn nguồn được hỗ trợ. Tệp được chọn được giữ nguyên; bản nhập riêng tư sẽ được dùng khi tải lại tin nhắn. Không tự tìm dữ liệu ứng dụng khác.").color(pal.text_secondary).size(12.2));
+                                            if ui.add_enabled(self.is_logged_in && !self.original_reaction_import_pending,
+                                                egui::Button::new("Chọn tệp cache cảm xúc JSON để nhập…")).clicked() {
+                                                import_original_reactions = true;
+                                            }
                                         }
                                         SettingsTab::Appearance => {
                                             ui.label(RichText::new("Cài đặt giao diện").color(pal.text_primary).size(13.5).strong());
@@ -1491,6 +1528,40 @@ impl ZaloGuiApp {
                                                 });
                                         }
                                         SettingsTab::Notifications => {
+                                            #[cfg(target_os = "macos")]
+                                            {
+                                                ui.label(RichText::new("Quyền thông báo macOS").strong());
+                                                let authorization = &self.notification_authorization;
+                                                ui.label(if authorization.pending.is_some() {
+                                                    "Đang kiểm tra quyền…".to_owned()
+                                                } else {
+                                                    match &authorization.result {
+                                                        Some(Ok(status)) => status.label().to_owned(),
+                                                        Some(Err(error)) => error.to_string(),
+                                                        None => "Chưa kiểm tra quyền thông báo".to_owned(),
+                                                    }
+                                                });
+                                                ui.label("Quyền hệ điều hành tách biệt với cài đặt Bật/Tắt bên dưới. Chưa bật gửi thông báo native.");
+                                                let ready = authorization.pending.is_none();
+                                                ui.horizontal(|ui| {
+                                                    let refresh = ui.add_enabled(ready, egui::Button::new("Đọc lại quyền")).clicked();
+                                                    let request = ui.add_enabled(ready, egui::Button::new("Yêu cầu quyền macOS")).clicked();
+                                                    if refresh || request {
+                                                        if let Some(request_id) = self.notification_authorization.begin() {
+                                                            let command = if request {
+                                                                WorkerCmd::RequestNotificationAuthorization { request_id }
+                                                            } else {
+                                                                WorkerCmd::ReadNotificationAuthorization { request_id }
+                                                            };
+                                                            if worker::WORKER_TX.get().map(|tx| tx.send(command).is_ok()) != Some(true) {
+                                                                self.notification_authorization.finish(request_id, Err(crate::native_notifications::NotificationError::Io));
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                                ui.add_space(16.0);
+                                            }
+
                                             ui.label(RichText::new("Cài đặt thông báo").color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(2.0);
                                             ui.label(RichText::new("Nhận được thông báo mỗi khi có tin nhắn mới").color(pal.text_secondary).size(12.2));
@@ -2286,26 +2357,20 @@ impl ZaloGuiApp {
             }
         }
 
+        if import_original_reactions {
+            if let Some(tx) = WORKER_TX.get() {
+                self.original_reaction_import_pending = tx.send(WorkerCmd::ImportOriginalReactions {
+                    account: self.user_uin.clone(), path: None,
+                }).is_ok();
+                if !self.original_reaction_import_pending { self.show_toast("Tác vụ nhập cache cảm xúc chưa được tiếp nhận"); }
+            } else { self.show_toast("Worker chưa sẵn sàng để nhập cache cảm xúc"); }
+        }
         if pick_migrate_file {
             if let Some(src_path) = pick_native_file_dialog(false) {
-                match crate::store::import_history_from_path(&src_path, "zalo_history.db") {
-                    Ok(summary) => {
-                        let t_cnt = summary.threads_imported;
-                        let m_cnt = summary.messages_imported;
-                        crate::store::load_history_into_threads(
-                            "zalo_history.db",
-                            &mut self.threads,
-                            crate::store::MessageStore::PRELOAD_MSGS,
-                        );
-                        self.persist_threads_async();
-                        self.show_toast(format!(
-                            "✅ Đã nhập {m_cnt} tin nhắn từ {t_cnt} hội thoại vào zalo_history.db"
-                        ));
-                    }
-                    Err(e) => {
-                        self.show_toast(format!("⚠️ Lỗi nhập lịch sử: {e}"));
-                    }
-                }
+                let sent = WORKER_TX.get().is_some_and(|tx| tx.send(WorkerCmd::ImportHistory {
+                    account: self.user_uin.clone(), revisions: self.history_revisions.clone(), path: src_path,
+                }).is_ok());
+                self.show_toast(if sent { "Đang nhập lịch sử trong nền…" } else { "Lỗi khởi động nhập lịch sử." });
             }
         }
         if export_theme_tpl {
@@ -4130,8 +4195,8 @@ impl ZaloGuiApp {
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(
-                        "Xoá zalo_history.db và threads_cache.json trên máy này. \
-                         Không thể hoàn tác, và tin nhắn cũ chỉ tải lại được từ đám mây Zalo.",
+                        "Xóa lịch sử cục bộ của tài khoản đang đăng nhập trên máy này. \
+                         Lịch sử cũ có thể tải lại từ máy chủ hoặc nhập từ bản sao lưu bạn chọn.",
                     )
                     .size(12.5)
                     .color(pal.text_secondary),
@@ -4178,7 +4243,7 @@ impl ZaloGuiApp {
         if confirm {
             self.wipe_confirm_open = false;
             if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::WipeLocalData);
+                let _ = tx.send(WorkerCmd::WipeLocalData { account: self.user_uin.clone() });
             }
         } else if cancel || !open {
             self.wipe_confirm_open = false;
@@ -4530,6 +4595,15 @@ impl ZaloGuiApp {
                                     .clicked()
                                 {
                                     should_close = true;
+                                }
+
+                                #[cfg(target_os = "macos")]
+                                if let Some(key) = viewer.native_photo.as_ref().filter(|key| key.account == self.user_uin) {
+                                    if ui.add_enabled(!self.native_photo_pending, egui::Button::new("Mở trình xem gốc"))
+                                        .on_hover_text("Mở cửa sổ gốc cho ảnh này; trình xem hiện tại vẫn được giữ.").clicked() {
+                                        self.native_photo_pending = WORKER_TX.get().is_some_and(|tx| tx.send(WorkerCmd::OpenNativePhoto { key: key.clone(), url: viewer.full_url.clone() }).is_ok());
+                                        if !self.native_photo_pending { self.show_toast("Lỗi khởi động trình xem gốc. Hãy thử lại."); }
+                                    }
                                 }
 
                                 if !viewer.full_url.is_empty() {
@@ -5251,6 +5325,7 @@ impl ZaloGuiApp {
                             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                                 let hd = self.request_hd_texture(&prof.cover_url);
                                 self.image_viewer = Some(ImageViewerModal {
+                                    native_photo: None,
                                     tex_key: ckey,
                                     hd_tex_key: hd,
                                     full_url: prof.cover_url.clone(),
@@ -5669,6 +5744,7 @@ impl ZaloGuiApp {
         if let Some((tkey, full_u, title, sender)) = clicked_image {
             let hd = self.request_hd_texture(&full_u);
             self.image_viewer = Some(ImageViewerModal {
+                native_photo: None,
                 tex_key: tkey,
                 hd_tex_key: hd,
                 full_url: full_u,
@@ -5751,6 +5827,7 @@ impl ZaloGuiApp {
                         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             let hd = self.request_hd_texture(&item.url);
                             self.image_viewer = Some(ImageViewerModal {
+                                native_photo: None,
                                 tex_key: tkey,
                                 hd_tex_key: hd,
                                 full_url: item.url.clone(),

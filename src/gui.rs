@@ -21,22 +21,111 @@ use crate::logger::{self, FindingLevel, LogEntry, ScanFinding};
 use crate::qr::QrLogin;
 use crate::session::Session;
 
-
+mod history;
+mod history_retention;
+mod group_history;
+mod phone_history;
+mod phone_pending;
+mod media_preview;
+mod native_photo_viewer;
 mod messages;
+mod emoji_text;
+mod composer;
+mod durable_composer;
+mod confirmed_history;
 mod modals;
 mod stickers;
 mod theme;
 mod worker;
 mod workspace;
 
-pub use theme::{emoji_to_tex_key, load_app_icon, lucide, REACTION_LIST};
-pub use worker::WorkerCmd;
 use messages::*;
 use stickers::*;
 use theme::*;
+pub use theme::{emoji_to_tex_key, load_app_icon, lucide, REACTION_LIST};
+pub use worker::WorkerCmd;
+pub use phone_history::PhoneAction;
 use worker::*;
 
+fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
+    crate::chat::merge_sent_message(thread, message);
+}
+
+fn reset_epoch_loading(
+    sets: &mut [&mut HashSet<String>],
+    packs: &mut HashSet<u64>,
+    flags: &mut [&mut bool],
+) {
+    for pending in sets { pending.clear(); }
+    packs.clear();
+    for pending in flags { **pending = false; }
+}
+
+fn is_epoch_transition(event: &GuiEvent) -> bool {
+    matches!(event, GuiEvent::AuthenticationStarted | GuiEvent::LifecycleFlushFailed(_) | GuiEvent::LoginSuccess { .. } | GuiEvent::LoggedOut | GuiEvent::LocalDataWiped | GuiEvent::HistoryClearFailed(_))
+}
+fn epoch_event_allowed(ui_generation: u64, generation: u64, event: &GuiEvent) -> bool {
+    is_epoch_transition(event) || ui_generation == generation || matches!(event, GuiEvent::CallStateChanged(state) if state == "free")
+}
+
+fn quote_reply_matches(current_thread: &str, current_request: u64, reply_thread: &str, reply_request: u64) -> bool {
+    current_thread == reply_thread && current_request == reply_request
+}
+
+fn profile_reply_matches(target: &str, request: u64, reply_target: &str, reply_request: u64) -> bool {
+    target == reply_target && request == reply_request
+}
+
 pub enum GuiEvent {
+    /// Independent local persistence and wire outcomes for a dwell-admitted viewport.
+    VisibleReadFinished { account: String, thread_id: String, visible: Vec<ChatMessage>, unsent: Vec<ChatMessage>, local: Result<bool, String>, seen: Result<bool, String> },
+    /// Terminal native-viewer result after its child closes or fails.
+    NativePhotoViewerFinished { account: String, result: Result<(), crate::media_resources::MediaError> },
+    /// Terminal result of background history import and hydration.
+    HistoryImported {
+        account: String,
+        revisions: HashMap<String, u64>,
+        result: Result<(crate::store_v2::MigrationReport, Vec<Thread>), String>,
+    },
+    /// Terminal result after server confirmation and exact local conversation deletion.
+    HistoryThreadDeleted { account: String, thread_id: String, result: Result<(), String> },
+    /// Account-scoped worker projection after durable history reconciliation.
+    AccountThreadsUpdated { account: String, threads: Vec<Thread>, live: bool },
+    /// One bounded archived page, separate from live arrival notifications.
+    HistoryPageLoaded { account: String, thread_id: String, revision: u64, result: Result<(Vec<ChatMessage>, bool), String> },
+    /// Exact offscreen quote navigation result, capped at 200 bodies.
+    HistoryNavigationLoaded { account: String, thread_id: String, reference: String, request_id: u64, revision: u64, result: Result<Option<(String, Vec<ChatMessage>)>, String> },
+    /// Bounded durable literal-search matches for the still-current query.
+    HistorySearchLoaded { account: String, thread_id: String, query: String, revision: u64, result: Result<Vec<ChatMessage>, String> },
+    /// Terminal result of an account-isolated photo request.
+    PhotoPreviewReady {
+        account: String,
+        key: String,
+        result: Result<egui::ColorImage, crate::media_resources::MediaError>,
+    },
+    /// Terminal delivery result without private notification content.
+    IncomingNotificationFinished {
+        result: Result<
+            crate::native_notifications::DeliveryResult,
+            crate::native_notifications::NotificationError,
+        >,
+    },
+    /// Accept the password-attempt epoch before progress or failure events are delivered.
+    AuthenticationStarted,
+    /// Shutdown barrier result; the GUI closes only after a successful acknowledgement.
+    ShutdownFinished(Result<(), String>),
+    /// Intentional lifecycle flush failed; acknowledge the resumed authenticated incarnation.
+    LifecycleFlushFailed(String),
+    /// Scoped worker output, checked again when dequeued by the UI.
+    Scoped { scope: crate::runtime_scope::SessionScope, event: Box<GuiEvent> },
+    /// Terminal response for a Settings authorization action.
+    NotificationAuthorization {
+        request_id: u64,
+        result: Result<
+            crate::native_notifications::AuthorizationStatus,
+            crate::native_notifications::NotificationError,
+        >,
+    },
     QrReady {
         qr_login: QrLogin,
         qr_image: egui::ColorImage,
@@ -51,12 +140,58 @@ pub enum GuiEvent {
     },
     LoginFailed(String),
     ThreadsUpdated(Vec<Thread>),
+    /// Historical arrivals never drive live unread or notification accounting.
+    PhoneHistoryThreads {
+        generation: u64,
+        account: String,
+        threads: Vec<Thread>,
+    },
+    /// Terminal or progress status for an explicit phone transfer run.
+    PhoneHistoryStatus {
+        generation: u64,
+        account: String,
+        message: String,
+        active: bool,
+    },
+    /// Progress from the shared-socket bounded group history cursor.
+    GroupHistoryStatus(String),
+    /// Old group pages, separate from live arrivals.
+    GroupHistoryThreads {
+        account: String,
+        threads: Vec<Thread>,
+    },
+    /// Exact remote progress, applied only to current outgoing message identities.
+    DeliveryEvents {
+        account: String,
+        events: Vec<crate::delivery_receipts::DeliveryEvent>,
+    },
+    /// Structured terminal result from the explicit Settings cache-import action.
+    OriginalReactionImportFinished {
+        account: String,
+        result: Result<
+            Option<crate::original_reactions::OriginalReactionCache>,
+            crate::original_reactions::ImportError,
+        >,
+    },
+    /// A durable batch arrived; request replay against currently loaded targets.
+    ReactionEvents {
+        account: String,
+    },
+    /// Worker projection merged only into still-existing reaction targets.
+    ReactionThreadsUpdated {
+        account: String,
+        threads: Vec<Thread>,
+    },
+    /// Explicit live socket/poll arrivals, never bootstrap, refresh or history snapshots.
+    LiveThreadsUpdated(Vec<Thread>),
     MessageSent {
+        client_message_id: String,
         thread_id: String,
         text: String,
         msg_id: String,
     },
     StickerSent {
+        client_message_id: String,
         thread_id: String,
         msg_id: String,
         sticker_id: u64,
@@ -67,6 +202,25 @@ pub enum GuiEvent {
         thread_id: String,
         msg: ChatMessage,
     },
+    /// Terminal result of a bounded background native emoji render.
+    InlineEmojiReady { cluster: String, sprite_id: Option<u16>, image: Option<egui::ColorImage> },
+    /// A selected attachment was saved into its exact account/thread draft off the UI thread.
+    ComposerAttachmentPicked { account: String, thread: String, path: std::path::PathBuf },
+    /// A durable stage completed; clear only the matching unchanged visible draft.
+    ComposerStaged { account: String, thread: String, draft: crate::composer_store::Draft },
+    /// Staging failed before transport; leave the user's original editable draft intact.
+    ComposerStageFailed { account: String, thread: String, error: String },
+    /// Worker-only draft read, applied only if the visible revision has not changed.
+    ComposerLoaded { account: String, thread: String, revision: u64, result: Result<(crate::composer_store::Draft, Vec<crate::composer_store::OutboxEntry>), String> },
+    /// Explicit recovery moved unresolved content into an editable durable draft, never sent it.
+    ComposerRecovered { account: String, revision: u64, result: Result<(String, crate::composer_store::Draft), String> },
+    /// Pending failures and attachment remainders for explicit user recovery.
+    ComposerOutbox { account: String, entries: Vec<crate::composer_store::OutboxEntry> },
+    /// Confirmed composer text with the exact request ID and selected mention metadata.
+    ComposerMessageSent { account: String, thread_id: String, msg: ChatMessage },
+    /// An in-memory composer failure preserves explicit selections and the original reply.
+    ComposerSendFailed { account: String, thread_id: String, text: String,
+        mentions: Vec<crate::composer_mentions::OutgoingMention>, quoted: Option<ChatMessage>, error: String },
     StickerImageReady {
         key: String,
         image: egui::ColorImage,
@@ -95,6 +249,7 @@ pub enum GuiEvent {
         online: Option<(bool, String)>,
     },
     QuoteSent {
+        client_message_id: String,
         thread_id: String,
         text: String,
         msg_id: String,
@@ -124,8 +279,10 @@ pub enum GuiEvent {
     SessionExpired(String),
     /// The server could not be reached: the session is intact, show it and retry (#21).
     SessionUnreachable(String),
-    /// `zalo_history.db` + `threads_cache.json` were removed on request (#21).
+    /// The current account-owned history was cleared without touching legacy stores.
     LocalDataWiped,
+    /// A clear failed after the epoch transition; acknowledge the new generation without clearing UI.
+    HistoryClearFailed(String),
     CallStateChanged(String),
     IncomingCall {
         call_id: i64,
@@ -164,10 +321,20 @@ pub enum GuiEvent {
         total: u64,
     },
     UpdateAppliedAndRestarting(String),
-    SocialProfileLoaded(Result<crate::feed::SocialUserProfile, String>),
+    SocialProfileLoaded {
+        target_uid: String,
+        request_id: u64,
+        result: Result<crate::feed::SocialUserProfile, String>,
+    },
     SocialAvatarsLoaded(Result<Vec<crate::feed::FeedMedia>, String>),
     SocialTimelineLoaded(
-        Result<(Vec<crate::feed::SocialUserProfile>, Vec<crate::feed::FeedItem>), String>,
+        Result<
+            (
+                Vec<crate::feed::SocialUserProfile>,
+                Vec<crate::feed::FeedItem>,
+            ),
+            String,
+        >,
     ),
     LoggedOut,
 }
@@ -212,10 +379,12 @@ struct ActiveCallOverlay {
     error_reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ImageViewerModal {
     tex_key: String,
     hd_tex_key: Option<String>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    native_photo: Option<crate::media_resources::MediaKey>,
     full_url: String,
     title: String,
     sender: String,
@@ -360,25 +529,98 @@ impl AppSettings {
 }
 
 
+/// A loaded-message jump stays bound to its conversation and exact reference.
+struct QuoteJump {
+    thread_id: String,
+    reference: String,
+    highlight_until: std::time::Instant,
+    scroll_pending: bool,
+}
+
+impl QuoteJump {
+    fn target_index(&self, thread_id: &str, messages: &[ChatMessage]) -> Option<usize> {
+        if self.thread_id != thread_id || std::time::Instant::now() >= self.highlight_until {
+            return None;
+        }
+        crate::message_navigation::unique_reference_index(messages, &self.reference)
+    }
+}
+
 /// Bubbles rendered per step in the chat view; "Tải thêm tin nhắn cũ" adds another step.
 const CHAT_RENDER_STEP: usize = 150;
 
 /// Worker → GUI channel that wakes the UI on every send. The GUI no longer repaints on a
 /// 1.2 s timer, so an event sent without a repaint would sit unseen until the next mouse move.
-#[derive(Clone)]
 pub struct GuiTx {
     tx: Sender<GuiEvent>,
     ctx: egui::Context,
+    scope: Option<crate::runtime_scope::SessionScope>,
+}
+impl Clone for GuiTx {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(), ctx: self.ctx.clone(),
+            // Native media threads have no Tokio task-local context, so retain their creation epoch.
+            scope: crate::runtime_scope::execution_scope().or_else(|| self.scope.clone()),
+        }
+    }
 }
 
 impl GuiTx {
+    /// Construct an isolated channel sender without starting a GUI or reading local user files.
+    #[cfg(test)]
+    pub(crate) fn for_test(tx: Sender<GuiEvent>) -> Self {
+        Self { tx, ctx: egui::Context::default(), scope: None }
+    }
+
     /// Same contract as `Sender::send` (callers already `let _ =` it), plus the wake-up.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, ev: GuiEvent) -> Result<(), std::sync::mpsc::SendError<GuiEvent>> {
+        let ev = if let Some(scope) = crate::runtime_scope::execution_scope().or_else(|| self.scope.clone()) {
+            if !crate::runtime_scope::registry().accepts(&scope) {
+                return Ok(());
+            }
+            GuiEvent::Scoped { scope, event: Box::new(ev) }
+        } else { ev };
         let res = self.tx.send(ev);
         self.ctx.request_repaint();
         res
     }
+}
+
+fn apply_import_delta(current: &mut Vec<Thread>, delta: Vec<Thread>) {
+    for imported in delta {
+        if let Some(existing) = current.iter_mut().find(|thread| thread.id == imported.id) {
+            if crate::chat::is_generic_thread_name(&existing.name)
+                && !crate::chat::is_generic_thread_name(&imported.name)
+            {
+                existing.name = imported.name.clone();
+            }
+            if existing.avatar.is_none() {
+                existing.avatar = imported.avatar.clone();
+            }
+            crate::chat::merge_cached_messages(existing, imported.messages);
+        } else { current.push(imported); }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn incoming_notification_commands(current: &[Thread], updates: &[Thread], account: &str, settings: &AppSettings, foreground: bool, live: bool, gate: &mut crate::native_notifications::DeliveryGate) -> Vec<WorkerCmd> {
+    if !live { return Vec::new(); }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let mut commands = Vec::new();
+    for update in updates {
+        let existing = current.iter().find(|thread| thread.id == update.id);
+        let muted = update.presentation.muted || existing.is_some_and(|thread| thread.presentation.muted) || settings.muted_threads.get(&update.id).is_some_and(|until| *until == -1 || *until > now);
+        let old_ids: HashSet<_> = existing.into_iter().flat_map(|thread| &thread.messages).filter_map(media_preview::message_identity).collect();
+        for message in &update.messages {
+            let Some(identity) = media_preview::message_identity(message) else { continue; };
+            if !old_ids.contains(&identity) && gate.admit(account, account, &update.id, &identity, settings.enable_notifications, muted, foreground, message.is_outgoing) {
+                commands.push(WorkerCmd::DeliverIncomingNotification { account: account.into(), thread: update.id.clone(), message: identity, sound: settings.play_notification_sound });
+            }
+        }
+    }
+    commands
 }
 
 pub struct ZaloGuiApp {
@@ -388,6 +630,11 @@ pub struct ZaloGuiApp {
 
     // Session state
     is_logged_in: bool,
+    phone_history_generation: u64,
+    phone_history_active: bool,
+    phone_history_status: String,
+    group_history_status: String,
+    original_reaction_import_pending: bool,
     user_name: String,
     user_uin: String,
     user_avatar: Option<String>,
@@ -405,10 +652,14 @@ pub struct ZaloGuiApp {
 
     // Chat screen state
     threads: Vec<Thread>,
+    local_history_tombstones: HashSet<(String, String)>,
+    history_revisions: HashMap<String, u64>,
     selected_thread_index: usize,
     thread_filter: ThreadFilter,
     search_query: String,
     input_message: String,
+    composer_mentions: crate::composer_mentions::ComposerMentions,
+    durable_composer: durable_composer::State,
     status_msg: String,
 
     // Reply / forward state
@@ -431,6 +682,7 @@ pub struct ZaloGuiApp {
     phone_lookup_error: Option<String>,
     in_chat_search_open: bool,
     in_chat_search_query: String,
+    archive_search_request: (String, String),
     in_chat_search_focus_pending: bool,
     // Sticker picker & image cache state
     sticker_picker_open: bool,
@@ -467,8 +719,14 @@ pub struct ZaloGuiApp {
     checking_friend_status: HashSet<String>,
     user_online_map: HashMap<String, (bool, String)>,
     allow_quit: bool,
+    shutdown_pending: bool,
     settings_modal_open: bool,
     settings_tab: SettingsTab,
+    notification_authorization: crate::native_notifications::AuthorizationState,
+    notification_delivery: crate::native_notifications::DeliveryGate,
+    failed_photo_previews: HashSet<String>,
+    native_photo_pending: bool,
+    photo_texture_budget: crate::media_resources::ResourceLru,
     settings: AppSettings,
     settings_blur_tex: Option<TextureHandle>,
     settings_blur_req_at: Option<std::time::Instant>,
@@ -489,6 +747,7 @@ pub struct ZaloGuiApp {
     feed_modal_tab: FeedModalTab,
     feed_target_uid: String,
     feed_loading_profile: bool,
+    feed_profile_request_id: u64,
     feed_profile: Option<crate::feed::SocialUserProfile>,
     feed_profile_error: Option<String>,
     feed_loading_avatars: bool,
@@ -515,6 +774,13 @@ pub struct ZaloGuiApp {
     event_tx: Sender<GuiEvent>,
     /// (thread id, number of newest bubbles rendered) — see `CHAT_RENDER_STEP`.
     chat_render_window: (String, usize),
+    quote_jump: Option<QuoteJump>,
+    quote_lookup_generation: u64,
+    quote_lookup_thread: String,
+    read_visibility: crate::read_receipts::ReadVisibilityGate,
+    live_read_ledger: crate::read_receipts::LiveReadLedger,
+    visible_read_pending: bool,
+    read_last_attempt_ms: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -575,16 +841,9 @@ impl ZaloGuiApp {
         // main() already read threads_cache.json and hydrated it from SQLite; reading, merging,
         // hydrating and rewriting the cache again here doubled startup I/O.
         let mut threads = initial_threads;
-        if let Some(li) = session.login.as_ref() {
-            if !li.send2me_id.is_empty() {
-                for t in threads.iter_mut() {
-                    if !t.is_group && t.name.contains("Cloud của tôi") {
-                        t.id = li.send2me_id.clone();
-                    }
-                }
-            }
-        }
-        crate::chat::deduplicate_threads(&mut threads, None);
+        // A display name or avatar is not evidence that two conversation IDs alias.
+        let mut seen = HashSet::new();
+        threads.retain(|thread| seen.insert(thread.id.clone()));
 
         let selected_thread_index = threads
             .iter()
@@ -596,7 +855,12 @@ impl ZaloGuiApp {
         let app = Self {
             dark_mode,
             theme_dirty: false,
+            phone_history_generation: 0,
+            phone_history_active: false,
+            phone_history_status: "Lịch sử trên điện thoại cần xác nhận đồng bộ riêng".into(),
+            group_history_status: "Lịch sử nhóm: chờ yêu cầu".into(),
             is_logged_in,
+            original_reaction_import_pending: false,
             user_name,
             user_uin,
             user_avatar,
@@ -608,10 +872,14 @@ impl ZaloGuiApp {
             qr_texture: None,
             qr_status: "Đang tạo mã QR đăng nhập…".into(),
             threads,
+            local_history_tombstones: HashSet::new(),
+            history_revisions: HashMap::new(),
             selected_thread_index,
             thread_filter: ThreadFilter::All,
             search_query: String::new(),
             input_message: String::new(),
+            composer_mentions: Default::default(),
+            durable_composer: Default::default(),
             replying_to: None,
             forward_msg: None,
             forward_filter: String::new(),
@@ -630,6 +898,7 @@ impl ZaloGuiApp {
             phone_lookup_error: None,
             in_chat_search_open: false,
             in_chat_search_query: String::new(),
+            archive_search_request: (String::new(), String::new()),
             in_chat_search_focus_pending: false,
             sticker_picker_open: false,
             sticker_tab: StickerTab::Popular,
@@ -671,8 +940,16 @@ impl ZaloGuiApp {
             checking_friend_status: HashSet::new(),
             user_online_map: HashMap::new(),
             allow_quit: false,
+            shutdown_pending: false,
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
+            notification_authorization: Default::default(),
+            notification_delivery: Default::default(),
+            failed_photo_previews: HashSet::new(),
+            native_photo_pending: false,
+            photo_texture_budget: crate::media_resources::ResourceLru::new(
+                crate::media_resources::TEXTURE_BUDGET,
+            ),
             settings: loaded_settings,
             settings_blur_tex: None,
             settings_blur_req_at: None,
@@ -693,6 +970,7 @@ impl ZaloGuiApp {
             feed_modal_tab: FeedModalTab::Profile,
             feed_target_uid: String::new(),
             feed_loading_profile: false,
+            feed_profile_request_id: 0,
             feed_profile: None,
             feed_profile_error: None,
             feed_loading_avatars: false,
@@ -716,6 +994,13 @@ impl ZaloGuiApp {
             event_rx: rx,
             event_tx: tx.clone(),
             chat_render_window: (String::new(), CHAT_RENDER_STEP),
+            quote_jump: None,
+            quote_lookup_generation: 0,
+            quote_lookup_thread: String::new(),
+            read_visibility: Default::default(),
+            live_read_ledger: Default::default(),
+            visible_read_pending: false,
+            read_last_attempt_ms: 0,
         };
         let mut app = app;
         let _ = app.reload_custom_sticker_packs();
@@ -734,13 +1019,19 @@ impl ZaloGuiApp {
             GuiTx {
                 tx,
                 ctx: cc.egui_ctx.clone(),
+                scope: None,
             },
             cc.egui_ctx.clone(),
         );
+        app.publish_known_threads();
         ensure_cjk_font(&cc.egui_ctx, thread_texts(&app.threads));
 
         if let Some(wtx) = WORKER_TX.get() {
             if is_logged_in {
+                let _ = wtx.send(WorkerCmd::ReplayReactions {
+                    account: app.user_uin.clone(),
+                    threads: app.threads.clone(),
+                });
                 let _ = wtx.send(WorkerCmd::RefreshThreads);
             } else {
                 let _ = wtx.send(WorkerCmd::RequestQr);
@@ -780,31 +1071,270 @@ impl ZaloGuiApp {
     /// Hand the worker's poll timer the thread ids/names it maps incoming messages onto.
     fn publish_known_threads(&self) {
         if let Ok(mut known) = KNOWN_THREADS.lock() {
-            *known = self
-                .threads
-                .iter()
-                .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
-                .collect();
+            let generation = WORKER_TX.get().map(|tx| tx.ui_generation()).unwrap_or_else(|| crate::runtime_scope::registry().generation());
+            if generation != crate::runtime_scope::registry().generation() { return; }
+            *known = (generation, self.threads.iter().map(|t| (t.id.clone(), t.name.clone(), t.is_group)).collect());
         }
     }
 
-    fn persist_threads_async(&self) {
-        self.publish_known_threads();
-        let snapshot = self.threads.clone();
+    fn reset_epoch_inflight(&mut self, ctx: &egui::Context) {
+        self.phone_history_generation = self.phone_history_generation.wrapping_add(1);
+        self.phone_history_active = false;
+        self.phone_history_status = "Phiên đồng bộ đã thay đổi; hãy yêu cầu lại".into();
+        self.group_history_status = "Lịch sử nhóm: chờ yêu cầu của phiên hiện tại".into();
+        emoji_text::reset_pending(ctx);
+        self.read_visibility.reset();
+        self.live_read_ledger = Default::default();
+        self.visible_read_pending = false;
+        self.read_last_attempt_ms = 0;
+        self.durable_composer.reset_loads();
+        self.native_photo_pending = false;
+        self.original_reaction_import_pending = false;
+        reset_epoch_loading(
+            &mut [&mut self.loading_stickers, &mut self.composer_sticker_loading,
+                &mut self.loading_link_previews, &mut self.checking_friend_status],
+            &mut self.loading_sticker_packs,
+            &mut [&mut self.login_in_progress, &mut self.phone_lookup_loading,
+                &mut self.sticker_store_loading, &mut self.sticker_search_loading,
+                &mut self.feed_loading_profile, &mut self.feed_loading_avatars,
+                &mut self.feed_loading_timeline],
+        );
+        self.last_sticker_search_dispatched.clear();
+    }
+
+    /// Version profile requests at the UI intent boundary, including error completions.
+    pub(super) fn request_social_profile(&mut self, target_uid: String) {
+        let Some(request_id) = self.feed_profile_request_id.checked_add(1) else { return; };
+        self.feed_profile_request_id = request_id;
+        self.feed_target_uid = target_uid.clone();
+        self.feed_loading_profile = true;
+        self.feed_profile = None;
+        self.feed_profile_error = None;
+        if WORKER_TX.get().map(|tx| tx.send(WorkerCmd::FetchSocialProfile { target_uid, request_id }).is_ok()) != Some(true) {
+            self.feed_loading_profile = false;
+            self.feed_profile_error = Some("Chưa kết nối được tiến trình nền để đọc hồ sơ".into());
+        }
+    }
+
+    fn request_shutdown(&mut self) {
+        if self.shutdown_pending || self.allow_quit { return; }
+        self.shutdown_pending = true;
+        self.status_msg = "Đang lưu dữ liệu và dừng cuộc gọi…".into();
+        if WORKER_TX.get().map(|tx| tx.send(WorkerCmd::Shutdown).is_ok()) != Some(true) {
+            self.shutdown_pending = false;
+            self.status_msg = "Chưa kết nối được tiến trình nền để đóng ứng dụng".into();
+        }
+    }
+
+    fn replay_reactions_async(&self) {
         if let Some(wtx) = WORKER_TX.get() {
-            let _ = wtx.send(WorkerCmd::PersistThreads(snapshot));
+            let _ = wtx.send(WorkerCmd::ReplayReactions {
+                account: self.user_uin.clone(),
+                threads: self.threads.clone(),
+            });
+        }
+    }
+
+    fn persist_threads_async(&mut self) {
+        self.publish_known_threads();
+        if let Some(wtx) = WORKER_TX.get() {
+            match history_retention::stage_gui(self.user_uin.clone(),wtx.ui_generation(),self.threads.clone()) {
+                Ok(true) => { if wtx.send(WorkerCmd::FlushHistory).is_err() { self.status_msg="Bộ xử lý đã đóng; lịch sử vẫn chờ lưu".into(); } }
+                Ok(false) => {}
+                Err(error) => {self.status_msg=error;}
+            }
         }
     }
 
     fn check_events(&mut self, ctx: &egui::Context) {
+        let selected = self.threads.get(self.selected_thread_index).map(|thread| thread.id.clone()).unwrap_or_default();
+        if selected != self.quote_lookup_thread {
+            self.quote_lookup_thread = selected;
+            self.quote_lookup_generation = self.quote_lookup_generation.wrapping_add(1);
+        }
         while let Ok(event) = self.event_rx.try_recv() {
+            let event = match event {
+                GuiEvent::Scoped { scope, event } => {
+                    if !crate::runtime_scope::registry().accepts(&scope) { continue; }
+                    let transition = is_epoch_transition(&event);
+                    if let Some(tx) = WORKER_TX.get() {
+                        if transition {
+                            if tx.ui_generation() != scope.generation { self.reset_epoch_inflight(ctx); }
+                            tx.acknowledge_ui_generation(scope.generation);
+                        }
+                        else if !epoch_event_allowed(tx.ui_generation(), scope.generation, &event) { continue; }
+                    }
+                    *event
+                }
+                event => event,
+            };
+            let event = match event {
+                GuiEvent::AccountThreadsUpdated { account, threads, live } => {
+                    if !self.is_logged_in || account != self.user_uin { continue; }
+                    if live { GuiEvent::LiveThreadsUpdated(threads) } else { GuiEvent::ThreadsUpdated(threads) }
+                }
+                other => other,
+            };
+            let live_arrival = matches!(&event, GuiEvent::LiveThreadsUpdated(_));
             match event {
+                GuiEvent::AuthenticationStarted => {
+                    self.is_logged_in = false;
+                    self.login_in_progress = true;
+                    // Keep the in-memory composer untouched; durable draft policy is independent.
+                    self.login_status_msg.clear();
+                }
+                GuiEvent::LifecycleFlushFailed(error) => {
+                    self.shutdown_pending = false;
+                    self.show_toast(error);
+                }
+                GuiEvent::ShutdownFinished(result) => {
+                    self.shutdown_pending = false;
+                    match result {
+                        Ok(()) => { self.allow_quit = true; ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+                        Err(error) => { self.status_msg = error.clone(); self.show_toast(error); }
+                    }
+                }
+                GuiEvent::Scoped { .. } => continue,
+                GuiEvent::AccountThreadsUpdated { .. } => unreachable!("account event normalized above"),
+                GuiEvent::HistoryThreadDeleted { account, thread_id, result } => {
+                    if self.is_logged_in && account == self.user_uin {
+                        match result {
+                            Ok(()) => {
+                                let revision = self.history_revisions.entry(thread_id.clone()).or_default();
+                                *revision = revision.wrapping_add(1);
+                                if let Some(thread) = self.threads.iter().find(|thread| thread.id == thread_id) {
+                                    self.local_history_tombstones.extend(thread.messages.iter().map(|message| (thread_id.clone(), message.id.clone())));
+                                }
+                                self.threads.retain(|thread| thread.id != thread_id);
+                                self.selected_thread_index = self.selected_thread_index.min(self.threads.len().saturating_sub(1));
+                                self.unread_counts.remove(&thread_id);
+                                self.settings.pinned_threads.retain(|id| id != &thread_id);
+                                self.settings.save();
+                                self.show_toast("Đã xóa lịch sử hội thoại ở phía bạn");
+                            }
+                            Err(message) => self.show_toast(message),
+                        }
+                    }
+                }
+                GuiEvent::HistoryPageLoaded { account, thread_id, revision, result } => {
+                    if self.is_logged_in && account == self.user_uin && history::revision_matches(&self.history_revisions, &thread_id, revision) {
+                        match result {
+                            Ok((messages, has_more)) => {
+                                history::merge_cached_page(&mut self.threads, &self.local_history_tombstones, &thread_id, messages);
+                                if !has_more { self.show_toast("Đã tải hết trang lịch sử cục bộ hiện có"); }
+                            }
+                            Err(message) => self.show_toast(message),
+                        }
+                    }
+                }
+                GuiEvent::HistoryNavigationLoaded { account, thread_id, reference, request_id, revision, result } => {
+                    if self.is_logged_in && account == self.user_uin
+                        && history::revision_matches(&self.history_revisions, &thread_id, revision)
+                        && self.threads.get(self.selected_thread_index).is_some_and(|thread| quote_reply_matches(&thread.id, self.quote_lookup_generation, &thread_id, request_id)) {
+                        match result {
+                            Ok(Some((_, messages))) => {
+                                history::merge_cached_page(&mut self.threads, &self.local_history_tombstones, &thread_id, messages);
+                                self.filter_starred_only = false;
+                                self.in_chat_search_open = false;
+                                self.in_chat_search_query.clear();
+                                self.quote_jump = Some(QuoteJump { thread_id, reference, highlight_until: std::time::Instant::now() + Duration::from_secs(3), scroll_pending: true });
+                            }
+                            Ok(None) => self.show_toast("Không có tin nhắn gốc với định danh duy nhất trong lịch sử đã lưu"),
+                            Err(message) => self.show_toast(message),
+                        }
+                    }
+                }
+                GuiEvent::HistorySearchLoaded { account, thread_id, query, revision, result } => {
+                    if self.is_logged_in && account == self.user_uin && self.in_chat_search_open
+                        && history::revision_matches(&self.history_revisions, &thread_id, revision)
+                        && self.archive_search_request == (thread_id.clone(), query) {
+                        match result {
+                            Ok(messages) => {
+                                history::merge_cached_page(&mut self.threads, &self.local_history_tombstones, &thread_id, messages);
+                            }
+                            Err(message) => self.show_toast(message),
+                        }
+                    }
+                }
+                GuiEvent::HistoryImported { account, revisions, result } => {
+                    if self.is_logged_in && account == self.user_uin {
+                        match result {
+                            Ok((report, mut threads)) => {
+                                threads.retain(|thread| history::revision_matches(&self.history_revisions, &thread.id, *revisions.get(&thread.id).unwrap_or(&0)));
+                                for thread in &mut threads {
+                                    thread.messages.retain(|message| !self.local_history_tombstones.contains(&(thread.id.clone(), message.id.clone())));
+                                }
+                                threads.retain(|thread| !thread.messages.is_empty() || !self.local_history_tombstones.iter().any(|(id,_)| id == &thread.id));
+                                apply_import_delta(&mut self.threads, threads);
+                                self.persist_threads_async();
+                                self.show_toast(format!(
+                                    "Đã nhập {} tin nhắn từ {} hội thoại",
+                                    report.messages, report.threads
+                                ));
+                            }
+                            Err(_) => self
+                                .show_toast("Lỗi nhập lịch sử. Hãy kiểm tra tệp nguồn và thử lại."),
+                        }
+                    }
+                }
+                GuiEvent::VisibleReadFinished { account, thread_id, visible, unsent, local, seen } => {
+                    if account == self.user_uin {
+                        self.visible_read_pending = false;
+                        self.live_read_ledger.release_unsent(&thread_id, &unsent);
+                        if matches!(local, Ok(true)) {
+                            if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == thread_id) {
+                                crate::read_receipts::read_local_visible(&mut thread.unread, &visible);
+                                if thread.unread.has_badge() { self.unread_counts.insert(thread_id, thread.unread.count().max(1)); }
+                                else { self.unread_counts.remove(&thread_id); }
+                            }
+                        } else if local.is_err() { self.show_toast("Lỗi lưu trạng thái đọc local. Trạng thái chưa được xác nhận."); }
+                        if seen.is_err() { self.show_toast("Đã lưu trạng thái đọc local; kết quả gửi xác nhận xem chưa rõ."); }
+                    }
+                }
+                GuiEvent::NativePhotoViewerFinished { account, result } => {
+                    if account == self.user_uin { self.native_photo_pending = false; }
+                    if self.is_logged_in && account == self.user_uin && result.is_err() {
+                        self.show_toast("Lỗi mở trình xem gốc. Ảnh vẫn có trong trình xem hiện tại; bạn có thể thử lại.");
+                    }
+                }
+                GuiEvent::PhotoPreviewReady {
+                    account,
+                    key,
+                    result,
+                } => {
+                    self.loading_stickers.remove(&key);
+                    if self.is_logged_in && account == self.user_uin {
+                        match result {
+                            Ok(image) => {
+                                self.failed_photo_previews.remove(&key);
+                                let bytes = image.pixels.len() as u64 * 4;
+                                let evicted = self.photo_texture_budget.insert(key.clone(), bytes);
+                                let tex = ctx.load_texture(&key, image, TextureOptions::LINEAR);
+                                self.sticker_textures.insert(key, tex);
+                                for evicted in evicted {
+                                    self.sticker_textures.remove(&evicted);
+                                }
+                            }
+                            Err(_) => {
+                                self.failed_photo_previews.insert(key);
+                            }
+                        }
+                    }
+                }
+                GuiEvent::IncomingNotificationFinished { result } => {
+                    if result.is_err() {
+                        crate::logger::log_error(
+                            "gui::notification",
+                            "Incoming notification helper failed",
+                        );
+                    }
+                }
+                GuiEvent::NotificationAuthorization { request_id, result } => {
+                    self.notification_authorization.finish(request_id, result);
+                }
                 GuiEvent::QrReady { qr_image, .. } => {
-                    self.qr_texture = Some(ctx.load_texture(
-                        "qr_code_tex",
-                        qr_image,
-                        TextureOptions::NEAREST,
-                    ));
+                    self.qr_texture =
+                        Some(ctx.load_texture("qr_code_tex", qr_image, TextureOptions::NEAREST));
                     self.qr_status = "Mở ứng dụng Zalo trên điện thoại và quét mã QR".into();
                     self.login_in_progress = false;
                 }
@@ -813,8 +1343,29 @@ impl ZaloGuiApp {
                         format!("Đã quét bởi {name} — Vui lòng bấm 'Đăng nhập' trên điện thoại…");
                 }
                 GuiEvent::LoginSuccess { name, uin, avatar } => {
+                    self.read_visibility.reset();
+                    self.live_read_ledger = Default::default();
+                    self.visible_read_pending = false;
+                    self.original_reaction_import_pending = false;
+                    if self.user_uin != uin {
+                        self.threads.clear();
+                        self.selected_thread_index = 0;
+                    }
+                    self.publish_known_threads();
                     self.is_logged_in = true;
                     self.user_name = name;
+                    if self.user_uin != uin {
+                        self.composer_mentions = Default::default();
+                        self.durable_composer = Default::default();
+                        self.input_message.clear();
+                        self.replying_to = None;
+                        self.threads.clear();
+                        self.local_history_tombstones.clear();
+                    self.history_revisions.clear();
+                        self.selected_thread_index = 0;
+                        self.quote_jump = None;
+                        self.archive_search_request = (String::new(), String::new());
+                    }
                     self.user_uin = uin;
                     if avatar.is_some() {
                         self.user_avatar = avatar;
@@ -827,18 +1378,99 @@ impl ZaloGuiApp {
                     self.login_in_progress = false;
                     self.login_status_msg = format!("Lỗi đăng nhập: {err}");
                 }
-                GuiEvent::ThreadsUpdated(updates) => {
+                GuiEvent::OriginalReactionImportFinished { account, result } => {
+                    if self.user_uin == account && self.is_logged_in {
+                        self.original_reaction_import_pending = false;
+                        match result {
+                            Ok(Some(cache)) => {
+                                // Pure reducer on the current UI state protects edits and live clears
+                                // that arrived while the worker validated and retained the file.
+                                let summary = cache.apply_to_threads(&mut self.threads);
+                                if summary.messages_updated > 0 {
+                                    self.persist_threads_async();
+                                }
+                                self.replay_reactions_async();
+                                self.show_toast(format!("Đã lưu {} snapshot cảm xúc; cập nhật {} tin đang tải, giữ nguyên {} tin có trạng thái mới, bỏ qua {} kết quả không duy nhất", summary.snapshots_loaded, summary.messages_updated, summary.messages_protected, summary.ambiguous_matches));
+                            }
+                            Ok(None) => self.show_toast("Đã hủy nhập cache cảm xúc"),
+                            Err(error) => self.show_toast(error.message()),
+                        }
+                    }
+                }
+                GuiEvent::DeliveryEvents { account, events } => {
+                    if self.is_logged_in
+                        && self.user_uin == account
+                        && !crate::delivery_receipts::apply_delivery_events(
+                            &mut self.threads, &events,
+                        ).is_empty()
+                    {
+                        self.persist_threads_async();
+                    }
+                }
+                GuiEvent::PhoneHistoryStatus {
+                    generation,
+                    account,
+                    message,
+                    active,
+                } => {
+                    if phone_history::accepts_event(
+                        self.is_logged_in,
+                        self.phone_history_generation,
+                        &self.user_uin,
+                        generation,
+                        &account,
+                    ) {
+                        self.phone_history_status = message;
+                        self.phone_history_active = active;
+                    }
+                }
+                GuiEvent::PhoneHistoryThreads {
+                    generation,
+                    account,
+                    threads,
+                } => {
+                    if phone_history::accepts_event(
+                        self.is_logged_in,
+                        self.phone_history_generation,
+                        &self.user_uin,
+                        generation,
+                        &account,
+                    ) {
+                        apply_import_delta(&mut self.threads, threads);
+                        self.replay_reactions_async();
+                    }
+                }
+                GuiEvent::GroupHistoryStatus(status) => self.group_history_status = status,
+                GuiEvent::GroupHistoryThreads { account, threads } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        apply_import_delta(&mut self.threads, threads);
+                        self.replay_reactions_async();
+                    }
+                }
+
+                GuiEvent::ReactionEvents { account } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        self.replay_reactions_async();
+                    }
+                }
+                GuiEvent::ReactionThreadsUpdated { account, threads } => {
+                    if self.is_logged_in
+                        && self.user_uin == account
+                        && crate::reaction_journal::merge_loaded_reactions(
+                            &mut self.threads,
+                            &threads,
+                        )
+                    {
+                        self.persist_threads_async();
+                    }
+                }
+                GuiEvent::ThreadsUpdated(updates) | GuiEvent::LiveThreadsUpdated(updates) => {
                     ensure_cjk_font(ctx, thread_texts(&updates));
                     if self.is_logged_in && !updates.is_empty() {
-                        let prev_selected_name = self
+                        let prev_selected_id = self
                             .threads
                             .get(self.selected_thread_index)
-                            .map(|t| (t.name.clone(), t.is_group));
-                        let live_ids: HashSet<String> = updates
-                            .iter()
-                            .filter(|u| !u.id.is_empty() && u.id != "0")
-                            .map(|u| u.id.clone())
-                            .collect();
+                            .map(|t| t.id.clone());
 
                         let active_tid = self
                             .threads
@@ -847,8 +1479,14 @@ impl ZaloGuiApp {
                             .unwrap_or_default();
                         let is_focused = ctx.input(|i| i.focused);
                         let mut new_incoming_alert = false;
+                        if live_arrival { self.live_read_ledger.observe(&self.user_uin, &self.threads, &updates); }
+                        for command in incoming_notification_commands(&self.threads, &updates, &self.user_uin, &self.settings, is_focused, live_arrival, &mut self.notification_delivery) {
+                            if let Some(tx) = WORKER_TX.get() { let _ = tx.send(command); }
+                        }
 
-                        for nt in updates {
+
+                        for mut nt in updates {
+                            nt.messages.retain(|message| !self.local_history_tombstones.contains(&(nt.id.clone(), message.id.clone())));
                             if let Some(existing) = self.threads.iter_mut().find(|t| t.id == nt.id)
                             {
                                 let old_len = existing.messages.len();
@@ -870,11 +1508,6 @@ impl ZaloGuiApp {
                                         new_incoming_alert = true;
                                     }
                                 }
-                            } else if let Some(existing) = self.threads.iter_mut().find(|t| {
-                                !live_ids.contains(&t.id)
-                                    && crate::chat::threads_represent_same_contact(t, &nt)
-                            }) {
-                                crate::chat::merge_thread_into(existing, nt, true);
                             } else if !nt.id.is_empty() && nt.id != "0" {
                                 self.threads.push(nt);
                             }
@@ -889,20 +1522,19 @@ impl ZaloGuiApp {
                             };
                             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
                             if !is_focused {
-                                ctx.send_viewport_cmd(
-                                    egui::ViewportCommand::RequestUserAttention(
-                                        egui::UserAttentionType::Informational,
-                                    ),
-                                );
+                                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                                    egui::UserAttentionType::Informational,
+                                ));
                             }
                         }
-                        crate::chat::deduplicate_threads(&mut self.threads, Some(&live_ids));
+                        let mut seen = HashSet::new();
+                        self.threads.retain(|thread| seen.insert(thread.id.clone()));
 
-                        if let Some((sel_name, sel_grp)) = prev_selected_name {
+                        if let Some(selected_id) = prev_selected_id {
                             if let Some(idx) = self
                                 .threads
                                 .iter()
-                                .position(|t| t.is_group == sel_grp && t.name == sel_name)
+                                .position(|t| t.id == selected_id)
                             {
                                 self.selected_thread_index = idx;
                             }
@@ -911,10 +1543,17 @@ impl ZaloGuiApp {
                             self.selected_thread_index = self.threads.len().saturating_sub(1);
                         }
                         self.persist_threads_async();
+                        self.replay_reactions_async();
                     }
                     self.status_msg = format!("Trực tuyến · Cập nhật {}", crate::ui::clock());
                 }
                 GuiEvent::SessionExpired(reason) => {
+                    self.read_visibility.reset();
+                    self.live_read_ledger = Default::default();
+                    self.visible_read_pending = false;
+                    self.original_reaction_import_pending = false;
+                    self.phone_history_generation = self.phone_history_generation.wrapping_add(1);
+                    self.phone_history_active = false;
                     self.is_logged_in = false;
                     self.qr_texture = None;
                     self.qr_status = format!(
@@ -927,22 +1566,124 @@ impl ZaloGuiApp {
                     // let the next poll retry (#21).
                     self.status_msg = format!("⚠️ {reason} — đang thử lại…");
                 }
+                GuiEvent::HistoryClearFailed(error) => { self.status_msg = error.clone(); self.show_toast(error); }
                 GuiEvent::LocalDataWiped => {
                     self.threads.clear();
+                    self.composer_mentions = Default::default();
+                    self.durable_composer = Default::default();
+                    self.input_message.clear();
+                    self.replying_to = None;
+                    self.publish_known_threads();
                     self.selected_thread_index = 0;
                     self.status_msg = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên)".into();
                 }
                 GuiEvent::LoggedOut => {
+                    self.read_visibility.reset();
+                    self.live_read_ledger = Default::default();
+                    self.visible_read_pending = false;
+                    self.native_photo_pending = false;
+                    self.local_history_tombstones.clear();
+                    self.history_revisions.clear();
+                    self.original_reaction_import_pending = false;
+                    self.phone_history_generation = self.phone_history_generation.wrapping_add(1);
+                    self.phone_history_active = false;
                     self.is_logged_in = false;
                     self.user_name.clear();
                     self.user_uin.clear();
                     self.threads.clear();
+                    self.composer_mentions = Default::default();
+                        self.durable_composer = Default::default();
+                    self.input_message.clear();
+                    self.replying_to = None;
                     self.selected_thread_index = 0;
                     self.qr_texture = None;
                     self.qr_status = "Đang xin mã QR mới…".into();
                     self.status_msg = "Đã đăng xuất".into();
+                    self.publish_known_threads();
+                }
+                GuiEvent::ComposerAttachmentPicked { account, thread, path } => {
+                    if self.is_logged_in && self.user_uin == account { self.durable_composer.add_path(&thread, path); }
+                }
+                GuiEvent::ComposerStaged { account, thread, draft } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        self.durable_composer.staged(&thread);
+                        let visible = self.threads.get(self.selected_thread_index).is_some_and(|current| current.id == thread);
+                        if self.durable_composer.attachments_match(&thread, &draft.attachments)
+                            && !(visible && self.pending_clipboard_image.is_some())
+                            && self.composer_mentions.acknowledge_staged(&thread, &draft, &mut self.input_message, &mut self.replying_to) {
+                            self.durable_composer.acknowledge_attachments(&thread, &draft.attachments);
+                            if self.threads.get(self.selected_thread_index).is_some_and(|current| current.id == thread) { self.pending_clipboard_image = None; }
+                        }
+                    }
+                }
+                GuiEvent::ComposerStageFailed { account, thread, error } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        self.durable_composer.staging.remove(&thread);
+                        self.durable_composer.invalidate_snapshot();
+                        self.show_toast(format!("Chưa gửi; nháp được giữ: {error}"));
+                    }
+                }
+                GuiEvent::ComposerLoaded { account, thread, revision, result } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        match result {
+                            Ok((draft, entries)) => {
+                                self.durable_composer.recovery = entries;
+                                if self.durable_composer.accept_load(&account, &thread, revision)
+                                    && self.input_message.is_empty() && self.replying_to.is_none()
+                                    && self.durable_composer.attachments.is_empty() {
+                                    self.composer_mentions.restore_failed(&thread, draft.text, &draft.mentions, draft.reply,
+                                        &mut self.input_message, &mut self.replying_to);
+                                    self.durable_composer.attachments = draft.attachments;
+                                    self.durable_composer.invalidate_snapshot();
+                                }
+                            }
+                            Err(error) => self.show_toast(format!("Đọc nháp thất bại: {error}")),
+                        }
+                    }
+                }
+                GuiEvent::ComposerRecovered { account, revision, result } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        match result {
+                            Ok((thread, draft)) => {
+                                if self.durable_composer.accept_load(&account, &thread, revision)
+                                    && self.input_message.is_empty() && self.replying_to.is_none()
+                                    && self.durable_composer.attachments.is_empty() {
+                                    self.composer_mentions.restore_failed(&thread, draft.text, &draft.mentions, draft.reply,
+                                        &mut self.input_message, &mut self.replying_to);
+                                    self.durable_composer.attachments = draft.attachments;
+                                    self.durable_composer.invalidate_snapshot();
+                                    self.durable_composer.recovery.retain(|entry| entry.thread_id != thread);
+                                } else {
+                                    self.durable_composer.reload_later(&thread);
+                                    self.show_toast("Phần khôi phục đã lưu thành nháp; ô soạn hiện tại được giữ nguyên");
+                                }
+                            }
+                            Err(error) => self.show_toast(format!("Khôi phục nháp thất bại: {error}")),
+                        }
+                    }
+                }
+                GuiEvent::ComposerOutbox { account, entries } => {
+                    if self.is_logged_in && self.user_uin == account { self.durable_composer.recovery = entries; }
+                }
+                GuiEvent::ComposerMessageSent { account, thread_id, msg } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == thread_id) {
+                            thread.preview = msg.text.clone();
+                            thread.time = msg.time.clone();
+                            merge_sent_message(thread, msg);
+                            self.persist_threads_async();
+                        }
+                    }
+                }
+                GuiEvent::ComposerSendFailed { account, thread_id, text, mentions, quoted, error } => {
+                    if self.is_logged_in && self.user_uin == account {
+                        self.composer_mentions.restore_failed(&thread_id, text, &mentions, quoted,
+                            &mut self.input_message, &mut self.replying_to);
+                        self.show_toast(format!("Gửi thất bại: {error}"));
+                    }
                 }
                 GuiEvent::MessageSent {
+                    client_message_id,
                     thread_id,
                     text,
                     msg_id,
@@ -952,27 +1693,29 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!("out_{}", crate::login::unix_now())
+                            format!("out_{client_message_id}")
                         } else {
                             msg_id
                         };
-                        if !t.messages.iter().any(|m| !m.id.is_empty() && m.id == final_id) {
-                            t.messages.push(ChatMessage {
+                        merge_sent_message(
+                            t,
+                            ChatMessage {
                                 id: final_id,
+                                client_message_id,
                                 sender: "Tôi".into(),
                                 text,
                                 time: now,
                                 is_outgoing: true,
                                 ts: (crate::login::unix_now() * 1000) as i64,
                                 ..Default::default()
-                            });
-                            t.messages.sort_by_key(|m| m.ts);
-                        }
+                            },
+                        );
                         self.persist_threads_async();
                     }
                     self.status_msg = format!("Đã gửi tin nhắn lúc {}", crate::ui::clock());
                 }
                 GuiEvent::StickerSent {
+                    client_message_id,
                     thread_id,
                     msg_id,
                     sticker_id,
@@ -984,13 +1727,15 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!("out_{}", crate::login::unix_now())
+                            format!("out_{client_message_id}")
                         } else {
                             msg_id
                         };
-                        if !t.messages.iter().any(|m| !m.id.is_empty() && m.id == final_id) {
-                            t.messages.push(ChatMessage {
+                        merge_sent_message(
+                            t,
+                            ChatMessage {
                                 id: final_id,
+                                client_message_id,
                                 sender: "Tôi".into(),
                                 text: "[Nhãn dán]".into(),
                                 time: now,
@@ -1000,9 +1745,8 @@ impl ZaloGuiApp {
                                 sticker_cate_id: Some(cate_id),
                                 sticker_type: Some(sticker_type),
                                 ..Default::default()
-                            });
-                            t.messages.sort_by_key(|m| m.ts);
-                        }
+                            },
+                        );
                         self.persist_threads_async();
                     }
                     self.status_msg = format!("Đã gửi nhãn dán lúc {}", crate::ui::clock());
@@ -1011,15 +1755,13 @@ impl ZaloGuiApp {
                     if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
                         t.preview = msg.text.clone();
                         t.time = msg.time.clone();
-                        if !t.messages.iter().any(|m| !m.id.is_empty() && m.id == msg.id) {
-                            t.messages.push(msg);
-                            t.messages.sort_by_key(|m| m.ts);
-                        }
+                        merge_sent_message(t, msg);
                         self.persist_threads_async();
                     }
                     self.status_msg = format!("Đã gửi đính kèm lúc {}", crate::ui::clock());
                 }
                 GuiEvent::QuoteSent {
+                    client_message_id,
                     thread_id,
                     text,
                     msg_id,
@@ -1030,13 +1772,15 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!("out_{}", crate::login::unix_now())
+                            format!("out_{client_message_id}")
                         } else {
                             msg_id
                         };
-                        if !t.messages.iter().any(|m| !m.id.is_empty() && m.id == final_id) {
-                            t.messages.push(ChatMessage {
+                        merge_sent_message(
+                            t,
+                            ChatMessage {
                                 id: final_id,
+                                client_message_id,
                                 sender: "Tôi".into(),
                                 text,
                                 time: now,
@@ -1046,9 +1790,8 @@ impl ZaloGuiApp {
                                 reply_to_sender: Some(quoted.sender.clone()),
                                 reply_to_text: Some(quoted.text.clone()),
                                 ..Default::default()
-                            });
-                            t.messages.sort_by_key(|m| m.ts);
-                        }
+                            },
+                        );
                         self.persist_threads_async();
                     }
                     self.status_msg = format!("Đã gửi trả lời lúc {}", crate::ui::clock());
@@ -1074,6 +1817,7 @@ impl ZaloGuiApp {
                     msg_id,
                     ts,
                 } => {
+                    self.local_history_tombstones.insert((thread_id.clone(), msg_id.clone()));
                     if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
                         t.messages.retain(|m| {
                             !((!msg_id.is_empty() && m.id == msg_id)
@@ -1107,6 +1851,9 @@ impl ZaloGuiApp {
                         self.persist_threads_async();
                     }
                     self.status_msg = "Đã thu hồi tin nhắn với mọi người".into();
+                }
+                GuiEvent::InlineEmojiReady { cluster, sprite_id, image } => {
+                    emoji_text::accept_result(ctx, cluster, image, sprite_id);
                 }
                 GuiEvent::StickerImageReady { key, image } => {
                     self.loading_stickers.remove(&key);
@@ -1282,7 +2029,9 @@ impl ZaloGuiApp {
                                 "calling" | "ringing" => "Đang đổ chuông…".into(),
                                 "incoming_ringing" => "Cuộc gọi đến đang đổ chuông…".into(),
                                 "connecting" => "Đang kết nối luồng âm thanh/video…".into(),
-                                "incall" | "connected" => "Đang trong cuộc gọi (Pure-Rust VoIP)".into(),
+                                "incall" | "connected" => {
+                                    "Đang trong cuộc gọi (Pure-Rust VoIP)".into()
+                                }
                                 _ => format!("Đang kết nối ({state})…"),
                             };
                         }
@@ -1441,13 +2190,12 @@ impl ZaloGuiApp {
                 GuiEvent::UpdateAppliedAndRestarting(ver) => {
                     self.update_downloading = false;
                     self.show_toast(format!("✅ Đã cập nhật lên v{ver} — Đang khởi động lại…"));
-                    self.allow_quit = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    std::process::exit(0);
+                    self.request_shutdown();
                 }
-                GuiEvent::SocialProfileLoaded(res) => {
+                GuiEvent::SocialProfileLoaded { target_uid, request_id, result } => {
+                    if !profile_reply_matches(&self.feed_target_uid, self.feed_profile_request_id, &target_uid, request_id) { continue; }
                     self.feed_loading_profile = false;
-                    match res {
+                    match result {
                         Ok(prof) => {
                             self.feed_profile = Some(prof);
                             self.feed_profile_error = None;
@@ -1497,14 +2245,11 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
-            || ctx.input(|i| i.viewport().close_requested())
+        if !self.allow_quit && (ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
+            || ctx.input(|i| i.viewport().close_requested()))
         {
-            self.allow_quit = true;
-            if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::EndCall);
-            }
-            std::process::exit(0);
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_shutdown();
         }
         if self.theme_dirty {
             self.palette().apply_to_ctx(ctx);
@@ -1576,6 +2321,9 @@ impl eframe::App for ZaloGuiApp {
             self.render_chat_workspace(ctx, &pal);
         }
 
+        let now = ctx.input(|input| (input.time * 1000.0).max(0.0) as u64);
+        self.read_visibility.finish_frame(now);
+
         // Auto-notification modal for new GitHub Releases (works on both Login & Chat screens)
         self.render_update_notification_modal(ctx, &pal);
 
@@ -1594,7 +2342,8 @@ impl eframe::App for ZaloGuiApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        std::process::exit(0);
+        // Normal close already received the worker's disk/media barrier acknowledgement.
+        crate::runtime_scope::registry().invalidate_now();
     }
 }
 
@@ -1764,12 +2513,7 @@ impl ZaloGuiApp {
                         );
                         let close_resp = close_resp.on_hover_text("Đóng ứng dụng (Ctrl+Q)");
                         if close_resp.clicked() || close_resp.secondary_clicked() {
-                            self.allow_quit = true;
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::EndCall);
-                            }
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            std::process::exit(0);
+                            self.request_shutdown();
                         }
 
                         // Maximize / Restore Button (46x32)
@@ -2176,7 +2920,114 @@ impl ZaloGuiApp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn password_attempt_epoch_accepts_progress_and_failure_after_handshake() {
+        let mut ui_generation = 7;
+        let attempt_generation = 8;
+        let failed = super::GuiEvent::LoginFailed("Sai thông tin đăng nhập".into());
+        assert!(!super::epoch_event_allowed(ui_generation, attempt_generation, &failed));
+        let started = super::GuiEvent::AuthenticationStarted;
+        assert!(super::is_epoch_transition(&started));
+        assert!(super::epoch_event_allowed(ui_generation, attempt_generation, &started));
+        ui_generation = attempt_generation;
+        assert!(super::epoch_event_allowed(ui_generation, attempt_generation, &super::GuiEvent::StatusUpdate("Đang xác thực".into())));
+        assert!(super::epoch_event_allowed(ui_generation, attempt_generation, &failed));
+    }
+
+    #[test]
+    fn epoch_change_clears_pending_sticker_and_profile_work_without_clearing_completed_cache() {
+        let mut stickers = std::collections::HashSet::from(["pending-image".to_owned()]);
+        let mut packs = std::collections::HashSet::from([7]);
+        let mut profile_loading = true;
+        let completed = std::collections::HashMap::from([("cached-image", "texture")]);
+        assert!(!stickers.insert("pending-image".to_owned()));
+        super::reset_epoch_loading(&mut [&mut stickers], &mut packs, &mut [&mut profile_loading]);
+        assert!(stickers.insert("pending-image".to_owned()));
+        assert!(packs.insert(7));
+        assert!(!profile_loading);
+        assert_eq!(completed.get("cached-image"), Some(&"texture"));
+        profile_loading = true;
+        assert!(profile_loading);
+    }
+
+    #[test]
+    fn profile_success_and_error_replies_need_matching_target_and_request() {
+        assert!(super::profile_reply_matches("user-b", 3, "user-b", 3));
+        assert!(!super::profile_reply_matches("user-b", 3, "user-a", 3));
+        assert!(!super::profile_reply_matches("user-b", 3, "user-b", 2));
+        assert!(!super::profile_reply_matches("user-a", 3, "user-a", 1));
+    }
+
     use super::is_newer_semver;
+
+    #[test]
+    fn sent_message_reconciles_when_server_push_arrives_first() {
+        let mut thread = crate::chat::Thread::default();
+        let server = crate::chat::ChatMessage {
+            id: "server-a".into(),
+            client_message_id: "client-a".into(),
+            text: "Server push".into(),
+            is_outgoing: true,
+            delivery: crate::message_model::DeliveryState::Delivered,
+            ..Default::default()
+        };
+        super::merge_sent_message(&mut thread, server.clone());
+        for local_id in ["out_client-a", "server-a"] {
+            super::merge_sent_message(
+                &mut thread,
+                crate::chat::ChatMessage {
+                    id: local_id.into(),
+                    client_message_id: "client-a".into(),
+                    text: "Local echo".into(),
+                    is_outgoing: true,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(thread.messages.len(), 1);
+            assert_eq!(thread.messages[0].id, "server-a");
+            assert_eq!(thread.messages[0].delivery, server.delivery);
+        }
+    }
+
+    #[test]
+    fn delayed_local_ack_preserves_server_chronology() {
+        let mut thread = crate::chat::Thread::default();
+        for (id, client, ts) in [
+            ("server-a", "client-a", 1000),
+            ("server-b", "client-b", 2000),
+        ] {
+            thread.messages.push(crate::chat::ChatMessage {
+                id: id.into(),
+                client_message_id: client.into(),
+                ts,
+                time: ts.to_string(),
+                is_outgoing: true,
+                ..Default::default()
+            });
+        }
+        for ack_id in ["out_client-a", "server-a"] {
+            super::merge_sent_message(
+                &mut thread,
+                crate::chat::ChatMessage {
+                    id: ack_id.into(),
+                    client_message_id: "client-a".into(),
+                    ts: 3000,
+                    time: "3000".into(),
+                    is_outgoing: true,
+                    ..Default::default()
+                },
+            );
+            let chronology: Vec<_> = thread
+                .messages
+                .iter()
+                .map(|message| (message.id.as_str(), message.ts, message.time.as_str()))
+                .collect();
+            assert_eq!(
+                chronology,
+                [("server-a", 1000, "1000"), ("server-b", 2000, "2000")]
+            );
+        }
+    }
 
     #[test]
     fn semver_comparison_handles_v_prefix_and_prerelease() {
@@ -2185,5 +3036,69 @@ mod tests {
         assert!(is_newer_semver("V1.0.0-beta.1", "0.9.9"));
         assert!(!is_newer_semver("v0.0.1", "0.0.1"));
         assert!(!is_newer_semver("0.0.1", "0.0.2"));
+    }
+}
+
+#[cfg(test)]
+mod media_delivery_revision_tests {
+    use super::*;
+    #[test]
+    fn imported_old_row_never_rewinds_live_clock_or_recall_content() {
+        let live = ChatMessage {
+            id: "message-a".into(), text: "Live content".into(),
+            ts: 2000, time: "live-time".into(),
+            kind: crate::message_model::MessageKind::Text,
+            ..Default::default()
+        };
+        let old = ChatMessage {
+            id: "message-a".into(), text: "[Tin nhắn đã thu hồi]".into(),
+            ts: 1000, kind: crate::message_model::MessageKind::Recall,
+            ..Default::default()
+        };
+        let mut current = vec![Thread { id:"thread-a".into(), name:"Live name".into(), messages:vec![live], ..Default::default() }];
+        apply_import_delta(&mut current, vec![Thread { id:"thread-a".into(), name:"Old name".into(), messages:vec![old], ..Default::default() }]);
+        assert_eq!(current[0].name,"Live name");
+        let m=&current[0].messages[0];
+        assert_eq!((m.ts,m.time.as_str(),m.text.as_str()),(2000,"live-time","Live content"));
+        assert_eq!(m.kind,crate::message_model::MessageKind::Text);
+        let mut recalled = current[0].clone();
+        recalled.messages[0].kind=crate::message_model::MessageKind::Recall;
+        recalled.messages[0].text="[Tin nhắn đã thu hồi]".into();
+        let mut stale=current[0].clone();
+        stale.messages[0].link_url=Some("https://fixture.invalid/old-photo".into());
+        let mut current=vec![recalled];
+        apply_import_delta(&mut current,vec![stale]);
+        assert!(current[0].messages[0].link_url.is_none());
+        assert_eq!(current[0].messages[0].kind,crate::message_model::MessageKind::Recall);
+    }
+
+    #[test]
+    fn first_live_message_in_unknown_thread_notifies_once_but_snapshots_do_not() {
+        let updates = vec![Thread { id: "new-thread".into(), messages: vec![ChatMessage { id: "message-1".into(), ..Default::default() }], ..Default::default() }];
+        let settings = AppSettings::default();
+        let mut gate = crate::native_notifications::DeliveryGate::default();
+        assert!(incoming_notification_commands(&[], &updates, "account", &settings, false, false, &mut gate).is_empty());
+        assert_eq!(incoming_notification_commands(&[], &updates, "account", &settings, false, true, &mut gate).len(), 1);
+        assert!(incoming_notification_commands(&[], &updates, "account", &settings, false, true, &mut gate).is_empty());
+        let mut gate = crate::native_notifications::DeliveryGate::default();
+        assert!(incoming_notification_commands(&[], &updates, "account", &settings, false, false, &mut gate).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod history_intent_tests {
+    #[test]
+    fn delayed_quote_lookup_cannot_replace_a_newer_local_or_archive_intent() {
+        assert!(!super::quote_reply_matches("thread-a",2,"thread-a",1));
+        assert!(!super::quote_reply_matches("thread-b",2,"thread-a",2));
+        assert!(!super::quote_reply_matches("thread-a",3,"thread-a",1));
+        assert!(super::quote_reply_matches("thread-a",3,"thread-a",3));
+    }
+    #[test]
+    fn clear_failure_acknowledges_new_epoch_without_becoming_a_success_event() {
+        let event=super::GuiEvent::HistoryClearFailed("Fixture write failure".into());
+        assert!(super::is_epoch_transition(&event));
+        assert!(super::epoch_event_allowed(1,2,&event));
+        assert!(!matches!(event,super::GuiEvent::LocalDataWiped));
     }
 }

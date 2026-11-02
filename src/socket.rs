@@ -25,7 +25,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use futures_util::{SinkExt, StreamExt};
 use generic_array::typenum::U16;
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -48,8 +48,21 @@ pub const CMD_CTRL_ACTION: u16 = 602;
 pub const CMD_CTRL_PULL_CTRL: u16 = 603;
 pub const CMD_CTRL_PULL_VOIP: u16 = 604;
 
+/// Transfer-sync-v2 request, disposal and wakeup namespace from the archived original client.
+pub const CMD_SYNC_V2_REQUEST: u16 = 590;
+/// Dispose a coordinator-owned phone transfer round.
+pub const CMD_SYNC_V2_DISPOSE: u16 = 591;
+/// Wake the phone for an existing transfer round.
+pub const CMD_SYNC_V2_WAKEUP: u16 = 592;
+/// Local-only notification, never serialized as a wire command.
+pub const CMD_TRANSPORT_STATUS: u16 = 0;
+
 pub const CMD_PUSH_MSG_1_1: u16 = 501;
 pub const CMD_PUSH_MSG_GROUP: u16 = 521;
+/// Original direct delivery-status handler command, also used for polling responses.
+pub const CMD_PULL_DELIVERIES: u16 = 502;
+/// Original group delivery-status handler command.
+pub const CMD_GROUP_DELIVERIES: u16 = 522;
 pub const CMD_PULL_MSG_1_1: u16 = 510;
 pub const CMD_PULL_MSG_GROUP: u16 = 511;
 pub const CMD_PULL_MSG_513: u16 = 513;
@@ -81,6 +94,18 @@ fn trace_on() -> bool {
 fn trace(msg: impl std::fmt::Display) {
     if trace_on() {
         eprintln!("[ws] {msg}");
+    }
+}
+
+fn history_trace_preview(cmd: u16, payload: &Value, group_history_selected: bool) -> String {
+    let raw = payload.to_string();
+    // Capability blob URLs and phone transfer bodies are never diagnostic payloads.
+    if matches!(cmd, CMD_SYNC_V2_REQUEST | CMD_SYNC_V2_DISPOSE | CMD_SYNC_V2_WAKEUP)
+        || group_history_selected && cmd == CMD_PULL_MSG_GROUP
+        || raw.contains("transfer_sync2") {
+        "<history payload redacted>".into()
+    } else {
+        truncate(&raw, 300)
     }
 }
 
@@ -238,6 +263,97 @@ pub struct WsEvent {
     pub payload: Value,
 }
 
+/// Commands owned by the shared history/phone coordinator, never a second socket.
+#[derive(Debug, Clone)]
+pub enum WsCommand {
+    RequestGroupHistory {
+        last_id: Option<String>,
+    },
+    RequestSyncV2 {
+        session_index: u32,
+        sync_id: String,
+        ek: String,
+        ik: String,
+        device_name: String,
+        request: Value,
+        request_id: String,
+    },
+    DisposeSyncV2 {
+        sync_id: String,
+    },
+    WakeupSyncV2 {
+        data: Value,
+        request_id: String,
+    },
+}
+
+#[derive(Default)]
+struct PhoneHistoryQueue {
+    group_requests: VecDeque<Option<String>>,
+    group_in_flight: bool,
+    groups_selected: bool,
+    sync_commands: VecDeque<WsCommand>,
+}
+impl PhoneHistoryQueue {
+    fn push(&mut self, command: WsCommand) {
+        if let WsCommand::RequestGroupHistory { last_id } = command {
+            self.groups_selected = true;
+            if self.group_requests.front() == Some(&last_id) {
+                self.group_in_flight = false;
+            } else if !self.group_requests.contains(&last_id) {
+                self.group_requests.push_back(last_id);
+            }
+        } else {
+            self.sync_commands.push_back(command);
+        }
+    }
+}
+
+fn group_history_frame(last_id: Option<&str>, req_id: &str) -> Vec<u8> {
+    encode_frame(
+        CMD_PULL_MSG_GROUP,
+        1,
+        1,
+        Some(&json!({
+            "first": true, "lastId": last_id, "preIds": [], "req_id": req_id,
+        })),
+    )
+}
+
+/// Serialize sync-v2 envelopes without touching their coordinator-owned keys or queries.
+fn sync_v2_frame(command: &WsCommand) -> Option<Vec<u8>> {
+    let (cmd, body) = match command {
+        WsCommand::RequestSyncV2 {
+            session_index,
+            sync_id,
+            ek,
+            ik,
+            device_name,
+            request,
+            request_id,
+        } => (
+            CMD_SYNC_V2_REQUEST,
+            json!({"data": {
+                "syncId": sync_id, "syncType": 0, "ek": ek, "ik": ik,
+                "toDevice": 0, "tempKey": "", "deviceName": device_name,
+                "req": request, "ver": 1, "ussidx": session_index,
+            }, "reqId": request_id}),
+        ),
+        WsCommand::DisposeSyncV2 { sync_id } => (
+            CMD_SYNC_V2_DISPOSE,
+            json!({"data": {"syncId": sync_id, "toDevice": 0, "reason": 1}, "reqId": "req_disp"}),
+        ),
+        // The owning socket API passes wakeup data directly, unlike 590/591.
+        WsCommand::WakeupSyncV2 { data, request_id } => {
+            let mut body = data.as_object()?.clone();
+            body.insert("reqId".into(), Value::String(request_id.clone()));
+            (CMD_SYNC_V2_WAKEUP, Value::Object(body))
+        }
+        WsCommand::RequestGroupHistory { .. } => return None,
+    };
+    Some(encode_frame(cmd, 0, 1, Some(&body)))
+}
+
 impl WsEvent {
     /// `true` for anything that may carry a VoIP invite (`601` push, `604` pull page).
     pub fn is_voip_ish(&self) -> bool {
@@ -358,31 +474,68 @@ fn pull_next_frame(
 ///
 /// Reconnects forever with capped backoff. Dropping the returned receiver stops the task.
 pub fn spawn(sess: Session) -> mpsc::UnboundedReceiver<WsEvent> {
+    let (events, _commands) = spawn_with_history(sess);
+    events
+}
+
+/// Stream events and accept caller-controlled group history and phone transfer requests.
+/// Requests queued before authentication survive reconnects until a history response arrives.
+pub fn spawn_with_history(
+    sess: Session,
+) -> (
+    mpsc::UnboundedReceiver<WsEvent>,
+    mpsc::UnboundedSender<WsCommand>,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
+    let (commands, mut command_rx) = mpsc::unbounded_channel();
+    crate::runtime_scope::spawn_inherited(async move {
         let mut backoff = 2u64;
         let mut endpoint_idx = 0usize;
+        let mut history = PhoneHistoryQueue::default();
         loop {
-            match run_once(&sess, &tx, endpoint_idx).await {
-                Ok(reason) => trace(format!("closed: {reason}")),
-                Err(e) => trace(format!("error: {e:#}")),
+            history.group_in_flight = false;
+            tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                result = run_once(&sess, &tx, endpoint_idx, &mut command_rx, &mut history) => {
+                    match result {
+                        Ok(reason) => trace(format!("closed: {reason}")),
+                        Err(e) => trace(format!("error: {e:#}")),
+                    }
+                }
             }
-            if tx.is_closed() {
-                break;
+            // A disconnected sync round belongs to the coordinator, which must
+            // restart it with fresh session keys. Never send a stale phone prompt.
+            history.sync_commands.clear();
+            while let Ok(command) = command_rx.try_recv() {
+                if matches!(command, WsCommand::RequestGroupHistory { .. }) {
+                    history.push(command);
+                }
             }
+            let _ = tx.send(WsEvent {
+                cmd: CMD_TRANSPORT_STATUS,
+                sub_cmd: 0,
+                version: 0,
+                payload: json!({"transport": "disconnected"}),
+            });
             // `3002 NOT_FOUND_WORKER` means this shard does not host the session; rotate.
             endpoint_idx = endpoint_idx.wrapping_add(1);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            tokio::select! {
+                _ = tx.closed() => break,
+                _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+            }
             backoff = (backoff * 2).min(30);
         }
     });
-    rx
+    (rx, commands)
 }
 
 async fn run_once(
     sess: &Session,
     tx: &mpsc::UnboundedSender<WsEvent>,
     endpoint_idx: usize,
+    commands: &mut mpsc::UnboundedReceiver<WsCommand>,
+    history: &mut PhoneHistoryQueue,
 ) -> Result<String> {
     let url = build_url(sess, endpoint_idx);
     trace(format!("connect {url}"));
@@ -401,7 +554,7 @@ async fn run_once(
         h.insert(USER_AGENT, HeaderValue::from_static(UA));
     }
 
-    let (mut ws, resp) = match connect_async(req).await {
+    let (mut ws, resp) = match tokio::time::timeout(Duration::from_secs(20), connect_async(req)).await? {
         Ok(pair) => pair,
         Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
             let mut detail = format!("handshake status {}", resp.status());
@@ -421,8 +574,35 @@ async fn run_once(
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // consume the immediate first tick
 
+    let auth_deadline = tokio::time::sleep(Duration::from_secs(20));
+    tokio::pin!(auth_deadline);
+    let mut commands_open = true;
     loop {
+        if authed {
+            while let Some(command) = history.sync_commands.pop_front() {
+                if let Some(frame) = sync_v2_frame(&command) {
+                    crate::runtime_scope::check()?;
+                    ws.send(Message::Binary(frame.into())).await?;
+                }
+            }
+            if !history.group_in_flight {
+                if let Some(last_id) = history.group_requests.front() {
+                    let id = format!("req_{req_id}");
+                    req_id += 1;
+                    crate::runtime_scope::check()?;
+                    ws.send(Message::Binary(group_history_frame(last_id.as_deref(), &id).into())).await?;
+                    history.group_in_flight = true;
+                }
+            }
+        }
         tokio::select! {
+            _ = &mut auth_deadline, if !authed => bail!("auth timeout"),
+            command = commands.recv(), if commands_open => {
+                match command {
+                    Some(command) => history.push(command),
+                    None => commands_open = false,
+                }
+            }
             _ = ping.tick() => {
                 if authed {
                     let body = json!({ "eventId": now_ms() });
@@ -459,7 +639,7 @@ async fn run_once(
                 let err = envelope.get("error_code").and_then(|v| v.as_i64());
                 trace(format!(
                     "<- v{version} cmd={cmd} sub={sub_cmd} enc={encrypt} err={err:?} {}",
-                    truncate(&envelope.to_string(), 300)
+                    history_trace_preview(cmd, &envelope, history.groups_selected)
                 ));
 
                 if cmd == CMD_AUTHEN {
@@ -483,7 +663,9 @@ async fn run_once(
                     authed = true;
                     let _ = tx.send(WsEvent { cmd, sub_cmd, version, payload: auth.clone() });
 
+                    while let Ok(command) = commands.try_recv() { history.push(command); }
                     for (qcmd, qsub) in queues_from_auth(&auth) {
+                        if history.groups_selected && (qcmd, qsub) == (CMD_PULL_MSG_GROUP, 1) { continue; }
                         let id = format!("req_{req_id}");
                         req_id += 1;
                         ws.send(Message::Binary(pull_frame(qcmd, qsub, &id).into())).await?;
@@ -524,7 +706,13 @@ async fn run_once(
                         trace(format!("-> get_msg 570_0 {id}"));
                     }
                 }
-                if payload.pointer("/data/more").and_then(|v| v.as_i64()) == Some(1) {
+                let group_history = history.groups_selected && (cmd, sub_cmd) == (CMD_PULL_MSG_GROUP, 1);
+                if group_history && history.group_in_flight {
+                    history.group_requests.pop_front();
+                    history.group_in_flight = false;
+                }
+                if !group_history && !matches!(cmd, CMD_SYNC_V2_REQUEST | CMD_SYNC_V2_DISPOSE | CMD_SYNC_V2_WAKEUP)
+                    && payload.pointer("/data/more").and_then(|v| v.as_i64()) == Some(1) {
                     let qkey = format!("{cmd}_{sub_cmd}");
                     let last_id = payload
                         .pointer("/data/lastActionId")
@@ -601,4 +789,208 @@ mod tests {
         let err = gcm_decrypt(&[0u8; 32], &[0u8; 16]).unwrap_err().to_string();
         assert!(err.contains("too short"), "{err}");
     }
+}
+
+#[cfg(test)]
+mod phone_socket_tests {
+    use super::*;
+    fn fixture_sync_request() -> WsCommand {
+        WsCommand::RequestSyncV2 {
+            session_index: 0,
+            sync_id: "sync_fixture".into(),
+            ek: "public_ek".into(),
+            ik: "public_ik".into(),
+            device_name: "Zalo Rust".into(),
+            request_id: "req_conv_sync_f".into(),
+            request: json!({"type": "conversation", "priority": 0, "batchSize": 2000,
+                "queries": [{"partition": "", "from": 0, "to": 123, "limit": 2147483647}]}),
+        }
+    }
+
+    #[test]
+    fn sync_v2_frames_match_owning_envelopes() {
+        let command = fixture_sync_request();
+        let (version, cmd, sub, body) = decode_frame(&sync_v2_frame(&command).unwrap()).unwrap();
+        assert_eq!((version, cmd, sub), (1, 590, 0));
+        assert_eq!(
+            body,
+            json!({"data": {
+            "syncId": "sync_fixture", "syncType": 0, "ek": "public_ek", "ik": "public_ik",
+            "toDevice": 0, "tempKey": "", "deviceName": "Zalo Rust", "ver": 1, "ussidx": 0,
+            "req": {"type": "conversation", "priority": 0, "batchSize": 2000,
+                "queries": [{"partition": "", "from": 0, "to": 123, "limit": 2147483647}]}
+        }, "reqId": "req_conv_sync_f"})
+        );
+        assert!(body.get("req_id").is_none());
+        let (_, cmd, sub, body) = decode_frame(
+            &sync_v2_frame(&WsCommand::DisposeSyncV2 {
+                sync_id: "sync_fixture".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!((cmd, sub), (591, 0));
+        assert_eq!(
+            body,
+            json!({"data": {"syncId": "sync_fixture", "toDevice": 0, "reason": 1}, "reqId": "req_disp"})
+        );
+        let (_, cmd, sub, body) = decode_frame(
+            &sync_v2_frame(&WsCommand::WakeupSyncV2 {
+                data: json!({"syncId": "sync_fixture"}),
+                request_id: "req_wake".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!((cmd, sub), (592, 0));
+        assert_eq!(body, json!({"syncId": "sync_fixture", "reqId": "req_wake"}));
+    }
+
+    #[test]
+    fn sync_v2_preserves_session_index_and_mobile_wakeup_destination() {
+        let mut command = fixture_sync_request();
+        if let WsCommand::RequestSyncV2 { session_index, .. } = &mut command {
+            *session_index = 7;
+        }
+        let (_, _, _, body) = decode_frame(&sync_v2_frame(&command).unwrap()).unwrap();
+        assert_eq!(body["data"]["ussidx"], 7);
+        let (_, cmd, _, body) = decode_frame(
+            &sync_v2_frame(&WsCommand::WakeupSyncV2 {
+                data: json!({"syncId":"same-session","toDevice":0}),
+                request_id: "req_wake".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cmd, 592);
+        assert_eq!(
+            body,
+            json!({"syncId":"same-session","toDevice":0,"reqId":"req_wake"})
+        );
+        assert!(body.get("data").is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_v2_pre_auth_fifo_and_events_share_connection() {
+        assert!(std::env::var("ZCALL_WS").unwrap_or_default().is_empty());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut session = Session::new(false, false, false).unwrap();
+        session.domains.ws = vec![format!("ws://{}", listener.local_addr().unwrap())];
+        let (mut events, commands) = spawn_with_history(session);
+        commands.send(fixture_sync_request()).unwrap();
+        commands
+            .send(WsCommand::DisposeSyncV2 {
+                sync_id: "sync_fixture".into(),
+            })
+            .unwrap();
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(40), ws.next())
+                .await
+                .is_err());
+            let auth =
+                json!({"encrypt": 0, "data": json!({"error_code": 0, "data": {}}).to_string()});
+            ws.send(Message::Binary(encode_frame(1, 0, 1, Some(&auth)).into()))
+                .await
+                .unwrap();
+            for expected in [590, 591] {
+                let frame = ws.next().await.unwrap().unwrap().into_data();
+                assert_eq!(decode_frame(&frame).unwrap().1, expected);
+            }
+            assert_eq!(events.recv().await.unwrap().cmd, CMD_AUTHEN);
+            for cmd in [590, 601] {
+                let mut payload = json!({"data": {"act": "transfer_sync2", "syncId": "sync_fixture", "status": 3}});
+                if cmd == CMD_SYNC_V2_REQUEST {
+                    payload["data"]["more"] = json!(1);
+                }
+                ws.send(Message::Binary(
+                    encode_frame(cmd, 0, 1, Some(&payload)).into(),
+                ))
+                .await
+                .unwrap();
+                let event = events.recv().await.unwrap();
+                assert_eq!(event.cmd, cmd);
+                assert_eq!(event.payload, payload);
+                assert!(tokio::time::timeout(Duration::from_millis(40), ws.next())
+                    .await
+                    .is_err());
+            }
+            ws.close(None).await.unwrap();
+            let disconnected = events.recv().await.unwrap();
+            assert_eq!(disconnected.cmd, CMD_TRANSPORT_STATUS);
+            assert_eq!(disconnected.payload, json!({"transport": "disconnected"}));
+            drop(events);
+            tokio::time::timeout(Duration::from_secs(1), commands.closed())
+                .await
+                .unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_history_owns_pagination_without_changing_other_auth_queues() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut session = Session::new(false, false, false).unwrap();
+        session.domains.ws = vec![format!("ws://{}", listener.local_addr().unwrap())];
+        let (mut events, commands) = spawn_with_history(session);
+        commands
+            .send(WsCommand::RequestGroupHistory { last_id: None })
+            .unwrap();
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let auth = json!({"encrypt":0,"data":json!({"error_code":0,"data":{"qCmds":[{"cmd":511,"subCmd":1},{"cmd":510,"subCmd":1}]}}).to_string()});
+            socket
+                .send(Message::Binary(
+                    encode_frame(CMD_AUTHEN, 0, 1, Some(&auth)).into(),
+                ))
+                .await
+                .unwrap();
+            // Preserve the upstream direct/offline queue while withholding automatic group paging.
+            let frame = socket.next().await.unwrap().unwrap().into_data();
+            assert_eq!(decode_frame(&frame).unwrap().1, CMD_PULL_MSG_1_1);
+            let frame = socket.next().await.unwrap().unwrap().into_data();
+            let (_, cmd, sub, body) = decode_frame(&frame).unwrap();
+            assert_eq!((cmd, sub), (CMD_PULL_MSG_GROUP, 1));
+            assert_eq!(body["lastId"], Value::Null);
+            assert!(body.get("req_id").is_some() && body.get("reqId").is_none());
+            events.recv().await.unwrap();
+            let payload =
+                json!({"data":{"more":1,"groupMsgs":[{"actionId":"101","msgId":"fixture"}]}});
+            socket
+                .send(Message::Binary(
+                    encode_frame(CMD_PULL_MSG_GROUP, 1, 1, Some(&payload)).into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(events.recv().await.unwrap().cmd, CMD_PULL_MSG_GROUP);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(40), socket.next())
+                    .await
+                    .is_err()
+            );
+            commands
+                .send(WsCommand::RequestGroupHistory {
+                    last_id: Some("101".into()),
+                })
+                .unwrap();
+            let frame = socket.next().await.unwrap().unwrap().into_data();
+            assert_eq!(decode_frame(&frame).unwrap().3["lastId"], "101");
+            drop(events);
+        };
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap();
+    }
+    #[test]
+    fn history_trace_never_contains_capability_urls_or_transfer_payloads() {
+        let raw = json!({"data":{"controls":[{"content":{"act_type":"transfer_sync2","msgUrl":"https://fixture.invalid/?token=secret-fixture"}}]}});
+        assert_eq!(history_trace_preview(CMD_CTRL_PUSH_CTRL,&raw,false), "<history payload redacted>");
+        assert_eq!(history_trace_preview(CMD_SYNC_V2_REQUEST,&json!({"fixture":"opaque"}),false), "<history payload redacted>");
+        assert_eq!(history_trace_preview(CMD_PULL_MSG_GROUP,&json!({"text":"private-fixture"}),true), "<history payload redacted>");
+    }
+
 }

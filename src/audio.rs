@@ -22,6 +22,7 @@ pub struct AudioHandle {
 impl AudioHandle {
     /// Start mic->speaker pass-through on a dedicated thread.
     pub fn start() -> Result<Self> {
+        crate::runtime_scope::check()?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let thread = thread::spawn(move || {

@@ -277,7 +277,7 @@ impl ChatMessage {
                 .get("msgType")
                 .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()));
             match kind {
-                Some(2..=4) => Some("Hình ảnh Zalo"),
+                Some(2..=4 | 31) => Some("Hình ảnh Zalo"),
                 Some(19) => Some("Video Zalo"),
                 _ => None,
             }
@@ -784,12 +784,208 @@ pub fn threads_represent_same_contact(a: &Thread, b: &Thread) -> bool {
     false
 }
 
+fn wire_identity(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(value) if !value.trim().is_empty() && value != "0" => Some(value.clone()),
+        Value::Number(value) => value.as_u64().filter(|id| *id > 0).map(|id| id.to_string()),
+        _ => None,
+    }
+}
+
+fn wire_sender(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(value) if !value.is_empty() => Some(value.clone()),
+        Value::Number(value) => value.as_u64().map(|id| id.to_string()),
+        _ => None,
+    }
+}
+
+fn server_message_id(message: &ChatMessage) -> Option<String> {
+    let wire_server = wire_identity(message.wire_ref.server_id.as_ref());
+    let wire_client = wire_identity(message.wire_ref.client_id.as_ref());
+    if message.id.starts_with("out_") || message.id.is_empty()
+        || wire_client.as_deref() == Some(message.id.as_str()) {
+        wire_server
+    } else {
+        wire_identity(Some(&Value::String(message.id.clone())))
+    }
+}
+
+fn client_message_id(message: &ChatMessage) -> Option<String> {
+    let wire = wire_identity(message.wire_ref.client_id.as_ref());
+    if message.client_message_id.trim().is_empty() || message.client_message_id == "0" {
+        wire
+    } else if wire
+        .as_ref()
+        .is_some_and(|id| id != &message.client_message_id)
+    {
+        None
+    } else {
+        Some(message.client_message_id.clone())
+    }
+}
+
+#[derive(Default)]
+struct MessageIdentityIndex {
+    rows: std::collections::HashMap<(u8, String), std::collections::HashSet<usize>>,
+}
+
+impl MessageIdentityIndex {
+    fn keys(message: &ChatMessage) -> Vec<(u8, String)> {
+        let mut keys = Vec::with_capacity(3);
+        if let Some(id) = server_message_id(message) {
+            keys.push((0, id));
+        } else if message.id.starts_with("out_") {
+            keys.push((1, message.id.clone()));
+        }
+        if !message.id.starts_with("out_") {
+            if let Some(id) = wire_identity(Some(&Value::String(message.id.clone()))) {
+                // Old caches only retain this ID; it may have come from cliMsgId.
+                keys.push((3, id));
+            }
+        }
+        if let Some(id) = client_message_id(message) {
+            keys.push((2, id));
+        }
+        keys
+    }
+
+    fn insert(&mut self, message: &ChatMessage, index: usize) {
+        for key in Self::keys(message) {
+            self.rows.entry(key).or_default().insert(index);
+        }
+    }
+
+    fn remove(&mut self, message: &ChatMessage, index: usize) {
+        for key in Self::keys(message) {
+            if let Some(rows) = self.rows.get_mut(&key) {
+                rows.remove(&index);
+            }
+        }
+    }
+
+    fn find(&self, messages: &[ChatMessage], incoming: &ChatMessage) -> Option<usize> {
+        for key in Self::keys(incoming) {
+            let Some(rows) = self.rows.get(&key).filter(|rows| !rows.is_empty()) else {
+                continue;
+            };
+            // A colliding identity is not evidence for selecting any particular row.
+            if rows.len() != 1 {
+                return None;
+            }
+            let index = *rows.iter().next()?;
+            let existing = &messages[index];
+            if existing.is_outgoing != incoming.is_outgoing {
+                return None;
+            }
+            if let (Some(a), Some(b)) = (
+                wire_sender(existing.wire_ref.sender.as_ref()),
+                wire_sender(incoming.wire_ref.sender.as_ref()),
+            ) {
+                if a != b {
+                    return None;
+                }
+            }
+            if key.0 != 2 {
+                if key.0 == 3 {
+                    if let (Some(a), Some(b)) = (
+                        wire_identity(existing.wire_ref.server_id.as_ref()),
+                        wire_identity(incoming.wire_ref.server_id.as_ref()),
+                    ) {
+                        if a != b {
+                            return None;
+                        }
+                    }
+                }
+                return Some(index);
+            }
+            // Client-only packets can replay before a server ID is known. A client
+            // reference never collapses two distinct pending or server messages.
+            let existing_server = server_message_id(existing);
+            let incoming_server = server_message_id(incoming);
+            let existing_local = existing.id.starts_with("out_") && existing_server.is_none();
+            let incoming_local = incoming.id.starts_with("out_") && incoming_server.is_none();
+            let client_only_replay = existing_server.is_none()
+                && incoming_server.is_none()
+                && (existing.id.is_empty() || incoming.id.is_empty());
+            return (client_only_replay || (existing.is_outgoing
+                && ((existing_local && incoming_server.is_some())
+                    || (incoming_local && existing_server.is_some()))))
+                .then_some(index);
+        }
+        None
+    }
+}
+
+/// Merge a local send acknowledgement without replacing an existing server clock.
+pub(crate) fn merge_sent_message(thread: &mut Thread, mut message: ChatMessage) {
+    let mut identities = MessageIdentityIndex::default();
+    for (row, existing) in thread.messages.iter().enumerate() {
+        identities.insert(existing, row);
+    }
+    if identities.find(&thread.messages, &message)
+        .is_some_and(|row| server_message_id(&thread.messages[row]).is_some())
+    {
+        // The acknowledgement receipt time is not the server's message timestamp.
+        message.ts = 0;
+        message.time.clear();
+    }
+    merge_thread_into(thread, Thread { messages: vec![message], ..Default::default() }, false);
+}
+
 /// Merge `incoming` thread into `target`. When `incoming_id_is_authoritative` is `true`,
 /// `target.id` is migrated to `incoming.id` so actions (chat/VoIP call) always target the active session's `userId`.
 pub fn merge_thread_into(
     target: &mut Thread,
     incoming: Thread,
     incoming_id_is_authoritative: bool,
+) {
+    merge_thread_into_with_source(target, incoming, incoming_id_is_authoritative, false);
+}
+
+/// Enrich live messages from persisted history without rewinding known content or clocks.
+pub(crate) fn merge_cached_messages(target: &mut Thread, messages: Vec<ChatMessage>) {
+    merge_thread_into_with_source(
+        target,
+        Thread {
+            messages,
+            ..Default::default()
+        },
+        false,
+        true,
+    );
+}
+
+fn merge_cached_wire_ref(
+    live: &crate::message_model::WireMessageRef,
+    cached: &crate::message_model::WireMessageRef,
+) -> crate::message_model::WireMessageRef {
+    let mut merged = live.clone();
+    for (key, value) in &cached.fields {
+        merged
+            .fields
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+    merged.server_id = merged.server_id.or_else(|| cached.server_id.clone());
+    merged.client_id = merged.client_id.or_else(|| cached.client_id.clone());
+    merged.sender = merged.sender.or_else(|| cached.sender.clone());
+    merged.destination = merged.destination.or_else(|| cached.destination.clone());
+    merged.original_type = merged
+        .original_type
+        .or_else(|| cached.original_type.clone());
+    merged.cmd = merged.cmd.or_else(|| cached.cmd.clone());
+    merged.st = merged.st.or_else(|| cached.st.clone());
+    merged.at = merged.at.or_else(|| cached.at.clone());
+    merged.ts = merged.ts.or_else(|| cached.ts.clone());
+    merged
+}
+
+fn merge_thread_into_with_source(
+    target: &mut Thread,
+    incoming: Thread,
+    incoming_id_is_authoritative: bool,
+    incoming_is_cache: bool,
 ) {
     if incoming_id_is_authoritative && !incoming.id.is_empty() && incoming.id != "0" {
         target.id = incoming.id;
@@ -804,50 +1000,93 @@ pub fn merge_thread_into(
     }
     target.is_group = target.is_group || incoming.is_group;
 
-    // Same two rules as before (equal ids, or same text + direction at the same clock time /
-    // within 5 s — how a local `out_*` echo meets its server copy), looked up through two
-    // indexes instead of scanning every message per incoming one: syncing 1 000 messages into
-    // a 1 000-message thread was a million comparisons.
-    use std::collections::HashMap;
-    let mut by_id: HashMap<String, usize> = HashMap::new();
-    let mut by_text: HashMap<(String, bool), Vec<usize>> = HashMap::new();
-    for (i, m) in target.messages.iter().enumerate() {
-        if !m.id.is_empty() {
-            by_id.entry(m.id.clone()).or_insert(i);
-        }
-        by_text.entry((m.text.clone(), m.is_outgoing)).or_default().push(i);
+    // Repeated text and timestamps are not identities. Keep ambiguous keys instead of
+    // choosing the first candidate, especially when multiple pending sends collide.
+    let mut identities = MessageIdentityIndex::default();
+    for (index, message) in target.messages.iter().enumerate() {
+        identities.insert(message, index);
     }
 
-    for msg in incoming.messages {
+    for mut msg in incoming.messages {
         if msg.text == "sendBubbleMessage" {
             continue;
         }
-        let text_key = (msg.text.clone(), msg.is_outgoing);
-        let found = by_id
-            .get(&msg.id)
-            .filter(|_| !msg.id.is_empty())
-            .copied()
-            .or_else(|| {
-                by_text.get(&text_key)?.iter().copied().find(|&i| {
-                    let m = &target.messages[i];
-                    m.time == msg.time || (m.ts != 0 && msg.ts != 0 && (m.ts - msg.ts).abs() < 5000)
-                })
-            });
+        let found = identities.find(&target.messages, &msg);
         if let Some(idx) = found {
             let existing_msg = &mut target.messages[idx];
-            let old_text_key = (existing_msg.text.clone(), existing_msg.is_outgoing);
+            identities.remove(existing_msg, idx);
+            let cached_recall = incoming_is_cache
+                && (existing_msg.kind == crate::message_model::MessageKind::Recall
+                    || existing_msg.text.trim() == "[Tin nhắn đã thu hồi]");
+            let cached_wire = incoming_is_cache.then(|| {
+                if cached_recall {
+                    // A recall is terminal: cached body/type/mention payloads are not enrichment.
+                    let mut envelope = msg.wire_ref.clone();
+                    envelope.fields.retain(|key, _| matches!(key.as_str(),
+                        "msgId" | "globalMsgId" | "lastMsgId" | "id" | "cliMsgId" | "clientId"
+                        | "client_message_id" | "uidFrom" | "fromUid" | "fromId" | "senderId"
+                        | "sender" | "idTo" | "toId" | "toUid" | "grid" | "groupId"
+                        | "cmd" | "st" | "ts"));
+                    envelope.original_type = None;
+                    envelope.at = None;
+                    merge_cached_wire_ref(&existing_msg.wire_ref, &envelope)
+                } else {
+                    merge_cached_wire_ref(&existing_msg.wire_ref, &msg.wire_ref)
+                }
+            });
+            if incoming_is_cache {
+                // Stored history enriches unknown fields; it is not a newer network event.
+                if cached_recall || existing_msg.kind != crate::message_model::MessageKind::Unknown {
+                    msg.kind = existing_msg.kind;
+                }
+                if existing_msg.unread_policy.params_ext_present {
+                    msg.unread_policy = existing_msg.unread_policy.clone();
+                }
+                if cached_recall || existing_msg.history_source.is_some() {
+                    msg.history_source = None;
+                }
+                if cached_recall {
+                    msg.sticker_id = None;
+                    msg.sticker_cate_id = None;
+                    msg.sticker_type = None;
+                    msg.reply_to_id = None;
+                    msg.reply_to_sender = None;
+                    msg.reply_to_text = None;
+                    msg.link_url = None;
+                    msg.link_title = None;
+                    msg.link_desc = None;
+                    msg.link_thumb = None;
+                    msg.link_src = None;
+                    msg.resolved_mention_uids.clear();
+                }
+                msg.resolved_mention_uids
+                    .extend(existing_msg.resolved_mention_uids.clone());
+                if !cached_recall && existing_msg.text.is_empty() {
+                    existing_msg.text = msg.text.clone();
+                }
+            }
+            existing_msg.merge_reaction_metadata(&msg);
+            if let Some(wire) = cached_wire {
+                // Different raw alias names can coexist without replacing a known typed slot.
+                existing_msg.wire_ref = wire;
+                if msg.unread_policy.params_ext_present {
+                    existing_msg.unread_policy = msg.unread_policy.clone();
+                }
+            }
             if existing_msg.id.starts_with("out_")
                 && !msg.id.is_empty()
                 && !msg.id.starts_with("out_")
             {
-                by_id.insert(msg.id.clone(), idx);
-                existing_msg.id = msg.id;
+                existing_msg.id = msg.id.clone();
             }
-            if msg.ts > 0 && existing_msg.ts != msg.ts {
+            if msg.ts > 0
+                && existing_msg.ts != msg.ts
+                && (!incoming_is_cache || existing_msg.ts <= 0)
+            {
                 existing_msg.ts = msg.ts;
                 existing_msg.time = msg.time;
             }
-            if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
+            if !incoming_is_cache && msg.text.trim() == "[Tin nhắn đã thu hồi]" {
                 existing_msg.text = "[Tin nhắn đã thu hồi]".to_string();
                 existing_msg.sticker_id = None;
                 existing_msg.link_url = None;
@@ -869,28 +1108,18 @@ pub fn merge_thread_into(
                 existing_msg.link_desc = msg.link_desc;
                 existing_msg.link_thumb = msg.link_thumb;
                 existing_msg.link_src = msg.link_src;
-                if !msg.text.is_empty() {
+                if !incoming_is_cache && !msg.text.is_empty() {
                     existing_msg.text = msg.text;
                 }
             }
-            if existing_msg.reactions.is_empty() && !msg.reactions.is_empty() {
-                existing_msg.reactions = msg.reactions;
-            }
+            // merge_reaction_metadata already handles legacy emojis and authoritative
+            // empty snapshots; a second fallback would resurrect a cleared reaction.
             existing_msg.is_pinned = existing_msg.is_pinned || msg.is_pinned;
             existing_msg.is_starred = existing_msg.is_starred || msg.is_starred;
-            if existing_msg.text != old_text_key.0 {
-                let new_key = (existing_msg.text.clone(), existing_msg.is_outgoing);
-                if let Some(v) = by_text.get_mut(&old_text_key) {
-                    v.retain(|&i| i != idx);
-                }
-                by_text.entry(new_key).or_default().push(idx);
-            }
+            identities.insert(existing_msg, idx);
         } else {
             let idx = target.messages.len();
-            if !msg.id.is_empty() {
-                by_id.entry(msg.id.clone()).or_insert(idx);
-            }
-            by_text.entry(text_key).or_default().push(idx);
+            identities.insert(&msg, idx);
             target.messages.push(msg);
         }
     }
@@ -1006,6 +1235,7 @@ pub fn load_threads_cache() -> Vec<Thread> {
 /// `PRELOAD_MSGS` messages per thread are kept: full history lives in `zalo_history.db`, and
 /// rewriting every message as pretty JSON on each change cost more than the SQLite write.
 pub fn save_threads_cache(threads: &[Thread]) {
+    let Ok(_scope_guard) = crate::runtime_scope::mutation() else { return; };
     let keep = crate::store::MessageStore::PRELOAD_MSGS;
     let slim: Vec<Thread> = threads
         .iter()
@@ -1022,7 +1252,9 @@ pub fn save_threads_cache(threads: &[Thread]) {
         })
         .collect();
     if let Ok(text) = serde_json::to_string(&slim) {
-        let _ = std::fs::write("threads_cache.json", text);
+        if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+            let _ = std::fs::write("threads_cache.json", text);
+        }
     }
 }
 
@@ -1031,6 +1263,18 @@ pub fn save_threads_cache(threads: &[Thread]) {
 /// Uses `s.domains.friend` (defaulting to `tt-friend-wpa.chat.zalo.me`), falling back
 /// to `s.domains.profile` only if `domains.friend` is empty.
 pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
+    get_friends_with_storage(s, true).await
+}
+
+/// Fetch contacts without reading unowned legacy history into an account-scoped GUI.
+///
+/// # Errors
+/// Returns the same transport/protocol errors as the legacy contact API.
+pub async fn get_friends_network(s: &Session) -> Result<Vec<Thread>> {
+    get_friends_with_storage(s, false).await
+}
+
+async fn get_friends_with_storage(s: &Session, hydrate_legacy: bool) -> Result<Vec<Thread>> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -1099,11 +1343,13 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
     }
 
     // Hydrate with locally persisted history from SQLite (`zalo_history.db`)
-    crate::store::load_history_into_threads(
-        "zalo_history.db",
-        &mut threads,
-        crate::store::MessageStore::PRELOAD_MSGS,
-    );
+    if hydrate_legacy {
+        crate::store::load_history_into_threads(
+            "zalo_history.db",
+            &mut threads,
+            crate::store::MessageStore::PRELOAD_MSGS,
+        );
+    }
 
     // Merge user groups (`getlg/v4` + `getmg-v2`) into threads list, upgrading any placeholder group names
     if let Ok(mut groups) = get_groups(s).await {
@@ -1166,15 +1412,48 @@ fn pick_str(v: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
+static LAST_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reserve a checked contiguous request-ID range shared by legacy and durable sends in this process.
+///
+/// # Errors
+/// Returns an error for an invalid batch size or exhausted client-ID space.
+pub(crate) fn reserve_client_message_ids(minimum: u64, count: usize) -> Result<u64> {
+    let now = u64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis())?;
+    reserve_client_ids_at(&LAST_CLIENT_ID, minimum, count, now)
+}
+fn reserve_client_ids_at(last: &std::sync::atomic::AtomicU64, minimum: u64, count: usize, now: u64) -> Result<u64> {
+    use std::sync::atomic::Ordering;
+    anyhow::ensure!((1..=33).contains(&count), "Invalid request ID batch size");
+    let mut previous = last.load(Ordering::Relaxed);
+    loop {
+        let first = previous.checked_add(1).ok_or_else(|| anyhow::anyhow!("Client ID space exhausted"))?.max(minimum).max(now);
+        let end = first.checked_add(count as u64 - 1).ok_or_else(|| anyhow::anyhow!("Client ID space exhausted"))?;
+        match last.compare_exchange_weak(previous, end, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(first), Err(current) => previous = current,
+        }
+    }
+}
+/// Allocate a millisecond-shaped request ID once per legacy send, including simultaneous sends.
+pub(crate) fn next_client_message_id() -> u64 {
+    reserve_client_message_ids(1, 1).expect("Client ID space exhausted")
+}
+
 /// Send a 1-1 text message: `POST {domains.chat}/api/message/sms?{common}`
 pub async fn send_message(s: &Session, to_id: &str, text: &str) -> Result<Value> {
+    send_message_with_client_id(s, to_id, text, next_client_message_id()).await
+}
+
+/// Preserve the request client ID for reconciliation with a later server echo.
+pub(crate) async fn send_message_with_client_id(
+    s: &Session,
+    to_id: &str,
+    text: &str,
+    now: u64,
+) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
     let body = obj(&[
         ("toid", json!(to_id)),
         ("message", json!(text)),
@@ -1213,6 +1492,28 @@ pub async fn send_message(s: &Session, to_id: &str, text: &str) -> Result<Value>
 
 /// Send a group text message: `POST {domains.group}/api/group/sendmsg?{common}`
 pub async fn send_group_message(s: &Session, grid: &str, text: &str) -> Result<Value> {
+    send_group_message_with_client_id(s, grid, text, next_client_message_id()).await
+}
+
+/// Preserve the request client ID for reconciliation with a later server echo.
+pub(crate) async fn send_group_message_with_client_id(
+    s: &Session,
+    grid: &str,
+    text: &str,
+    now: u64,
+) -> Result<Value> {
+    send_group_message_with_mentions_and_client_id(s, grid, text, now, &[]).await
+}
+
+/// Send group text with explicit verified mentions, preserving the caller-owned request ID.
+///
+/// # Errors
+/// Returns an error for invalid mention spans, authentication, encoding or API failures.
+pub(crate) async fn send_group_message_with_mentions_and_client_id(
+    s: &Session, grid: &str, text: &str, now: u64,
+    mentions: &[crate::composer_mentions::OutgoingMention],
+) -> Result<Value> {
+    crate::composer_mentions::validate_mentions(text, mentions)?;
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -1220,19 +1521,20 @@ pub async fn send_group_message(s: &Session, grid: &str, text: &str) -> Result<V
         .trim_start_matches("group_")
         .trim_start_matches('g')
         .trim_start_matches('G');
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let body = obj(&[
+    let mut body = obj(&[
         ("grid", json!(clean_grid)),
         ("message", json!(text)),
         ("clientId", json!(now)),
         ("imei", json!(s.imei)),
         ("visibility", json!(0)),
     ]);
+    if !mentions.is_empty() {
+        body["mentionInfo"] = json!(serde_json::to_string(mentions)?);
+        body["language"] = json!("vi");
+    }
     let params = s.encoded_params(&body)?;
-    let url = format!("{}/api/group/sendmsg?{}", s.domains.group, s.common_params());
+    let operation = if mentions.is_empty() { "sendmsg" } else { "mention" };
+    let url = format!("{}/api/group/{operation}?{}", s.domains.group, s.common_params());
     let form = format!("params={params}");
     let resp = s.post_form(&url, form).await?;
     let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
@@ -1283,10 +1585,22 @@ pub async fn send_attachment(
     file_path: &std::path::Path,
     caption: &str,
 ) -> Result<(Value, ChatMessage)> {
+    send_attachment_with_client_id(s, to_id, is_group, file_path, caption, next_client_message_id()).await
+}
+
+/// Preserve the persisted outbox request ID through attachment upload and send fallbacks.
+///
+/// # Errors
+/// Returns upload, protocol, decoding, or filesystem errors from the standard attachment path.
+pub(crate) async fn send_attachment_with_client_id(
+    s: &Session, to_id: &str, is_group: bool, file_path: &std::path::Path,
+    caption: &str, client_id: u64,
+) -> Result<(Value, ChatMessage)> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let file_bytes = std::fs::read(file_path)?;
+    let owned_path = file_path.to_path_buf();
+    let file_bytes = crate::runtime_scope::spawn_blocking(move || std::fs::read(owned_path)).await???;
     if file_bytes.is_empty() {
         anyhow::bail!("Tập tin rỗng (0 byte)");
     }
@@ -1320,10 +1634,6 @@ pub async fn send_attachment(
     } else {
         to_id
     };
-    let client_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(1793165000000);
     let total_size = file_bytes.len() as u64;
     let chunk_size: usize = 1_048_576; // 1 MiB chunks
     let total_chunks = file_bytes.len().div_ceil(chunk_size).max(1);
@@ -1464,13 +1774,17 @@ pub async fn send_attachment(
         };
         // Pre-populate `stickers_cache/thumb_<md5>.png` with the local image bytes so the GUI
         // renders the sent photo immediately without an extra network round-trip.
-        let _ = std::fs::create_dir_all("stickers_cache");
+        if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+            let _ = std::fs::create_dir_all("stickers_cache");
+        }
         let cache_key = format!("thumb_{}", crate::crypto::md5_hex(&final_thumb));
-        let _ = std::fs::write(format!("stickers_cache/{cache_key}.png"), &file_bytes);
+        if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+            let _ = std::fs::write(format!("stickers_cache/{cache_key}.png"), &file_bytes);
+        }
 
         let msg_id = send_resp
             .get("data")
-            .and_then(|d| pick_str(d, &["msgId", "cliMsgId"]))
+            .and_then(|d| pick_str(d, &["msgId"]))
             .unwrap_or_else(|| format!("out_{client_id}"));
         let now_str = crate::ui::clock();
         let display_text = if !caption.trim().is_empty() {
@@ -1480,6 +1794,7 @@ pub async fn send_attachment(
         };
         let cm = ChatMessage {
             id: msg_id,
+            client_message_id: client_id.to_string(),
             sender: "Tôi".into(),
             text: display_text.clone(),
             time: now_str,
@@ -1632,7 +1947,7 @@ pub async fn send_attachment(
     };
     let msg_id = send_resp
         .get("data")
-        .and_then(|d| pick_str(d, &["msgId", "cliMsgId"]))
+        .and_then(|d| pick_str(d, &["msgId"]))
         .unwrap_or_else(|| format!("out_{client_id}"));
     let kind_label = if is_video { "Video" } else { "Tập tin" };
     let display_text = if !caption.trim().is_empty() {
@@ -1642,6 +1957,7 @@ pub async fn send_attachment(
     };
     let cm = ChatMessage {
         id: msg_id,
+        client_message_id: client_id.to_string(),
         sender: "Tôi".into(),
         text: display_text,
         time: crate::ui::clock(),
@@ -1916,13 +2232,21 @@ pub async fn send_link_message(
     meta: &LinkMetadata,
     is_group: bool,
 ) -> Result<Value> {
+    send_link_message_with_client_id(s, to_id, text, meta, is_group, next_client_message_id()).await
+}
+
+/// Preserve the request client ID for reconciliation with a later server echo.
+pub(crate) async fn send_link_message_with_client_id(
+    s: &Session,
+    to_id: &str,
+    text: &str,
+    meta: &LinkMetadata,
+    is_group: bool,
+    now: u64,
+) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
     let msg_str = if text.trim().is_empty() {
         meta.url.as_str()
     } else {
@@ -2018,9 +2342,9 @@ pub async fn send_link_message(
         Ok(v) => Ok(v),
         Err(_) => {
             if is_group {
-                send_group_message(s, to_id, msg_str).await
+                send_group_message_with_client_id(s, to_id, msg_str, now).await
             } else {
-                send_message(s, to_id, msg_str).await
+                send_message_with_client_id(s, to_id, msg_str, now).await
             }
         }
     }
@@ -2037,13 +2361,31 @@ pub async fn send_sticker(
     sticker_type: u32,
     is_group: bool,
 ) -> Result<Value> {
+    send_sticker_with_client_id(
+        s,
+        to_id,
+        sticker_id,
+        cate_id,
+        sticker_type,
+        is_group,
+        next_client_message_id(),
+    )
+    .await
+}
+
+/// Preserve the request client ID for reconciliation with a later server echo.
+pub(crate) async fn send_sticker_with_client_id(
+    s: &Session,
+    to_id: &str,
+    sticker_id: u64,
+    cate_id: u64,
+    sticker_type: u32,
+    is_group: bool,
+    now: u64,
+) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
 
     let url = if is_group {
         let clean_grid = to_id
@@ -2133,7 +2475,9 @@ pub struct StickerItem {
 /// `stickers_cache/store_packs.json`.
 pub async fn fetch_sticker_store_packs(s: &Session) -> Result<Vec<StickerPackInfo>> {
     let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+        let _ = std::fs::create_dir_all(cache_dir);
+    }
     let cache_path = cache_dir.join("store_packs.json");
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<StickerPackInfo>>(&raw_cache) {
@@ -2240,7 +2584,9 @@ pub async fn fetch_sticker_store_packs(s: &Session) -> Result<Vec<StickerPackInf
     // Sort newest packs first (`id` descending) so modern Zalo packs appear at the top of the store
     packs.sort_by(|a, b| b.id.cmp(&a.id));
     if let Ok(txt) = serde_json::to_string(&packs) {
-        let _ = std::fs::write(&cache_path, txt);
+        if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+            let _ = std::fs::write(&cache_path, txt);
+        }
     }
     Ok(packs)
 }
@@ -2263,7 +2609,9 @@ pub async fn fetch_sticker_pack_items(
     }
 
     let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+        let _ = std::fs::create_dir_all(cache_dir);
+    }
     let cache_path = cache_dir.join(format!("pack_{cate_id}.json"));
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<StickerItem>>(&raw_cache) {
@@ -2316,7 +2664,9 @@ pub async fn fetch_sticker_pack_items(
 
     if !items.is_empty() {
         if let Ok(txt) = serde_json::to_string(&items) {
-            let _ = std::fs::write(&cache_path, txt);
+            if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+                let _ = std::fs::write(&cache_path, txt);
+            }
         }
     }
     Ok(items)
@@ -2442,7 +2792,9 @@ pub fn canonical_vn_sticker_queries(keyword: &str) -> Vec<String> {
 /// unaccented Vietnamese triggers suggestions reliably.
 pub async fn fetch_sticker_suggest_keywords(s: &Session) -> Result<Vec<String>> {
     let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+        let _ = std::fs::create_dir_all(cache_dir);
+    }
     let cache_path = cache_dir.join("suggest_keywords_v2.json");
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<String>>(&raw_cache) {
@@ -2502,7 +2854,9 @@ pub async fn fetch_sticker_suggest_keywords(s: &Session) -> Result<Vec<String>> 
     }
     if !kws.is_empty() {
         if let Ok(txt) = serde_json::to_string(&kws) {
-            let _ = std::fs::write(&cache_path, txt);
+            if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+                let _ = std::fs::write(&cache_path, txt);
+            }
         }
     }
     Ok(kws)
@@ -2647,7 +3001,9 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
         return Ok(Vec::new());
     }
     let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+        let _ = std::fs::create_dir_all(cache_dir);
+    }
     let cache_path = cache_dir.join(format!("suggest_v2_{}.json", crate::crypto::md5_hex(&kw)));
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<StickerItem>>(&raw_cache) {
@@ -2747,7 +3103,9 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
 
     if !out.is_empty() {
         if let Ok(txt) = serde_json::to_string(&out) {
-            let _ = std::fs::write(&cache_path, txt);
+            if let Ok(_scope_guard) = crate::runtime_scope::mutation() {
+                let _ = std::fs::write(&cache_path, txt);
+            }
         }
     }
     Ok(out)
@@ -2764,13 +3122,36 @@ pub async fn send_quote_message(
     quoted: &ChatMessage,
     is_group: bool,
 ) -> Result<Value> {
+    send_quote_message_with_client_id(s, to_id, text, quoted, is_group, next_client_message_id())
+        .await
+}
+
+/// Preserve the request client ID for reconciliation with a later server echo.
+pub(crate) async fn send_quote_message_with_client_id(
+    s: &Session,
+    to_id: &str,
+    text: &str,
+    quoted: &ChatMessage,
+    is_group: bool,
+    now: u64,
+) -> Result<Value> {
+    send_quote_message_with_mentions_and_client_id(s, to_id, text, quoted, is_group, now, &[]).await
+}
+
+/// Keep explicit mention metadata through group replies and their existing plain-text fallback.
+///
+/// # Errors
+/// Returns an error for invalid spans, unsupported direct mentions, authentication or API failures.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_quote_message_with_mentions_and_client_id(
+    s: &Session, to_id: &str, text: &str, quoted: &ChatMessage, is_group: bool, now: u64,
+    mentions: &[crate::composer_mentions::OutgoingMention],
+) -> Result<Value> {
+    crate::composer_mentions::validate_mentions(text, mentions)?;
+    anyhow::ensure!(is_group || mentions.is_empty(), "Chưa xác minh gửi nhắc tên trong hội thoại cá nhân");
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
 
     let my_uid = s
         .login
@@ -2806,7 +3187,7 @@ pub async fn send_quote_message(
                 .trim_start_matches("group_")
                 .trim_start_matches('g')
                 .trim_start_matches('G');
-            let body = obj(&[
+            let mut body = obj(&[
                 ("grid", json!(clean_grid)),
                 ("message", json!(text)),
                 ("clientId", json!(now)),
@@ -2822,6 +3203,9 @@ pub async fn send_quote_message(
                 ("imei", json!(s.imei)),
                 ("zsource", json!(101)),
             ]);
+            if !mentions.is_empty() {
+                body["mentionInfo"] = json!(serde_json::to_string(mentions)?);
+            }
             let params = s.encoded_params(&body)?;
             let url = format!("{}/api/group/quote?{}", s.domains.group, s.common_params());
             let resp = s.post_form(&url, format!("params={params}")).await?;
@@ -2873,9 +3257,9 @@ pub async fn send_quote_message(
         Ok(r) => Ok(r),
         Err(_) => {
             if is_group {
-                send_group_message(s, to_id, text).await
+                send_group_message_with_mentions_and_client_id(s, to_id, text, now, mentions).await
             } else {
-                send_message(s, to_id, text).await
+                send_message_with_client_id(s, to_id, text, now).await
             }
         }
     }
@@ -2888,17 +3272,38 @@ pub async fn forward_message(
     target_is_group: bool,
     msg: &ChatMessage,
 ) -> Result<Value> {
+    forward_message_with_client_id(s, target_id, target_is_group, msg, next_client_message_id())
+        .await
+}
+
+/// Preserve the request client ID for reconciliation with a later server echo.
+pub(crate) async fn forward_message_with_client_id(
+    s: &Session,
+    target_id: &str,
+    target_is_group: bool,
+    msg: &ChatMessage,
+    now: u64,
+) -> Result<Value> {
     if let Some(sid) = msg.sticker_id {
         if sid > 0 {
             let cid = msg.sticker_cate_id.unwrap_or(0);
             let stype = msg.sticker_type.unwrap_or(7);
-            return send_sticker(s, target_id, sid, cid, stype, target_is_group).await;
+            return send_sticker_with_client_id(
+                s,
+                target_id,
+                sid,
+                cid,
+                stype,
+                target_is_group,
+                now,
+            )
+            .await;
         }
     }
     if target_is_group {
-        send_group_message(s, target_id, &msg.text).await
+        send_group_message_with_client_id(s, target_id, &msg.text, now).await
     } else {
-        send_message(s, target_id, &msg.text).await
+        send_message_with_client_id(s, target_id, &msg.text, now).await
     }
 }
 
@@ -3987,6 +4392,29 @@ pub async fn poll_new_messages(
     state: &mut PollState,
     threads: &mut Vec<Thread>,
 ) -> Result<()> {
+    poll_new_messages_with_storage(s, state, threads, true, None).await
+}
+
+/// Poll and reduce network messages without legacy persistence or inferred thread aliases.
+///
+/// # Errors
+/// Returns an error when the session is not authenticated or a required operation fails.
+pub async fn poll_new_messages_network(s: &Session, state: &mut PollState, threads: &mut Vec<Thread>) -> Result<()> {
+    poll_new_messages_with_storage(s, state, threads, false, None).await
+}
+
+/// Retain each parsed network response synchronously before the next network await.
+///
+/// # Errors
+/// Returns a network or retention error; callers must keep their committed poll cursor unchanged.
+pub async fn poll_new_messages_network_retained(
+    s:&Session,state:&mut PollState,threads:&mut Vec<Thread>,
+    retained:&mut (dyn FnMut(&[Thread])->Result<()> + Send),
+)->Result<()> {
+    poll_new_messages_with_storage(s,state,threads,false,Some(retained)).await
+}
+
+async fn poll_new_messages_with_storage(s: &Session, state: &mut PollState, threads: &mut Vec<Thread>, persist_legacy: bool, mut retained: Option<&mut (dyn FnMut(&[Thread])->Result<()> + Send)>) -> Result<()> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -3996,6 +4424,7 @@ pub async fn poll_new_messages(
             break;
         };
         merge_previews(threads, &lp_resp);
+        if let Some(retain)=retained.as_mut() { retain(threads)?; }
         let data_node = lp_resp.get("data").unwrap_or(&lp_resp);
         let more = data_node.get("more").and_then(Value::as_i64).unwrap_or(0);
         let has_reset = pick_str(data_node, &["resetLastActionId"])
@@ -4008,6 +4437,7 @@ pub async fn poll_new_messages(
     // 2. Poll conversation previews via `get-last-msgs` (both empty map and populated known thread IDs)
     if let Ok(preview_resp) = get_last_msgs(s, &[]).await {
         merge_previews(threads, &preview_resp);
+        if let Some(retain)=retained.as_mut() { retain(threads)?; }
     }
     let known_ids: Vec<String> = threads
         .iter()
@@ -4023,6 +4453,7 @@ pub async fn poll_new_messages(
     for chunk in known_ids.chunks(25) {
         if let Ok(preview_resp) = get_last_msgs(s, chunk).await {
             merge_previews(threads, &preview_resp);
+        if let Some(retain)=retained.as_mut() { retain(threads)?; }
         }
     }
     // 2b. Sync Cloud của tôi (`send2me_id`) and group conversations via `/api/cm/getrecentv2`
@@ -4038,6 +4469,7 @@ pub async fn poll_new_messages(
             } else {
                 merge_previews(threads, &cm_resp);
             }
+            if let Some(retain)=retained.as_mut() { retain(threads)?; }
         }
     }
     let group_ids: Vec<String> = threads
@@ -4050,16 +4482,22 @@ pub async fn poll_new_messages(
             if let Some(t) = threads.iter_mut().find(|t| t.id == gid) {
                 merge_group_history(t, &cm_resp);
             }
+            if let Some(retain)=retained.as_mut() { retain(threads)?; }
         }
     }
     // 3. Resolve display names for any newly discovered threads
     resolve_thread_names(s, threads).await;
     threads.retain(|t| !t.messages.is_empty() || !t.name.starts_with("Người dùng "));
-    deduplicate_threads(threads, None);
-    if let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") {
-        let _ = crate::store::persist_threads(&mut store, threads);
+    if persist_legacy {
+        deduplicate_threads(threads, None);
+        if let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") {
+            let _ = crate::store::persist_threads(&mut store, threads);
+        }
+        save_threads_cache(threads);
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        threads.retain(|thread| seen.insert(thread.id.clone()));
     }
-    save_threads_cache(threads);
     Ok(())
 }
 
@@ -4332,19 +4770,11 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         None
     };
 
+    // Preserve the persisted canonical ID contract until a schema-aware migration
+    // can replace legacy cliMsgId keys without duplicating cached messages.
     let msg_id = undo_target_id
-        .or_else(|| {
-            it.get("msgId")
-                .or_else(|| it.get("cliMsgId"))
-                .or_else(|| it.get("globalMsgId"))
-                .or_else(|| it.get("lastMsgId"))
-                .or_else(|| it.get("id"))
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    Value::Number(n) => Some(n.to_string()),
-                    _ => None,
-                })
-        })
+        .or_else(|| ["msgId", "cliMsgId", "globalMsgId", "lastMsgId", "id"].iter()
+            .find_map(|key| wire_identity(it.get(*key))))
         .unwrap_or_default();
 
     if content.is_empty() && msg_id.is_empty() {
@@ -4410,7 +4840,11 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     };
 
     Some(ChatMessage {
+        history_source: it.get("historySource").cloned(),
         id: msg_id,
+        client_message_id: ["cliMsgId", "clientId", "client_message_id"].iter()
+            .find_map(|key| wire_identity(it.get(*key))).unwrap_or_default(),
+        wire_ref: crate::message_model::WireMessageRef::from_raw(it),
         sender: display_sender,
         text: content,
         time,
@@ -4597,6 +5031,17 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
         }
     }
 
+    let mut message_indices: Vec<MessageIdentityIndex> = threads
+        .iter()
+        .map(|thread| {
+            let mut index = MessageIdentityIndex::default();
+            for (row, message) in thread.messages.iter().enumerate() {
+                index.insert(message, row);
+            }
+            index
+        })
+        .collect();
+
     for (entry, is_grp_bucket) in entries {
         let mut raw_msgs: Vec<(&Value, bool)> = Vec::new();
         if let Some(arr) = entry.get("messages").and_then(Value::as_array) {
@@ -4637,18 +5082,20 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 continue;
             };
 
-            if let Some(t) = threads.iter_mut().find(|t| t.id == tid) {
+            if let Some(thread_index) = threads.iter().position(|thread| thread.id == tid) {
+                let t = &mut threads[thread_index];
+                let identities = &mut message_indices[thread_index];
                 if thread_is_group {
                     t.is_group = true;
                 }
-                if let Some(existing) = t.messages.iter_mut().find(|existing| {
-                    (!existing.id.is_empty() && !parsed.id.is_empty() && existing.id == parsed.id)
-                        || (existing.text == parsed.text
-                            && existing.is_outgoing == parsed.is_outgoing
-                            && (existing.time == parsed.time
-                                || (existing.ts != 0 && parsed.ts != 0 && (existing.ts - parsed.ts).abs() < 5000)))
-                }) {
-                    if existing.id.starts_with("out_") && !parsed.id.is_empty() && !parsed.id.starts_with("out_") {
+                if let Some(row) = identities.find(&t.messages, &parsed) {
+                    let existing = &mut t.messages[row];
+                    identities.remove(existing, row);
+                    existing.merge_reaction_metadata(&parsed);
+                    if existing.id.starts_with("out_")
+                        && !parsed.id.is_empty()
+                        && !parsed.id.starts_with("out_")
+                    {
                         existing.id = parsed.id;
                     }
                     if parsed.ts > 0 && existing.ts != parsed.ts {
@@ -4686,7 +5133,9 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                     }
                     existing.is_pinned = existing.is_pinned || parsed.is_pinned;
                     existing.is_starred = existing.is_starred || parsed.is_starred;
+                    identities.insert(existing, row);
                 } else {
+                    identities.insert(&parsed, t.messages.len());
                     t.messages.push(parsed);
                 }
             } else {
@@ -4696,6 +5145,9 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 } else {
                     format!("Người dùng {}", tid)
                 };
+                let mut identities = MessageIdentityIndex::default();
+                identities.insert(&parsed, 0);
+                message_indices.push(identities);
                 threads.push(Thread {
                     presentation: Default::default(),
                     unread: Default::default(),
@@ -4755,16 +5207,9 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
         .trim_start_matches('G')
         .to_string();
 
-    // Index existing messages once (ids, and text+ts) instead of scanning per incoming message.
-    let mut by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut by_text_ts: std::collections::HashMap<(String, i64), usize> = std::collections::HashMap::new();
-    for (i, m) in thread.messages.iter().enumerate() {
-        if !m.id.is_empty() {
-            by_id.entry(m.id.clone()).or_insert(i);
-        }
-        if m.ts != 0 {
-            by_text_ts.entry((m.text.clone(), m.ts)).or_insert(i);
-        }
+    let mut identities = MessageIdentityIndex::default();
+    for (row, message) in thread.messages.iter().enumerate() {
+        identities.insert(message, row);
     }
 
     for it in raw_msgs {
@@ -4780,12 +5225,14 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
             }
         }
         if let Some(m) = parse_chat_message(it) {
-            let hit = by_id
-                .get(&m.id)
-                .filter(|_| !m.id.is_empty())
-                .or_else(|| by_text_ts.get(&(m.text.clone(), m.ts)).filter(|_| m.ts != 0))
-                .copied();
-            if let Some(existing) = hit.map(|i| &mut thread.messages[i]) {
+            if let Some(row) = identities.find(&thread.messages, &m) {
+                let existing = &mut thread.messages[row];
+                identities.remove(existing, row);
+                existing.merge_reaction_metadata(&m);
+                if existing.id.starts_with("out_") && !m.id.is_empty() && !m.id.starts_with("out_")
+                {
+                    existing.id = m.id.clone();
+                }
                 if existing.link_url.is_none() && m.link_url.is_some() {
                     existing.link_url = m.link_url;
                     existing.link_title = m.link_title;
@@ -4796,14 +5243,9 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
                         existing.text = m.text;
                     }
                 }
+                identities.insert(existing, row);
             } else {
-                let idx = thread.messages.len();
-                if !m.id.is_empty() {
-                    by_id.entry(m.id.clone()).or_insert(idx);
-                }
-                if m.ts != 0 {
-                    by_text_ts.entry((m.text.clone(), m.ts)).or_insert(idx);
-                }
+                identities.insert(&m, thread.messages.len());
                 thread.messages.push(m);
             }
         }
@@ -4916,53 +5358,9 @@ pub async fn get_user_online_status(s: &Session, uid: &str) -> Result<(bool, Str
         s.common_params()
     );
     let resp = s.get(&url).await?;
-    let mut dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    if let Some(d_str) = dec.get("data").and_then(Value::as_str) {
-        if let Ok(parsed) = serde_json::from_str::<Value>(d_str.trim()) {
-            dec["data"] = parsed;
-        }
-    }
-    let d = dec
-        .pointer("/data/data")
-        .or_else(|| dec.get("data"))
-        .unwrap_or(&dec);
-    let show_online = d
-        .pointer("/settings/show_online_status")
-        .and_then(|v| v.as_bool().or_else(|| v.as_i64().map(|n| n != 0)))
-        .unwrap_or(true);
-    if !show_online {
-        return Ok((false, String::new()));
-    }
-    let last_onl_raw = d
-        .get("lastOnline")
-        .and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
-        })
-        .unwrap_or(0);
-    if last_onl_raw <= 0 {
-        return Ok((false, String::new()));
-    }
-    let last_sec = if last_onl_raw > 10_000_000_000 {
-        last_onl_raw / 1000
-    } else {
-        last_onl_raw
-    };
-    let now_sec = crate::login::unix_now() as i64;
-    let diff_sec = (now_sec - last_sec).max(0);
-    if diff_sec <= 300 {
-        return Ok((true, "Vừa mới truy cập".into()));
-    }
-    let mins = diff_sec / 60;
-    if mins < 60 {
-        return Ok((false, format!("Truy cập {mins} phút trước")));
-    }
-    let hours = diff_sec / 3600;
-    if hours < 24 {
-        return Ok((false, format!("Truy cập {hours} giờ trước")));
-    }
-    let days = (diff_sec / 86400).min(7);
-    Ok((false, format!("Truy cập {days} ngày trước")))
+    let decoded = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    let now_second = crate::login::unix_now() as i64;
+    Ok(crate::presence::LastOnline::parse(&decoded, now_second)?.status(now_second))
 }
 
 /// Send a friend request to a target user (`/api/friend/sendreq`, cmd `11424`).
@@ -5488,9 +5886,14 @@ mod tests {
     }
 
     #[test]
-    fn merge_thread_into_keeps_match_rules() {
+    fn merge_thread_into_matches_exact_client_reference() {
         let m = |id: &str, text: &str, ts: i64, out: bool| ChatMessage {
             id: id.into(),
+            client_message_id: if id == "out_9" || id == "77" {
+                "client-9".into()
+            } else {
+                String::new()
+            },
             text: text.into(),
             ts,
             time: format!("{}", ts / 60_000),
@@ -5510,10 +5913,10 @@ mod tests {
         };
         let incoming = Thread {
             messages: vec![
-                m("1", "chào", 1_000_000, false),       // same id -> no duplicate
-                m("77", "ok", 2_002_000, true),          // echo of out_9 within 5 s -> takes real id
-                m("78", "ok", 9_000_000_000, true),      // same text, other day -> new message
-                m("79", "mới", 3_000_000, false),        // new
+                m("1", "chào", 1_000_000, false),   // same id -> no duplicate
+                m("77", "ok", 2_002_000, true),     // exact client reference -> takes server ID
+                m("78", "ok", 9_000_000_000, true), // same text, other day -> new message
+                m("79", "mới", 3_000_000, false),   // new
             ],
             ..target.clone()
         };
@@ -6079,4 +6482,272 @@ mod message_state_defaults_tests {
         assert_eq!(restored.presentation, thread.presentation);
         assert_eq!(restored.unread, thread.unread);
     }
+}
+
+#[cfg(test)]
+mod send_identity_tests {
+    use super::*;
+
+    #[test]
+    fn reserved_and_legacy_ids_interleave_without_same_clock_or_rollback_collisions() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let allocator = AtomicU64::new(0);
+        let plain = reserve_client_ids_at(&allocator, 1, 1, 1000).unwrap();
+        let staged = reserve_client_ids_at(&allocator, 1, 3, 1000).unwrap();
+        let sticker = reserve_client_ids_at(&allocator, 1, 1, 1000).unwrap();
+        let rollback_floor = reserve_client_ids_at(&allocator, 1, 1, 10).unwrap();
+        assert_eq!([plain, staged, staged + 1, staged + 2, sticker, rollback_floor], [1000,1001,1002,1003,1004,1005]);
+        assert!(reserve_client_ids_at(&allocator, u64::MAX, 2, 1000).is_err());
+        assert_eq!(allocator.load(Ordering::Relaxed), 1005);
+        assert!(reserve_client_ids_at(&allocator, 1, 34, 1000).is_err());
+        assert_eq!(reserve_client_ids_at(&allocator, 5000, 2, 1000).unwrap(), 5000);
+    }
+
+    #[test]
+    fn request_ids_are_unique_when_sends_share_a_clock_tick() {
+        let ids: Vec<_> = (0..10_000).map(|_| next_client_message_id()).collect();
+        assert!(ids.windows(2).all(|ids| ids[0] < ids[1]));
+    }
+
+    #[tokio::test]
+    async fn request_client_id_survives_send_variants_and_fallbacks() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        // Only loopback fixture traffic is used; all keys and identifiers are synthetic.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let fixture = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..9 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                    assert!(headers.len() < 16_384);
+                }
+                let headers = String::from_utf8(headers).unwrap();
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                assert!(size < 16_384);
+                let mut body = vec![0; size];
+                stream.read_exact(&mut body).unwrap();
+                let query = reqwest::Url::parse(&format!(
+                    "http://fixture.invalid/?{}",
+                    String::from_utf8(body).unwrap()
+                ))
+                .unwrap();
+                let encrypted = query
+                    .query_pairs()
+                    .find(|(key, _)| key == "params")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                let body: Value =
+                    serde_json::from_str(&crate::crypto::decode_aes(&[7; 32], &encrypted).unwrap())
+                        .unwrap();
+                let path = headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                let fail = path.contains("/link?") || path.contains("/quote?");
+                requests.push((path, body));
+                let response = if fail {
+                    r#"{"error_code":114}"#
+                } else {
+                    r#"{"error_code":0,"data":{"msgId":"server-a"}}"#
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", response.len(), response).unwrap();
+            }
+            requests
+        });
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo::default());
+        session.secret_key = Some(vec![7; 32]);
+        session.domains.chat = host.clone();
+        session.domains.group = host;
+        let client_id = 1_793_425_680_123;
+        send_message_with_client_id(&session, "contact-1", "Text", client_id)
+            .await
+            .unwrap();
+        send_group_message_with_client_id(&session, "group-1", "Text", client_id)
+            .await
+            .unwrap();
+        send_link_message_with_client_id(
+            &session,
+            "contact-1",
+            "Text",
+            &LinkMetadata {
+                url: "https://example.invalid/link".into(),
+                title: "Title".into(),
+                desc: String::new(),
+                thumb: String::new(),
+                src: String::new(),
+            },
+            false,
+            client_id,
+        )
+        .await
+        .unwrap();
+        send_sticker_with_client_id(&session, "contact-1", 1, 2, 7, false, client_id)
+            .await
+            .unwrap();
+        send_quote_message_with_client_id(
+            &session,
+            "contact-1",
+            "Text",
+            &ChatMessage {
+                id: "server-quote".into(),
+                ..Default::default()
+            },
+            false,
+            client_id,
+        )
+        .await
+        .unwrap();
+        forward_message_with_client_id(
+            &session,
+            "contact-1",
+            false,
+            &ChatMessage {
+                text: "Forward".into(),
+                ..Default::default()
+            },
+            client_id,
+        )
+        .await
+        .unwrap();
+        forward_message_with_client_id(
+            &session,
+            "contact-1",
+            false,
+            &ChatMessage {
+                sticker_id: Some(1),
+                ..Default::default()
+            },
+            client_id,
+        )
+        .await
+        .unwrap();
+        let requests = fixture.join().unwrap();
+        assert_eq!(requests.len(), 9);
+        for (_, body) in requests {
+            assert_eq!(body["clientId"], json!(client_id));
+        }
+    }
+    #[tokio::test]
+    async fn composer_signed_group_mentions_preserve_raw_spans_quote_and_request_id() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+        // Only loopback fixture traffic is used; all keys and identifiers are synthetic.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let fixture = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                    assert!(headers.len() < 16_384);
+                }
+                let headers = String::from_utf8(headers).unwrap();
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                assert!(size < 16_384);
+                let mut body = vec![0; size];
+                stream.read_exact(&mut body).unwrap();
+                let query = reqwest::Url::parse(&format!(
+                    "http://fixture.invalid/?{}",
+                    String::from_utf8(body).unwrap()
+                ))
+                .unwrap();
+                let encrypted = query
+                    .query_pairs()
+                    .find(|(key, _)| key == "params")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                let body: Value =
+                    serde_json::from_str(&crate::crypto::decode_aes(&[7; 32], &encrypted).unwrap())
+                        .unwrap();
+                let path = headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                let fail = body["qmsgId"] == json!(999);
+                requests.push((path, body));
+                let response = if fail {
+                    r#"{"error_code":114}"#
+                } else {
+                    r#"{"error_code":0,"data":{"msgId":"server-a"}}"#
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", response.len(), response).unwrap();
+            }
+            requests
+        });
+
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo::default());
+        session.secret_key = Some(vec![7; 32]);
+        session.domains.group = host;
+        let sample: Value = serde_json::from_str(include_str!("../tests/fixtures/composer_group_mentions.json")).unwrap();
+        let client_id = sample["client_id"].as_u64().unwrap();
+        let text = sample["text"].as_str().unwrap();
+        let mentions: Vec<crate::composer_mentions::OutgoingMention> = serde_json::from_value(sample["mentions"].clone()).unwrap();
+        send_group_message_with_mentions_and_client_id(&session, "group_123", text, client_id, &mentions).await.unwrap();
+        for id in ["123", "999", "local_1"] {
+            let quoted = ChatMessage { id: id.into(), sender: "33".into(), text: "Raw :+1: 😀".into(), ts: 123456, ..Default::default() };
+            send_quote_message_with_mentions_and_client_id(&session, "group_123", text, &quoted, true, client_id, &mentions).await.unwrap();
+        }
+        let requests = fixture.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        for (index, (path, body)) in requests.iter().enumerate() {
+            assert!(path.starts_with(if matches!(index, 1 | 2) { "/api/group/quote?" } else { "/api/group/mention?" }));
+            assert_eq!(body["message"], text);
+            assert_eq!(body["grid"], "123");
+            assert_eq!(body["clientId"], json!(client_id));
+            assert_eq!(body["language"], "vi");
+            let actual: Vec<crate::composer_mentions::OutgoingMention> = serde_json::from_str(body["mentionInfo"].as_str().expect("PC encodes mentionInfo as a JSON string")).unwrap();
+            assert_eq!(actual, mentions);
+            if matches!(index, 1 | 2) {
+                assert_eq!(body["qmsg"], "Raw :+1: 😀");
+                assert_eq!(body["qmsgOwner"], "33");
+                assert_eq!(body["qmsgTs"], 123456);
+            }
+        }
+    }
+
 }

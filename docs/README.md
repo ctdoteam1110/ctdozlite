@@ -7,6 +7,7 @@ Thư mục này chứa tài liệu chi tiết về cách sử dụng, cấu trú
 | Tài liệu | Nội dung |
 |---|---|
 | [0. Tính năng & giới hạn](TINH_NANG.md) | Cái gì đang chạy, cái gì chạy một phần, cái gì chưa có — kèm issue theo dõi. |
+| [Bộ tính năng khôi phục](KHOI_PHUC_TINH_NANG.md) | Emoji, reaction, mention, lịch sử, nháp/gửi bền và ranh giới kiểm chứng. |
 | [0b. Đã biết](DA_BIET.md) | **Sinh tự động** từ GitHub Issues. Đừng sửa tay. |
 | [1. Cài đặt](CAI_DAT.md) | Tải và cài đặt trên Linux, Windows, macOS; kiểm tra SHA-256 và gỡ cài đặt. |
 | [2. Hướng dẫn sử dụng](HUONG_DAN_SU_DUNG.md) | Các tham số CLI, thao tác trên GUI (`egui`), phím tắt TUI (`ratatui`) và công cụ kiểm thử. |

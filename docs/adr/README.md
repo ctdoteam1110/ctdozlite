@@ -35,6 +35,12 @@ What we will do, in one paragraph, present tense.
 
 | ADR | Title | Status |
 | :--- | :--- | :--- |
-| — | No decisions recorded yet | — |
+| [0001](0001-history-sync.md) | History sync | Accepted |
+| [0002](0002-self-updater.md) | Self updater | Accepted |
+| [0003](0003-changelog-policy.md) | Changelog policy | Accepted |
+| [0004](0004-account-owned-history-store.md) | Separate account-owned incremental history storage | Accepted |
+| [0005](0005-server-aware-deletion-tombstones.md) | Preserve verified server identity in deletion tombstones | Accepted |
+
+| [0006](0006-evidence-bound-seen-v2-transport.md) | Evidence-bound seen-v2 transport exception | Proposed |
 
 Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).
