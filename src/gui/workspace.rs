@@ -1639,11 +1639,16 @@ impl ZaloGuiApp {
                     self.in_chat_search_query = q_str;
                 }
                 if let Some((idx, tid, is_group)) = clicked_thread {
-                    if self.selected_thread_index != idx {
+                    let resolved_idx = self
+                        .threads
+                        .iter()
+                        .position(|t| t.id == tid)
+                        .unwrap_or(idx);
+                    if self.selected_thread_index != resolved_idx {
                         self.replying_to = None;
                         self.filter_starred_only = false;
                     }
-                    self.selected_thread_index = idx;
+                    self.selected_thread_index = resolved_idx;
                     if self.unread_counts.remove(&tid).is_some() {
                         let total_unread: usize = self.unread_counts.values().sum();
                         let title = if total_unread > 0 {
@@ -1655,7 +1660,7 @@ impl ZaloGuiApp {
                     }
                     let is_cloud = self
                         .threads
-                        .get(idx)
+                        .get(resolved_idx)
                         .map(|t| t.name.contains("Cloud của tôi"))
                         .unwrap_or(false);
                     if is_group || is_cloud {

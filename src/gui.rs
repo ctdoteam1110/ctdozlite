@@ -830,19 +830,25 @@ impl ZaloGuiApp {
                 GuiEvent::ThreadsUpdated(updates) => {
                     ensure_cjk_font(ctx, thread_texts(&updates));
                     if self.is_logged_in && !updates.is_empty() {
-                        let prev_selected_name = self
+                        let prev_selected = self
                             .threads
                             .get(self.selected_thread_index)
-                            .map(|t| (t.name.clone(), t.is_group));
-                        let live_ids: HashSet<String> = updates
+                            .cloned();
+                        let live_ids: HashSet<String> = self
+                            .threads
+                            .iter()
+                            .chain(updates.iter())
+                            .filter(|u| !u.id.is_empty() && u.id != "0")
+                            .map(|u| u.id.clone())
+                            .collect();
+                        let update_ids: HashSet<String> = updates
                             .iter()
                             .filter(|u| !u.id.is_empty() && u.id != "0")
                             .map(|u| u.id.clone())
                             .collect();
 
-                        let active_tid = self
-                            .threads
-                            .get(self.selected_thread_index)
+                        let active_tid = prev_selected
+                            .as_ref()
                             .map(|t| t.id.clone())
                             .unwrap_or_default();
                         let is_focused = ctx.input(|i| i.focused);
@@ -871,7 +877,7 @@ impl ZaloGuiApp {
                                     }
                                 }
                             } else if let Some(existing) = self.threads.iter_mut().find(|t| {
-                                !live_ids.contains(&t.id)
+                                !update_ids.contains(&t.id)
                                     && crate::chat::threads_represent_same_contact(t, &nt)
                             }) {
                                 crate::chat::merge_thread_into(existing, nt, true);
@@ -898,11 +904,15 @@ impl ZaloGuiApp {
                         }
                         crate::chat::deduplicate_threads(&mut self.threads, Some(&live_ids));
 
-                        if let Some((sel_name, sel_grp)) = prev_selected_name {
-                            if let Some(idx) = self
+                        // Restore selected thread by exact `id` first so contacts sharing the
+                        // same Zalo display name never jump to each other's chat window (#63).
+                        if let Some(prev) = prev_selected {
+                            if let Some(idx) = self.threads.iter().position(|t| t.id == prev.id) {
+                                self.selected_thread_index = idx;
+                            } else if let Some(idx) = self
                                 .threads
                                 .iter()
-                                .position(|t| t.is_group == sel_grp && t.name == sel_name)
+                                .position(|t| crate::chat::threads_represent_same_contact(t, &prev))
                             {
                                 self.selected_thread_index = idx;
                             }

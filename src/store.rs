@@ -285,15 +285,17 @@ impl MessageStore {
                     existing.name = st.name;
                 }
                 existing.is_group = existing.is_group || st.is_group;
-            } else if !crate::chat::is_generic_thread_name(&st.name)
+            } else if !st.is_group
+                && st.name.contains("Cloud của tôi")
                 && threads
                     .iter()
-                    .any(|t| t.is_group == st.is_group && t.name.trim() == st.name.trim())
+                    .any(|t| !t.is_group && t.name.contains("Cloud của tôi"))
             {
-                // Migrate stale session-scoped `thread_id` in SQLite to the active contact's `id`
+                // Migrate stale session-scoped `send2me_id` ("Cloud của tôi") in SQLite to the active session's `id`.
+                // Normal contacts/groups must NEVER be merged by display name alone (#63).
                 if let Some(live_id) = threads
                     .iter()
-                    .find(|t| t.is_group == st.is_group && t.name.trim() == st.name.trim())
+                    .find(|t| !t.is_group && t.name.contains("Cloud của tôi"))
                     .map(|t| t.id.clone())
                 {
                     let _ = self.conn.execute(

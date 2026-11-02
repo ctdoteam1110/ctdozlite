@@ -762,6 +762,11 @@ pub fn should_replace_avatar(current: Option<&str>, incoming: Option<&str>) -> b
 
 /// Return `true` if two `Thread` entries represent the same underlying contact or group,
 /// even if Zalo issued a new session-scoped `userId` after a QR re-login.
+///
+/// Two threads with distinct non-empty IDs are NEVER treated as the same contact solely
+/// because their display names match (#63 — multiple Zalo contacts/groups frequently share
+/// the same display name). Across different IDs, only the singleton "Cloud của tôi" thread
+/// or contacts sharing the same non-default CDN avatar hash (`avatar_file_key`) and name match.
 pub fn threads_represent_same_contact(a: &Thread, b: &Thread) -> bool {
     if !a.id.is_empty() && a.id == b.id {
         return true;
@@ -769,17 +774,19 @@ pub fn threads_represent_same_contact(a: &Thread, b: &Thread) -> bool {
     if a.is_group != b.is_group {
         return false;
     }
+    if !a.is_group && a.name.contains("Cloud của tôi") && b.name.contains("Cloud của tôi") {
+        return true;
+    }
     if let (Some(ka), Some(kb)) = (
         avatar_file_key(a.avatar.as_deref()),
         avatar_file_key(b.avatar.as_deref()),
     ) {
-        return ka == kb;
-    }
-    if !is_generic_thread_name(&a.name)
-        && !is_generic_thread_name(&b.name)
-        && a.name.trim() == b.name.trim()
-    {
-        return true;
+        if !ka.contains("default") && ka == kb {
+            return is_generic_thread_name(&a.name)
+                || is_generic_thread_name(&b.name)
+                || a.name.trim() == b.name.trim();
+        }
+        return false;
     }
     false
 }
@@ -6041,6 +6048,57 @@ mod tests {
         assert_eq!(list[0].messages.len(), 1);
         assert!(list[1].messages.is_empty());
         assert!(list[1].preview.is_empty());
+    }
+
+    #[test]
+    fn test_duplicate_display_names_with_different_ids_stay_distinct() {
+        let contact_a = Thread {
+            presentation: Default::default(),
+            unread: Default::default(),
+            id: "1000000000000000111".into(),
+            name: "Nguyễn Văn A".into(),
+            preview: "Xin chào từ người 1".into(),
+            time: "09:00".into(),
+            avatar: Some("https://s120-ava-talk.zadn.vn/1/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg".into()),
+            is_group: false,
+            messages: vec![ChatMessage {
+                id: "m_a".into(),
+                sender: "Nguyễn Văn A".into(),
+                text: "Xin chào từ người 1".into(),
+                time: "09:00".into(),
+                is_outgoing: false,
+                ts: 1700000001000,
+                ..Default::default()
+            }],
+        };
+        // Second contact has the exact same Zalo display name and no avatar URL yet (e.g., from incoming poll)
+        let contact_b = Thread {
+            presentation: Default::default(),
+            unread: Default::default(),
+            id: "1000000000000000222".into(),
+            name: "Nguyễn Văn A".into(),
+            preview: "Tin nhắn mới từ người 2".into(),
+            time: "10:30".into(),
+            avatar: None,
+            is_group: false,
+            messages: vec![ChatMessage {
+                id: "m_b".into(),
+                sender: "Nguyễn Văn A".into(),
+                text: "Tin nhắn mới từ người 2".into(),
+                time: "10:30".into(),
+                is_outgoing: false,
+                ts: 1700000002000,
+                ..Default::default()
+            }],
+        };
+        assert!(!threads_represent_same_contact(&contact_a, &contact_b));
+        let mut threads = vec![contact_a, contact_b];
+        deduplicate_threads(&mut threads, None);
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].id, "1000000000000000111");
+        assert_eq!(threads[1].id, "1000000000000000222");
+        assert_eq!(threads[0].messages[0].text, "Xin chào từ người 1");
+        assert_eq!(threads[1].messages[0].text, "Tin nhắn mới từ người 2");
     }
 }
 

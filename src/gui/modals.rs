@@ -2896,7 +2896,8 @@ impl ZaloGuiApp {
         let call_ava = self
             .threads
             .iter()
-            .find(|t| t.id == call.partner_id || t.name == call.partner_name)
+            .find(|t| !call.partner_id.is_empty() && t.id == call.partner_id)
+            .or_else(|| self.threads.iter().find(|t| t.name == call.partner_name))
             .and_then(|t| t.avatar.clone());
 
         // Extract remote participants for group call multi-tile view (excluding our own user name)
