@@ -96,6 +96,8 @@ pub enum WorkerCmd {
     PrepareVideo {
         url: String,
     },
+    /// "Đóng" on the missing-messages banner → `MessageStore::dismiss_missing_ranges`.
+    DismissMissingRanges,
     /// Measure `paths::cache_dir()` → `GuiEvent::CacheSizeComputed`.
     ComputeCacheSize,
     /// Delete the contents of `paths::cache_dir()` (`stickers_cache/` only) →
@@ -348,13 +350,99 @@ async fn prefetch_missing_sticker_thumbnails(
     futures_util::future::join_all(futs).await;
 }
 
+/// Offline catch-up progress shared by the socket loop and `RefreshThreads`: ids of messages
+/// seen while a catch-up runs, deduplicated across socket and long-poll.
+#[derive(Default)]
+struct CatchUp {
+    active: bool,
+    ids: HashSet<String>,
+}
+
+type SharedCatchUp = std::sync::Arc<std::sync::Mutex<CatchUp>>;
+
+fn catchup_key(thread_id: &str, m: &ChatMessage) -> String {
+    if m.id.is_empty() {
+        format!("{thread_id}@{}", m.ts)
+    } else {
+        format!("{thread_id}:{}", m.id)
+    }
+}
+
+/// Count the messages of `threads` into a running catch-up and report progress.
+fn catchup_note(c: &SharedCatchUp, threads: &[Thread], gui_tx: &Sender<GuiEvent>, ctx: &egui::Context) {
+    let Ok(mut cu) = c.lock() else {
+        return;
+    };
+    if !cu.active {
+        return;
+    }
+    let before = cu.ids.len();
+    for t in threads {
+        for m in &t.messages {
+            cu.ids.insert(catchup_key(&t.id, m));
+        }
+    }
+    if cu.ids.len() != before {
+        let _ = gui_tx.send(GuiEvent::SyncProgress { fetched: cu.ids.len(), done: false });
+        ctx.request_repaint();
+    }
+}
+
+/// Push the open missing-message ranges to the GUI when a new gap was recorded.
+fn send_new_gaps(gui_tx: &Sender<GuiEvent>, ctx: &egui::Context) {
+    if !crate::sync_state::take_new_gaps() {
+        return;
+    }
+    if let Ok(store) = crate::store::MessageStore::open(crate::paths::history_db()) {
+        let ranges = store.open_missing_ranges().unwrap_or_default();
+        let _ = gui_tx.send(GuiEvent::MissingRanges(ranges));
+        ctx.request_repaint();
+    }
+}
+
+/// Recompute conversation order (`get-last-msgs` activity + msgId clock) for the GUI.
+fn send_conversation_activity(gui_tx: &Sender<GuiEvent>, ctx: &egui::Context) {
+    if let Ok(store) = crate::store::MessageStore::open(crate::paths::history_db()) {
+        let map = crate::sync_state::load_conversation_activity(&store);
+        let _ = gui_tx.send(GuiEvent::ConversationActivity(map));
+        ctx.request_repaint();
+    }
+}
+
+/// Consecutive `RefreshThreads` attempts that found the server unreachable.
+static REFRESH_RETRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Ask for another `RefreshThreads` later (5 s, 15 s, 30 s, then every 60 s) so a start-up
+/// without network still catches up once the network is back.
+fn schedule_refresh_retry() {
+    let n = REFRESH_RETRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as usize;
+    let delay = [5u64, 15, 30, 60][n.min(3)];
+    crate::trace_shape::line("sync", format!("refresh: retry in {delay}s (attempt {})", n + 1));
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+        if let Some(tx) = WORKER_TX.get() {
+            let _ = tx.send(WorkerCmd::RefreshThreads);
+        }
+    });
+}
+
 pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: egui::Context) {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
     let _ = WORKER_TX.set(cmd_tx);
 
+    // Saved cursors of this account (A1): the long-poll state and the socket queue cursors.
+    let saved = crate::sync_state::SyncState::load(
+        &session.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default(),
+    );
+    let ws_cursors: crate::socket::WsCursors =
+        std::sync::Arc::new(std::sync::Mutex::new(saved.ws_queues.clone()));
+    let catchup: SharedCatchUp = std::sync::Arc::new(std::sync::Mutex::new(CatchUp {
+        active: session.login.is_some(),
+        ids: HashSet::new(),
+    }));
+
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
-    let poll_state =
-        std::sync::Arc::new(tokio::sync::Mutex::new(crate::chat::PollState::default()));
+    let poll_state = std::sync::Arc::new(tokio::sync::Mutex::new(saved.poll));
     let ctrl_poll_state =
         std::sync::Arc::new(tokio::sync::Mutex::new(crate::call::CtrlPollState::default()));
 
@@ -397,12 +485,50 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                     egui_ctx.clone(),
                 ));
 
+                // 0) Persist the sync cursors (A1): every 2 s, only when they changed.
+                {
+                    let s_sv = session.clone();
+                    let ps_sv = poll_state.clone();
+                    let wc_sv = ws_cursors.clone();
+                    tokio::spawn(async move {
+                        let mut last_saved: Option<crate::sync_state::SyncState> = None;
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            let uin = {
+                                let s = s_sv.lock().await;
+                                s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default()
+                            };
+                            if crate::sync_state::sanitize_uin(&uin).is_none() {
+                                continue;
+                            }
+                            // A long-poll holds this lock for up to 12 s; try again next tick.
+                            let Ok(poll) = ps_sv.try_lock().map(|p| p.clone()) else {
+                                continue;
+                            };
+                            let mut st = crate::sync_state::SyncState::new(&uin);
+                            st.poll = poll;
+                            st.ws_queues = wc_sv.lock().map(|c| c.clone()).unwrap_or_default();
+                            if last_saved.as_ref() == Some(&st) {
+                                continue;
+                            }
+                            let mut to_save = st.clone();
+                            to_save.updated_at_ms = crate::timefmt::now_ms();
+                            match to_save.save() {
+                                Ok(()) => last_saved = Some(st),
+                                Err(e) => crate::logger::log_error("worker::sync_state", &e.to_string()),
+                            }
+                        }
+                    });
+                }
+
                 // 1) Real-time `zpw_ws` WebSocket loop for instant chat messages + VoIP events
                 {
                     let s_ws = session.clone();
                     let cb = call_bridge.clone();
                     let gui_tx_ws = gui_tx.clone();
                     let ctx_ws = egui_ctx.clone();
+                    let wc_ws = ws_cursors.clone();
+                    let cu_ws = catchup.clone();
                     tokio::spawn(async move {
                         let mut ws_rx: Option<
                             tokio::sync::mpsc::UnboundedReceiver<crate::socket::WsEvent>,
@@ -414,7 +540,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                 let cur_sek = s_snap.zpw_sek.clone().unwrap_or_default();
                                 if !cur_sek.is_empty() && (ws_rx.is_none() || ws_sek != cur_sek) {
                                     ws_sek = cur_sek;
-                                    ws_rx = Some(crate::socket::spawn(s_snap.clone()));
+                                    ws_rx = Some(crate::socket::spawn_with_cursors(
+                                        s_snap.clone(),
+                                        wc_ws.clone(),
+                                    ));
                                 }
                                 if let Some(rx) = ws_rx.as_mut() {
                                     match tokio::time::timeout(
@@ -432,6 +561,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                 crate::call::extract_voip_controls(data_node)
                                             {
                                                 cb.handle_control_event(voip_ev);
+                                            }
+                                            if ev.is_chat_ish()
+                                                && crate::sync_state::record_gaps_from(&ev.payload)
+                                            {
+                                                send_new_gaps(&gui_tx_ws, &ctx_ws);
                                             }
                                             if ev.is_chat_ish() {
                                                 let mut ws_threads = Vec::new();
@@ -454,6 +588,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                     &ev.payload,
                                                 );
                                                 ws_threads.retain(|t| !t.messages.is_empty());
+                                                catchup_note(&cu_ws, &ws_threads, &gui_tx_ws, &ctx_ws);
                                                 if !ws_threads.is_empty() {
                                                     crate::chat::resolve_thread_names(
                                                         &s_snap,
@@ -537,11 +672,22 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let _ = std::fs::remove_file(crate::paths::threads_cache_file());
                             {
                                 let mut s = session.lock().await;
+                                // Cursors belong to the session that ends here.
+                                if let Some(path) = s
+                                    .login
+                                    .as_ref()
+                                    .and_then(|l| crate::paths::sync_state_file(&l.uin))
+                                {
+                                    let _ = std::fs::remove_file(path);
+                                }
                                 s.logout();
                             }
                             {
                                 let mut ps = poll_state.lock().await;
                                 *ps = crate::chat::PollState::default();
+                            }
+                            if let Ok(mut c) = ws_cursors.lock() {
+                                c.clear();
                             }
                             let _ = gui_tx.send(GuiEvent::LoggedOut);
                             egui_ctx.request_repaint();
@@ -554,6 +700,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
+                            let wc_qr = ws_cursors.clone();
 
                             let handle = tokio::spawn(async move {
                                 {
@@ -563,6 +710,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                 {
                                     let mut ps = poll_clone.lock().await;
                                     *ps = crate::chat::PollState::default();
+                                }
+                                // Another account may log in: never reuse its cursors.
+                                if let Ok(mut c) = wc_qr.lock() {
+                                    c.clear();
                                 }
                                 let _ = gui_tx_clone
                                     .send(GuiEvent::StatusUpdate("Đang xin mã QR mới…".into()));
@@ -669,6 +820,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                             .as_ref()
                                                             .map(|l| l.avatar.clone())
                                                             .filter(|a| !a.is_empty());
+                                                        // Cursors saved earlier for this account, if any.
+                                                        let saved = crate::sync_state::SyncState::load(&uin);
+                                                        *poll_clone.lock().await = saved.poll;
+                                                        if let Ok(mut c) = wc_qr.lock() {
+                                                            *c = saved.ws_queues;
+                                                        }
                                                         let _ = gui_tx_clone.send(
                                                             GuiEvent::LoginSuccess {
                                                                 name: dname,
@@ -699,6 +856,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                         }
                                                         let _ = gui_tx_clone
                                                             .send(GuiEvent::ThreadsUpdated(list));
+                                                        send_conversation_activity(&gui_tx_clone, &ctx_clone);
+                                                        send_new_gaps(&gui_tx_clone, &ctx_clone);
                                                         ctx_clone.request_repaint();
 
                                                         let s_kw = s.clone();
@@ -731,6 +890,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
+                            let cu_rf = catchup.clone();
                             tokio::spawn(async move {
                                 let mut s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
@@ -740,12 +900,17 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         format!("refresh: check_session -> {status:?}"),
                                     );
                                     match status {
-                                        crate::session::SessionStatus::Valid => {}
+                                        crate::session::SessionStatus::Valid => {
+                                            REFRESH_RETRIES
+                                                .store(0, std::sync::atomic::Ordering::SeqCst);
+                                        }
                                         crate::session::SessionStatus::Unreachable(why) => {
-                                            // Keep the saved session; just say we are offline.
+                                            // Keep the saved session; say we are offline and
+                                            // try again so the catch-up still happens.
                                             let _ = gui_tx_clone
                                                 .send(GuiEvent::StatusUpdate(unreachable_status(&why)));
                                             ctx_clone.request_repaint();
+                                            schedule_refresh_retry();
                                             return;
                                         }
                                         crate::session::SessionStatus::Expired => {
@@ -804,6 +969,20 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             errors.len()
                                         ),
                                     );
+                                    if let Ok(mut cu) = cu_rf.lock() {
+                                        if !cu.active {
+                                            cu.active = true;
+                                            cu.ids.clear();
+                                        }
+                                        let _ = gui_tx_clone.send(GuiEvent::SyncProgress {
+                                            fetched: cu.ids.len(),
+                                            done: false,
+                                        });
+                                    }
+                                    let before: HashSet<String> = list
+                                        .iter()
+                                        .flat_map(|t| t.messages.iter().map(move |m| catchup_key(&t.id, m)))
+                                        .collect();
                                     {
                                         let mut ps = poll_clone.lock().await;
                                         if let Err(e) =
@@ -814,6 +993,23 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         }
                                     }
                                     crate::trace_shape::line("sync", "refresh: poll_new_messages done");
+                                    if let Ok(mut cu) = cu_rf.lock() {
+                                        for t in &list {
+                                            for m in &t.messages {
+                                                let k = catchup_key(&t.id, m);
+                                                if !before.contains(&k) {
+                                                    cu.ids.insert(k);
+                                                }
+                                            }
+                                        }
+                                        cu.active = false;
+                                        let _ = gui_tx_clone.send(GuiEvent::SyncProgress {
+                                            fetched: cu.ids.len(),
+                                            done: true,
+                                        });
+                                    }
+                                    send_conversation_activity(&gui_tx_clone, &ctx_clone);
+                                    send_new_gaps(&gui_tx_clone, &ctx_clone);
                                     let thread_count = list.len();
                                     let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(list));
                                     let status = if errors.is_empty() {
@@ -840,6 +1036,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
+                            let cu_pm = catchup.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
@@ -857,29 +1054,30 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         .collect();
 
                                     let mut poll_err: Option<String> = None;
-                                    for _ in 0..3 {
+                                    for _ in 0..crate::chat::LP_CATCHUP_MAX_BATCHES {
                                         let poll_res = {
                                             let mut ps = poll_clone.lock().await;
-                                            crate::chat::get_chat_from_polling(&s, &mut ps).await
+                                            let before = ps.clone();
+                                            crate::chat::get_chat_from_polling(&s, &mut ps)
+                                                .await
+                                                .map(|r| {
+                                                    let go_on =
+                                                        crate::chat::lp_should_continue(&before, &ps, &r);
+                                                    (r, go_on)
+                                                })
                                         };
                                         match poll_res {
-                                            Ok(lp_resp) => {
+                                            Ok((lp_resp, go_on)) => {
                                                 crate::chat::merge_previews(
                                                     &mut temp_threads,
                                                     &lp_resp,
                                                 );
-                                                let data_node =
-                                                    lp_resp.get("data").unwrap_or(&lp_resp);
-                                                let more = data_node
-                                                    .get("more")
-                                                    .and_then(serde_json::Value::as_i64)
-                                                    .unwrap_or(0);
-                                                let has_reset = data_node
-                                                    .get("resetLastActionId")
-                                                    .and_then(serde_json::Value::as_str)
-                                                    .map(|r| r != "0" && !r.is_empty())
-                                                    .unwrap_or(false);
-                                                if more == 0 && !has_reset {
+                                                if !go_on {
+                                                    // Stuck on a queue we do not track: wait
+                                                    // before asking again instead of spinning.
+                                                    if crate::chat::lp_reply_wants_more(&lp_resp) {
+                                                        tokio::time::sleep(Duration::from_secs(10)).await;
+                                                    }
                                                     break;
                                                 }
                                             }
@@ -901,7 +1099,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             .await;
                                         }
                                     } else {
+                                        send_new_gaps(&gui_tx_clone, &ctx_clone);
                                         temp_threads.retain(|t| !t.messages.is_empty());
+                                        catchup_note(&cu_pm, &temp_threads, &gui_tx_clone, &ctx_clone);
                                         if !temp_threads.is_empty() {
                                             crate::chat::resolve_thread_names(
                                                 &s,
@@ -1954,6 +2154,19 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         let _ = gui_tx_clone.send(GuiEvent::VideoFailed { url, error });
                                     }
                                 }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::DismissMissingRanges => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Ok(store) =
+                                    crate::store::MessageStore::open(crate::paths::history_db())
+                                {
+                                    let _ = store.dismiss_missing_ranges();
+                                }
+                                let _ = gui_tx_clone.send(GuiEvent::MissingRanges(Vec::new()));
                                 ctx_clone.request_repaint();
                             });
                         }

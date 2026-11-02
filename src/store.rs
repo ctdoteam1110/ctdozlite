@@ -29,6 +29,15 @@ pub struct StoredThread {
     pub last_ts: i64,
 }
 
+/// A span in which messages may be missing (see `MessageStore::add_missing_range`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingRange {
+    pub conv_id: String,
+    pub from_ts: i64,
+    pub to_ts: i64,
+    pub reason: String,
+}
+
 pub struct MessageStore {
     pub conn: Connection,
 }
@@ -67,10 +76,119 @@ impl MessageStore {
                 name TEXT,
                 is_group INTEGER,
                 last_ts INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS missing_ranges (
+                id INTEGER PRIMARY KEY,
+                conv_id TEXT NOT NULL,
+                from_ts INTEGER NOT NULL,
+                to_ts INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                dismissed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS thread_activity (
+                thread_id TEXT PRIMARY KEY,
+                is_group INTEGER NOT NULL,
+                last_msg_id TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
             );",
         )?;
 
         Ok(Self { conn })
+    }
+
+    /// Record a span in which messages may be missing (`conv_id = "*"`: any conversation),
+    /// e.g. after the server evicted part of an offline queue. An open range for the same
+    /// conversation that starts at the same time is extended instead of duplicated.
+    /// Returns `true` when a new range was added.
+    pub fn add_missing_range(&self, conv_id: &str, from_ts: i64, to_ts: i64, reason: &str) -> Result<bool> {
+        let extended = self.conn.execute(
+            "UPDATE missing_ranges SET to_ts = MAX(to_ts, ?3)
+             WHERE conv_id = ?1 AND from_ts = ?2 AND dismissed = 0",
+            params![conv_id, from_ts, to_ts],
+        )?;
+        if extended > 0 {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "INSERT INTO missing_ranges (conv_id, from_ts, to_ts, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![conv_id, from_ts, to_ts, reason, crate::timefmt::now_ms()],
+        )?;
+        Ok(true)
+    }
+
+    /// Ranges the user has not dismissed yet, oldest first.
+    pub fn open_missing_ranges(&self) -> Result<Vec<MissingRange>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT conv_id, from_ts, to_ts, reason FROM missing_ranges
+             WHERE dismissed = 0 ORDER BY from_ts ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(MissingRange {
+                conv_id: r.get(0)?,
+                from_ts: r.get(1)?,
+                to_ts: r.get(2)?,
+                reason: r.get(3)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// "Đóng" on the missing-messages banner.
+    pub fn dismiss_missing_ranges(&self) -> Result<()> {
+        self.conn
+            .execute("UPDATE missing_ranges SET dismissed = 1 WHERE dismissed = 0", [])?;
+        Ok(())
+    }
+
+    /// Timestamp of the newest stored message, if any.
+    pub fn newest_message_ts(&self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(ts) FROM messages WHERE ts > 0", [], |r| r.get::<_, Option<i64>>(0))?)
+    }
+
+    /// Remember each conversation's last message id (`get-last-msgs` → `clearUnreads`).
+    pub fn upsert_thread_activity(&mut self, rows: &[(String, bool, String)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let now = crate::timefmt::now_ms();
+        for (thread_id, is_group, last_msg_id) in rows {
+            tx.execute(
+                "INSERT INTO thread_activity (thread_id, is_group, last_msg_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(thread_id) DO UPDATE SET
+                     is_group = excluded.is_group,
+                     last_msg_id = excluded.last_msg_id,
+                     updated_at = excluded.updated_at",
+                params![thread_id, if *is_group { 1 } else { 0 }, last_msg_id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `(thread_id, last_msg_id)` for every conversation seen in `get-last-msgs`.
+    pub fn thread_activity(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT thread_id, last_msg_id FROM thread_activity")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Up to `limit` newest `(numeric msg_id, ts)` pairs, to fit [`crate::sync_state::MsgIdClock`].
+    pub fn msg_id_ts_pairs(&self, limit: usize) -> Result<Vec<(u64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT msg_id, ts FROM messages WHERE ts > 0 ORDER BY ts DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        Ok(rows
+            .filter_map(|r| r.ok())
+            .filter_map(|(id, ts)| id.parse::<u64>().ok().map(|n| (n, ts)))
+            .collect())
     }
 
     /// Insert a message. Returns `true` if a new row was inserted, `false` if already existed.
@@ -575,6 +693,52 @@ mod tests {
 
         assert!(store.upsert_message(&msg).unwrap());
         assert!(!store.upsert_message(&msg).unwrap());
+    }
+
+    #[test]
+    fn missing_ranges_extend_and_dismiss() {
+        let store = MessageStore::open(":memory:").unwrap();
+        assert!(store.add_missing_range("*", 1_000, 2_000, "evict:510_1").unwrap());
+        assert!(!store.add_missing_range("*", 1_000, 5_000, "evict:510_1").unwrap(), "same start extends");
+        assert!(store.add_missing_range("*", 9_000, 9_500, "reset").unwrap());
+        let open = store.open_missing_ranges().unwrap();
+        assert_eq!(open.len(), 2);
+        assert_eq!((open[0].from_ts, open[0].to_ts), (1_000, 5_000));
+        store.dismiss_missing_ranges().unwrap();
+        assert!(store.open_missing_ranges().unwrap().is_empty());
+        // A dismissed range is not extended: a new gap with the same start is new again.
+        assert!(store.add_missing_range("*", 1_000, 6_000, "evict:510_1").unwrap());
+    }
+
+    #[test]
+    fn thread_activity_and_clock_pairs() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        store
+            .upsert_thread_activity(&[("111".into(), false, "8440000000000".into()), ("222".into(), true, "8430000000000".into())])
+            .unwrap();
+        store.upsert_thread_activity(&[("111".into(), false, "8441000000000".into())]).unwrap();
+        let mut rows = store.thread_activity().unwrap();
+        rows.sort();
+        assert_eq!(rows, vec![("111".into(), "8441000000000".into()), ("222".into(), "8430000000000".into())]);
+
+        assert_eq!(store.newest_message_ts().unwrap(), None);
+        for (id, ts) in [("8440959449359", 1_793_550_037_212i64), ("local_1", 1_793_550_000_000), ("7674131260947", 1_774_875_484_698)] {
+            let m = StoredMessage {
+                msg_id: id.into(),
+                thread_id: "111".into(),
+                sender_id: String::new(),
+                sender_name: String::new(),
+                text: String::new(),
+                msg_type: String::new(),
+                ts,
+                is_outgoing: false,
+                raw_json: String::new(),
+            };
+            store.upsert_message(&m).unwrap();
+        }
+        assert_eq!(store.newest_message_ts().unwrap(), Some(1_793_550_037_212));
+        let pairs = store.msg_id_ts_pairs(10).unwrap();
+        assert_eq!(pairs, vec![(8_440_959_449_359, 1_793_550_037_212), (7_674_131_260_947, 1_774_875_484_698)]);
     }
 
     #[test]
