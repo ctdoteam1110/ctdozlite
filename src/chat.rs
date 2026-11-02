@@ -3961,9 +3961,14 @@ fn media_fields(kind: MediaKind, content: Option<&Value>) -> MediaFields {
 }
 
 /// Media kind of a bare Zalo CDN URL, for rows stored before media messages were recognised
-/// (their `text` is the URL itself). Conservative on purpose: only `*.zdn.vn` / `*.zadn.vn`
-/// hosts, and only when the path ends in a photo / video extension or a host label names the
-/// media (`photo-…`, `video-…`). Everything else stays an ordinary link.
+/// (their `text` is the URL itself). Conservative on purpose, by CDN family seen on the real
+/// account (02/11):
+/// * `*.zdn.vn` / `*.zadn.vn` (`photo-stal-N`, `fN-zpg-r`, `fN-zpc`, `voice-aac-dl`): a
+///   photo / video extension, or a host label naming the media (`photo`, `video`, `voice`);
+/// * `*.dlmd.me` (`video-stal-N`, no file extension): a host label naming `video`;
+/// * `*.dlfl.vn` (`file-stal-N`, `otN`, `fgN`): Zalo's file CDN, always a file.
+///
+/// Everything else stays an ordinary link.
 pub fn media_kind_from_legacy_url(url: &str) -> Option<MediaKind> {
     let u = url.trim();
     let rest = u
@@ -3983,9 +3988,15 @@ pub fn media_kind_from_legacy_url(url: &str) -> Option<MediaKind> {
         .unwrap_or("")
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    let base = ["zdn.vn", "zadn.vn"]
-        .into_iter()
-        .find(|b| host == *b || host.ends_with(&format!(".{b}")))?;
+    let on = |b: &str| host == b || host.ends_with(&format!(".{b}"));
+    if on("dlfl.vn") {
+        return Some(MediaKind::File);
+    }
+    if on("dlmd.me") {
+        let labels = host.strip_suffix("dlmd.me").unwrap_or("").trim_end_matches('.');
+        return labels.split('.').any(|l| l.contains("video")).then_some(MediaKind::Video);
+    }
+    let base = ["zdn.vn", "zadn.vn"].into_iter().find(|b| on(b))?;
     let path = rest[auth_end..]
         .split(['?', '#'])
         .next()
@@ -4011,13 +4022,17 @@ pub fn media_kind_from_legacy_url(url: &str) -> Option<MediaKind> {
         if label.contains("video") {
             return Some(MediaKind::Video);
         }
+        if label.contains("voice") {
+            return Some(MediaKind::Voice);
+        }
     }
     None
 }
 
-/// Media kind of a stored row that predates media parsing: `text` is exactly its `link_url`
-/// and that URL is a Zalo media URL ([`media_kind_from_legacy_url`]). Rows that already carry
-/// a media marker, a sticker, or any other text are not legacy rows.
+/// Media kind of a stored row that predates media parsing: its `link_url` is a Zalo media URL
+/// ([`media_kind_from_legacy_url`]) and `text` is that URL — or, for files, the file name
+/// (older builds took the attachment title as text). Rows that already carry a media marker,
+/// a label (`[…]`) or a sticker are not legacy rows.
 pub fn legacy_media_kind(msg: &ChatMessage) -> Option<MediaKind> {
     if msg.sticker_id.is_some() {
         return None;
@@ -4029,10 +4044,12 @@ pub fn legacy_media_kind(msg: &ChatMessage) -> Option<MediaKind> {
         return None;
     }
     let url = msg.link_url.as_deref()?.trim();
-    if url.is_empty() || msg.text.trim() != url {
+    let text = msg.text.trim();
+    if url.is_empty() || text.starts_with('[') {
         return None;
     }
-    media_kind_from_legacy_url(url)
+    let kind = media_kind_from_legacy_url(url)?;
+    (text == url || kind == MediaKind::File).then_some(kind)
 }
 
 fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
@@ -5414,6 +5431,14 @@ mod tests {
         assert_eq!(k("https://f.zdn.vn/a.webp"), None);
         assert_eq!(k("ftp://photo.zdn.vn/a.jpg"), None);
         assert_eq!(k("xem https://photo.zdn.vn/a.jpg"), None);
+        // CDN families seen on the real account (02/11).
+        assert_eq!(k("https://video-stal-44.dlmd.me/no/15321b8f/2aObo"), Some(Video));
+        assert_eq!(k("https://file-stal-3.dlfl.vn/f/abc/def"), Some(File));
+        assert_eq!(k("https://ot46.dlfl.vn/x"), Some(File));
+        assert_eq!(k("https://voice-aac-dl.zdn.vn/a/b"), Some(Voice));
+        assert_eq!(k("https://cdn.dlmd.me/no/abc"), None, "dlmd.me without a video label");
+        assert_eq!(k("https://dlmd.me.example.com/video"), None);
+        assert_eq!(k("https://evildlfl.vn/f"), None);
 
         let row = |text: &str, url: Option<&str>| ChatMessage {
             text: text.into(),
@@ -5433,6 +5458,14 @@ mod tests {
             legacy_media_kind(&row("https://news.example.com/a", Some("https://news.example.com/a"))),
             None
         );
+        // Old file rows kept the file name as text.
+        let f = "https://file-stal-3.dlfl.vn/f/abc/def";
+        assert_eq!(legacy_media_kind(&row("bao-cao.xlsx", Some(f))), Some(File));
+        assert_eq!(legacy_media_kind(&row("[Tập tin] bao-cao.xlsx", Some(f))), None);
+        // A video row still needs text == URL.
+        let v = "https://video-stal-44.dlmd.me/no/15321b8f/2aObo";
+        assert_eq!(legacy_media_kind(&row(v, Some(v))), Some(Video));
+        assert_eq!(legacy_media_kind(&row("xem clip", Some(v))), None);
     }
 
     #[test]

@@ -2203,13 +2203,14 @@ pub(super) fn file_card_texts(msg: &ChatMessage) -> (String, String) {
     (title.to_string(), sub.to_string())
 }
 
-/// Rows stored before media messages were parsed (`text` = a Zalo CDN URL, no marker): a view
-/// of the row as the photo / video card it is, instead of a link card that opens the browser.
-/// `None` for every other message (see [`crate::chat::legacy_media_kind`]).
+/// Rows stored before media messages were parsed (`text` = a Zalo CDN URL or a file name, no
+/// marker): a view of the row as the photo / video / file / voice card it is, instead of a link
+/// card that opens the browser. `None` for every other message (see
+/// [`crate::chat::legacy_media_kind`]).
 pub(super) fn legacy_media_view(msg: &ChatMessage) -> Option<ChatMessage> {
     let kind = crate::chat::legacy_media_kind(msg)?;
     let mut m = msg.clone();
-    m.link_title = None;
+    let old_title = m.link_title.take();
     m.link_desc = None;
     match kind {
         crate::chat::MediaKind::Photo => {
@@ -2223,7 +2224,23 @@ pub(super) fn legacy_media_view(msg: &ChatMessage) -> Option<ChatMessage> {
             m.text = "[Video]".into();
             m.link_src = Some("Video Zalo".into());
         }
-        crate::chat::MediaKind::File | crate::chat::MediaKind::Voice => return None,
+        crate::chat::MediaKind::File => {
+            // The file name: the old text when it is not the URL itself, else the old title.
+            let text = msg.text.trim();
+            let name = if !text.is_empty() && Some(text) != msg.link_url.as_deref().map(str::trim) {
+                text.to_string()
+            } else {
+                old_title.unwrap_or_default()
+            };
+            m.text = if name.is_empty() { "[Tập tin]".into() } else { format!("[Tập tin] {name}") };
+            m.link_title = (!name.is_empty()).then_some(name);
+            m.link_src = Some("Tập tin Zalo".into());
+        }
+        crate::chat::MediaKind::Voice => {
+            m.text = "[Tin nhắn thoại]".into();
+            m.link_title = Some("Tin nhắn thoại".into());
+            m.link_src = None;
+        }
     }
     Some(m)
 }
