@@ -149,7 +149,7 @@ async fn main() -> Result<()> {
     }
 
     // Attempt to restore persistent session from disk
-    let session_restored = if !force_logout {
+    let mut session_restored = if !force_logout {
         if let Ok(_) = s.load_from_file("session.json") {
             if let Some(li) = &s.login {
                 let name = if li.display_name.is_empty() {
@@ -171,6 +171,23 @@ async fn main() -> Result<()> {
     } else {
         false
     };
+
+    // Bound profiles must never expose another account's history.
+    let profile_bound = if std::path::Path::new("zalo_history.db").exists() {
+        let store = store::MessageStore::open("zalo_history.db")?;
+        let bound = store.profile_is_bound()?;
+        if let Some(login) = s.login.as_ref() {
+            if !store.profile_allows_account(&login.uin)? {
+                s.logout();
+                session_restored = false;
+                eprintln!("Hồ sơ dữ liệu thuộc tài khoản khác; hãy đăng nhập đúng tài khoản.");
+            }
+        }
+        bound
+    } else { false };
+    if profile_bound && s.login.is_none() && (force_mcp || api_port.is_some()) {
+        anyhow::bail!("Hãy đăng nhập đúng tài khoản trước khi mở API cho hồ sơ này");
+    }
 
     // If `--mcp` is requested, run the Model Context Protocol JSON-RPC 2.0 server over stdio (#35).
     if force_mcp {
@@ -221,12 +238,10 @@ async fn main() -> Result<()> {
             ..Default::default()
         };
 
-        let mut initial_threads = chat::load_threads_cache();
-        store::load_history_into_threads(
-            "zalo_history.db",
-            &mut initial_threads,
-            store::MessageStore::PRELOAD_MSGS,
-        );
+        let mut initial_threads = if profile_bound && s.login.is_none() { Vec::new() } else { chat::load_threads_cache() };
+        if !profile_bound || s.login.is_some() {
+            store::load_history_into_threads("zalo_history.db", &mut initial_threads, store::MessageStore::PRELOAD_MSGS);
+        }
 
         let app_session = s;
         let res = eframe::run_native(
@@ -338,6 +353,12 @@ async fn main() -> Result<()> {
                 };
                 logged_in_now = true;
             }
+        }
+    }
+
+    if let Some(login) = s.login.as_ref() {
+        if std::path::Path::new("zalo_history.db").exists() && !store::MessageStore::open("zalo_history.db")?.profile_allows_account(&login.uin)? {
+            anyhow::bail!("Hồ sơ dữ liệu thuộc tài khoản khác");
         }
     }
 

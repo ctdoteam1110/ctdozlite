@@ -309,12 +309,22 @@ pub async fn handle_mcp_request(
     }
 }
 
+async fn profile_access_allowed(session: &Arc<Mutex<Session>>, db_path: &str) -> bool {
+    let s = session.lock().await;
+    let Ok(store) = MessageStore::open(db_path) else { return false; };
+    match store.profile_is_bound() {
+        Ok(false) => true,
+        Ok(true) => s.login.as_ref().is_some_and(|login| store.profile_allows_account(&login.uin).unwrap_or(false)),
+        Err(_) => false,
+    }
+}
 async fn execute_tool_call(
     session: &Arc<Mutex<Session>>,
     name: &str,
     args: &Value,
     db_path: &str,
 ) -> (bool, Value) {
+    if !profile_access_allowed(session, db_path).await { return (true, json!({ "error": "Hồ sơ dữ liệu thuộc tài khoản khác hoặc chưa đăng nhập" })); }
     match name {
         "zalo_status" => {
             let s = session.lock().await;
@@ -550,6 +560,7 @@ pub async fn handle_rest_request(
     body: &str,
     db_path: &str,
 ) -> (u16, Value) {
+    if !profile_access_allowed(session, db_path).await { return (403, json!({ "error": "Hồ sơ dữ liệu thuộc tài khoản khác hoặc chưa đăng nhập" })); }
     let (path, query_str) = path_and_query
         .split_once('?')
         .unwrap_or((path_and_query, ""));

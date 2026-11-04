@@ -1395,8 +1395,7 @@ pub(super) fn render_message_body(
                 }
             }
             let open_target = msg
-                .link_url
-                .as_deref()
+                .backup_media_ref.as_deref().or(msg.link_url.as_deref())
                 .filter(|u| !u.is_empty())
                 .unwrap_or(thumb_url)
                 .to_string();
@@ -1565,8 +1564,8 @@ pub(super) fn render_message_body(
             )
             .on_hover_cursor(CursorIcon::PointingHand);
         if resp.clicked() || dom_resp.clicked() {
-            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-                if is_vid && !url.to_ascii_lowercase().contains("/renewmedia") {
+            if let Some(url) = msg.backup_media_ref.as_deref().or(msg.link_url.as_deref()).filter(|u| !u.is_empty()) {
+                if is_vid && !url.starts_with("backup-media:") && !url.to_ascii_lowercase().contains("/renewmedia") {
                     open_external_url(url);
                 } else {
                     return Some(BubbleAction::DownloadFile {
@@ -1740,14 +1739,14 @@ pub(super) fn is_zalo_file_or_video_message(msg: &ChatMessage) -> bool {
 }
 
 pub(super) fn photo_primary_url(msg: &ChatMessage) -> Option<&str> {
-    msg.link_thumb
+    msg.backup_media_ref.as_deref().filter(|u| !u.is_empty()).or_else(|| msg.link_thumb
         .as_deref()
         .filter(|u| !u.is_empty())
         .or_else(|| msg.link_url.as_deref().filter(|u| !u.is_empty()))
         .or_else(|| {
             let t = msg.text.trim();
             crate::chat::is_zalo_photo_cdn_url(t).then_some(t)
-        })
+        }))
 }
 
 pub(super) fn is_zalo_photo_message(msg: &ChatMessage) -> bool {
@@ -2325,8 +2324,9 @@ pub(super) fn bubble_context_menu(
                     action = Some(BubbleAction::OpenImagePopup {
                         tex_key: format!("thumb_{}", crate::crypto::md5_hex(thumb_url)),
                         full_url: msg
-                            .link_url
+                            .backup_media_ref
                             .clone()
+                            .or_else(|| msg.link_url.clone())
                             .filter(|u| !u.is_empty())
                             .unwrap_or_else(|| thumb_url.to_string()),
                         title: msg
@@ -2350,7 +2350,7 @@ pub(super) fn bubble_context_menu(
             }
         }
         if is_zalo_file_or_video_message(msg) {
-            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
+            if let Some(url) = msg.backup_media_ref.as_deref().or(msg.link_url.as_deref()).filter(|u| !u.is_empty()) {
                 let resolved_name = crate::chat::resolve_attachment_file_name(
                     msg.link_title.as_deref(),
                     msg.text.trim(),

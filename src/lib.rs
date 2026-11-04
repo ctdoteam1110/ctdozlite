@@ -1,4 +1,8 @@
 pub mod audio;
+/// Compatibility helpers for Zalo Desktop backup files.
+pub mod backup;
+/// Temporary local recovery of an authorized Desktop backup key.
+pub mod backup_recovery;
 pub mod call;
 pub mod chat;
 pub mod clock;

@@ -1399,6 +1399,47 @@ impl ZaloGuiApp {
                                                         }
                                                     });
                                                 });
+                                            ui.add_space(16.0);
+                                            ui.label(RichText::new("Nhập bản sao lưu Zalo Desktop (.zl.zip)").color(pal.text_primary).size(13.5).strong());
+                                            ui.label(RichText::new("Đăng nhập cùng tài khoản đã tạo bản sao lưu. Giá trị UIN nội bộ chỉ dùng tại máy và không được lưu.").color(pal.text_secondary).size(12.2));
+                                            ui.hyperlink_to("Hướng dẫn lấy UIN từ phiên Zalo đã đăng nhập", "https://imtien.com/software-development/decrypting-zalo-desktop-backups/");
+                                            ui.collapsing("Các bước trên Windows", |ui| {
+                                                ui.label("1. Thoát hoàn toàn Zalo từ khay hệ thống. Mở Zalo.exe trong thư mục phiên bản với --remote-debugging-address=127.0.0.1 --remote-debugging-port=9229.");
+                                                ui.label("2. Trong Chrome/Edge, mở chrome://inspect, kết nối localhost:9229, chọn trang Zalo chính. Dùng đoạn JavaScript trong hướng dẫn để lấy UIN nội bộ.");
+                                                ui.label("3. Thoát phiên Zalo có debugger, mở Zalo bình thường, rồi nhập UIN vào ô bên dưới. Không chia sẻ UIN.");
+                                            });
+                                            if ui.add_enabled(!self.backup_busy, egui::Button::new("Chọn bản sao lưu…")).clicked() {
+                                                if let Some(tx) = WORKER_TX.get() { let _ = tx.send(WorkerCmd::PickDesktopBackup); }
+                                            }
+                                            if let Some(path) = &self.backup_file { ui.label(path.file_name().unwrap_or_default().to_string_lossy()); }
+                                            ui.label("Thoát Zalo hoàn toàn từ khay hệ thống, rồi chọn Tự tìm khóa. Ứng dụng sẽ mở Zalo tạm thời và tự xác minh khóa trên máy này.");
+                                            if ui.add_enabled(!self.backup_busy && self.is_logged_in && self.backup_file.is_some(), egui::Button::new("Tự tìm khóa từ Zalo")).clicked() {
+                                                if let (Some(tx), Some(path)) = (WORKER_TX.get(), self.backup_file.clone()) {
+                                                    BACKUP_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                    if tx.send(WorkerCmd::RecoverDesktopBackupKey { path }).is_ok() {
+                                                        self.backup_busy = true;
+                                                        self.backup_status = "Đang mở Zalo và tìm khóa…".into();
+                                                    }
+                                                }
+                                            }
+                                            ui.add(egui::TextEdit::singleline(&mut *self.backup_key).password(true).hint_text("UIN nội bộ (32 ký tự)"));
+                                            if self.backup_busy {
+                                                ui.horizontal(|ui| { ui.spinner(); ui.label("Đang xác thực và nhập dữ liệu…"); });
+                                                if ui.button("Dừng nhập").clicked() { BACKUP_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst); }
+                                            } else {
+                                                let ready = self.is_logged_in && !self.user_uin.is_empty() && self.backup_file.is_some() && self.backup_key.len() == 32;
+                                                if ui.add_enabled(ready, egui::Button::new("Nhập bản sao lưu")).clicked() {
+                                                    if let (Some(tx), Some(path)) = (WORKER_TX.get(), self.backup_file.clone()) {
+                                                        BACKUP_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                        let key = zeroize::Zeroizing::new(std::mem::take(&mut *self.backup_key));
+                                                        if tx.send(WorkerCmd::ImportDesktopBackup { path, key, account_id: self.user_uin.clone() }).is_ok() {
+                                                            self.backup_busy = true;
+                                                            self.backup_status = "Đang nhập bản sao lưu…".into();
+                                                        } else { self.backup_status = "Không thể khởi động tác vụ nhập".into(); }
+                                                    }
+                                                }
+                                            }
+                                            if !self.backup_status.is_empty() { ui.label(RichText::new(&self.backup_status).color(pal.text_secondary).size(12.0)); }
                                         }
                                         SettingsTab::Appearance => {
                                             ui.label(RichText::new("Cài đặt giao diện").color(pal.text_primary).size(13.5).strong());
@@ -4955,7 +4996,13 @@ impl ZaloGuiApp {
                                     should_close = true;
                                 }
 
-                                if !viewer.full_url.is_empty() {
+                                if viewer.full_url.starts_with("backup-media:") {
+                                    if ui.button("Lưu ảnh đã khôi phục").clicked() {
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let _ = tx.send(WorkerCmd::DownloadFile { url: viewer.full_url.clone(), file_name: viewer.title.clone(), download_dir: self.settings.download_dir.clone() });
+                                        }
+                                    }
+                                } else if !viewer.full_url.is_empty() {
                                     let ext_btn = egui::Button::new(
                                         RichText::new(format!("{} Mở gốc", lucide::EXTERNAL_LINK))
                                             .size(11.8)

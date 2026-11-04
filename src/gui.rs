@@ -48,6 +48,17 @@ pub enum GuiEvent {
             crate::native_notifications::NotificationError,
         >,
     },
+    /// Result of a user-initiated backup file selection.
+    BackupFileSelected(Option<std::path::PathBuf>),
+    /// Result of temporary local backup-key recovery.
+    BackupKeyRecovered(Result<zeroize::Zeroizing<String>, String>),
+    /// Non-sensitive phase update from the importer.
+    BackupProgress(String),
+    /// Terminal response for the local backup import.
+    BackupImportFinished {
+        account_id: String,
+        result: Result<(crate::backup::BackupImportSummary, Vec<Thread>, bool), String>,
+    },
     QrReady {
         qr_login: QrLogin,
         qr_image: egui::ColorImage,
@@ -535,6 +546,10 @@ pub struct ZaloGuiApp {
     user_online_map: HashMap<String, (bool, String)>,
     allow_quit: bool,
     settings_modal_open: bool,
+    backup_file: Option<std::path::PathBuf>,
+    backup_key: zeroize::Zeroizing<String>,
+    backup_busy: bool,
+    backup_status: String,
     settings_tab: SettingsTab,
     notification_authorization: crate::native_notifications::AuthorizationState,
     settings: AppSettings,
@@ -767,6 +782,10 @@ impl ZaloGuiApp {
             user_online_map: HashMap::new(),
             allow_quit: false,
             settings_modal_open: false,
+            backup_file: None,
+            backup_key: zeroize::Zeroizing::new(String::new()),
+            backup_busy: false,
+            backup_status: String::new(),
             settings_tab: SettingsTab::General,
             notification_authorization: Default::default(),
             settings: loaded_settings,
@@ -905,6 +924,32 @@ impl ZaloGuiApp {
             match event {
                 GuiEvent::NotificationAuthorization { request_id, result } => {
                     self.notification_authorization.finish(request_id, result);
+                }
+                GuiEvent::BackupProgress(phase) => { self.backup_status = phase; }
+                GuiEvent::BackupKeyRecovered(result) => {
+                    self.backup_busy = false;
+                    match result { Ok(key) if self.is_logged_in => { self.backup_key = key; self.backup_status = "Đã xác minh khóa. Hãy chọn Nhập bản sao lưu.".into(); }, Ok(_) => self.backup_status = "Phiên đăng nhập đã kết thúc".into(), Err(error) => self.backup_status = error }
+                }
+                GuiEvent::BackupFileSelected(path) => {
+                    self.backup_key = zeroize::Zeroizing::new(String::new());
+                    self.backup_file = path;
+                }
+                GuiEvent::BackupImportFinished { account_id, result } => {
+                    self.backup_busy = false;
+                    self.backup_status = match result {
+                        Ok((report, updates, refreshed)) => {
+                            if self.is_logged_in && self.user_uin == account_id {
+                                for incoming in updates {
+                                    if let Some(existing) = self.threads.iter_mut().find(|t| t.id == incoming.id) {
+                                        crate::chat::merge_thread_into(existing, incoming, false);
+                                    } else { self.threads.push(incoming); }
+                                }
+                            }
+                            format!("Đã nhập {} tin nhắn · {} tệp · {} loại chưa hỗ trợ · {} tệp không có trong sao lưu{}", report.messages_added, report.media_added, report.unsupported_records, report.missing_media, if refreshed { "" } else { " · Không thể làm mới hội thoại, hãy mở lại ứng dụng" })
+                        }
+                        Err(error) => format!("Không thể nhập bản sao lưu: {error}"),
+                    };
+                    self.show_toast(self.backup_status.clone());
                 }
                 GuiEvent::QrReady { qr_image, .. } => {
                     self.qr_texture =
@@ -1069,6 +1114,8 @@ impl ZaloGuiApp {
                     self.status_msg = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên)".into();
                 }
                 GuiEvent::LoggedOut => {
+                    self.backup_key = zeroize::Zeroizing::new(String::new());
+                    BACKUP_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
                     self.is_logged_in = false;
                     self.user_name.clear();
                     self.user_uin.clear();
@@ -1976,6 +2023,7 @@ impl eframe::App for ZaloGuiApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        BACKUP_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
         std::process::exit(0);
     }
 }

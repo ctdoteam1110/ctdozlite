@@ -6,6 +6,12 @@ pub(super) static KNOWN_THREADS: std::sync::Mutex<Vec<(String, String, bool)>> =
     std::sync::Mutex::new(Vec::new());
 
 pub enum WorkerCmd {
+    /// Select a Desktop backup without blocking the GUI.
+    PickDesktopBackup,
+    /// Recover a verified key from the locally signed-in Zalo app.
+    RecoverDesktopBackupKey { path: std::path::PathBuf },
+    /// Import a Desktop backup for the active account.
+    ImportDesktopBackup { path: std::path::PathBuf, key: zeroize::Zeroizing<String>, account_id: String },
     /// Read OS authorization without prompting.
     ReadNotificationAuthorization {
         request_id: u64,
@@ -200,6 +206,9 @@ pub enum WorkerCmd {
     },
 }
 
+pub(super) static BACKUP_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(super) static BACKUP_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub(super) static WORKER_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<WorkerCmd>> =
     std::sync::OnceLock::new();
 
@@ -305,6 +314,16 @@ async fn prefetch_missing_sticker_thumbnails(
         }
     });
     futures_util::future::join_all(futs).await;
+}
+
+async fn profile_allows_login(account_id: String) -> bool {
+    tokio::task::spawn_blocking(move || {
+        if account_id.is_empty() { return false; }
+        let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") else { return false; };
+        if !store.profile_allows_account(&account_id).unwrap_or(false) { return false; }
+        if !store.profile_is_bound().unwrap_or(true) { let _ = store.ensure_profile_owner(&account_id); }
+        true
+    }).await.unwrap_or(false)
 }
 
 pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: egui::Context) {
@@ -625,6 +644,51 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
 
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
+                        WorkerCmd::PickDesktopBackup => {
+                            let tx = gui_tx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let path = pick_native_file_dialog(false);
+                                let _ = tx.send(GuiEvent::BackupFileSelected(path));
+                            });
+                        }
+                        WorkerCmd::RecoverDesktopBackupKey { path } => {
+                            let tx = gui_tx.clone();
+                            tokio::spawn(async move {
+                                let result = crate::backup_recovery::recover(path, &BACKUP_CANCEL).await;
+                                let _ = tx.send(GuiEvent::BackupKeyRecovered(result));
+                            });
+                        }
+                        WorkerCmd::ImportDesktopBackup { path, key, account_id } => {
+                            use std::sync::atomic::Ordering;
+                            if BACKUP_RUNNING.swap(true, Ordering::SeqCst) {
+                                let _ = gui_tx.send(GuiEvent::BackupImportFinished { account_id, result: Err("Đang có bản sao lưu khác được nhập".into()) });
+                                continue;
+                            }
+
+                            let tx = gui_tx.clone();
+                            let session_clone = session.clone();
+                            tokio::spawn(async move {
+                                let valid = session_clone.lock().await.login.as_ref().is_some_and(|login| login.uin == account_id);
+                                if !valid {
+                                    BACKUP_RUNNING.store(false, Ordering::SeqCst);
+                                    let _ = tx.send(GuiEvent::BackupImportFinished { account_id, result: Err("Tài khoản đã thay đổi".into()) });
+                                    return;
+                                }
+                                let task_account = account_id.clone();
+                                let progress_tx = tx.clone();
+                                let result = tokio::task::spawn_blocking(move || {
+                                    let file = std::fs::File::open(path).map_err(|_| "Không thể mở tệp sao lưu".to_string())?;
+                                    let mut store = crate::store::MessageStore::open("zalo_history.db").map_err(|_| "Không thể mở dữ liệu cục bộ".to_string())?;
+                                    let report = crate::backup::import_encrypted_backup_with_progress(file, &key, &task_account, &mut store, &BACKUP_CANCEL, &|phase| { let _ = progress_tx.send(GuiEvent::BackupProgress(phase.to_owned())); })
+                                        .map_err(|e| e.to_string())?;
+                                    let mut threads = Vec::new();
+                                    let refreshed = store.hydrate_threads(&mut threads, crate::store::MessageStore::PRELOAD_MSGS).is_ok();
+                                    Ok((report, threads, refreshed))
+                                }).await.unwrap_or_else(|_| Err("Tác vụ nhập kết thúc ngoài dự kiến".into()));
+                                BACKUP_RUNNING.store(false, Ordering::SeqCst);
+                                let _ = tx.send(GuiEvent::BackupImportFinished { account_id, result });
+                            });
+                        }
                         WorkerCmd::ReadNotificationAuthorization { request_id }
                         | WorkerCmd::RequestNotificationAuthorization { request_id } => {
                             let request = matches!(
@@ -655,6 +719,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::Logout => {
+                            BACKUP_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
                             if let Some(task) = current_qr_task.take() {
                                 task.abort();
                             }
@@ -674,6 +739,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             egui_ctx.request_repaint();
                         }
                         WorkerCmd::WipeLocalData => {
+                            BACKUP_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+                            while BACKUP_RUNNING.load(std::sync::atomic::Ordering::SeqCst) { tokio::time::sleep(std::time::Duration::from_millis(100)).await; }
                             let _ = std::fs::remove_file("zalo_history.db");
                             let _ = std::fs::remove_file("threads_cache.json");
                             let _ = gui_tx.send(GuiEvent::LocalDataWiped);
@@ -851,7 +918,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                         crate::qr::confirm(&s_snap, &q).await;
 
                                                     if let Ok(resp) = confirm_res {
-                                                        let mut s = session_clone.lock().await;
+                                                        let mut s = session_clone.lock().await.clone();
                                                         if let Some(sek) =
                                                             crate::qr::extract_zpw_sek(&resp)
                                                         {
@@ -862,7 +929,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                 &mut s, data,
                                                             );
                                                         }
-                                                        let _ = s.save_to_file("session.json");
 
                                                         if let Ok(info) =
                                                             crate::login::get_login_info(&s).await
@@ -875,13 +941,18 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                             }
                                                         }
                                                         let _ = s.sync_profile_me().await;
-                                                        let _ = s.save_to_file("session.json");
 
                                                         let uin = s
                                                             .login
                                                             .as_ref()
                                                             .map(|l| l.uin.clone())
                                                             .unwrap_or_default();
+                                                        if !profile_allows_login(uin.clone()).await {
+                                                            let _ = gui_tx_clone.send(GuiEvent::LoginFailed("Hồ sơ dữ liệu thuộc tài khoản khác".into()));
+                                                            return;
+                                                        }
+                                                        *session_clone.lock().await = s.clone();
+                                                        let _ = s.save_to_file("session.json");
                                                         let dname = s
                                                             .login
                                                             .as_ref()
@@ -1066,6 +1137,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         }
                                     }
                                     if let Some((uid, name)) = s.sync_profile_me().await {
+                                        if !profile_allows_login(uid.clone()).await {
+                                            session_clone.lock().await.logout();
+                                            let _ = gui_tx_clone.send(GuiEvent::LoggedOut);
+                                            let _ = gui_tx_clone.send(GuiEvent::LoginFailed("Hồ sơ dữ liệu thuộc tài khoản khác".into()));
+                                            return;
+                                        }
                                         {
                                             let mut sl = session_clone.lock().await;
                                             if let Some(ref mut li) = sl.login {
@@ -2085,6 +2162,24 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::FetchStickerImage { key, url } => {
+                            if let Some(id) = url.strip_prefix("backup-media:").map(str::to_owned) {
+                                let tx = gui_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let result = (|| -> anyhow::Result<_> {
+                                        let store = crate::store::MessageStore::open("zalo_history.db")?;
+                                        let bytes: Vec<u8> = store.conn.query_row(
+                                            "SELECT data FROM backup_media WHERE msg_id=?1 AND length(data)<=?2",
+                                            rusqlite::params![id, 64_i64 * 1024 * 1024], |row| row.get(0),
+                                        )?;
+                                        crate::backup::decode_backup_image(&bytes)
+                                    })();
+                                    if let Ok(img) = result {
+                                        let size = [img.width() as usize, img.height() as usize];
+                                        let _ = tx.send(GuiEvent::StickerImageReady { key, image: egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()) });
+                                    }
+                                });
+                                continue;
+                            }
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -2619,7 +2714,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     "Đang xác thực tài khoản…".into(),
                                 ));
                                 ctx_clone.request_repaint();
-                                let mut s = session_clone.lock().await;
+                                let mut s = session_clone.lock().await.clone();
                                 match crate::login::login_by_password(&mut s, &phone, &pass, "VN")
                                     .await
                                 {
@@ -2628,13 +2723,18 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             if let Some(cfg) = info.get("data") {
                                                 crate::login::apply_login_config(&mut s, cfg);
                                                 s.apply_server_info(cfg);
-                                                let _ = s.save_to_file("session.json");
 
                                                 let uin = s
                                                     .login
                                                     .as_ref()
                                                     .map(|l| l.uin.clone())
                                                     .unwrap_or_default();
+                                                if !profile_allows_login(uin.clone()).await {
+                                                    let _ = gui_tx_clone.send(GuiEvent::LoginFailed("Hồ sơ dữ liệu thuộc tài khoản khác".into()));
+                                                    return;
+                                                }
+                                                *session_clone.lock().await = s.clone();
+                                                let _ = s.save_to_file("session.json");
                                                 let name = s
                                                     .login
                                                     .as_ref()
@@ -2940,6 +3040,18 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             file_name,
                             download_dir,
                         } => {
+                            if let Some(id) = url.strip_prefix("backup-media:").map(str::to_owned) {
+                                let tx = gui_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let result = save_backup_media(&id, &file_name, &download_dir);
+                                    if let Ok((_, path)) = &result {
+                                        let ext = std::path::Path::new(path).extension().and_then(|v| v.to_str()).unwrap_or("").to_ascii_lowercase();
+                                        if matches!(ext.as_str(), "mp4" | "mov" | "mkv") { open_recovered_video(path); }
+                                    }
+                                    let _ = tx.send(GuiEvent::FileDownloaded(result));
+                                });
+                                continue;
+                            }
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -3270,4 +3382,45 @@ async fn download_attachment_with_original_name(
     })
     .await
     .map_err(|e| format!("Lỗi tác vụ lưu file: {e}"))?
+}
+
+fn save_backup_media(msg_id: &str, file_name: &str, download_dir: &str) -> Result<(String, String), String> {
+    let store = crate::store::MessageStore::open("zalo_history.db").map_err(|_| "Không thể mở dữ liệu cục bộ".to_string())?;
+    let extension: String = store.conn.query_row("SELECT extension FROM backup_media WHERE msg_id=?1", [msg_id], |r| r.get(0))
+        .map_err(|_| "Không tìm thấy tệp đã khôi phục".to_string())?;
+    let mut name = crate::chat::resolve_attachment_file_name(Some(file_name), file_name, "");
+    if std::path::Path::new(&name).extension().is_none() && extension.bytes().all(|b| b.is_ascii_alphanumeric()) && extension.len() <= 8 {
+        name.push('.'); name.push_str(&extension);
+    }
+    let dir = if download_dir.trim().is_empty() { std::path::PathBuf::from("downloads") } else { std::path::PathBuf::from(download_dir.trim()) };
+    std::fs::create_dir_all(&dir).map_err(|_| "Không thể tạo thư mục lưu tệp".to_string())?;
+    for suffix in 0..10000u32 {
+        let chosen = if suffix == 0 { name.clone() } else {
+            let path = std::path::Path::new(&name);
+            let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("file");
+            match path.extension().and_then(|x| x.to_str()) { Some(ext) => format!("{stem} ({suffix}).{ext}"), None => format!("{stem} ({suffix})") }
+        };
+        let dest = dir.join(&chosen);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&dest) {
+            Ok(mut file) => {
+                if crate::backup::copy_backup_media(&store, msg_id, &mut file).and_then(|_| file.sync_all().map_err(Into::into)).is_err() {
+                    drop(file); let _ = std::fs::remove_file(&dest);
+                    return Err("Không thể lưu tệp đã khôi phục".to_string());
+                }
+                return Ok((chosen, dest.to_string_lossy().into_owned()));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("Không thể tạo tệp đích".to_string()),
+        }
+    }
+    Err("Không thể tìm tên tệp còn trống".to_string())
+}
+
+fn open_recovered_video(path: &str) {
+    #[cfg(target_os = "windows")]
+    { let _ = std::process::Command::new("explorer.exe").arg(path).spawn(); }
+    #[cfg(target_os = "macos")]
+    { let _ = std::process::Command::new("open").arg(path).spawn(); }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    { let _ = std::process::Command::new("xdg-open").arg(path).spawn(); }
 }

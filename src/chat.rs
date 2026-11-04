@@ -67,6 +67,8 @@ pub struct ChatMessage {
     pub link_src: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_source: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_media_ref: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub resolved_mention_uids: std::collections::BTreeMap<String, String>,
 }
@@ -813,6 +815,7 @@ fn server_message_id(message: &ChatMessage) -> Option<String> {
     let wire_server = wire_identity(message.wire_ref.server_id.as_ref());
     let wire_client = wire_identity(message.wire_ref.client_id.as_ref());
     if message.id.starts_with("out_")
+        || message.id.starts_with("backup:")
         || message.id.is_empty()
         || wire_client.as_deref() == Some(message.id.as_str())
     {
@@ -893,7 +896,7 @@ impl MessageIdentityIndex {
                 wire_sender(existing.wire_ref.sender.as_ref()),
                 wire_sender(incoming.wire_ref.sender.as_ref()),
             ) {
-                if a != b {
+                if a != b && !(existing.is_outgoing && (a == "0" || b == "0")) {
                     return None;
                 }
             }
@@ -989,6 +992,7 @@ pub fn merge_thread_into(
             let existing_msg = &mut target.messages[idx];
             identities.remove(existing_msg, idx);
             existing_msg.merge_reaction_metadata(&msg);
+            if msg.id.starts_with("backup:") { existing_msg.id = msg.id.clone(); }
             if existing_msg.id.starts_with("out_")
                 && !msg.id.is_empty()
                 && !msg.id.starts_with("out_")
@@ -1014,6 +1018,9 @@ pub fn merge_thread_into(
                 existing_msg.reply_to_id = msg.reply_to_id;
                 existing_msg.reply_to_sender = msg.reply_to_sender;
                 existing_msg.reply_to_text = msg.reply_to_text;
+            }
+            if existing_msg.backup_media_ref.is_none() {
+                existing_msg.backup_media_ref = msg.backup_media_ref.clone();
             }
             if existing_msg.link_url.is_none() && msg.link_url.is_some() {
                 existing_msg.link_url = msg.link_url;
@@ -3369,6 +3376,12 @@ pub fn reaction_code_and_type(emoji_or_code: &str) -> (&'static str, i32) {
     }
 }
 
+fn action_message_id(message: &ChatMessage) -> anyhow::Result<String> {
+    if message.id.starts_with("backup:") {
+        return server_message_id(message).ok_or_else(|| anyhow::anyhow!("Thiếu mã gốc của tin nhắn sao lưu"));
+    }
+    Ok(message.id.clone())
+}
 /// Send a message reaction (`sendReactionMessage` in `compact-app-pc.b7bec208c4c8f73e09f8.js:14317097`, cmd `12410` / `12411`).
 pub async fn send_reaction(
     s: &Session,
@@ -3391,9 +3404,11 @@ pub async fn send_reaction(
     let g_msg_id_val = if is_local_id {
         json!("")
     } else {
-        json!(msg.id)
+        json!(action_message_id(msg)?)
     };
-    let c_msg_id = if msg.ts > 0 {
+    let c_msg_id = if msg.id.starts_with("backup:") && client_message_id(msg).and_then(|id| id.parse::<u64>().ok()).is_some() {
+        client_message_id(msg).and_then(|id| id.parse::<u64>().ok()).unwrap()
+    } else if msg.ts > 0 {
         msg.ts as u64
     } else {
         msg.id.parse::<u64>().unwrap_or(now)
@@ -3466,14 +3481,17 @@ pub async fn delete_message_for_me(
         .as_ref()
         .map(|l| l.uin.clone())
         .unwrap_or_else(|| "0".into());
+    let backup_sender = if msg.id.starts_with("backup:") { wire_sender(msg.wire_ref.sender.as_ref()) } else { None };
     let owner_id = if msg.is_outgoing {
         my_uid.as_str()
     } else if !is_group {
         to_id
     } else {
-        &msg.sender
+        backup_sender.as_deref().unwrap_or(&msg.sender)
     };
-    let cli_id = if msg.ts > 0 {
+    let cli_id = if msg.id.starts_with("backup:") && client_message_id(msg).is_some() {
+        client_message_id(msg).unwrap()
+    } else if msg.ts > 0 {
         msg.ts.to_string()
     } else {
         now.to_string()
@@ -3481,7 +3499,7 @@ pub async fn delete_message_for_me(
 
     let msgs_arr = json!([{
         "cliMsgId": cli_id,
-        "globalMsgId": msg.id,
+        "globalMsgId": action_message_id(msg)?,
         "ownerId": owner_id,
         "destId": to_id
     }]);
@@ -3542,7 +3560,9 @@ pub async fn recall_message(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let cli_id = if msg.ts > 0 {
+    let cli_id = if msg.id.starts_with("backup:") && client_message_id(msg).is_some() {
+        client_message_id(msg).unwrap()
+    } else if msg.ts > 0 {
         msg.ts.to_string()
     } else {
         now.to_string()
@@ -3554,7 +3574,7 @@ pub async fn recall_message(
             .trim_start_matches('g')
             .trim_start_matches('G');
         let body = obj(&[
-            ("msgId", json!(msg.id)),
+            ("msgId", json!(action_message_id(msg)?)),
             ("grid", json!(clean_grid)),
             ("clientId", json!(now)),
             ("visibility", json!(0)),
@@ -3579,7 +3599,7 @@ pub async fn recall_message(
             &s.domains.chat
         };
         let body = obj(&[
-            ("msgId", json!(msg.id)),
+            ("msgId", json!(action_message_id(msg)?)),
             ("toid", json!(to_id)),
             ("clientId", json!(now)),
             ("cliMsgIdUndo", json!(cli_id)),
@@ -4895,7 +4915,7 @@ fn extract_link_info(
         _ => (None, None, None, None, None),
     }
 }
-fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
+pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     let msg_type = normalize_msg_type(it);
 
     let raw_content_val = it
@@ -7467,5 +7487,29 @@ mod send_identity_tests {
         let msg_b = parse_chat_message(&raw_file_no_ext).expect("must parse file message");
         assert_eq!(msg_b.link_src.as_deref(), Some("Tập tin Zalo"));
         assert_eq!(msg_b.link_title.as_deref(), Some("De_cuong_mon_hoc.doc"));
+    }
+}
+
+#[cfg(test)]
+mod backup_identity_tests {
+    use super::*;
+    #[test]
+    fn recovered_local_id_uses_original_id_for_actions_and_live_merge() {
+        let wire = crate::message_model::WireMessageRef::from_raw(&serde_json::json!({"msgId":"12345","cliMsgId":"67890","fromUid":"42"}));
+        let recovered = ChatMessage { id: "backup:synthetic".into(), wire_ref: wire, sender: "42".into(), text: "test".into(), ts: 1, ..Default::default() };
+        assert_eq!(action_message_id(&recovered).unwrap(), "12345");
+        let mut existing = Thread { id: "thread".into(), messages: vec![recovered], ..Default::default() };
+        let live = ChatMessage { id: "12345".into(), sender: "42".into(), text: "test".into(), ts: 1, ..Default::default() };
+        merge_thread_into(&mut existing, Thread { id: "thread".into(), messages: vec![live], ..Default::default() }, false);
+        assert_eq!(existing.messages.len(), 1);
+        assert_eq!(existing.messages[0].id, "backup:synthetic");
+        let wire = crate::message_model::WireMessageRef::from_raw(&serde_json::json!({"msgId":"12345","cliMsgId":"67890","fromUid":"0"}));
+        let backup = ChatMessage { id: "backup:synthetic".into(), wire_ref: wire, is_outgoing: true, ts: 1, ..Default::default() };
+        let live_wire = crate::message_model::WireMessageRef::from_raw(&serde_json::json!({"msgId":"12345","cliMsgId":"67890","fromUid":"42"}));
+        let live = ChatMessage { id: "12345".into(), wire_ref: live_wire, is_outgoing: true, ts: 1, ..Default::default() };
+        let mut existing = Thread { id: "thread".into(), messages: vec![live], ..Default::default() };
+        merge_thread_into(&mut existing, Thread { id: "thread".into(), messages: vec![backup], ..Default::default() }, false);
+        assert_eq!(existing.messages.len(), 1);
+        assert_eq!(existing.messages[0].id, "backup:synthetic");
     }
 }

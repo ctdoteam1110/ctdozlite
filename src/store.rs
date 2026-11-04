@@ -46,6 +46,11 @@ impl MessageStore {
             Connection::open(path)?
         };
 
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")?;
+
+        let current_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if current_version > 4 { anyhow::bail!("Phiên bản dữ liệu mới hơn ứng dụng"); }
+        if current_version < 4 {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
                 msg_id TEXT PRIMARY KEY,
@@ -66,18 +71,67 @@ impl MessageStore {
                 last_ts INTEGER
             );",
         )?;
-        // Migration 1: one-time cleanup of placeholder rows. This DELETE used to run (a full
-        // table scan) on every hydrate; new rows are filtered in `persist_threads` instead.
-        if conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? < 1 {
-            conn.execute_batch(
-                "BEGIN;
-                 DELETE FROM messages WHERE text = 'sendBubbleMessage';
-                 PRAGMA user_version = 1;
-                 COMMIT;",
-            )?;
+        // Acquire the writer lock before checking the schema version so concurrent
+        // startup workers cannot race a migration or downgrade its version.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let migration = (|| -> Result<()> {
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if version > 4 { anyhow::bail!("Phiên bản dữ liệu mới hơn ứng dụng"); }
+            if version < 1 { conn.execute_batch("DELETE FROM messages WHERE text = 'sendBubbleMessage';")?; }
+            if version < 2 { conn.execute_batch("CREATE TABLE IF NOT EXISTS backup_media (msg_id TEXT PRIMARY KEY REFERENCES messages(msg_id) ON DELETE CASCADE, data BLOB NOT NULL, extension TEXT NOT NULL);")?; }
+            if version < 3 { conn.execute_batch("CREATE TABLE IF NOT EXISTS backup_unknown_records (msg_id TEXT PRIMARY KEY REFERENCES messages(msg_id) ON DELETE CASCADE, payload TEXT NOT NULL);")?; }
+            if version < 4 { conn.execute_batch("CREATE TABLE IF NOT EXISTS profile_owner (id INTEGER PRIMARY KEY CHECK(id=1), account_id TEXT NOT NULL);")?; }
+            if version < 4 { conn.execute_batch("PRAGMA user_version = 4;")?; }
+            Ok(())
+        })();
+        match migration {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(error) => { let _ = conn.execute_batch("ROLLBACK"); return Err(error); }
+        }
+
         }
 
         Ok(Self { conn })
+    }
+
+    /// Return whether a local profile has an explicit account owner.
+    ///
+    /// # Errors
+    /// Returns an error if the ownership record cannot be read.
+    pub fn profile_is_bound(&self) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM profile_owner WHERE id=1)", [], |r| r.get(0))?)
+    }
+
+    /// Check a bound profile against an account; an unbound profile returns true.
+    ///
+    /// # Errors
+    /// Returns an error if the ownership record cannot be read.
+    pub fn profile_allows_account(&self, account_id: &str) -> Result<bool> {
+        use rusqlite::OptionalExtension;
+        if account_id.is_empty() { return Ok(false); }
+        let owner: Option<String> = self.conn.query_row("SELECT account_id FROM profile_owner WHERE id=1", [], |r| r.get(0)).optional()?;
+        Ok(owner.as_deref().map_or(true, |id| id == account_id))
+    }
+
+    /// Bind an empty profile to an account, or verify its existing binding.
+    ///
+    /// # Errors
+    /// Rejects a different account and refuses to claim an unbound nonempty history.
+    pub fn ensure_profile_owner(&mut self, account_id: &str) -> Result<()> {
+        use rusqlite::OptionalExtension;
+        if account_id.is_empty() { anyhow::bail!("Thiếu mã tài khoản hiện tại"); }
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let owner: Option<String> = tx.query_row("SELECT account_id FROM profile_owner WHERE id=1", [], |r| r.get(0)).optional()?;
+        match owner {
+            Some(owner) if owner != account_id => anyhow::bail!("Hồ sơ dữ liệu thuộc tài khoản khác"),
+            Some(_) => {},
+            None => {
+                let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages LIMIT 1)", [], |r| r.get(0))?;
+                if occupied { anyhow::bail!("Lịch sử hiện có chưa xác minh chủ sở hữu; hãy dùng hồ sơ mới"); }
+                tx.execute("INSERT INTO profile_owner(id,account_id) VALUES(1,?1)", [account_id])?;
+            }
+        }
+        tx.commit()?; Ok(())
     }
 
     /// Insert a message. Returns `true` if a new row was inserted, `false` if already existed.
@@ -99,8 +153,8 @@ impl MessageStore {
         )?;
         if rows == 0 && !msg.raw_json.is_empty() {
             let _ = self.conn.execute(
-                "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3",
-                params![msg.raw_json, msg.msg_type, msg.msg_id, msg.text],
+                "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3 AND thread_id = ?5",
+                params![msg.raw_json, msg.msg_type, msg.msg_id, msg.text, msg.thread_id],
             );
         }
         Ok(rows > 0)
@@ -355,8 +409,9 @@ impl MessageStore {
                 let time = if sm.ts > 0 {
                     crate::clock::message_time(sm.ts)
                 } else {
-                    crate::ui::clock()
+                    String::new()
                 };
+                let mut backup_wire = None;
                 let mut sticker_id = None;
                 let mut sticker_cate_id = None;
                 let mut sticker_type = None;
@@ -373,6 +428,7 @@ impl MessageStore {
                 let mut link_src = None;
                 if !sm.raw_json.is_empty() {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sm.raw_json) {
+                        backup_wire = val.get("backup_wire").cloned();
                         sticker_id = val
                             .get("stickerId")
                             .or_else(|| val.get("id"))
@@ -433,7 +489,7 @@ impl MessageStore {
                             .map(str::to_string);
                     }
                 }
-                let cm = ChatMessage {
+                let mut cm = ChatMessage {
                     id: sm.msg_id,
                     sender: if !sm.sender_name.is_empty() {
                         sm.sender_name
@@ -461,12 +517,23 @@ impl MessageStore {
 
                     ..Default::default()
                 };
+                if let Some(wire) = backup_wire { cm.wire_ref = crate::message_model::WireMessageRef::from_raw(&wire); }
+                let has_backup_media: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM backup_media WHERE msg_id = ?1)",
+                    [&cm.id], |r| r.get(0),
+                )?;
+                if has_backup_media {
+                    cm.backup_media_ref = Some(format!("backup-media:{}", cm.id));
+                }
                 if let Some(existing) = t.messages.iter_mut().find(|existing| {
                     (!existing.id.is_empty() && existing.id == cm.id)
-                        || (existing.text == cm.text
+                        || ((existing.id.is_empty() || cm.id.is_empty()) && existing.text == cm.text
                             && existing.is_outgoing == cm.is_outgoing
                             && (existing.ts == cm.ts || (existing.ts != 0 && cm.ts != 0 && (existing.ts - cm.ts).abs() < 5000)))
                 }) {
+                    if existing.backup_media_ref.is_none() {
+                        existing.backup_media_ref = cm.backup_media_ref.clone();
+                    }
                     if existing.sticker_id.is_none() && cm.sticker_id.is_some() {
                         existing.sticker_id = cm.sticker_id;
                         existing.sticker_cate_id = cm.sticker_cate_id;
@@ -517,6 +584,10 @@ impl MessageStore {
 impl From<&ChatMessage> for StoredMessage {
     fn from(m: &ChatMessage) -> Self {
         let mut meta = serde_json::Map::new();
+        if m.id.starts_with("backup:") && !m.wire_ref.fields.is_empty() {
+            meta.insert("backup_wire".into(), serde_json::Value::Object(m.wire_ref.fields.clone().into_iter().collect()));
+            if let Some(original) = &m.wire_ref.server_id { meta.insert("backup_original_msg_id".into(), original.clone()); }
+        }
         let msg_type = if let Some(sid) = m.sticker_id {
             let cid = m.sticker_cate_id.unwrap_or(0);
             let st = m.sticker_type.unwrap_or(7);
