@@ -3673,7 +3673,7 @@ impl ZaloGuiApp {
                             self.replying_to = None;
                         }
                     }
-                    // 3c. Clipboard Image Preview Banner (`Ctrl+V` / `Shift+Insert` screenshot or image file paste)
+                    // 3c. Clipboard Image Preview Banner (`Ctrl/Cmd+V` / `Shift+Insert` screenshot or image file paste)
                     if is_clipboard_paste_triggered(ctx) {
                         if let Some((path, w, h, col_img)) = read_clipboard_image_to_png() {
                             // Consume any text Paste event on this frame so the composer doesn't paste a file path
@@ -4218,8 +4218,13 @@ impl ZaloGuiApp {
                                     response.context_menu(|ui| {
                                         if ui
                                             .button(format!(
-                                                "{} Dán hình ảnh từ Clipboard (Ctrl+V)",
-                                                lucide::IMAGE
+                                                "{} Dán hình ảnh từ Clipboard ({})",
+                                                lucide::IMAGE,
+                                                if cfg!(target_os = "macos") {
+                                                    "Cmd+V"
+                                                } else {
+                                                    "Ctrl+V"
+                                                }
                                             ))
                                             .clicked()
                                         {

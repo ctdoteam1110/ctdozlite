@@ -5,6 +5,9 @@ Xem thêm quy ước tại [ADR 0003 — Chính sách Changelog & Release Notes]
 
 ## [Unreleased]
 
+### Fixed (Sửa lỗi)
+- **Dán ảnh từ Clipboard vào khung chat trên macOS (`src/gui/messages.rs`):** `Cmd+V` giờ nhận ảnh chụp màn hình, ảnh sao chép từ trình duyệt/Preview và tệp ảnh sao chép trong Finder (đọc qua `arboard`). Ảnh hiện ở thanh xem trước để nhập chú thích, nhấn `Enter` để gửi. Đồng thời sửa lỗi phím tắt dán bị `egui-winit` bỏ qua khi Clipboard chỉ chứa ảnh (cũng áp dụng cho `Ctrl+V` trên Linux).
+
 ## [0.0.7] - 2026-11-03
 
 ### Fixed (Sửa lỗi & Tinh chỉnh giao diện)
