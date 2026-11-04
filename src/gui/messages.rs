@@ -472,8 +472,75 @@ pub(super) fn pick_native_file_dialog(images_only: bool) -> Option<std::path::Pa
     }
 }
 
-/// Detect `Ctrl+V` or `Shift+Insert` reliably on Windows even when `egui-winit` swallows `Key::V`
-/// because the system clipboard contains an image instead of UTF-8 text.
+/// How long after `command` is released a stray `V` release still counts as the paste shortcut.
+#[cfg(any(not(target_os = "windows"), test))]
+const PASTE_COMMAND_RELEASE_GRACE_SECS: f64 = 0.5;
+
+/// Detects `Cmd+V` / `Ctrl+V` presses that `egui-winit` swallowed: it turns the press into
+/// `Event::Paste` only when the clipboard holds text, but always forwards the key release.
+#[cfg(any(not(target_os = "windows"), test))]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct PasteKeyTracker {
+    v_press_seen: bool,
+    command_held: bool,
+    command_released_at: Option<f64>,
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
+impl PasteKeyTracker {
+    /// Feed one frame of input; returns `true` when this frame ends a swallowed paste shortcut.
+    ///
+    /// A `V` release only counts while `command` is (or was just) held: macOS Telex IME can
+    /// consume a plain `v` key-down and still forward its key-up.
+    pub(super) fn observe(
+        &mut self,
+        events: &[egui::Event],
+        frame_modifiers: egui::Modifiers,
+        now: f64,
+    ) -> bool {
+        let mut triggered = false;
+        for event in events {
+            match event {
+                // A text paste already consumed this V press; its release must not re-trigger.
+                egui::Event::Paste(_) => self.v_press_seen = true,
+                egui::Event::Key {
+                    key: Key::V,
+                    pressed: true,
+                    ..
+                } => self.v_press_seen = true,
+                egui::Event::Key {
+                    key: Key::V,
+                    pressed: false,
+                    modifiers,
+                    ..
+                } => {
+                    let paired = std::mem::take(&mut self.v_press_seen);
+                    let command_active = modifiers.command
+                        || frame_modifiers.command
+                        || self.command_held
+                        || self
+                            .command_released_at
+                            .is_some_and(|t| now - t <= PASTE_COMMAND_RELEASE_GRACE_SECS);
+                    if !paired && command_active {
+                        triggered = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if self.command_held && !frame_modifiers.command {
+            self.command_released_at = Some(now);
+        }
+        self.command_held = frame_modifiers.command;
+        triggered
+    }
+}
+
+/// Detect the paste shortcut even when the clipboard holds an image instead of UTF-8 text.
+///
+/// `egui-winit` swallows the `V` key press in that case. On Windows the key state is polled via
+/// `GetAsyncKeyState`; elsewhere an unpaired `V` release under `command` is detected by
+/// [`PasteKeyTracker`].
 pub(super) fn is_clipboard_paste_triggered(ctx: &egui::Context) -> bool {
     let egui_paste = ctx.input(|i| {
         (i.modifiers.ctrl && i.key_pressed(Key::V))
@@ -512,7 +579,11 @@ pub(super) fn is_clipboard_paste_triggered(ctx: &egui::Context) -> bool {
 
     #[cfg(not(target_os = "windows"))]
     {
-        egui_paste
+        let id = egui::Id::new("clipboard_paste_key_tracker");
+        let mut tracker = ctx.data_mut(|d| *d.get_temp_mut_or_default::<PasteKeyTracker>(id));
+        let swallowed = ctx.input(|i| tracker.observe(&i.events, i.modifiers, i.time));
+        ctx.data_mut(|d| d.insert_temp(id, tracker));
+        egui_paste || swallowed
     }
 }
 
@@ -531,6 +602,15 @@ pub(super) fn finalize_clipboard_rgba_image(
     let path = std::path::PathBuf::from(format!("stickers_cache/clipboard_{now_ms}.png"));
     rgba.save(&path).ok()?;
 
+    Some(clipboard_image_preview(path, rgba))
+}
+
+/// Build the composer preview tuple for an image already on disk at `path`.
+fn clipboard_image_preview(
+    path: std::path::PathBuf,
+    rgba: image::RgbaImage,
+) -> (std::path::PathBuf, u32, u32, egui::ColorImage) {
+    let (width, height) = rgba.dimensions();
     let thumb = if width > 240 || height > 240 {
         image::imageops::thumbnail(&rgba, 240, 240)
     } else {
@@ -539,13 +619,19 @@ pub(super) fn finalize_clipboard_rgba_image(
     let (tw, th) = thumb.dimensions();
     let col_img =
         egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], thumb.as_raw());
-    Some((path, width, height, col_img))
+    (path, width, height, col_img)
 }
 
-/// Read an image from the Windows Clipboard supporting:
+/// Read an image from the system clipboard into a preview tuple.
+///
+/// Windows supports:
 /// 1. Registered `"PNG"` / `"image/png"` streams (Snipping Tool, ShareX, Chrome/Edge, Discord)
 /// 2. `CF_HDROP` (`15`) copied image files from Windows Explorer or ShareX
 /// 3. `CF_DIB` (`8`) / `CF_DIBV5` (`17`) 24-bit & 32-bit bitmaps (`BI_RGB` & `BI_BITFIELDS`)
+///
+/// macOS (via `arboard`): copied Finder image files first, then the TIFF pasteboard bitmap.
+///
+/// Other Unix: `wl-paste` (Wayland) or `xclip` (X11) reading `image/png`.
 pub(super) fn read_clipboard_image_to_png(
 ) -> Option<(std::path::PathBuf, u32, u32, egui::ColorImage)> {
     #[cfg(target_os = "windows")]
@@ -634,19 +720,7 @@ pub(super) fn read_clipboard_image_to_png(
                             std::path::PathBuf::from(String::from_utf16_lossy(&buf[..chars]));
                         if let Ok(dyn_img) = image::open(&file_path) {
                             CloseClipboard();
-                            let rgba = dyn_img.to_rgba8();
-                            let (width, height) = rgba.dimensions();
-                            let thumb = if width > 240 || height > 240 {
-                                image::imageops::thumbnail(&rgba, 240, 240)
-                            } else {
-                                rgba
-                            };
-                            let (tw, th) = thumb.dimensions();
-                            let col_img = egui::ColorImage::from_rgba_unmultiplied(
-                                [tw as usize, th as usize],
-                                thumb.as_raw(),
-                            );
-                            return Some((file_path, width, height, col_img));
+                            return Some(clipboard_image_preview(file_path, dyn_img.to_rgba8()));
                         }
                     }
                 }
@@ -737,7 +811,27 @@ pub(super) fn read_clipboard_image_to_png(
             None
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        let mut clipboard = arboard::Clipboard::new().ok()?;
+        // Finder copies put the file URL plus the file's icon as TIFF; for file copies use only
+        // the file itself so copying a PDF never pastes its icon.
+        if let Ok(files) = clipboard.get().file_list() {
+            return files.into_iter().find_map(|path| {
+                let rgba = image::open(&path).ok()?.to_rgba8();
+                Some(clipboard_image_preview(path, rgba))
+            });
+        }
+        // Raw bitmap (screenshots, browser "Copy Image", Preview); arboard reads NSPasteboardTypeTIFF.
+        let data = clipboard.get_image().ok()?;
+        let rgba = image::RgbaImage::from_raw(
+            u32::try_from(data.width).ok()?,
+            u32::try_from(data.height).ok()?,
+            data.bytes.into_owned(),
+        )?;
+        finalize_clipboard_rgba_image(rgba)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         // Wayland (`wl-paste --type image/png`) or X11 (`xclip -selection clipboard -t image/png -o`)
         for (prog, args) in [
@@ -2705,5 +2799,64 @@ mod quote_navigation_tests {
             }
         }
         panic!("Quote with an exact reference must advertise a clickable target");
+    }
+}
+
+#[cfg(test)]
+mod clipboard_paste_tests {
+    use super::*;
+    use egui::Modifiers;
+
+    fn v_key(pressed: bool, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key: Key::V,
+            physical_key: Some(Key::V),
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn swallowed_cmd_v_triggers_on_release() {
+        let mut t = PasteKeyTracker::default();
+        assert!(!t.observe(&[], Modifiers::COMMAND, 0.0));
+        assert!(t.observe(&[v_key(false, Modifiers::COMMAND)], Modifiers::COMMAND, 0.1));
+    }
+
+    #[test]
+    fn typed_v_does_not_trigger() {
+        let mut t = PasteKeyTracker::default();
+        let events = [v_key(true, Modifiers::NONE), v_key(false, Modifiers::NONE)];
+        assert!(!t.observe(&events, Modifiers::NONE, 0.0));
+    }
+
+    #[test]
+    fn ime_release_without_command_does_not_trigger() {
+        let mut t = PasteKeyTracker::default();
+        assert!(!t.observe(&[v_key(false, Modifiers::NONE)], Modifiers::NONE, 0.0));
+    }
+
+    #[test]
+    fn text_paste_release_does_not_double_trigger() {
+        let mut t = PasteKeyTracker::default();
+        assert!(!t.observe(&[egui::Event::Paste("x".into())], Modifiers::COMMAND, 0.0));
+        assert!(!t.observe(&[v_key(false, Modifiers::COMMAND)], Modifiers::COMMAND, 0.1));
+    }
+
+    #[test]
+    fn command_released_just_before_v_still_triggers() {
+        let mut t = PasteKeyTracker::default();
+        assert!(!t.observe(&[], Modifiers::COMMAND, 0.0));
+        assert!(!t.observe(&[], Modifiers::NONE, 0.1));
+        assert!(t.observe(&[v_key(false, Modifiers::NONE)], Modifiers::NONE, 0.3));
+    }
+
+    #[test]
+    fn stale_command_release_does_not_trigger() {
+        let mut t = PasteKeyTracker::default();
+        assert!(!t.observe(&[], Modifiers::COMMAND, 0.0));
+        assert!(!t.observe(&[], Modifiers::NONE, 0.1));
+        assert!(!t.observe(&[v_key(false, Modifiers::NONE)], Modifiers::NONE, 1.0));
     }
 }
