@@ -256,16 +256,39 @@ async fn test_outbound_forward_dispatch_direct_and_group() {
         // 4. Group file message with link_url
         for _ in 0..4 {
             let (mut stream, _) = listener.accept().expect("Failed to accept connection");
-            let mut buf = [0u8; 8192];
+            let mut buf = vec![0u8; 16384];
             let mut read_bytes = 0;
+            let mut header_end = None;
+            let mut expected_total = None;
+
             loop {
                 let n = stream.read(&mut buf[read_bytes..]).unwrap();
                 if n == 0 {
                     break;
                 }
                 read_bytes += n;
-                if buf[..read_bytes].windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+
+                if header_end.is_none() {
+                    if let Some(pos) = buf[..read_bytes].windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos);
+                        let header_str = String::from_utf8_lossy(&buf[..pos]);
+                        let mut clen = 0usize;
+                        for line in header_str.lines() {
+                            if let Some(val) =
+                                line.to_ascii_lowercase().strip_prefix("content-length:")
+                            {
+                                clen = val.trim().parse::<usize>().unwrap_or(0);
+                                break;
+                            }
+                        }
+                        expected_total = Some(pos + 4 + clen);
+                    }
+                }
+
+                if let Some(total) = expected_total {
+                    if read_bytes >= total {
+                        break;
+                    }
                 }
             }
             let req_str = String::from_utf8_lossy(&buf[..read_bytes]);

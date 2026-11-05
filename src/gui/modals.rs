@@ -3346,23 +3346,9 @@ impl ZaloGuiApp {
         }
         if pick_dl_dir {
             if let Some(folder) = pick_native_folder_dialog() {
-                let writable = std::fs::create_dir_all(&folder).is_ok() && {
-                    let probe = folder.join(".zalo_write_probe");
-                    let ok = std::fs::write(&probe, b"").is_ok();
-                    let _ = std::fs::remove_file(&probe);
-                    ok
-                };
-                if writable {
-                    self.settings.download_dir = folder.display().to_string();
-                    self.settings.save();
-                    self.show_toast(format!(
-                        "Đã đổi thư mục lưu file: {}",
-                        self.settings.download_dir
-                    ));
-                } else {
-                    self.show_toast(
-                        "⚠️ Không thể ghi vào thư mục đã chọn. Giữ nguyên thư mục cũ.".to_string(),
-                    );
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx
+                        .send(crate::gui::worker::WorkerCmd::ValidateDownloadDir { path: folder });
                 }
             }
         }

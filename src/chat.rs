@@ -1559,7 +1559,7 @@ pub(crate) async fn send_message_with_client_id(
         || s.domains.chat.contains("tt-chat2-wpa")
         || s.domains.chat.is_empty()
     {
-        "https://tt-chat3-wpa.api.zaloapp.com"
+        crate::endpoints::CHAT_FALLBACK
     } else {
         &s.domains.chat
     };
@@ -1585,7 +1585,13 @@ pub async fn send_group_message(s: &Session, grid: &str, text: &str) -> Result<V
     send_group_message_with_client_id(s, grid, text, next_client_message_id()).await
 }
 
-/// Preserve the request client ID for reconciliation with a later server echo.
+/// Send a raw 1-1 text/media payload bypassing RTF markdown formatting.
+///
+/// Preserves the provided request client ID for local echo reconciliation.
+///
+/// # Errors
+/// Returns an error if the session is not logged in, parameter encoding fails,
+/// network transport fails, or the server responds with a non-zero `error_code`.
 pub(crate) async fn send_raw_message_with_client_id(
     s: &Session,
     to_id: &str,
@@ -1606,7 +1612,7 @@ pub(crate) async fn send_raw_message_with_client_id(
         || s.domains.chat.contains("tt-chat2-wpa")
         || s.domains.chat.is_empty()
     {
-        "https://tt-chat3-wpa.api.zaloapp.com"
+        crate::endpoints::CHAT_FALLBACK
     } else {
         &s.domains.chat
     };
@@ -1626,6 +1632,13 @@ pub(crate) async fn send_raw_message_with_client_id(
     Ok(resp)
 }
 
+/// Send a raw group text/media payload bypassing RTF markdown formatting.
+///
+/// Preserves the provided request client ID for local echo reconciliation.
+///
+/// # Errors
+/// Returns an error if the session is not logged in, parameter encoding fails,
+/// network transport fails, or the server responds with a non-zero `error_code`.
 pub(crate) async fn send_raw_group_message_with_client_id(
     s: &Session,
     grid: &str,
@@ -3634,6 +3647,12 @@ pub fn filter_forward_candidates<'a>(threads: &'a [Thread], query: &str) -> Vec<
 }
 
 /// Forward a message or sticker to another conversation (`forwardMultiMessage` @ `compact-app-pc.js:14323900`).
+///
+/// Generates a fresh client message ID and delegates to [`forward_message_with_client_id`].
+///
+/// # Errors
+/// Returns an error if the session is unauthenticated, parameter encoding fails,
+/// network transport fails, or the server responds with a non-zero `error_code`.
 pub async fn forward_message(
     s: &Session,
     target_id: &str,
@@ -3644,7 +3663,19 @@ pub async fn forward_message(
         .await
 }
 
-/// Preserve the request client ID for reconciliation with a later server echo.
+/// Forward an existing chat message to a peer or group target with an explicit client message ID.
+///
+/// Preserves the provided request client ID for local echo reconciliation. Dispatches stickers
+/// via [`send_sticker_with_client_id`], raw media (photos, files, links) via
+/// [`send_raw_message_with_client_id`] or [`send_raw_group_message_with_client_id`] to preserve
+/// raw URLs without RTF parsing, or standard text messages via [`send_message_with_client_id`].
+///
+/// # Errors
+/// Returns an error if:
+/// - The session is not authenticated (`login` is `None`).
+/// - Request parameter serialization or AES-CBC encoding fails.
+/// - Network transport or HTTP POST fails.
+/// - The Zalo server responds with a non-zero `error_code`.
 pub async fn forward_message_with_client_id(
     s: &Session,
     target_id: &str,

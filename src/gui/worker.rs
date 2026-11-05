@@ -62,6 +62,10 @@ pub enum WorkerCmd {
         is_group: bool,
         msg: ChatMessage,
     },
+    /// Validate directory creation and probe writability off the UI thread (#7, R1).
+    ValidateDownloadDir {
+        path: std::path::PathBuf,
+    },
     RecallMessage {
         to_id: String,
         is_group: bool,
@@ -2061,6 +2065,33 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         )));
                                     }
                                 }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::ValidateDownloadDir { path } => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let writable = if std::fs::create_dir_all(&path).is_ok() {
+                                    let pid = std::process::id();
+                                    let probe_name = format!(".zalo_write_probe_{pid}");
+                                    let probe_path = path.join(probe_name);
+                                    let file_res = std::fs::OpenOptions::new()
+                                        .write(true)
+                                        .create_new(true)
+                                        .open(&probe_path);
+                                    let created = file_res.is_ok();
+                                    if created {
+                                        let _ = std::fs::remove_file(&probe_path);
+                                    }
+                                    created
+                                } else {
+                                    false
+                                };
+                                let _ = gui_tx_clone.send(GuiEvent::DownloadDirValidated {
+                                    path,
+                                    writable,
+                                });
                                 ctx_clone.request_repaint();
                             });
                         }

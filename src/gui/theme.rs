@@ -268,7 +268,7 @@ impl ThemePalette {
         bubble_in_hex: Option<&str>,
     ) {
         if let Some(hex) = primary_hex {
-            if let Some(c) = parse_hex_color(hex) {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
                 self.primary = c;
                 self.primary_hover = Color32::from_rgb(
                     c.r().saturating_add(25),
@@ -285,7 +285,7 @@ impl ThemePalette {
             }
         }
         if let Some(hex) = accent_hex {
-            if let Some(c) = parse_hex_color(hex) {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
                 self.accent_online = c;
             }
         }

@@ -2488,21 +2488,25 @@ pub(super) fn render_chat_bubble(
                             }
                         });
                     });
-                let is_top_layer = ui
-                    .ctx()
-                    .top_layer_id()
-                    .map(|top| top == ui.layer_id())
-                    .unwrap_or(true);
-                let is_double_clicked = is_top_layer
-                    && ui.input(|i| {
-                        i.pointer
-                            .button_double_clicked(egui::PointerButton::Primary)
-                            && i.pointer
-                                .interact_pos()
-                                .or(i.pointer.latest_pos())
-                                .map(|pos| fr.response.rect.contains(pos))
-                                .unwrap_or(false)
+                let is_double_clicked = {
+                    let (is_double, click_pos) = ui.input(|i| {
+                        (
+                            i.pointer
+                                .button_double_clicked(egui::PointerButton::Primary),
+                            i.pointer.interact_pos().or(i.pointer.latest_pos()),
+                        )
                     });
+                    is_double
+                        && click_pos
+                            .map(|pos| {
+                                fr.response.rect.contains(pos)
+                                    && ui
+                                        .ctx()
+                                        .layer_id_at(pos)
+                                        .map_or(true, |layer| layer == ui.layer_id())
+                            })
+                            .unwrap_or(false)
+                };
                 if is_double_clicked {
                     return Some(BubbleAction::Reply);
                 }
@@ -2638,21 +2642,25 @@ pub(super) fn render_chat_bubble(
                             }
                         });
                     });
-                let is_top_layer = ui
-                    .ctx()
-                    .top_layer_id()
-                    .map(|top| top == ui.layer_id())
-                    .unwrap_or(true);
-                let is_double_clicked = is_top_layer
-                    && ui.input(|i| {
-                        i.pointer
-                            .button_double_clicked(egui::PointerButton::Primary)
-                            && i.pointer
-                                .interact_pos()
-                                .or(i.pointer.latest_pos())
-                                .map(|pos| fr.response.rect.contains(pos))
-                                .unwrap_or(false)
+                let is_double_clicked = {
+                    let (is_double, click_pos) = ui.input(|i| {
+                        (
+                            i.pointer
+                                .button_double_clicked(egui::PointerButton::Primary),
+                            i.pointer.interact_pos().or(i.pointer.latest_pos()),
+                        )
                     });
+                    is_double
+                        && click_pos
+                            .map(|pos| {
+                                fr.response.rect.contains(pos)
+                                    && ui
+                                        .ctx()
+                                        .layer_id_at(pos)
+                                        .map_or(true, |layer| layer == ui.layer_id())
+                            })
+                            .unwrap_or(false)
+                };
                 if is_double_clicked {
                     return Some(BubbleAction::Reply);
                 }
@@ -3342,6 +3350,14 @@ mod quote_navigation_tests {
                     ..Default::default()
                 },
                 |ctx| {
+                    // Separate Middle-order Area elsewhere on screen:
+                    // layer_id_at(pos) confirms bubble's layer owns the click position.
+                    egui::Area::new(egui::Id::new("separate_middle_area"))
+                        .order(egui::Order::Middle)
+                        .fixed_pos(egui::pos2(400.0, 300.0))
+                        .show(ctx, |ui| {
+                            ui.label("Separate Area");
+                        });
                     egui::CentralPanel::default().show(ctx, |ui| {
                         action = render_chat_bubble(
                             ui,
@@ -3410,6 +3426,14 @@ mod quote_navigation_tests {
                     ..Default::default()
                 },
                 |ctx| {
+                    // Separate Middle-order Area elsewhere on screen:
+                    // layer_id_at(pos) confirms bubble's layer owns the click position.
+                    egui::Area::new(egui::Id::new("separate_middle_area"))
+                        .order(egui::Order::Middle)
+                        .fixed_pos(egui::pos2(400.0, 300.0))
+                        .show(ctx, |ui| {
+                            ui.label("Separate Area");
+                        });
                     egui::CentralPanel::default().show(ctx, |ui| {
                         action = render_chat_bubble(
                             ui,

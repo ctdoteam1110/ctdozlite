@@ -138,6 +138,11 @@ pub enum GuiEvent {
     SessionExpired(String),
     /// The server could not be reached: the session is intact, show it and retry (#21).
     SessionUnreachable(String),
+    /// Result of off-UI-thread download folder validation (#7, R1).
+    DownloadDirValidated {
+        path: std::path::PathBuf,
+        writable: bool,
+    },
     /// `zalo_history.db` + `threads_cache.json` were removed on request (#21).
     LocalDataWiped,
     CallStateChanged(String),
@@ -1611,6 +1616,21 @@ impl ZaloGuiApp {
                         self.show_toast(format!("⚠️ {msg}"));
                     }
                     self.status_msg = msg;
+                }
+                GuiEvent::DownloadDirValidated { path, writable } => {
+                    if writable {
+                        self.settings.download_dir = path.display().to_string();
+                        self.settings.save();
+                        self.show_toast(format!(
+                            "Đã đổi thư mục lưu file: {}",
+                            self.settings.download_dir
+                        ));
+                    } else {
+                        self.show_toast(
+                            "⚠️ Không thể ghi vào thư mục đã chọn. Giữ nguyên thư mục cũ."
+                                .to_string(),
+                        );
+                    }
                 }
                 GuiEvent::HistoryReachedStart(tid) => {
                     self.history_reached_start.insert(tid);

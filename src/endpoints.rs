@@ -35,6 +35,9 @@ pub const AUTH: &str = "https://wpa.zaloapp.com";
 /// Base host that serves `getServerInfo` for an authenticated web session.
 pub const WPA_CHAT: &str = "https://wpa.chat.zalo.me";
 
+/// Fallback chat host for standard messages when domain contains `-msg-chat.`, `tt-chat2-wpa`, or is empty.
+pub const CHAT_FALLBACK: &str = "https://tt-chat3-wpa.api.zaloapp.com";
+
 /// Look up a service domain by key.
 pub fn service(key: &str) -> Option<&'static str> {
     SERVICE_MAP_V3
