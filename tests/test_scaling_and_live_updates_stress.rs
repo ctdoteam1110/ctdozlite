@@ -39,7 +39,9 @@ fn create_test_font_definitions(font_choice: &str) -> FontDefinitions {
             ];
             for path in candidates {
                 if let Ok(data) = std::fs::read(path) {
-                    fonts.font_data.insert("selected_font".to_owned(), FontData::from_owned(data));
+                    fonts
+                        .font_data
+                        .insert("selected_font".to_owned(), FontData::from_owned(data));
                     selected_font_loaded = true;
                     break;
                 }
@@ -53,7 +55,9 @@ fn create_test_font_definitions(font_choice: &str) -> FontDefinitions {
             ];
             for path in candidates {
                 if let Ok(data) = std::fs::read(path) {
-                    fonts.font_data.insert("selected_font".to_owned(), FontData::from_owned(data));
+                    fonts
+                        .font_data
+                        .insert("selected_font".to_owned(), FontData::from_owned(data));
                     selected_font_loaded = true;
                     break;
                 }
@@ -66,7 +70,9 @@ fn create_test_font_definitions(font_choice: &str) -> FontDefinitions {
             ];
             for path in candidates {
                 if let Ok(data) = std::fs::read(path) {
-                    fonts.font_data.insert("selected_font".to_owned(), FontData::from_owned(data));
+                    fonts
+                        .font_data
+                        .insert("selected_font".to_owned(), FontData::from_owned(data));
                     selected_font_loaded = true;
                     break;
                 }
@@ -75,7 +81,9 @@ fn create_test_font_definitions(font_choice: &str) -> FontDefinitions {
         "default" | "" => {}
         custom_path => {
             if let Ok(data) = std::fs::read(custom_path) {
-                fonts.font_data.insert("selected_font".to_owned(), FontData::from_owned(data));
+                fonts
+                    .font_data
+                    .insert("selected_font".to_owned(), FontData::from_owned(data));
                 selected_font_loaded = true;
             }
         }
@@ -116,7 +124,10 @@ fn test_zoom_factor_egui_boundary_limits() {
     // 2. Normal range (80% to 140% as supported by ctdozlite slider)
     for factor in [0.80, 0.90, 1.00, 1.10, 1.25, 1.40] {
         ctx.set_zoom_factor(factor);
-        println!("After set_zoom_factor({factor}): zoom_factor={}", ctx.zoom_factor());
+        println!(
+            "After set_zoom_factor({factor}): zoom_factor={}",
+            ctx.zoom_factor()
+        );
         let _ = ctx.run(RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.label("Kiểm tra tỷ lệ thu phóng bình thường");
@@ -155,7 +166,10 @@ fn test_zoom_factor_egui_boundary_limits() {
                 let _ = ui.button("Bấm");
             });
         });
-        assert!(!output.shapes.is_empty(), "Empty shapes for small zoom {small_zoom}");
+        assert!(
+            !output.shapes.is_empty(),
+            "Empty shapes for small zoom {small_zoom}"
+        );
     }
 
     // 5. Boundary test: very large zoom factor (> 3.0, e.g. 3.0, 3.5, 5.0, 10.0, 50.0)
@@ -167,7 +181,10 @@ fn test_zoom_factor_egui_boundary_limits() {
                 ui.label("Kiểm tra zoom lớn");
             });
         });
-        assert!(!output.shapes.is_empty(), "Empty shapes for large zoom {large_zoom}");
+        assert!(
+            !output.shapes.is_empty(),
+            "Empty shapes for large zoom {large_zoom}"
+        );
     }
 
     // 6. Reset to 1.0
@@ -182,28 +199,26 @@ fn test_app_settings_zoom_factor_safety_and_clamping() {
     // `if loaded_settings.font_scale > 0.0 { cc.egui_ctx.set_zoom_factor(loaded_settings.font_scale); }`
     // And in UI (src/gui/modals.rs:2140), slider clamps between 80% and 140%.
 
-    // Simulate clamping function that protects against corrupted JSON or extreme scales:
-    let clamp_scale = |raw: f32| -> f32 {
-        if raw.is_nan() || raw.is_infinite() || raw <= 0.0 {
-            1.0 // fallback to standard scale
-        } else {
-            raw.clamp(0.5, 3.0)
-        }
+    // Test production AppSettings::normalized_font_scale startup normalization:
+    let check_scale = |raw: f32| -> f32 {
+        let mut s = zalo_rust::gui::AppSettings::default();
+        s.font_scale = raw;
+        s.normalized_font_scale()
     };
 
-    assert_eq!(clamp_scale(0.0), 1.0);
-    assert_eq!(clamp_scale(-1.0), 1.0);
-    assert_eq!(clamp_scale(f32::NAN), 1.0);
-    assert_eq!(clamp_scale(f32::INFINITY), 1.0);
-    assert_eq!(clamp_scale(f32::NEG_INFINITY), 1.0);
-    assert_eq!(clamp_scale(0.1), 0.5); // Clamped to lower safe bound
-    assert_eq!(clamp_scale(0.49), 0.5); // Clamped to lower safe bound
-    assert_eq!(clamp_scale(0.80), 0.80);
-    assert_eq!(clamp_scale(1.00), 1.00);
-    assert_eq!(clamp_scale(1.25), 1.25);
-    assert_eq!(clamp_scale(1.40), 1.40);
-    assert_eq!(clamp_scale(3.5), 3.0); // Clamped to upper safe bound
-    assert_eq!(clamp_scale(50.0), 3.0); // Clamped to upper safe bound
+    assert_eq!(check_scale(0.0), 1.0);
+    assert_eq!(check_scale(-1.0), 1.0);
+    assert_eq!(check_scale(f32::NAN), 1.0);
+    assert_eq!(check_scale(f32::INFINITY), 1.0);
+    assert_eq!(check_scale(f32::NEG_INFINITY), 1.0);
+    assert_eq!(check_scale(0.1), 0.5); // Clamped to lower safe bound
+    assert_eq!(check_scale(0.49), 0.5); // Clamped to lower safe bound
+    assert_eq!(check_scale(0.80), 0.80);
+    assert_eq!(check_scale(1.00), 1.00);
+    assert_eq!(check_scale(1.25), 1.25);
+    assert_eq!(check_scale(1.40), 1.40);
+    assert_eq!(check_scale(3.5), 3.0); // Clamped to upper safe bound
+    assert_eq!(check_scale(50.0), 3.0); // Clamped to upper safe bound
 }
 
 // ===========================================================================
@@ -211,23 +226,13 @@ fn test_app_settings_zoom_factor_safety_and_clamping() {
 // ===========================================================================
 
 const VIETNAMESE_LOWERCASE_TONES: &[&str] = &[
-    "ấ", "ầ", "ẩ", "ẫ", "ậ",
-    "ắ", "ằ", "ẳ", "ẵ", "ặ",
-    "ế", "ề", "ể", "ễ", "ệ",
-    "ố", "ồ", "ổ", "ỗ", "ộ",
-    "ớ", "ờ", "ở", "ỡ", "ợ",
-    "ứ", "ừ", "ử", "ữ", "ự",
-    "ỳ", "ỷ", "ỹ", "ỵ",
+    "ấ", "ầ", "ẩ", "ẫ", "ậ", "ắ", "ằ", "ẳ", "ẵ", "ặ", "ế", "ề", "ể", "ễ", "ệ", "ố", "ồ", "ổ", "ỗ",
+    "ộ", "ớ", "ờ", "ở", "ỡ", "ợ", "ứ", "ừ", "ử", "ữ", "ự", "ỳ", "ỷ", "ỹ", "ỵ",
 ];
 
 const VIETNAMESE_UPPERCASE_TONES: &[&str] = &[
-    "Ấ", "Ầ", "Ẩ", "Ẫ", "Ậ",
-    "Ắ", "Ằ", "Ẳ", "Ẵ", "Ặ",
-    "Ế", "Ề", "Ể", "Ễ", "Ệ",
-    "Ố", "Ồ", "Ổ", "Ỗ", "Ộ",
-    "Ớ", "Ờ", "Ở", "Ỡ", "Ợ",
-    "Ứ", "Ừ", "Ử", "Ữ", "Ự",
-    "Ỳ", "Ỷ", "Ỹ", "Ỵ",
+    "Ấ", "Ầ", "Ẩ", "Ẫ", "Ậ", "Ắ", "Ằ", "Ẳ", "Ẵ", "Ặ", "Ế", "Ề", "Ể", "Ễ", "Ệ", "Ố", "Ồ", "Ổ", "Ỗ",
+    "Ộ", "Ớ", "Ờ", "Ở", "Ỡ", "Ợ", "Ứ", "Ừ", "Ử", "Ữ", "Ự", "Ỳ", "Ỷ", "Ỹ", "Ỵ",
 ];
 
 #[test]
@@ -285,14 +290,26 @@ fn test_bundled_be_vietnam_pro_all_tone_marks_rendering() {
     for s in sample_sentences {
         let font_id = FontId::proportional(13.5);
         let galley = ctx.fonts(|f| f.layout_no_wrap(s.to_string(), font_id, Color32::WHITE));
-        assert!(galley.size().x > 10.0, "Sentence galley width too small: {s}");
-        assert!(galley.size().y > 10.0, "Sentence galley height too small: {s}");
+        assert!(
+            galley.size().x > 10.0,
+            "Sentence galley width too small: {s}"
+        );
+        assert!(
+            galley.size().y > 10.0,
+            "Sentence galley height too small: {s}"
+        );
     }
 }
 
 #[test]
 fn test_font_fallback_chains_with_system_fonts_and_invalid_paths() {
-    let choices = ["segoe_ui", "arial", "tahoma", "default", "invalid_nonexistent_font_path.ttf"];
+    let choices = [
+        "segoe_ui",
+        "arial",
+        "tahoma",
+        "default",
+        "invalid_nonexistent_font_path.ttf",
+    ];
 
     for choice in choices {
         let ctx = egui::Context::default();
@@ -326,7 +343,10 @@ fn test_font_fallback_chains_with_system_fonts_and_invalid_paths() {
             });
         });
 
-        assert!(!output.shapes.is_empty(), "Frame produced 0 shapes for font choice {choice}");
+        assert!(
+            !output.shapes.is_empty(),
+            "Frame produced 0 shapes for font choice {choice}"
+        );
     }
 }
 
@@ -359,7 +379,7 @@ fn test_rapid_sequential_theme_resets_and_swatches_switching() {
         let is_dark = (i % 2) == 0;
 
         // 1. Dynamic Font Update
-        if i % 10 == 0 {
+        if i % 3 == 0 {
             let fonts = create_test_font_definitions(font_choice);
             ctx.set_fonts(fonts);
         }
@@ -368,7 +388,11 @@ fn test_rapid_sequential_theme_resets_and_swatches_switching() {
         ctx.set_zoom_factor(zoom);
 
         // 3. Theme Visuals Update
-        let mut visuals = if is_dark { Visuals::dark() } else { Visuals::light() };
+        let mut visuals = if is_dark {
+            Visuals::dark()
+        } else {
+            Visuals::light()
+        };
         visuals.widgets.active.bg_fill = swatch_col;
         visuals.widgets.hovered.bg_fill = swatch_col;
         visuals.selection.bg_fill = swatch_col;
@@ -381,11 +405,18 @@ fn test_rapid_sequential_theme_resets_and_swatches_switching() {
 
                 // Inbound bubble simulation
                 egui::Frame::none()
-                    .fill(if is_dark { Color32::from_rgb(50, 56, 66) } else { Color32::WHITE })
+                    .fill(if is_dark {
+                        Color32::from_rgb(50, 56, 66)
+                    } else {
+                        Color32::WHITE
+                    })
                     .rounding(egui::Rounding::same(8.0))
                     .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                     .show(ui, |ui| {
-                        ui.label(RichText::new("Chào bạn! Thử nghiệm font tiếng Việt: ấ ế ố ứ ỳ").size(12.5));
+                        ui.label(
+                            RichText::new("Chào bạn! Thử nghiệm font tiếng Việt: ấ ế ố ứ ỳ")
+                                .size(12.5),
+                        );
                     });
 
                 // Outbound bubble simulation
@@ -394,7 +425,11 @@ fn test_rapid_sequential_theme_resets_and_swatches_switching() {
                     .rounding(egui::Rounding::same(8.0))
                     .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                     .show(ui, |ui| {
-                        ui.label(RichText::new("Tin nhắn phản hồi: Rất mượt mà, không giật lag!").color(Color32::WHITE).size(12.5));
+                        ui.label(
+                            RichText::new("Tin nhắn phản hồi: Rất mượt mà, không giật lag!")
+                                .color(Color32::WHITE)
+                                .size(12.5),
+                        );
                     });
 
                 // Simulate reset default at milestone iterations
@@ -418,8 +453,14 @@ fn test_rapid_sequential_theme_resets_and_swatches_switching() {
             if let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive {
                 // Verify mesh does not contain NaN or infinite coordinates
                 for vert in &mesh.vertices {
-                    assert!(vert.pos.x.is_finite(), "NaN or Inf vertex X at iteration {i}");
-                    assert!(vert.pos.y.is_finite(), "NaN or Inf vertex Y at iteration {i}");
+                    assert!(
+                        vert.pos.x.is_finite(),
+                        "NaN or Inf vertex X at iteration {i}"
+                    );
+                    assert!(
+                        vert.pos.y.is_finite(),
+                        "NaN or Inf vertex Y at iteration {i}"
+                    );
                     assert!(vert.uv.x.is_finite(), "NaN or Inf uv X at iteration {i}");
                     assert!(vert.uv.y.is_finite(), "NaN or Inf uv Y at iteration {i}");
                 }

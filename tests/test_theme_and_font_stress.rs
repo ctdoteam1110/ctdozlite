@@ -25,7 +25,10 @@ impl TempStressFile {
             .unwrap()
             .as_nanos();
         let seq = STRESS_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("m2_stress_{}_{nonce}_{seq}_{suffix}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "m2_stress_{}_{nonce}_{seq}_{suffix}",
+            std::process::id()
+        ));
         Self { path }
     }
 }
@@ -49,14 +52,19 @@ fn parse_hex_color(s: &str) -> Option<Color32> {
         let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
         let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
         let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
-        Some(Color32::from_rgba_premultiplied(r, g, b, a))
+        Some(Color32::from_rgba_unmultiplied(r, g, b, a))
     } else {
         None
     }
 }
 
 fn format_hex_color(c: Color32) -> String {
-    format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    if a == 255 {
+        format!("#{:02X}{:02X}{:02X}", r, g, b)
+    } else {
+        format!("#{:02X}{:02X}{:02X}{:02X}", r, g, b, a)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,7 +120,7 @@ impl MockPalette {
             }
         }
         if let Some(hex) = bubble_out_hex {
-            if let Some(c) = parse_hex_color(hex) {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
                 self.bubble_out_bg = c;
                 let lum = 0.299 * (c.r() as f32) + 0.587 * (c.g() as f32) + 0.114 * (c.b() as f32);
                 if lum > 140.0 {
@@ -125,7 +133,7 @@ impl MockPalette {
             }
         }
         if let Some(hex) = bubble_in_hex {
-            if let Some(c) = parse_hex_color(hex) {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
                 self.bubble_in_bg = c;
                 let lum = 0.299 * (c.r() as f32) + 0.587 * (c.g() as f32) + 0.114 * (c.b() as f32);
                 if lum > 140.0 {
@@ -200,7 +208,10 @@ fn test_adversarial_huge_hex_string_handled_safely() {
 
     // Trimming 50,000 outer spaces must succeed safely and yield the valid color
     let huge_outer_spaces = format!("   #0068FF   {}", " ".repeat(50_000));
-    assert_eq!(parse_hex_color(&huge_outer_spaces), Some(Color32::from_rgb(0, 104, 255)));
+    assert_eq!(
+        parse_hex_color(&huge_outer_spaces),
+        Some(Color32::from_rgb(0, 104, 255))
+    );
 
     // Internal space within a huge string must be safely rejected
     let huge_internal_spaces = format!("   #00 68FF   {}", " ".repeat(50_000));
@@ -210,22 +221,34 @@ fn test_adversarial_huge_hex_string_handled_safely() {
 #[test]
 fn test_valid_hex_parsing_variations() {
     // 6-digit with #
-    assert_eq!(parse_hex_color("#0068FF"), Some(Color32::from_rgb(0, 104, 255)));
+    assert_eq!(
+        parse_hex_color("#0068FF"),
+        Some(Color32::from_rgb(0, 104, 255))
+    );
     // 6-digit lowercase
-    assert_eq!(parse_hex_color("#0068ff"), Some(Color32::from_rgb(0, 104, 255)));
+    assert_eq!(
+        parse_hex_color("#0068ff"),
+        Some(Color32::from_rgb(0, 104, 255))
+    );
     // 6-digit without #
-    assert_eq!(parse_hex_color("0068FF"), Some(Color32::from_rgb(0, 104, 255)));
+    assert_eq!(
+        parse_hex_color("0068FF"),
+        Some(Color32::from_rgb(0, 104, 255))
+    );
     // 6-digit with outer whitespace
-    assert_eq!(parse_hex_color("  #059669  "), Some(Color32::from_rgb(5, 150, 105)));
+    assert_eq!(
+        parse_hex_color("  #059669  "),
+        Some(Color32::from_rgb(5, 150, 105))
+    );
     // 8-digit with alpha
     assert_eq!(
         parse_hex_color("#528BFF80"),
-        Some(Color32::from_rgba_premultiplied(82, 139, 255, 128))
+        Some(Color32::from_rgba_unmultiplied(82, 139, 255, 128))
     );
     // 8-digit without #
     assert_eq!(
         parse_hex_color("E11D48FF"),
-        Some(Color32::from_rgba_premultiplied(225, 29, 72, 255))
+        Some(Color32::from_rgba_unmultiplied(225, 29, 72, 255))
     );
 }
 
@@ -248,6 +271,13 @@ fn test_color_format_roundtrip_property() {
         assert_eq!(parsed.b(), b);
         assert_eq!(parsed.a(), 255);
     }
+
+    // Translucent color format and roundtrip with alpha
+    let translucent = Color32::from_rgba_unmultiplied(82, 139, 255, 128);
+    let hex8 = format_hex_color(translucent);
+    assert_eq!(hex8, "#528BFF80");
+    let parsed8 = parse_hex_color(&hex8).expect("Must parse 8-digit hex");
+    assert_eq!(parsed8, translucent);
 }
 
 // ---------------------------------------------------------------------------
@@ -331,18 +361,12 @@ fn test_extreme_luminance_contrast_readability() {
         "Contrast on neon yellow must be >= 14.0, got {ratio_yellow}"
     );
 
-    // 6. Transparent colors (#00000000, #FFFFFF00)
+    // 6. Transparent colors (#00000000, #FFFFFF00) - must be rejected, preserving valid palette
+    let prev_out_bg = pal.bubble_out_bg;
+    let prev_in_bg = pal.bubble_in_bg;
     pal.apply_custom_colors(None, None, Some("#00000000"), Some("#FFFFFF00"));
-    assert_eq!(
-        pal.bubble_out_bg,
-        Color32::from_rgba_premultiplied(0, 0, 0, 0)
-    );
-    assert_eq!(pal.bubble_out_text, Color32::from_rgb(235, 240, 246)); // light text for 0 RGB
-    assert_eq!(
-        pal.bubble_in_bg,
-        Color32::from_rgba_premultiplied(255, 255, 255, 0)
-    );
-    assert_eq!(pal.bubble_in_text, Color32::from_rgb(15, 23, 42)); // dark text for 255 RGB
+    assert_eq!(pal.bubble_out_bg, prev_out_bg);
+    assert_eq!(pal.bubble_in_bg, prev_in_bg);
 }
 
 #[test]
@@ -370,7 +394,10 @@ fn test_palette_apply_malformed_hex_preserves_previous_state() {
         Some("#123"),
         Some("#FFFFFFFFF"),
     );
-    assert_eq!(pal, original, "Malformed overrides must leave palette unchanged");
+    assert_eq!(
+        pal, original,
+        "Malformed overrides must leave palette unchanged"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -407,26 +434,34 @@ fn test_font_switching_stress_in_headless_egui_context() {
         match choice_norm.as_str() {
             "segoe_ui" | "segoe" => {
                 if let Ok(data) = fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
-                    fonts.font_data.insert("selected_font".to_owned(), egui::FontData::from_owned(data));
+                    fonts
+                        .font_data
+                        .insert("selected_font".to_owned(), egui::FontData::from_owned(data));
                     selected_font_loaded = true;
                 }
             }
             "arial" => {
                 if let Ok(data) = fs::read("C:\\Windows\\Fonts\\arial.ttf") {
-                    fonts.font_data.insert("selected_font".to_owned(), egui::FontData::from_owned(data));
+                    fonts
+                        .font_data
+                        .insert("selected_font".to_owned(), egui::FontData::from_owned(data));
                     selected_font_loaded = true;
                 }
             }
             "tahoma" => {
                 if let Ok(data) = fs::read("C:\\Windows\\Fonts\\tahoma.ttf") {
-                    fonts.font_data.insert("selected_font".to_owned(), egui::FontData::from_owned(data));
+                    fonts
+                        .font_data
+                        .insert("selected_font".to_owned(), egui::FontData::from_owned(data));
                     selected_font_loaded = true;
                 }
             }
             "default" | "" => {}
             custom_path => {
                 if let Ok(data) = fs::read(custom_path) {
-                    fonts.font_data.insert("selected_font".to_owned(), egui::FontData::from_owned(data));
+                    fonts
+                        .font_data
+                        .insert("selected_font".to_owned(), egui::FontData::from_owned(data));
                     selected_font_loaded = true;
                 }
             }
@@ -435,10 +470,15 @@ fn test_font_switching_stress_in_headless_egui_context() {
         // Bundled Be Vietnam Pro fallback representation
         fonts.font_data.insert(
             "bundled_sans".to_owned(),
-            egui::FontData::from_static(include_bytes!("../src/assets/fonts/BeVietnamPro-Regular.ttf")),
+            egui::FontData::from_static(include_bytes!(
+                "../src/assets/fonts/BeVietnamPro-Regular.ttf"
+            )),
         );
 
-        let prop = fonts.families.entry(egui::FontFamily::Proportional).or_default();
+        let prop = fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default();
         if selected_font_loaded {
             prop.insert(0, "selected_font".to_owned());
             prop.push("bundled_sans".to_owned());
@@ -446,7 +486,10 @@ fn test_font_switching_stress_in_headless_egui_context() {
             prop.insert(0, "bundled_sans".to_owned());
         }
 
-        let mono = fonts.families.entry(egui::FontFamily::Monospace).or_default();
+        let mono = fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default();
         if selected_font_loaded {
             mono.insert(0, "selected_font".to_owned());
             mono.push("bundled_sans".to_owned());
@@ -486,7 +529,8 @@ fn test_app_settings_boundary_zoom_scales() {
         fs::write(&fixture.path, &json).expect("Write AppSettings");
 
         let read_back = fs::read_to_string(&fixture.path).expect("Read AppSettings");
-        let loaded: AppSettings = serde_json::from_str(&read_back).expect("Deserialize AppSettings");
+        let loaded: AppSettings =
+            serde_json::from_str(&read_back).expect("Deserialize AppSettings");
 
         assert_eq!(
             loaded.font_scale, scale,
@@ -522,7 +566,8 @@ fn test_app_settings_adversarial_font_family_names() {
         fs::write(&fixture.path, &json).expect("Write AppSettings");
 
         let read_back = fs::read_to_string(&fixture.path).expect("Read AppSettings");
-        let loaded: AppSettings = serde_json::from_str(&read_back).expect("Deserialize AppSettings");
+        let loaded: AppSettings =
+            serde_json::from_str(&read_back).expect("Deserialize AppSettings");
 
         assert_eq!(
             loaded.font_family, name,
@@ -579,7 +624,8 @@ fn test_app_settings_adversarial_custom_colors_roundtrip() {
         fs::write(&fixture.path, &json).expect("Write AppSettings");
 
         let read_back = fs::read_to_string(&fixture.path).expect("Read AppSettings");
-        let loaded: AppSettings = serde_json::from_str(&read_back).expect("Deserialize AppSettings");
+        let loaded: AppSettings =
+            serde_json::from_str(&read_back).expect("Deserialize AppSettings");
 
         assert_eq!(loaded.custom_primary_color, p);
         assert_eq!(loaded.custom_accent_color, a);
@@ -591,14 +637,14 @@ fn test_app_settings_adversarial_custom_colors_roundtrip() {
 #[test]
 fn test_app_settings_corrupted_json_graceful_fallback() {
     let corrupted_payloads = [
-        "",                                     // Empty file
-        "{ invalid json",                       // Truncated syntax
-        "[]",                                   // Array instead of object
-        "\"string value\"",                     // Primitive string
-        "12345",                                // Primitive number
-        "null",                                 // Null
-        "{\"font_scale\": \"not_a_number\"}",   // Type mismatch on numeric field
-        "{\"custom_primary_color\": 12345}",    // Type mismatch on string field
+        "",                                       // Empty file
+        "{ invalid json",                         // Truncated syntax
+        "[]",                                     // Array instead of object
+        "\"string value\"",                       // Primitive string
+        "12345",                                  // Primitive number
+        "null",                                   // Null
+        "{\"font_scale\": \"not_a_number\"}",     // Type mismatch on numeric field
+        "{\"custom_primary_color\": 12345}",      // Type mismatch on string field
         "{\"pinned_threads\": \"not_an_array\"}", // Type mismatch on vec field
     ];
 
@@ -607,12 +653,36 @@ fn test_app_settings_corrupted_json_graceful_fallback() {
         // serde_json::from_str::<Self>(&s).ok().unwrap_or_default()
         let recovered = serde_json::from_str::<AppSettings>(payload).unwrap_or_default();
         // Regardless of corruption syntax, recovery must guarantee valid theme and font defaults
-        assert_eq!(recovered.font_family, "default", "Payload {:?} failed to recover default font_family", payload);
-        assert_eq!(recovered.font_scale, 1.0, "Payload {:?} failed to recover default font_scale", payload);
-        assert_eq!(recovered.custom_primary_color, None, "Payload {:?} failed to recover None primary color", payload);
-        assert_eq!(recovered.custom_accent_color, None, "Payload {:?} failed to recover None accent color", payload);
-        assert_eq!(recovered.custom_bubble_out_bg, None, "Payload {:?} failed to recover None bubble out", payload);
-        assert_eq!(recovered.custom_bubble_in_bg, None, "Payload {:?} failed to recover None bubble in", payload);
+        assert_eq!(
+            recovered.font_family, "default",
+            "Payload {:?} failed to recover default font_family",
+            payload
+        );
+        assert_eq!(
+            recovered.font_scale, 1.0,
+            "Payload {:?} failed to recover default font_scale",
+            payload
+        );
+        assert_eq!(
+            recovered.custom_primary_color, None,
+            "Payload {:?} failed to recover None primary color",
+            payload
+        );
+        assert_eq!(
+            recovered.custom_accent_color, None,
+            "Payload {:?} failed to recover None accent color",
+            payload
+        );
+        assert_eq!(
+            recovered.custom_bubble_out_bg, None,
+            "Payload {:?} failed to recover None bubble out",
+            payload
+        );
+        assert_eq!(
+            recovered.custom_bubble_in_bg, None,
+            "Payload {:?} failed to recover None bubble in",
+            payload
+        );
     }
 }
 
@@ -626,7 +696,8 @@ fn test_app_settings_forward_compatibility_extra_fields() {
         "another_future_field": { "nested": [1, 2, 3] }
     }"##;
 
-    let parsed: AppSettings = serde_json::from_str(forward_json).expect("Must ignore unknown fields");
+    let parsed: AppSettings =
+        serde_json::from_str(forward_json).expect("Must ignore unknown fields");
     assert_eq!(parsed.font_family, "segoe_ui");
     assert_eq!(parsed.font_scale, 1.10);
     assert_eq!(parsed.custom_primary_color, Some("#0068FF".to_string()));

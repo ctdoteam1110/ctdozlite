@@ -492,35 +492,67 @@ pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
             #[allow(dead_code)]
             struct IFileDialogVtbl {
                 // IUnknown (3 methods)
-                QueryInterface: unsafe extern "system" fn(*mut std::ffi::c_void, *const GUID, *mut *mut std::ffi::c_void) -> i32,
+                QueryInterface: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *const GUID,
+                    *mut *mut std::ffi::c_void,
+                ) -> i32,
                 AddRef: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
                 Release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
                 // IModalWindow (1 method)
-                Show: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
+                Show:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
                 // IFileDialog (23 methods)
-                SetFileTypes: unsafe extern "system" fn(*mut std::ffi::c_void, u32, *const std::ffi::c_void) -> i32,
+                SetFileTypes: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    u32,
+                    *const std::ffi::c_void,
+                ) -> i32,
                 SetFileTypeIndex: unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32,
                 GetFileTypeIndex: unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32) -> i32,
-                Advise: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut u32) -> i32,
+                Advise: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut std::ffi::c_void,
+                    *mut u32,
+                ) -> i32,
                 Unadvise: unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32,
                 SetOptions: unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32,
                 GetOptions: unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32) -> i32,
-                SetDefaultFolder: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
-                SetFolder: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
-                GetFolder: unsafe extern "system" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> i32,
-                GetCurrentSelection: unsafe extern "system" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> i32,
+                SetDefaultFolder:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
+                SetFolder:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
+                GetFolder: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut *mut std::ffi::c_void,
+                ) -> i32,
+                GetCurrentSelection: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut *mut std::ffi::c_void,
+                ) -> i32,
                 SetFileName: unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
                 GetFileName: unsafe extern "system" fn(*mut std::ffi::c_void, *mut *mut u16) -> i32,
                 SetTitle: unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
-                SetOkButtonLabel: unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
-                SetFileNameLabel: unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
-                GetResult: unsafe extern "system" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> i32,
-                AddPlace: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32) -> i32,
-                SetDefaultExtension: unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
+                SetOkButtonLabel:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
+                SetFileNameLabel:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
+                GetResult: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut *mut std::ffi::c_void,
+                ) -> i32,
+                AddPlace: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut std::ffi::c_void,
+                    u32,
+                ) -> i32,
+                SetDefaultExtension:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
                 Close: unsafe extern "system" fn(*mut std::ffi::c_void, i32) -> i32,
                 SetClientGuid: unsafe extern "system" fn(*mut std::ffi::c_void, *const GUID) -> i32,
                 ClearClientData: unsafe extern "system" fn(*mut std::ffi::c_void) -> i32,
-                SetFilter: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
+                SetFilter:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
             }
 
             #[repr(C)]
@@ -528,15 +560,35 @@ pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
             #[allow(dead_code)]
             struct IShellItemVtbl {
                 // IUnknown (3 methods)
-                QueryInterface: unsafe extern "system" fn(*mut std::ffi::c_void, *const GUID, *mut *mut std::ffi::c_void) -> i32,
+                QueryInterface: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *const GUID,
+                    *mut *mut std::ffi::c_void,
+                ) -> i32,
                 AddRef: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
                 Release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
                 // IShellItem (5 methods)
-                BindToHandler: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *const GUID, *const GUID, *mut *mut std::ffi::c_void) -> i32,
-                GetParent: unsafe extern "system" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> i32,
-                GetDisplayName: unsafe extern "system" fn(*mut std::ffi::c_void, u32, *mut *mut u16) -> i32,
-                GetAttributes: unsafe extern "system" fn(*mut std::ffi::c_void, u32, *mut u32) -> i32,
-                Compare: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, *mut i32) -> i32,
+                BindToHandler: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut std::ffi::c_void,
+                    *const GUID,
+                    *const GUID,
+                    *mut *mut std::ffi::c_void,
+                ) -> i32,
+                GetParent: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut *mut std::ffi::c_void,
+                ) -> i32,
+                GetDisplayName:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, u32, *mut *mut u16) -> i32,
+                GetAttributes:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, u32, *mut u32) -> i32,
+                Compare: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut std::ffi::c_void,
+                    u32,
+                    *mut i32,
+                ) -> i32,
             }
 
             #[link(name = "ole32")]
@@ -591,9 +643,13 @@ pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
                     let mut options = 0u32;
                     let _ = ((*vtbl).GetOptions)(dialog, &mut options);
                     // FOS_PICKFOLDERS (0x20) | FOS_FORCEFILESYSTEM (0x40) | FOS_PATHMUSTEXIST (0x800)
-                    let _ = ((*vtbl).SetOptions)(dialog, options | 0x0000_0020 | 0x0000_0040 | 0x0000_0800);
+                    let _ = ((*vtbl).SetOptions)(
+                        dialog,
+                        options | 0x0000_0020 | 0x0000_0040 | 0x0000_0800,
+                    );
 
-                    let title_u16: Vec<u16> = "Chọn thư mục lưu tệp tải về\0".encode_utf16().collect();
+                    let title_u16: Vec<u16> =
+                        "Chọn thư mục lưu tệp tải về\0".encode_utf16().collect();
                     let _ = ((*vtbl).SetTitle)(dialog, title_u16.as_ptr());
 
                     let hr_show = ((*vtbl).Show)(dialog, std::ptr::null_mut());
@@ -604,13 +660,16 @@ pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
                             let item_vtbl = *(psi as *mut *mut IShellItemVtbl);
                             let mut path_ptr: *mut u16 = std::ptr::null_mut();
                             // SIGDN_FILESYSPATH = 0x80058000
-                            let hr_path = ((*item_vtbl).GetDisplayName)(psi, 0x8005_8000, &mut path_ptr);
+                            let hr_path =
+                                ((*item_vtbl).GetDisplayName)(psi, 0x8005_8000, &mut path_ptr);
                             if hr_path >= 0 && !path_ptr.is_null() {
                                 let mut len = 0;
                                 while *path_ptr.add(len) != 0 {
                                     len += 1;
                                 }
-                                let s = String::from_utf16_lossy(std::slice::from_raw_parts(path_ptr, len));
+                                let s = String::from_utf16_lossy(std::slice::from_raw_parts(
+                                    path_ptr, len,
+                                ));
                                 CoTaskMemFree(path_ptr as *mut _);
                                 let trimmed = s.trim();
                                 if !trimmed.is_empty() {
@@ -642,7 +701,10 @@ pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
                 #[allow(dead_code)]
                 extern "system" {
                     fn SHBrowseForFolderW(lpbi: *mut BrowseInfoW) -> *mut std::ffi::c_void;
-                    fn SHGetPathFromIDListW(pidl: *const std::ffi::c_void, psz_path: *mut u16) -> i32;
+                    fn SHGetPathFromIDListW(
+                        pidl: *const std::ffi::c_void,
+                        psz_path: *mut u16,
+                    ) -> i32;
                 }
                 let title_u16: Vec<u16> = "Chọn thư mục lưu tệp tải về\0".encode_utf16().collect();
                 let mut display_name = vec![0u16; 1024];
@@ -663,7 +725,10 @@ pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
                     let ok = unsafe { SHGetPathFromIDListW(pidl, path_buf.as_mut_ptr()) };
                     unsafe { CoTaskMemFree(pidl) };
                     if ok != 0 {
-                        let end = path_buf.iter().position(|&c| c == 0).unwrap_or(path_buf.len());
+                        let end = path_buf
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(path_buf.len());
                         let s = String::from_utf16_lossy(&path_buf[..end]);
                         let trimmed = s.trim();
                         if !trimmed.is_empty() {
@@ -689,7 +754,10 @@ pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
     {
         if let Ok(out) = std::process::Command::new("osascript")
-            .args(["-e", "POSIX path of (choose folder with prompt \"Chọn thư mục lưu tệp tải về\")"])
+            .args([
+                "-e",
+                "POSIX path of (choose folder with prompt \"Chọn thư mục lưu tệp tải về\")",
+            ])
             .output()
         {
             if out.status.success() {
@@ -703,29 +771,46 @@ pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        if let Ok(out) = std::process::Command::new("zenity")
-            .args(["--file-selection", "--directory", "--title=Chọn thư mục lưu tệp tải về"])
+        match std::process::Command::new("zenity")
+            .args([
+                "--file-selection",
+                "--directory",
+                "--title=Chọn thư mục lưu tệp tải về",
+            ])
             .output()
         {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    return Some(std::path::PathBuf::from(s));
+            Ok(out) => {
+                if out.status.success() {
+                    let s = String::from_utf8_lossy(&out.stdout)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_string();
+                    if !s.is_empty() {
+                        return Some(std::path::PathBuf::from(s));
+                    }
                 }
+                None
+            }
+            Err(_) => {
+                if let Ok(out) = std::process::Command::new("kdialog")
+                    .args([
+                        "--getexistingdirectory",
+                        "--title",
+                        "Chọn thư mục lưu tệp tải về",
+                    ])
+                    .output()
+                {
+                    if out.status.success() {
+                        let s = String::from_utf8_lossy(&out.stdout)
+                            .trim_end_matches(['\r', '\n'])
+                            .to_string();
+                        if !s.is_empty() {
+                            return Some(std::path::PathBuf::from(s));
+                        }
+                    }
+                }
+                None
             }
         }
-        if let Ok(out) = std::process::Command::new("kdialog")
-            .args(["--getexistingdirectory", "--title", "Chọn thư mục lưu tệp tải về"])
-            .output()
-        {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    return Some(std::path::PathBuf::from(s));
-                }
-            }
-        }
-        None
     }
 }
 
@@ -743,21 +828,27 @@ if ($fbd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     Write-Output $fbd.SelectedPath
 }
 "#;
-    let utf16_bytes: Vec<u8> = code
-        .encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect();
+    let utf16_bytes: Vec<u8> = code.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&utf16_bytes);
 
     let mut cmd = std::process::Command::new("powershell");
-    cmd.args(["-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand", &b64]);
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-STA",
+        "-EncodedCommand",
+        &b64,
+    ]);
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     if let Ok(out) = cmd.output() {
         if out.status.success() {
             let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let clean = s.lines()
-                .find(|line| !line.starts_with("#<") && !line.starts_with("<") && !line.trim().is_empty())
+            let clean = s
+                .lines()
+                .find(|line| {
+                    !line.starts_with("#<") && !line.starts_with("<") && !line.trim().is_empty()
+                })
                 .unwrap_or("")
                 .trim();
             if !clean.is_empty() {
@@ -2132,10 +2223,10 @@ pub(super) fn render_chat_bubble(
         None
     };
     let has_photo_caption = photo_caption.is_some();
-    let is_frameless_photo = is_photo_card
-        && !has_photo_caption
-        && msg.reply_to_text.is_none()
-        && (msg.is_outgoing || !is_group);
+    let quote_info = resolve_quote_info(msg, is_group, Some(thread_name));
+    let has_quote = quote_info.is_some();
+    let is_frameless_photo =
+        is_photo_card && !has_photo_caption && !has_quote && (msg.is_outgoing || !is_group);
 
     let sender_is_name = !msg.sender.is_empty()
         && msg.sender != "0"
@@ -2239,8 +2330,8 @@ pub(super) fn render_chat_bubble(
             .size()
             .x
         });
-        let quote_w = match msg.reply_to_text.as_ref() {
-            Some(qt) => {
+        let quote_w = match &quote_info {
+            Some((qt, who)) => {
                 let q_body_w = ui.fonts(|f| {
                     f.layout(
                         truncate_chars(qt, 80).into_owned(),
@@ -2251,13 +2342,8 @@ pub(super) fn render_chat_bubble(
                     .size()
                     .x
                 });
-                let who = msg
-                    .reply_to_sender
-                    .as_deref()
-                    .filter(|sn| !sn.is_empty() && !sn.chars().all(|c| c.is_ascii_digit()))
-                    .unwrap_or("Tin nhắn trích dẫn");
                 let q_who_w = ui.fonts(|f| {
-                    f.layout_no_wrap(who.to_string(), FontId::proportional(11.5), Color32::WHITE)
+                    f.layout_no_wrap(who.clone(), FontId::proportional(11.5), Color32::WHITE)
                         .size()
                         .x
                 });
@@ -2360,7 +2446,15 @@ pub(super) fn render_chat_bubble(
                         ui.set_min_width(content_width);
                         ui.set_max_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            quote_action = render_quote_block(ui, msg, pal, true, content_width, Some(thread_name));
+                            quote_action = render_quote_block(
+                                ui,
+                                msg,
+                                pal,
+                                true,
+                                content_width,
+                                is_group,
+                                Some(thread_name),
+                            );
                             if let Some(card) = &call_card_opt {
                                 card_action = render_call_card_widget(ui, card, pal, content_width);
                             } else if !render_sticker_widget(
@@ -2394,14 +2488,21 @@ pub(super) fn render_chat_bubble(
                             }
                         });
                     });
-                let is_double_clicked = ui.input(|i| {
-                    i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                        && i.pointer
-                            .interact_pos()
-                            .or(i.pointer.latest_pos())
-                            .map(|pos| fr.response.rect.contains(pos))
-                            .unwrap_or(false)
-                });
+                let is_top_layer = ui
+                    .ctx()
+                    .top_layer_id()
+                    .map(|top| top == ui.layer_id())
+                    .unwrap_or(true);
+                let is_double_clicked = is_top_layer
+                    && ui.input(|i| {
+                        i.pointer
+                            .button_double_clicked(egui::PointerButton::Primary)
+                            && i.pointer
+                                .interact_pos()
+                                .or(i.pointer.latest_pos())
+                                .map(|pos| fr.response.rect.contains(pos))
+                                .unwrap_or(false)
+                    });
                 if is_double_clicked {
                     return Some(BubbleAction::Reply);
                 }
@@ -2498,7 +2599,15 @@ pub(super) fn render_chat_bubble(
                                 );
                                 ui.add_space(2.0);
                             }
-                            quote_action = render_quote_block(ui, msg, pal, false, content_width, Some(thread_name));
+                            quote_action = render_quote_block(
+                                ui,
+                                msg,
+                                pal,
+                                false,
+                                content_width,
+                                is_group,
+                                Some(thread_name),
+                            );
                             if let Some(card) = &call_card_opt {
                                 card_action = render_call_card_widget(ui, card, pal, content_width);
                             } else if !render_sticker_widget(
@@ -2529,14 +2638,21 @@ pub(super) fn render_chat_bubble(
                             }
                         });
                     });
-                let is_double_clicked = ui.input(|i| {
-                    i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                        && i.pointer
-                            .interact_pos()
-                            .or(i.pointer.latest_pos())
-                            .map(|pos| fr.response.rect.contains(pos))
-                            .unwrap_or(false)
-                });
+                let is_top_layer = ui
+                    .ctx()
+                    .top_layer_id()
+                    .map(|top| top == ui.layer_id())
+                    .unwrap_or(true);
+                let is_double_clicked = is_top_layer
+                    && ui.input(|i| {
+                        i.pointer
+                            .button_double_clicked(egui::PointerButton::Primary)
+                            && i.pointer
+                                .interact_pos()
+                                .or(i.pointer.latest_pos())
+                                .map(|pos| fr.response.rect.contains(pos))
+                                .unwrap_or(false)
+                    });
                 if is_double_clicked {
                     return Some(BubbleAction::Reply);
                 }
@@ -2738,27 +2854,29 @@ pub(super) fn bubble_context_menu(
 }
 
 /// Quoted-message block shown at the top of a reply bubble.
-pub(super) fn render_quote_block(
-    ui: &mut egui::Ui,
-    msg: &ChatMessage,
-    pal: &ThemePalette,
-    outgoing: bool,
-    max_w: f32,
-    thread_name: Option<&str>,
-) -> Option<BubbleAction> {
+/// Resolve the quote text and sender display name for a message, treating JSON null as absent.
+pub(crate) fn resolve_quote_info<'a>(
+    msg: &'a ChatMessage,
+    is_group: bool,
+    thread_name: Option<&'a str>,
+) -> Option<(&'a str, String)> {
     let has_quote = msg.reply_to_id.is_some()
         || msg.reply_to_text.is_some()
-        || msg.wire_ref.fields.contains_key("quote")
+        || msg
+            .wire_ref
+            .fields
+            .get("quote")
+            .is_some_and(|q| !q.is_null())
         || msg
             .history_source
             .as_ref()
             .and_then(|r| r.pointer("/meta/quote"))
-            .is_some();
+            .is_some_and(|q| !q.is_null());
     if !has_quote {
         return None;
     }
 
-    let qt_extracted = msg
+    let qt = msg
         .reply_to_text
         .as_deref()
         .filter(|t| !t.is_empty())
@@ -2777,20 +2895,58 @@ pub(super) fn render_quote_block(
                     .or_else(|| r.pointer("/meta/quote/text"))
                     .and_then(|v| v.as_str())
             })
-        });
-    let qt = qt_extracted.unwrap_or("[Tin nhắn trích dẫn]");
+        })
+        .unwrap_or("[Tin nhắn trích dẫn]");
+
+    let who = if let Some(sn) = msg.reply_to_sender.as_deref().filter(|s| !s.is_empty()) {
+        if sn == "Tôi" || sn == "Bạn" || sn == "chính bạn" {
+            "Bạn".to_string()
+        } else if !sn.chars().all(|c| c.is_ascii_digit()) && sn != "0" {
+            sn.to_string()
+        } else if !is_group
+            && thread_name.is_some_and(|t| !t.is_empty() && !t.chars().all(|c| c.is_ascii_digit()))
+        {
+            thread_name.unwrap().to_string()
+        } else {
+            format!("Người dùng {sn}")
+        }
+    } else if !is_group
+        && thread_name.is_some_and(|t| !t.is_empty() && !t.chars().all(|c| c.is_ascii_digit()))
+    {
+        thread_name.unwrap().to_string()
+    } else {
+        "Tin nhắn trích dẫn".to_string()
+    };
+
+    Some((qt, who))
+}
+
+pub(super) fn render_quote_block(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    pal: &ThemePalette,
+    outgoing: bool,
+    max_w: f32,
+    is_group: bool,
+    thread_name: Option<&str>,
+) -> Option<BubbleAction> {
+    let (qt, who) = resolve_quote_info(msg, is_group, thread_name)?;
 
     let (text_col, meta_col) = if outgoing {
         (pal.bubble_out_text, pal.bubble_out_meta)
     } else {
         (pal.bubble_in_text, pal.bubble_in_meta)
     };
-    let bar_col = if outgoing && pal.is_dark {
+    let bubble_out_is_dark = {
+        let c = pal.bubble_out_bg;
+        0.299 * (c.r() as f32) + 0.587 * (c.g() as f32) + 0.114 * (c.b() as f32) <= 140.0
+    };
+    let bar_col = if outgoing && (pal.is_dark || bubble_out_is_dark) {
         Color32::from_rgb(147, 197, 253)
     } else {
         pal.primary
     };
-    let bg_col = if outgoing && pal.is_dark {
+    let bg_col = if outgoing && (pal.is_dark || bubble_out_is_dark) {
         Color32::from_rgba_unmultiplied(0, 0, 0, 42)
     } else if outgoing {
         Color32::from_rgba_unmultiplied(255, 255, 255, 150)
@@ -2809,21 +2965,6 @@ pub(super) fn render_quote_block(
                     .rect_filled(bar_rect, Rounding::same(1.5), bar_col);
                 ui.vertical(|ui| {
                     ui.set_width(inner_col_w);
-                    let who = if let Some(sn) = msg.reply_to_sender.as_deref().filter(|s| !s.is_empty()) {
-                        if sn == "Tôi" || sn == "Bạn" || sn == "chính bạn" {
-                            "Bạn".to_string()
-                        } else if !sn.chars().all(|c| c.is_ascii_digit()) && sn != "0" {
-                            sn.to_string()
-                        } else if let Some(tn) = thread_name.filter(|t| !t.is_empty() && !t.chars().all(|c| c.is_ascii_digit())) {
-                            tn.to_string()
-                        } else {
-                            format!("Người dùng {sn}")
-                        }
-                    } else if let Some(tn) = thread_name.filter(|t| !t.is_empty() && !t.chars().all(|c| c.is_ascii_digit())) {
-                        tn.to_string()
-                    } else {
-                        "Tin nhắn trích dẫn".to_string()
-                    };
                     ui.label(RichText::new(&who).color(bar_col).size(11.5).strong());
                     ui.add(
                         egui::Label::new(
@@ -3026,7 +3167,15 @@ mod quote_navigation_tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        action = render_quote_block(ui, &msg, &ThemePalette::light(), false, 300.0, None);
+                        action = render_quote_block(
+                            ui,
+                            &msg,
+                            &ThemePalette::light(),
+                            false,
+                            300.0,
+                            false,
+                            None,
+                        );
                     });
                 },
             );
@@ -3052,7 +3201,15 @@ mod quote_navigation_tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        render_quote_block(ui, &msg, &ThemePalette::light(), false, 300.0, None);
+                        render_quote_block(
+                            ui,
+                            &msg,
+                            &ThemePalette::light(),
+                            false,
+                            300.0,
+                            false,
+                            None,
+                        );
                     });
                 },
             );
@@ -3080,15 +3237,21 @@ mod quote_navigation_tests {
         );
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
+                let (resolved_text, resolved_who) =
+                    resolve_quote_info(&msg, false, Some("Hồng Nhung"))
+                        .expect("Must resolve quote info");
+                assert_eq!(resolved_text, "Quoted from wire ref");
+                assert_eq!(resolved_who, "Hồng Nhung");
+
                 let action = render_quote_block(
                     ui,
                     &msg,
                     &ThemePalette::light(),
                     false,
                     300.0,
+                    false,
                     Some("Hồng Nhung"),
                 );
-                // Action is None when not clicked, but the block was rendered
                 assert!(action.is_none());
             });
         });
@@ -3102,6 +3265,7 @@ mod quote_navigation_tests {
             text: "Hello world".into(),
             ..Default::default()
         };
+        assert!(resolve_quote_info(&msg, false, Some("Hồng Nhung")).is_none());
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let action = render_quote_block(
@@ -3110,6 +3274,7 @@ mod quote_navigation_tests {
                     &ThemePalette::light(),
                     false,
                     300.0,
+                    false,
                     Some("Hồng Nhung"),
                 );
                 assert!(action.is_none());
@@ -3126,15 +3291,26 @@ mod quote_navigation_tests {
             reply_to_text: Some("Quoted content".into()),
             ..Default::default()
         };
+        // 1-1 chat: numeric sender falls back to thread name
+        let (resolved_text, resolved_who) =
+            resolve_quote_info(&msg, false, Some("Nguyễn Văn A")).expect("Must resolve");
+        assert_eq!(resolved_text, "Quoted content");
+        assert_eq!(resolved_who, "Nguyễn Văn A");
+
+        // Group chat: numeric sender displays "Người dùng <id>" rather than group title
+        let (_, group_who) =
+            resolve_quote_info(&msg, true, Some("Nhóm Công Việc")).expect("Must resolve");
+        assert_eq!(group_who, "Người dùng 987654321");
+
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                // Renders without panic and utilizes thread name fallback
                 let action = render_quote_block(
                     ui,
                     &msg,
                     &ThemePalette::light(),
                     false,
                     300.0,
+                    false,
                     Some("Nguyễn Văn A"),
                 );
                 assert!(action.is_none());
@@ -3280,33 +3456,65 @@ mod quote_navigation_tests {
             #[allow(non_snake_case)]
             #[allow(dead_code)]
             struct IFileDialogVtbl {
-                QueryInterface: unsafe extern "system" fn(*mut std::ffi::c_void, *const GUID, *mut *mut std::ffi::c_void) -> i32,
+                QueryInterface: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *const GUID,
+                    *mut *mut std::ffi::c_void,
+                ) -> i32,
                 AddRef: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
                 Release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
-                Show: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
-                SetFileTypes: unsafe extern "system" fn(*mut std::ffi::c_void, u32, *const std::ffi::c_void) -> i32,
+                Show:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
+                SetFileTypes: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    u32,
+                    *const std::ffi::c_void,
+                ) -> i32,
                 SetFileTypeIndex: unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32,
                 GetFileTypeIndex: unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32) -> i32,
-                Advise: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut u32) -> i32,
+                Advise: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut std::ffi::c_void,
+                    *mut u32,
+                ) -> i32,
                 Unadvise: unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32,
                 SetOptions: unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32,
                 GetOptions: unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32) -> i32,
-                SetDefaultFolder: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
-                SetFolder: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
-                GetFolder: unsafe extern "system" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> i32,
-                GetCurrentSelection: unsafe extern "system" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> i32,
+                SetDefaultFolder:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
+                SetFolder:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
+                GetFolder: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut *mut std::ffi::c_void,
+                ) -> i32,
+                GetCurrentSelection: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut *mut std::ffi::c_void,
+                ) -> i32,
                 SetFileName: unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
                 GetFileName: unsafe extern "system" fn(*mut std::ffi::c_void, *mut *mut u16) -> i32,
                 SetTitle: unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
-                SetOkButtonLabel: unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
-                SetFileNameLabel: unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
-                GetResult: unsafe extern "system" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> i32,
-                AddPlace: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32) -> i32,
-                SetDefaultExtension: unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
+                SetOkButtonLabel:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
+                SetFileNameLabel:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
+                GetResult: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut *mut std::ffi::c_void,
+                ) -> i32,
+                AddPlace: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    *mut std::ffi::c_void,
+                    u32,
+                ) -> i32,
+                SetDefaultExtension:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32,
                 Close: unsafe extern "system" fn(*mut std::ffi::c_void, i32) -> i32,
                 SetClientGuid: unsafe extern "system" fn(*mut std::ffi::c_void, *const GUID) -> i32,
                 ClearClientData: unsafe extern "system" fn(*mut std::ffi::c_void) -> i32,
-                SetFilter: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
+                SetFilter:
+                    unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
             }
 
             #[link(name = "ole32")]

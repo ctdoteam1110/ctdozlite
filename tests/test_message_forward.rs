@@ -221,6 +221,26 @@ fn test_media_message_forwarding_url_preservation() {
     );
 }
 
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[tokio::test]
 async fn test_outbound_forward_dispatch_direct_and_group() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind test listener");
@@ -324,14 +344,9 @@ async fn test_outbound_forward_dispatch_direct_and_group() {
         text: "Thông báo bảo trì hệ thống".into(),
         ..Default::default()
     };
-    let res3 = forward_message_with_client_id(
-        &session,
-        "group_100",
-        true,
-        &group_msg,
-        client_id_base + 3,
-    )
-    .await;
+    let res3 =
+        forward_message_with_client_id(&session, "group_100", true, &group_msg, client_id_base + 3)
+            .await;
     assert!(res3.is_ok(), "Group text forward failed: {:?}", res3);
 
     // 4. Forward file message with URL to group chat
@@ -342,14 +357,9 @@ async fn test_outbound_forward_dispatch_direct_and_group() {
         kind: MessageKind::File,
         ..Default::default()
     };
-    let res4 = forward_message_with_client_id(
-        &session,
-        "group_200",
-        true,
-        &file_msg,
-        client_id_base + 4,
-    )
-    .await;
+    let res4 =
+        forward_message_with_client_id(&session, "group_200", true, &file_msg, client_id_base + 4)
+            .await;
     assert!(res4.is_ok(), "Group file forward failed: {:?}", res4);
 
     let recorded_requests = server_handle.join().expect("Mock server thread failed");
@@ -372,6 +382,74 @@ async fn test_outbound_forward_dispatch_direct_and_group() {
         recorded_requests[3].0.contains("/api/group/sendmsg"),
         "Group file forward must route to /api/group/sendmsg"
     );
+
+    // Assert wire payloads: decrypt params using secret_key
+    let key = [7u8; 32];
+    for (i, (_path, body_str)) in recorded_requests.iter().enumerate() {
+        assert!(
+            body_str.starts_with("params="),
+            "Request body must start with params="
+        );
+        let params_b64 = percent_decode(&body_str[7..]);
+        let decrypted =
+            zalo_rust::crypto::decode_aes(&key, &params_b64).expect("Failed to decode AES params");
+        let json_body: serde_json::Value =
+            serde_json::from_str(&decrypted).expect("Invalid decrypted JSON");
+
+        match i {
+            0 => {
+                assert_eq!(
+                    json_body.get("toid").and_then(|v| v.as_str()),
+                    Some("contact_user_1")
+                );
+                assert_eq!(
+                    json_body.get("message").and_then(|v| v.as_str()),
+                    Some("Kế hoạch tuần tới")
+                );
+                assert_eq!(
+                    json_body.get("clientId").and_then(|v| v.as_u64()),
+                    Some(client_id_base + 1)
+                );
+            }
+            1 => {
+                assert_eq!(
+                    json_body.get("toid").and_then(|v| v.as_str()),
+                    Some("contact_user_2")
+                );
+                assert_eq!(
+                    json_body.get("message").and_then(|v| v.as_str()),
+                    Some("https://cdn.zalo.me/photos/screenshot.png")
+                );
+                assert_eq!(
+                    json_body.get("clientId").and_then(|v| v.as_u64()),
+                    Some(client_id_base + 2)
+                );
+            }
+            2 => {
+                assert_eq!(json_body.get("grid").and_then(|v| v.as_str()), Some("100"));
+                assert_eq!(
+                    json_body.get("message").and_then(|v| v.as_str()),
+                    Some("Thông báo bảo trì hệ thống")
+                );
+                assert_eq!(
+                    json_body.get("clientId").and_then(|v| v.as_u64()),
+                    Some(client_id_base + 3)
+                );
+            }
+            3 => {
+                assert_eq!(json_body.get("grid").and_then(|v| v.as_str()), Some("200"));
+                assert_eq!(
+                    json_body.get("message").and_then(|v| v.as_str()),
+                    Some("bao_cao_tai_chinh.xlsx\nhttps://files.zalo.me/bao_cao_tai_chinh.xlsx")
+                );
+                assert_eq!(
+                    json_body.get("clientId").and_then(|v| v.as_u64()),
+                    Some(client_id_base + 4)
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 #[test]

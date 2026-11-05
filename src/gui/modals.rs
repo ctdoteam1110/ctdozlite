@@ -52,7 +52,10 @@ pub(crate) fn compute_call_gallery_tiles(
         let row_w = (in_row as f32) * tw + ((in_row - 1) as f32) * gap;
         let x0 = rect.left() + ((total_w - row_w) * 0.5).max(0.0).floor();
         out.push(Rect::from_min_size(
-            Pos2::new(x0 + (col as f32) * (tw + gap), y0 + (row as f32) * (th + gap)),
+            Pos2::new(
+                x0 + (col as f32) * (tw + gap),
+                y0 + (row as f32) * (th + gap),
+            ),
             Vec2::new(tw, th),
         ));
     }
@@ -150,7 +153,10 @@ pub(crate) fn compute_call_speaker_layout(
                 Vec2::new(tile_w, tile_h),
             ));
         }
-        let main = Rect::from_min_size(rect.min, Vec2::new((box_w - strip_w - gap).max(120.0), box_h));
+        let main = Rect::from_min_size(
+            rect.min,
+            Vec2::new((box_w - strip_w - gap).max(120.0), box_h),
+        );
         (main, strip)
     } else {
         let strip_h = (box_h * 0.20).floor().clamp(84.0, 128.0);
@@ -167,11 +173,13 @@ pub(crate) fn compute_call_speaker_layout(
                 Vec2::new(tile_w, tile_h),
             ));
         }
-        let main = Rect::from_min_size(rect.min, Vec2::new(box_w, (box_h - strip_h - gap).max(120.0)));
+        let main = Rect::from_min_size(
+            rect.min,
+            Vec2::new(box_w, (box_h - strip_h - gap).max(120.0)),
+        );
         (main, strip)
     }
 }
-
 
 impl ZaloGuiApp {
     pub(super) fn render_profile_popover(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
@@ -3338,13 +3346,24 @@ impl ZaloGuiApp {
         }
         if pick_dl_dir {
             if let Some(folder) = pick_native_folder_dialog() {
-                let _ = std::fs::create_dir_all(&folder);
-                self.settings.download_dir = folder.display().to_string();
-                self.settings.save();
-                self.show_toast(format!(
-                    "Đã đổi thư mục lưu file: {}",
-                    self.settings.download_dir
-                ));
+                let writable = std::fs::create_dir_all(&folder).is_ok() && {
+                    let probe = folder.join(".zalo_write_probe");
+                    let ok = std::fs::write(&probe, b"").is_ok();
+                    let _ = std::fs::remove_file(&probe);
+                    ok
+                };
+                if writable {
+                    self.settings.download_dir = folder.display().to_string();
+                    self.settings.save();
+                    self.show_toast(format!(
+                        "Đã đổi thư mục lưu file: {}",
+                        self.settings.download_dir
+                    ));
+                } else {
+                    self.show_toast(
+                        "⚠️ Không thể ghi vào thư mục đã chọn. Giữ nguyên thư mục cũ.".to_string(),
+                    );
+                }
             }
         }
         if open_dl_dir {
@@ -5881,7 +5900,7 @@ impl ZaloGuiApp {
                                             let send_btn = egui::Button::new(
                                                 RichText::new("Chuyển tiếp")
                                                     .size(12.0)
-                                                    .color(Color32::WHITE),
+                                                    .color(pal.primary_fg),
                                             )
                                             .fill(pal.primary)
                                             .rounding(4.0);
@@ -5922,8 +5941,7 @@ impl ZaloGuiApp {
                     target_is_group,
                     msg,
                 });
-                self.show_toast(format!("Đã chuyển tiếp tin nhắn tới {target_name}"));
-                self.status_msg = format!("Đã chuyển tiếp tới {target_name}");
+                self.status_msg = format!("Đang chuyển tiếp tới {target_name}...");
             }
             self.forward_msg = None;
             self.forward_filter.clear();
@@ -7149,10 +7167,8 @@ impl ZaloGuiApp {
 
                 // Search bar (matching Chat / Contacts sidebar search box)
                 let has_q = !self.feed_search_query.is_empty();
-                let (sbox_rect, _) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), 34.0),
-                    Sense::hover(),
-                );
+                let (sbox_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::hover());
                 ui.painter()
                     .rect_filled(sbox_rect, Rounding::same(8.0), pal.bg_input);
                 ui.painter().rect_stroke(
@@ -7263,11 +7279,8 @@ impl ZaloGuiApp {
                                 } else {
                                     pal.primary.linear_multiply(0.16)
                                 };
-                                ui.painter().rect_filled(
-                                    row_rect,
-                                    Rounding::same(8.0),
-                                    active_bg,
-                                );
+                                ui.painter()
+                                    .rect_filled(row_rect, Rounding::same(8.0), active_bg);
                                 ui.painter().rect_stroke(
                                     row_rect,
                                     Rounding::same(8.0),
@@ -7335,11 +7348,10 @@ impl ZaloGuiApp {
             .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
             .show(ctx, |ui| {
                 // Full-width Top Header Bar (54px)
-                let (hdr_rect, _) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), 54.0),
-                    Sense::hover(),
-                );
-                ui.painter().rect_filled(hdr_rect, Rounding::ZERO, pal.bg_sidebar);
+                let (hdr_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 54.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(hdr_rect, Rounding::ZERO, pal.bg_sidebar);
                 ui.painter().line_segment(
                     [
                         Pos2::new(hdr_rect.left(), hdr_rect.bottom()),
@@ -7357,7 +7369,11 @@ impl ZaloGuiApp {
                         for (tab, icon, title) in [
                             (FeedModalTab::Profile, lucide::GLOBE, "Nhật Ký"),
                             (FeedModalTab::Avatars, lucide::IMAGE, "Kho Ảnh Cá Nhân"),
-                            (FeedModalTab::Packet50001, lucide::FILE_TEXT, "Giao thức Feed (Cmd 50001)"),
+                            (
+                                FeedModalTab::Packet50001,
+                                lucide::FILE_TEXT,
+                                "Giao thức Feed (Cmd 50001)",
+                            ),
                         ] {
                             let active = self.feed_modal_tab == tab;
                             let btn = egui::Button::new(
@@ -7370,11 +7386,7 @@ impl ZaloGuiApp {
                                     })
                                     .strong(),
                             )
-                            .fill(if active {
-                                pal.primary
-                            } else {
-                                pal.bg_elevated
-                            })
+                            .fill(if active { pal.primary } else { pal.bg_elevated })
                             .stroke(if active {
                                 Stroke::NONE
                             } else {
@@ -7620,9 +7632,17 @@ impl ZaloGuiApp {
                     .feed_profile
                     .as_ref()
                     .map(|p| {
-                        p.display_name.trim().eq_ignore_ascii_case(item.author.display_name.trim())
-                            || p.zalo_name.trim().eq_ignore_ascii_case(item.author.display_name.trim())
-                            || item.author.display_name.trim().eq_ignore_ascii_case(p.display_name.trim())
+                        p.display_name
+                            .trim()
+                            .eq_ignore_ascii_case(item.author.display_name.trim())
+                            || p.zalo_name
+                                .trim()
+                                .eq_ignore_ascii_case(item.author.display_name.trim())
+                            || item
+                                .author
+                                .display_name
+                                .trim()
+                                .eq_ignore_ascii_case(p.display_name.trim())
                     })
                     .unwrap_or(false);
                 if !matches_name {
@@ -8425,10 +8445,18 @@ mod tests {
         let icon99 = crate::gui::theme::load_app_icon_with_badge(125).unwrap();
         assert_eq!((icon99.width, icon99.height), (64, 64));
 
-        assert!(crate::media::is_ignored_virtual_or_ir_device("Integrated IR Camera"));
-        assert!(crate::media::is_ignored_virtual_or_ir_device("Windows Hello Depth Camera"));
-        assert!(crate::media::is_ignored_virtual_or_ir_device("Monitor of Built-in Audio"));
-        assert!(!crate::media::is_ignored_virtual_or_ir_device("Integrated Webcam"));
+        assert!(crate::media::is_ignored_virtual_or_ir_device(
+            "Integrated IR Camera"
+        ));
+        assert!(crate::media::is_ignored_virtual_or_ir_device(
+            "Windows Hello Depth Camera"
+        ));
+        assert!(crate::media::is_ignored_virtual_or_ir_device(
+            "Monitor of Built-in Audio"
+        ));
+        assert!(!crate::media::is_ignored_virtual_or_ir_device(
+            "Integrated Webcam"
+        ));
     }
 
     #[test]

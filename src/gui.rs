@@ -223,7 +223,11 @@ fn phone_sync_completion_message(
     if let Some(err) = error {
         return format!("⚠️ Đồng bộ thất bại: {err}");
     }
-    let prefix = if cancelled { "Đã dừng" } else { "Đã hoàn tất" };
+    let prefix = if cancelled {
+        "Đã dừng"
+    } else {
+        "Đã hoàn tất"
+    };
     format!(
         "{prefix} yêu cầu: {added} tin mới từ Cloud/Nhóm ({active_threads} hội thoại). Lịch sử điện thoại chưa được tải vào ứng dụng."
     )
@@ -440,6 +444,14 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    pub fn normalized_font_scale(&self) -> f32 {
+        if self.font_scale.is_nan() || self.font_scale.is_infinite() || self.font_scale <= 0.0 {
+            1.0
+        } else {
+            self.font_scale.clamp(0.5, 3.0)
+        }
+    }
+
     fn load() -> Self {
         std::fs::read_to_string("app_settings.json")
             .ok()
@@ -670,9 +682,8 @@ impl ZaloGuiApp {
     ) -> Self {
         let mut loaded_settings = AppSettings::load();
         setup_custom_fonts_with_choice(&cc.egui_ctx, &loaded_settings.font_family);
-        if loaded_settings.font_scale > 0.0 {
-            cc.egui_ctx.set_zoom_factor(loaded_settings.font_scale);
-        }
+        let safe_scale = loaded_settings.normalized_font_scale();
+        cc.egui_ctx.set_zoom_factor(safe_scale);
         if session.proxy_url.is_none() && !loaded_settings.proxy_url.trim().is_empty() {
             let _ = session.set_proxy(Some(&loaded_settings.proxy_url));
         } else if let Some(ref p) = session.proxy_url {
@@ -1283,13 +1294,14 @@ impl ZaloGuiApp {
                         } else {
                             "[Tin nhắn]".to_string()
                         };
-                        let quote_sender = if !quoted.sender.trim().is_empty() && quoted.sender != "0" {
-                            quoted.sender.clone()
-                        } else if quoted.is_outgoing {
-                            "Tôi".to_string()
-                        } else {
-                            t.name.clone()
-                        };
+                        let quote_sender =
+                            if !quoted.sender.trim().is_empty() && quoted.sender != "0" {
+                                quoted.sender.clone()
+                            } else if quoted.is_outgoing {
+                                "Tôi".to_string()
+                            } else {
+                                t.name.clone()
+                            };
                         merge_sent_message(
                             t,
                             ChatMessage {
@@ -1593,6 +1605,11 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::StatusUpdate(msg) => {
+                    if msg.starts_with("Đã chuyển tiếp") {
+                        self.show_toast(&msg);
+                    } else if msg.starts_with("Chuyển tiếp thất bại") {
+                        self.show_toast(format!("⚠️ {msg}"));
+                    }
                     self.status_msg = msg;
                 }
                 GuiEvent::HistoryReachedStart(tid) => {
@@ -1886,7 +1903,9 @@ impl eframe::App for ZaloGuiApp {
             }
             std::process::exit(0);
         }
-        if ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::P)) {
+        if ctx.input(|i| {
+            (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::P)
+        }) {
             self.settings_modal_open = true;
             self.settings_tab = SettingsTab::Privacy;
         }
@@ -2809,7 +2828,8 @@ mod tests {
 
         // Backwards compatibility test: legacy JSON without font and color fields
         let legacy_json = r#"{"theme_mode":"light","download_dir":"C:\\Downloads"}"#;
-        let legacy_loaded: super::AppSettings = serde_json::from_str(legacy_json).expect("deserialize legacy settings");
+        let legacy_loaded: super::AppSettings =
+            serde_json::from_str(legacy_json).expect("deserialize legacy settings");
         assert_eq!(legacy_loaded.font_family, "default");
         assert_eq!(legacy_loaded.font_scale, 1.0);
         assert_eq!(legacy_loaded.custom_primary_color, None);

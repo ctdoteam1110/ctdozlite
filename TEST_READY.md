@@ -6,8 +6,6 @@
   $env:PATH = "C:\Users\cuongdm.pa\.cargo\bin;C:\Users\cuongdm.pa\AppData\Local\Programs\Git\cmd;C:\Users\cuongdm.pa\AppData\Local\Programs\CMake\bin;C:\Users\cuongdm.pa\AppData\Local\Programs\LLVM\bin;" + $env:PATH
   $env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"
   $env:CMAKE_GENERATOR = "Ninja"
-  $env:INCLUDE = "C:\Users\cuongdm.pa\winsysroot\VC\Tools\MSVC\14.44.17.14\include;C:\Users\cuongdm.pa\winsysroot\Windows Kits\10\Include\10.0.26100\ucrt;C:\Users\cuongdm.pa\winsysroot\Windows Kits\10\Include\10.0.26100\um;C:\Users\cuongdm.pa\winsysroot\Windows Kits\10\Include\10.0.26100\shared;"
-  $env:LIB = "C:\Users\cuongdm.pa\winsysroot\VC\Tools\MSVC\14.44.17.14\lib\x64;C:\Users\cuongdm.pa\winsysroot\Windows Kits\10\Lib\10.0.26100\um\x64;C:\Users\cuongdm.pa\winsysroot\Windows Kits\10\Lib\10.0.26100\ucrt\x64;"
   cargo check --locked
   cargo test --locked -- --test-threads=1
   ```

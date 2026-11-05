@@ -358,7 +358,8 @@ impl ZaloGuiApp {
                         .clicked()
                     {
                         self.phone_sync_progress = 0.05;
-                        self.phone_sync_status = "📲 Đang gửi yêu cầu đồng bộ tin nhắn tới điện thoại…".into();
+                        self.phone_sync_status =
+                            "📲 Đang gửi yêu cầu đồng bộ tin nhắn tới điện thoại…".into();
                         let threads = self.threads.clone();
                         if let Some(tx) = WORKER_TX.get() {
                             let _ = tx.send(WorkerCmd::SyncPhoneMessages {
@@ -3766,7 +3767,11 @@ impl ZaloGuiApp {
                     // 3b. Reply banner (quoted message preview above the composer)
                     if self.replying_to.is_some() {
                         let mut cancel = false;
-                        if ui.input(|i| i.key_pressed(Key::Escape)) {
+                        let overlay_open = self.forward_msg.is_some()
+                            || self.settings_modal_open
+                            || self.schedule_modal_open
+                            || self.image_viewer.is_some();
+                        if !overlay_open && ui.input(|i| i.key_pressed(Key::Escape)) {
                             cancel = true;
                         }
                         if let Some(q) = &self.replying_to {
@@ -3812,8 +3817,10 @@ impl ZaloGuiApp {
                                             } else if is_zalo_photo_message(q) {
                                                 "[Hình ảnh]".to_string()
                                             } else if is_zalo_file_or_video_message(q) {
-                                                let fn_str = q.link_title.as_deref().unwrap_or("[Tập tin]");
-                                                format!("[Tập tin] {fn_str}")
+                                                match q.link_title.as_deref().filter(|t| !t.trim().is_empty()) {
+                                                    Some(name) => format!("[Tập tin] {}", truncate_chars(name, 100)),
+                                                    None => "[Tập tin]".to_string(),
+                                                }
                                             } else if q.text.trim().is_empty() {
                                                 "[Tin nhắn]".to_string()
                                             } else {

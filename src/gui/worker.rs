@@ -2041,7 +2041,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             });
                                         }
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
-                                            "Đã chuyển tiếp tin nhắn".into(),
+                                            "Đã chuyển tiếp tin nhắn thành công".into(),
                                         ));
                                     }
                                     Ok(resp) => {
@@ -3523,7 +3523,7 @@ async fn download_attachment_with_original_name(
         .map_err(|e| format!("Lỗi đọc dữ liệu tập tin: {e}"))?;
 
     let target_dir = if !download_dir.trim().is_empty() {
-        std::path::PathBuf::from(download_dir.trim())
+        std::path::PathBuf::from(download_dir)
     } else {
         std::env::var("USERPROFILE")
             .ok()

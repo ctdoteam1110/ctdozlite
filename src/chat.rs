@@ -1350,7 +1350,7 @@ pub(crate) fn next_client_message_id() -> u64 {
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     let previous = LAST_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
             Some(now.max(last.saturating_add(1)))
         })
         .unwrap_or_else(|last| last);
@@ -1394,6 +1394,12 @@ pub fn extract_zalo_rtf_text_properties(raw: &str) -> (String, Option<String>) {
         let line_start_u16 = out_text.encode_utf16().count();
         let mut rest = line;
         while !rest.is_empty() {
+            if rest.starts_with("http://") || rest.starts_with("https://") {
+                let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+                out_text.push_str(&rest[..end]);
+                rest = &rest[end..];
+                continue;
+            }
             let mut matched_span = false;
             for (delim, st_tag) in [("`", ""), ("**", "b"), ("__", "u"), ("~~", "s"), ("*", "i")] {
                 if rest.starts_with(delim) {
@@ -1580,6 +1586,87 @@ pub async fn send_group_message(s: &Session, grid: &str, text: &str) -> Result<V
 }
 
 /// Preserve the request client ID for reconciliation with a later server echo.
+pub(crate) async fn send_raw_message_with_client_id(
+    s: &Session,
+    to_id: &str,
+    text: &str,
+    now: u64,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let body = obj(&[
+        ("toid", json!(to_id)),
+        ("message", json!(text)),
+        ("clientId", json!(now)),
+        ("imei", json!(s.imei)),
+    ]);
+    let params = s.encoded_params(&body)?;
+    let host = if s.domains.chat.contains("-msg-chat.")
+        || s.domains.chat.contains("tt-chat2-wpa")
+        || s.domains.chat.is_empty()
+    {
+        "https://tt-chat3-wpa.api.zaloapp.com"
+    } else {
+        &s.domains.chat
+    };
+    let url = format!("{host}/api/message/sms?{}", s.common_params());
+    let form = format!("params={params}");
+    let resp = s.post_form(&url, form).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = resp
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Err(crate::session::SessionError::new(code, msg).into());
+        }
+    }
+    Ok(resp)
+}
+
+pub(crate) async fn send_raw_group_message_with_client_id(
+    s: &Session,
+    grid: &str,
+    text: &str,
+    now: u64,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let clean_grid = grid
+        .trim_start_matches("group_")
+        .trim_start_matches('g')
+        .trim_start_matches('G');
+    let body = obj(&[
+        ("grid", json!(clean_grid)),
+        ("message", json!(text)),
+        ("clientId", json!(now)),
+        ("imei", json!(s.imei)),
+        ("visibility", json!(0)),
+    ]);
+    let params = s.encoded_params(&body)?;
+    let url = format!(
+        "{}/api/group/sendmsg?{}",
+        s.domains.group,
+        s.common_params()
+    );
+    let form = format!("params={params}");
+    let resp = s.post_form(&url, form).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = resp
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Err(crate::session::SessionError::new(code, msg).into());
+        }
+    }
+    Ok(resp)
+}
+
 pub(crate) async fn send_group_message_with_client_id(
     s: &Session,
     grid: &str,
@@ -3486,7 +3573,7 @@ pub(crate) async fn send_quote_message_with_client_id(
 /// this ensures the media URL is preserved and forwarded rather than the placeholder
 /// label string (e.g. `"[Hình ảnh]"` or `"[Photo]"` or `"[Tập tin]"`).
 pub fn forward_content_for_message(msg: &ChatMessage) -> String {
-    if let Some(ref url) = msg.link_url {
+    if let Some(url) = msg.link_url.as_ref().filter(|u| !u.trim().is_empty()) {
         let trimmed = msg.text.trim();
         if trimmed.is_empty()
             || trimmed == "[Hình ảnh]"
@@ -3505,6 +3592,8 @@ pub fn forward_content_for_message(msg: &ChatMessage) -> String {
         {
             if caption.trim().is_empty() {
                 url.clone()
+            } else if caption.contains(url) {
+                caption.trim().to_string()
             } else {
                 format!("{}\n{}", caption.trim(), url)
             }
@@ -3514,6 +3603,8 @@ pub fn forward_content_for_message(msg: &ChatMessage) -> String {
         {
             if caption.trim().is_empty() {
                 url.clone()
+            } else if caption.contains(url) {
+                caption.trim().to_string()
             } else {
                 format!("{}\n{}", caption.trim(), url)
             }
@@ -3591,14 +3682,13 @@ pub async fn forward_message_with_client_id(
             thumb: msg.link_thumb.clone().unwrap_or_default(),
             src: msg.link_src.clone().unwrap_or_default(),
         };
-        let text = if msg.text.trim().is_empty()
-            || msg.text == "[Chia sẻ]"
-            || msg.text == "[Tin nhắn]"
-        {
-            url
-        } else {
-            msg.text.trim()
-        };
+        let text =
+            if msg.text.trim().is_empty() || msg.text == "[Chia sẻ]" || msg.text == "[Tin nhắn]"
+            {
+                url
+            } else {
+                msg.text.trim()
+            };
         if let Ok(resp) =
             send_link_message_with_client_id(s, target_id, text, &meta, target_is_group, now).await
         {
@@ -3607,10 +3697,19 @@ pub async fn forward_message_with_client_id(
     }
 
     let forward_text = forward_content_for_message(msg);
+    let is_media_url = msg.link_url.as_ref().is_some_and(|u| !u.trim().is_empty());
     if target_is_group {
-        send_group_message_with_client_id(s, target_id, &forward_text, now).await
+        if is_media_url {
+            send_raw_group_message_with_client_id(s, target_id, &forward_text, now).await
+        } else {
+            send_group_message_with_client_id(s, target_id, &forward_text, now).await
+        }
     } else {
-        send_message_with_client_id(s, target_id, &forward_text, now).await
+        if is_media_url {
+            send_raw_message_with_client_id(s, target_id, &forward_text, now).await
+        } else {
+            send_message_with_client_id(s, target_id, &forward_text, now).await
+        }
     }
 }
 
@@ -5400,6 +5499,20 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
             (None, None, None)
         };
 
+    let msg_kind = if sticker_meta.is_some() {
+        crate::message_model::MessageKind::Sticker
+    } else if is_photo_msg {
+        crate::message_model::MessageKind::Photo
+    } else if is_file_msg {
+        crate::message_model::MessageKind::File
+    } else if link_url.is_some()
+        && (link_title.is_some() || link_thumb.is_some() || link_desc.is_some())
+    {
+        crate::message_model::MessageKind::Link
+    } else {
+        crate::message_model::MessageKind::Text
+    };
+
     Some(ChatMessage {
         id: msg_id,
         client_message_id: ["cliMsgId", "clientId", "client_message_id"]
@@ -5412,6 +5525,7 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         time,
         is_outgoing,
         ts,
+        kind: msg_kind,
         sticker_id: sticker_meta.map(|(sid, _, _)| sid),
         sticker_cate_id: sticker_meta.map(|(_, cid, _)| cid),
         sticker_type: sticker_meta.map(|(_, _, st)| st),
@@ -6221,11 +6335,7 @@ pub async fn update_pinned_conversation(
 
 /// Send a real-time "is typing" indicator to a 1-1 contact (`cmd 11144`, `/api/message/typing`)
 /// or a group (`cmd 11196`, `/api/group/typing`), unless blocked by `block_typing`.
-pub async fn send_typing_indicator(
-    s: &Session,
-    thread_id: &str,
-    is_group: bool,
-) -> Result<Value> {
+pub async fn send_typing_indicator(s: &Session, thread_id: &str, is_group: bool) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -6837,7 +6947,8 @@ pub fn extract_mobile_sync_controls(data_node: &Value) -> Vec<MobileSyncControlE
                 let is_last = parsed_data
                     .get("isLast")
                     .and_then(|v| v.as_i64())
-                    .unwrap_or(0) == 1;
+                    .unwrap_or(0)
+                    == 1;
                 if !url.is_empty() {
                     out.push(MobileSyncControlEvent::SyncV2Batch {
                         url,
