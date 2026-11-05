@@ -310,7 +310,7 @@ enum SettingsTab {
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-struct AppSettings {
+pub struct AppSettings {
     // 1. Cài đặt chung
     show_all_contacts: bool,
     language: String,
@@ -331,8 +331,14 @@ struct AppSettings {
     friend_src_group: bool,
     friend_src_card: bool,
     // 3. Giao diện
-    theme_mode: String, // "light" | "dark" | "system"
-    use_avatar_as_wallpaper: bool,
+    pub theme_mode: String, // "light" | "dark" | "system"
+    pub use_avatar_as_wallpaper: bool,
+    pub font_family: String,
+    pub font_scale: f32,
+    pub custom_primary_color: Option<String>,
+    pub custom_accent_color: Option<String>,
+    pub custom_bubble_out_bg: Option<String>,
+    pub custom_bubble_in_bg: Option<String>,
     // 4. Thông báo
     enable_notifications: bool,
     play_notification_sound: bool,
@@ -398,6 +404,12 @@ impl Default for AppSettings {
             friend_src_card: true,
             theme_mode: "dark".into(),
             use_avatar_as_wallpaper: false,
+            font_family: "default".into(),
+            font_scale: 1.0,
+            custom_primary_color: None,
+            custom_accent_color: None,
+            custom_bubble_out_bg: None,
+            custom_bubble_in_bg: None,
             enable_notifications: true,
             play_notification_sound: false,
             quick_messages_enabled: true,
@@ -503,7 +515,7 @@ pub struct ZaloGuiApp {
     qr_status: String,
 
     // Chat screen state
-    threads: Vec<Thread>,
+    pub threads: Vec<Thread>,
     selected_thread_index: usize,
     thread_filter: ThreadFilter,
     search_query: String,
@@ -512,8 +524,9 @@ pub struct ZaloGuiApp {
 
     // Reply / forward state
     replying_to: Option<ChatMessage>,
-    forward_msg: Option<ChatMessage>,
-    forward_filter: String,
+    pub forward_msg: Option<ChatMessage>,
+    pub forward_filter: String,
+    pub forward_search_query: String,
     filter_starred_only: bool,
     active_call: Option<ActiveCallOverlay>,
     image_viewer: Option<ImageViewerModal>,
@@ -655,8 +668,11 @@ impl ZaloGuiApp {
         dev_mode: bool,
         initial_threads: Vec<Thread>,
     ) -> Self {
-        setup_custom_fonts(&cc.egui_ctx);
         let mut loaded_settings = AppSettings::load();
+        setup_custom_fonts_with_choice(&cc.egui_ctx, &loaded_settings.font_family);
+        if loaded_settings.font_scale > 0.0 {
+            cc.egui_ctx.set_zoom_factor(loaded_settings.font_scale);
+        }
         if session.proxy_url.is_none() && !loaded_settings.proxy_url.trim().is_empty() {
             let _ = session.set_proxy(Some(&loaded_settings.proxy_url));
         } else if let Some(ref p) = session.proxy_url {
@@ -673,7 +689,14 @@ impl ZaloGuiApp {
             loaded_settings.block_seen,
         );
         let dark_mode = loaded_settings.theme_mode != "light";
-        ThemePalette::load_with_custom_override(dark_mode).apply_to_ctx(&cc.egui_ctx);
+        let mut initial_palette = ThemePalette::load_with_custom_override(dark_mode);
+        initial_palette.apply_custom_colors(
+            loaded_settings.custom_primary_color.as_deref(),
+            loaded_settings.custom_accent_color.as_deref(),
+            loaded_settings.custom_bubble_out_bg.as_deref(),
+            loaded_settings.custom_bubble_in_bg.as_deref(),
+        );
+        initial_palette.apply_to_ctx(&cc.egui_ctx);
 
         let (tx, rx) = channel();
 
@@ -751,6 +774,7 @@ impl ZaloGuiApp {
             replying_to: None,
             forward_msg: None,
             forward_filter: String::new(),
+            forward_search_query: String::new(),
             filter_starred_only: false,
             active_call: None,
             image_viewer: None,
@@ -899,7 +923,14 @@ impl ZaloGuiApp {
     }
 
     fn palette(&self) -> ThemePalette {
-        ThemePalette::load_with_custom_override(self.dark_mode)
+        let mut pal = ThemePalette::load_with_custom_override(self.dark_mode);
+        pal.apply_custom_colors(
+            self.settings.custom_primary_color.as_deref(),
+            self.settings.custom_accent_color.as_deref(),
+            self.settings.custom_bubble_out_bg.as_deref(),
+            self.settings.custom_bubble_in_bg.as_deref(),
+        );
+        pal
     }
 
     pub(super) fn reload_custom_sticker_packs(&mut self) -> usize {
@@ -1240,6 +1271,25 @@ impl ZaloGuiApp {
                         } else {
                             msg_id
                         };
+                        let quote_text = if !quoted.text.trim().is_empty() {
+                            quoted.text.clone()
+                        } else if quoted.sticker_id.is_some() {
+                            "[Nhãn dán]".to_string()
+                        } else if quoted.link_url.is_some() {
+                            quoted
+                                .link_title
+                                .clone()
+                                .unwrap_or_else(|| "[Hình ảnh/Tập tin]".to_string())
+                        } else {
+                            "[Tin nhắn]".to_string()
+                        };
+                        let quote_sender = if !quoted.sender.trim().is_empty() && quoted.sender != "0" {
+                            quoted.sender.clone()
+                        } else if quoted.is_outgoing {
+                            "Tôi".to_string()
+                        } else {
+                            t.name.clone()
+                        };
                         merge_sent_message(
                             t,
                             ChatMessage {
@@ -1251,8 +1301,8 @@ impl ZaloGuiApp {
                                 is_outgoing: true,
                                 ts: (crate::login::unix_now() * 1000) as i64,
                                 reply_to_id: Some(quoted.id.clone()),
-                                reply_to_sender: Some(quoted.sender.clone()),
-                                reply_to_text: Some(quoted.text.clone()),
+                                reply_to_sender: Some(quote_sender),
+                                reply_to_text: Some(quote_text),
                                 ..Default::default()
                             },
                         );
@@ -2727,5 +2777,41 @@ mod tests {
 
         let failed = phone_sync_completion_message(0, 0, false, Some("network"));
         assert!(failed.contains("Đồng bộ thất bại: network"));
+    }
+
+    #[test]
+    fn test_app_settings_font_and_color_defaults_and_serde() {
+        let default_settings = super::AppSettings::default();
+        assert_eq!(default_settings.font_family, "default");
+        assert_eq!(default_settings.font_scale, 1.0);
+        assert_eq!(default_settings.custom_primary_color, None);
+        assert_eq!(default_settings.custom_accent_color, None);
+        assert_eq!(default_settings.custom_bubble_out_bg, None);
+        assert_eq!(default_settings.custom_bubble_in_bg, None);
+
+        // Test serde serialization & deserialization with custom values
+        let mut custom = default_settings.clone();
+        custom.font_family = "segoe_ui".into();
+        custom.font_scale = 1.15;
+        custom.custom_primary_color = Some("#0068FF".into());
+        custom.custom_accent_color = Some("#059669".into());
+        custom.custom_bubble_out_bg = Some("#25374D".into());
+        custom.custom_bubble_in_bg = Some("#323842".into());
+
+        let json = serde_json::to_string(&custom).expect("serialize settings");
+        let loaded: super::AppSettings = serde_json::from_str(&json).expect("deserialize settings");
+        assert_eq!(loaded.font_family, "segoe_ui");
+        assert_eq!(loaded.font_scale, 1.15);
+        assert_eq!(loaded.custom_primary_color.as_deref(), Some("#0068FF"));
+        assert_eq!(loaded.custom_accent_color.as_deref(), Some("#059669"));
+        assert_eq!(loaded.custom_bubble_out_bg.as_deref(), Some("#25374D"));
+        assert_eq!(loaded.custom_bubble_in_bg.as_deref(), Some("#323842"));
+
+        // Backwards compatibility test: legacy JSON without font and color fields
+        let legacy_json = r#"{"theme_mode":"light","download_dir":"C:\\Downloads"}"#;
+        let legacy_loaded: super::AppSettings = serde_json::from_str(legacy_json).expect("deserialize legacy settings");
+        assert_eq!(legacy_loaded.font_family, "default");
+        assert_eq!(legacy_loaded.font_scale, 1.0);
+        assert_eq!(legacy_loaded.custom_primary_color, None);
     }
 }

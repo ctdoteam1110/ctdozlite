@@ -2032,10 +2032,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 sticker_type: msg.sticker_type.unwrap_or(7),
                                             });
                                         } else {
+                                            let forward_text = crate::chat::forward_content_for_message(&msg);
                                             let _ = gui_tx_clone.send(GuiEvent::MessageSent {
                                                 client_message_id: client_id.to_string(),
                                                 thread_id: target_id,
-                                                text: msg.text.clone(),
+                                                text: forward_text,
                                                 msg_id,
                                             });
                                         }

@@ -3479,6 +3479,69 @@ pub(crate) async fn send_quote_message_with_client_id(
     }
 }
 
+/// Resolve the forwarded payload text for a message.
+///
+/// For stickers, sticker ID takes precedence in dispatch.
+/// For media messages (image/photo, file, web content/links) where `link_url` is present,
+/// this ensures the media URL is preserved and forwarded rather than the placeholder
+/// label string (e.g. `"[Hình ảnh]"` or `"[Photo]"` or `"[Tập tin]"`).
+pub fn forward_content_for_message(msg: &ChatMessage) -> String {
+    if let Some(ref url) = msg.link_url {
+        let trimmed = msg.text.trim();
+        if trimmed.is_empty()
+            || trimmed == "[Hình ảnh]"
+            || trimmed == "[Photo]"
+            || trimmed == "[Tập tin]"
+            || trimmed == "[File]"
+            || trimmed == "[Nhãn dán]"
+            || trimmed == "[Chia sẻ]"
+            || trimmed == "[Video]"
+            || trimmed == "[Tin nhắn]"
+        {
+            url.clone()
+        } else if let Some(caption) = trimmed
+            .strip_prefix("[Hình ảnh] ")
+            .or_else(|| trimmed.strip_prefix("[Photo] "))
+        {
+            if caption.trim().is_empty() {
+                url.clone()
+            } else {
+                format!("{}\n{}", caption.trim(), url)
+            }
+        } else if let Some(caption) = trimmed
+            .strip_prefix("[Tập tin] ")
+            .or_else(|| trimmed.strip_prefix("[File] "))
+        {
+            if caption.trim().is_empty() {
+                url.clone()
+            } else {
+                format!("{}\n{}", caption.trim(), url)
+            }
+        } else if !trimmed.contains(url) {
+            format!("{trimmed}\n{url}")
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        msg.text.clone()
+    }
+}
+
+/// Filter thread candidates for forwarding by search keyword matching name or ID case-insensitively.
+pub fn filter_forward_candidates<'a>(threads: &'a [Thread], query: &str) -> Vec<&'a Thread> {
+    let q = query.trim().to_lowercase();
+    threads
+        .iter()
+        .filter(|t| {
+            if q.is_empty() {
+                true
+            } else {
+                t.name.to_lowercase().contains(&q) || t.id.to_lowercase().contains(&q)
+            }
+        })
+        .collect()
+}
+
 /// Forward a message or sticker to another conversation (`forwardMultiMessage` @ `compact-app-pc.js:14323900`).
 pub async fn forward_message(
     s: &Session,
@@ -3491,7 +3554,7 @@ pub async fn forward_message(
 }
 
 /// Preserve the request client ID for reconciliation with a later server echo.
-pub(crate) async fn forward_message_with_client_id(
+pub async fn forward_message_with_client_id(
     s: &Session,
     target_id: &str,
     target_is_group: bool,
@@ -3514,10 +3577,40 @@ pub(crate) async fn forward_message_with_client_id(
             .await;
         }
     }
+
+    if (msg.kind == crate::message_model::MessageKind::Link
+        || msg.kind == crate::message_model::MessageKind::WebContent)
+        && msg.link_url.is_some()
+        && (msg.link_title.is_some() || msg.link_thumb.is_some())
+    {
+        let url = msg.link_url.as_deref().unwrap_or_default();
+        let meta = LinkMetadata {
+            url: url.to_string(),
+            title: msg.link_title.clone().unwrap_or_default(),
+            desc: msg.link_desc.clone().unwrap_or_default(),
+            thumb: msg.link_thumb.clone().unwrap_or_default(),
+            src: msg.link_src.clone().unwrap_or_default(),
+        };
+        let text = if msg.text.trim().is_empty()
+            || msg.text == "[Chia sẻ]"
+            || msg.text == "[Tin nhắn]"
+        {
+            url
+        } else {
+            msg.text.trim()
+        };
+        if let Ok(resp) =
+            send_link_message_with_client_id(s, target_id, text, &meta, target_is_group, now).await
+        {
+            return Ok(resp);
+        }
+    }
+
+    let forward_text = forward_content_for_message(msg);
     if target_is_group {
-        send_group_message_with_client_id(s, target_id, &msg.text, now).await
+        send_group_message_with_client_id(s, target_id, &forward_text, now).await
     } else {
-        send_message_with_client_id(s, target_id, &msg.text, now).await
+        send_message_with_client_id(s, target_id, &forward_text, now).await
     }
 }
 

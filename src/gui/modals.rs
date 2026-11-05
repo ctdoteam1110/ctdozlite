@@ -1258,12 +1258,13 @@ impl ZaloGuiApp {
                                                             RichText::new(truncate_chars(&self.settings.download_dir, 36))
                                                                 .size(12.0)
                                                                 .color(pal.text_muted),
-                                                        );
+                                                        )
+                                                        .on_hover_text(&self.settings.download_dir);
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            if ui.button("Thay đổi").clicked() {
+                                                            if ui.button("Thay đổi").on_hover_text("Duyệt chọn thư mục lưu tệp tải về").clicked() {
                                                                 pick_dl_dir = true;
                                                             }
-                                                            if ui.button("Mở thư mục").clicked() {
+                                                            if ui.button("Mở thư mục").on_hover_text("Mở thư mục lưu tệp trong trình duyệt tệp").clicked() {
                                                                 open_dl_dir = true;
                                                             }
                                                         });
@@ -2062,6 +2063,331 @@ impl ZaloGuiApp {
                                                             );
                                                         }
                                                     });
+                                                });
+                                            ui.add_space(16.0);
+
+                                            // ---------------------------------------------------------------
+                                            // Font Family & Display Zoom (Requirement R2)
+                                            // ---------------------------------------------------------------
+                                            ui.label(RichText::new("Phông chữ & Kích thước hiển thị").color(pal.text_primary).size(13.5).strong());
+                                            ui.add_space(6.0);
+                                            egui::Frame::none()
+                                                .fill(pal.bg_elevated)
+                                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                                .rounding(Rounding::same(8.0))
+                                                .inner_margin(Margin::symmetric(14.0, 12.0))
+                                                .show(ui, |ui| {
+                                                    let mut font_changed = false;
+                                                    let mut scale_changed = false;
+
+                                                    // Row 1: Font Family Selector
+                                                    ui.horizontal(|ui| {
+                                                        ui.vertical(|ui| {
+                                                            ui.label(RichText::new("Phông chữ hiển thị").color(pal.text_primary).size(13.2).strong());
+                                                            ui.label(RichText::new("Tự động dùng Be Vietnam Pro làm fallback nếu font thiếu ký tự tiếng Việt").color(pal.text_secondary).size(11.5));
+                                                        });
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            let current_label = match self.settings.font_family.as_str() {
+                                                                "segoe_ui" | "segoe" => "Segoe UI",
+                                                                "arial" => "Arial",
+                                                                "tahoma" => "Tahoma",
+                                                                _ => "Mặc định (Be Vietnam Pro)",
+                                                            };
+                                                            egui::ComboBox::from_id_salt("appearance_font_family_combo")
+                                                                .selected_text(current_label)
+                                                                .width(190.0)
+                                                                .show_ui(ui, |ui| {
+                                                                    if ui.selectable_value(&mut self.settings.font_family, "default".into(), "Mặc định (Be Vietnam Pro)").changed() {
+                                                                        font_changed = true;
+                                                                    }
+                                                                    if ui.selectable_value(&mut self.settings.font_family, "segoe_ui".into(), "Segoe UI").changed() {
+                                                                        font_changed = true;
+                                                                    }
+                                                                    if ui.selectable_value(&mut self.settings.font_family, "arial".into(), "Arial").changed() {
+                                                                        font_changed = true;
+                                                                    }
+                                                                    if ui.selectable_value(&mut self.settings.font_family, "tahoma".into(), "Tahoma").changed() {
+                                                                        font_changed = true;
+                                                                    }
+                                                                });
+                                                        });
+                                                    });
+
+                                                    ui.add_space(10.0);
+                                                    ui.separator();
+                                                    ui.add_space(10.0);
+
+                                                    // Row 2: UI Zoom / Font Scale presets and slider
+                                                    ui.horizontal(|ui| {
+                                                        ui.vertical(|ui| {
+                                                            ui.label(RichText::new("Thu phóng giao diện & Cỡ chữ").color(pal.text_primary).size(13.2).strong());
+                                                            ui.label(RichText::new("Thu phóng toàn bộ kích thước chữ và biểu tượng giao diện").color(pal.text_secondary).size(11.5));
+                                                        });
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            for (pct_str, factor) in [("125%", 1.25_f32), ("110%", 1.10_f32), ("100%", 1.00_f32), ("90%", 0.90_f32)] {
+                                                                let is_sel = (self.settings.font_scale - factor).abs() < 0.01;
+                                                                if ui.selectable_label(is_sel, pct_str).clicked() {
+                                                                    self.settings.font_scale = factor;
+                                                                    scale_changed = true;
+                                                                }
+                                                            }
+                                                        });
+                                                    });
+                                                    ui.add_space(6.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new(format!("{:.0}%", self.settings.font_scale * 100.0)).color(pal.text_secondary).size(12.0));
+                                                        let mut pct = (self.settings.font_scale * 100.0).round();
+                                                        let slider = egui::Slider::new(&mut pct, 80.0_f32..=140.0_f32)
+                                                            .step_by(5.0)
+                                                            .suffix("%")
+                                                            .show_value(true);
+                                                        if ui.add(slider).changed() {
+                                                            self.settings.font_scale = (pct / 100.0 * 100.0).round() / 100.0;
+                                                            scale_changed = true;
+                                                        }
+                                                    });
+
+                                                    if font_changed {
+                                                        crate::gui::theme::setup_custom_fonts_with_choice(ui.ctx(), &self.settings.font_family);
+                                                        self.settings.save();
+                                                        ui.ctx().request_repaint();
+                                                    }
+                                                    if scale_changed {
+                                                        ui.ctx().set_zoom_factor(self.settings.font_scale);
+                                                        self.settings.save();
+                                                        ui.ctx().request_repaint();
+                                                    }
+                                                });
+                                            ui.add_space(16.0);
+
+                                            // ---------------------------------------------------------------
+                                            // Direct Color Customizer & Live Bubble Preview (Requirement R2)
+                                            // ---------------------------------------------------------------
+                                            ui.label(RichText::new("Tùy biến màu sắc giao diện & Bong bóng").color(pal.text_primary).size(13.5).strong());
+                                            ui.add_space(6.0);
+                                            egui::Frame::none()
+                                                .fill(pal.bg_elevated)
+                                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                                .rounding(Rounding::same(8.0))
+                                                .inner_margin(Margin::symmetric(14.0, 12.0))
+                                                .show(ui, |ui| {
+                                                    let mut color_changed = false;
+
+                                                    // 1) Preset Swatches
+                                                    ui.label(RichText::new("Bảng màu chủ đề gợi ý:").color(pal.text_secondary).size(12.0).strong());
+                                                    ui.add_space(6.0);
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+                                                        let swatches = [
+                                                            ("Zalo Blue", "#0068FF", Color32::from_rgb(0, 104, 255)),
+                                                            ("Atom Blue", "#528BFF", Color32::from_rgb(82, 139, 255)),
+                                                            ("Emerald", "#059669", Color32::from_rgb(5, 150, 105)),
+                                                            ("Violet", "#7C3AED", Color32::from_rgb(124, 58, 237)),
+                                                            ("Rose", "#E11D48", Color32::from_rgb(225, 29, 72)),
+                                                            ("Amber", "#D97706", Color32::from_rgb(217, 119, 6)),
+                                                            ("Slate", "#475569", Color32::from_rgb(71, 85, 105)),
+                                                        ];
+                                                        for (name, hex, col) in swatches {
+                                                            let is_active = self.settings.custom_primary_color.as_deref() == Some(hex);
+                                                            let (btn_rect, btn_resp) = ui.allocate_exact_size(Vec2::new(94.0, 28.0), Sense::click());
+                                                            let fill_c = if btn_resp.hovered() { pal.bg_hover } else { pal.bg_app };
+                                                            let stroke_c = if is_active { pal.primary_hover } else if btn_resp.hovered() { pal.text_secondary } else { pal.border };
+                                                            ui.painter().rect_filled(btn_rect, Rounding::same(6.0), fill_c);
+                                                            ui.painter().rect_stroke(btn_rect, Rounding::same(6.0), Stroke::new(if is_active { 1.8_f32 } else { 1.0_f32 }, stroke_c));
+                                                            let circle_center = Pos2::new(btn_rect.left() + 14.0, btn_rect.center().y);
+                                                            ui.painter().circle_filled(circle_center, 6.0, col);
+                                                            ui.painter().text(
+                                                                Pos2::new(btn_rect.left() + 25.0, btn_rect.center().y),
+                                                                egui::Align2::LEFT_CENTER,
+                                                                name,
+                                                                FontId::proportional(11.2),
+                                                                pal.text_primary,
+                                                            );
+                                                            if btn_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                                                self.settings.custom_primary_color = Some(hex.to_string());
+                                                                color_changed = true;
+                                                            }
+                                                        }
+                                                    });
+
+                                                    ui.add_space(12.0);
+                                                    ui.separator();
+                                                    ui.add_space(10.0);
+
+                                                    // 2) Direct Color Pickers
+                                                    ui.label(RichText::new("Tùy chỉnh mã màu trực tiếp:").color(pal.text_secondary).size(12.0).strong());
+                                                    ui.add_space(6.0);
+
+                                                    // Primary
+                                                    let mut cur_primary = self.settings.custom_primary_color
+                                                        .as_deref()
+                                                        .and_then(crate::gui::theme::parse_hex_color)
+                                                        .unwrap_or(pal.primary);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new("Màu chủ đạo (Primary):").color(pal.text_primary).size(12.8));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            if self.settings.custom_primary_color.is_some() {
+                                                                if ui.small_button("↺").on_hover_text("Khôi phục mặc định").clicked() {
+                                                                    self.settings.custom_primary_color = None;
+                                                                    color_changed = true;
+                                                                }
+                                                            }
+                                                            ui.label(RichText::new(crate::gui::theme::format_hex_color(cur_primary)).color(pal.text_secondary).monospace().size(11.5));
+                                                            if ui.color_edit_button_srgba(&mut cur_primary).changed() {
+                                                                self.settings.custom_primary_color = Some(crate::gui::theme::format_hex_color(cur_primary));
+                                                                color_changed = true;
+                                                            }
+                                                        });
+                                                    });
+                                                    ui.add_space(6.0);
+
+                                                    // Accent
+                                                    let mut cur_accent = self.settings.custom_accent_color
+                                                        .as_deref()
+                                                        .and_then(crate::gui::theme::parse_hex_color)
+                                                        .unwrap_or(pal.accent_online);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new("Màu điểm nhấn (Accent / Trực tuyến):").color(pal.text_primary).size(12.8));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            if self.settings.custom_accent_color.is_some() {
+                                                                if ui.small_button("↺").on_hover_text("Khôi phục mặc định").clicked() {
+                                                                    self.settings.custom_accent_color = None;
+                                                                    color_changed = true;
+                                                                }
+                                                            }
+                                                            ui.label(RichText::new(crate::gui::theme::format_hex_color(cur_accent)).color(pal.text_secondary).monospace().size(11.5));
+                                                            if ui.color_edit_button_srgba(&mut cur_accent).changed() {
+                                                                self.settings.custom_accent_color = Some(crate::gui::theme::format_hex_color(cur_accent));
+                                                                color_changed = true;
+                                                            }
+                                                        });
+                                                    });
+                                                    ui.add_space(6.0);
+
+                                                    // Outbound Bubble
+                                                    let mut cur_bubble_out = self.settings.custom_bubble_out_bg
+                                                        .as_deref()
+                                                        .and_then(crate::gui::theme::parse_hex_color)
+                                                        .unwrap_or(pal.bubble_out_bg);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new("Màu nền bong bóng gửi đi (Outbound):").color(pal.text_primary).size(12.8));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            if self.settings.custom_bubble_out_bg.is_some() {
+                                                                if ui.small_button("↺").on_hover_text("Khôi phục mặc định").clicked() {
+                                                                    self.settings.custom_bubble_out_bg = None;
+                                                                    color_changed = true;
+                                                                }
+                                                            }
+                                                            ui.label(RichText::new(crate::gui::theme::format_hex_color(cur_bubble_out)).color(pal.text_secondary).monospace().size(11.5));
+                                                            if ui.color_edit_button_srgba(&mut cur_bubble_out).changed() {
+                                                                self.settings.custom_bubble_out_bg = Some(crate::gui::theme::format_hex_color(cur_bubble_out));
+                                                                color_changed = true;
+                                                            }
+                                                        });
+                                                    });
+                                                    ui.add_space(6.0);
+
+                                                    // Inbound Bubble
+                                                    let mut cur_bubble_in = self.settings.custom_bubble_in_bg
+                                                        .as_deref()
+                                                        .and_then(crate::gui::theme::parse_hex_color)
+                                                        .unwrap_or(pal.bubble_in_bg);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new("Màu nền bong bóng nhận (Inbound):").color(pal.text_primary).size(12.8));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            if self.settings.custom_bubble_in_bg.is_some() {
+                                                                if ui.small_button("↺").on_hover_text("Khôi phục mặc định").clicked() {
+                                                                    self.settings.custom_bubble_in_bg = None;
+                                                                    color_changed = true;
+                                                                }
+                                                            }
+                                                            ui.label(RichText::new(crate::gui::theme::format_hex_color(cur_bubble_in)).color(pal.text_secondary).monospace().size(11.5));
+                                                            if ui.color_edit_button_srgba(&mut cur_bubble_in).changed() {
+                                                                self.settings.custom_bubble_in_bg = Some(crate::gui::theme::format_hex_color(cur_bubble_in));
+                                                                color_changed = true;
+                                                            }
+                                                        });
+                                                    });
+
+                                                    ui.add_space(12.0);
+                                                    ui.separator();
+                                                    ui.add_space(10.0);
+
+                                                    // 3) Live Chat Bubble Preview Box
+                                                    ui.label(RichText::new("Xem trước hiển thị trực tiếp (Live Preview):").color(pal.text_secondary).size(12.0).strong());
+                                                    ui.add_space(6.0);
+                                                    egui::Frame::none()
+                                                        .fill(pal.bg_chat_canvas)
+                                                        .stroke(Stroke::new(1.0_f32, pal.border))
+                                                        .rounding(Rounding::same(8.0))
+                                                        .inner_margin(Margin::symmetric(14.0, 12.0))
+                                                        .show(ui, |ui| {
+                                                            // Inbound message bubble
+                                                            ui.horizontal(|ui| {
+                                                                let lum_in = 0.299 * (cur_bubble_in.r() as f32) + 0.587 * (cur_bubble_in.g() as f32) + 0.114 * (cur_bubble_in.b() as f32);
+                                                                let in_text_col = if lum_in > 140.0 { Color32::from_rgb(15, 23, 42) } else { Color32::from_rgb(215, 218, 224) };
+                                                                let in_meta_col = if lum_in > 140.0 { Color32::from_rgb(100, 116, 139) } else { Color32::from_rgb(142, 150, 165) };
+                                                                egui::Frame::none()
+                                                                    .fill(cur_bubble_in)
+                                                                    .stroke(Stroke::new(1.0_f32, pal.bubble_in_border))
+                                                                    .rounding(Rounding::same(8.0))
+                                                                    .inner_margin(Margin::symmetric(10.0, 8.0))
+                                                                    .show(ui, |ui| {
+                                                                        ui.vertical(|ui| {
+                                                                            ui.label(RichText::new("Chào bạn! Màu sắc và font chữ mới hiển thị thế nào?").color(in_text_col).size(12.6));
+                                                                            ui.label(RichText::new("10:45").color(in_meta_col).size(10.5));
+                                                                        });
+                                                                    });
+                                                            });
+                                                            ui.add_space(6.0);
+                                                            // Outbound message bubble
+                                                            ui.horizontal(|ui| {
+                                                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                                    let lum_out = 0.299 * (cur_bubble_out.r() as f32) + 0.587 * (cur_bubble_out.g() as f32) + 0.114 * (cur_bubble_out.b() as f32);
+                                                                    let out_text_col = if lum_out > 140.0 { Color32::from_rgb(15, 23, 42) } else { Color32::from_rgb(235, 240, 246) };
+                                                                    let out_meta_col = if lum_out > 140.0 { Color32::from_rgb(71, 92, 122) } else { Color32::from_rgb(154, 171, 192) };
+                                                                    egui::Frame::none()
+                                                                        .fill(cur_bubble_out)
+                                                                        .rounding(Rounding::same(8.0))
+                                                                        .inner_margin(Margin::symmetric(10.0, 8.0))
+                                                                        .show(ui, |ui| {
+                                                                            ui.vertical(|ui| {
+                                                                                ui.label(RichText::new("Rất đẹp mắt, thay đổi cập nhật tức thì trên màn hình! 👍").color(out_text_col).size(12.6));
+                                                                                ui.label(RichText::new("10:46 · Đã gửi").color(out_meta_col).size(10.5));
+                                                                            });
+                                                                        });
+                                                                });
+                                                            });
+                                                        });
+
+                                                    ui.add_space(10.0);
+                                                    // 4) Reset Defaults Button
+                                                    ui.horizontal(|ui| {
+                                                        let reset_btn = egui::Button::new(RichText::new("Khôi phục mặc định").size(12.2).color(pal.text_primary))
+                                                            .fill(pal.bg_app)
+                                                            .stroke(Stroke::new(1.0_f32, pal.border))
+                                                            .rounding(Rounding::same(6.0));
+                                                        if ui.add(reset_btn).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                                            self.settings.font_family = "default".into();
+                                                            self.settings.font_scale = 1.0;
+                                                            self.settings.custom_primary_color = None;
+                                                            self.settings.custom_accent_color = None;
+                                                            self.settings.custom_bubble_out_bg = None;
+                                                            self.settings.custom_bubble_in_bg = None;
+                                                            ui.ctx().set_zoom_factor(1.0);
+                                                            crate::gui::theme::setup_custom_fonts_with_choice(ui.ctx(), "default");
+                                                            self.theme_dirty = true;
+                                                            self.settings.save();
+                                                            ui.ctx().request_repaint();
+                                                            self.show_toast("Đã khôi phục cài đặt phông chữ và màu sắc về mặc định");
+                                                        }
+                                                    });
+
+                                                    if color_changed {
+                                                        self.theme_dirty = true;
+                                                        self.settings.save();
+                                                        ui.ctx().request_repaint();
+                                                    }
                                                 });
                                             ui.add_space(16.0);
 
@@ -3011,9 +3337,9 @@ impl ZaloGuiApp {
             }
         }
         if pick_dl_dir {
-            if let Some(folder) = pick_native_file_dialog(false) {
-                let dir_path = folder.parent().unwrap_or(&folder).to_path_buf();
-                self.settings.download_dir = dir_path.display().to_string();
+            if let Some(folder) = pick_native_folder_dialog() {
+                let _ = std::fs::create_dir_all(&folder);
+                self.settings.download_dir = folder.display().to_string();
                 self.settings.save();
                 self.show_toast(format!(
                     "Đã đổi thư mục lưu file: {}",
@@ -5436,32 +5762,61 @@ impl ZaloGuiApp {
         if self.forward_msg.is_none() {
             return;
         }
+
+        // Keyboard dismissal via Escape key
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.forward_msg = None;
+            self.forward_filter.clear();
+            self.forward_search_query.clear();
+            ctx.request_repaint();
+            return;
+        }
+
         let preview = self
             .forward_msg
             .as_ref()
             .map(|m| {
                 if m.sticker_id.is_some() {
                     "[Nhãn dán]".to_string()
-                } else {
+                } else if !m.text.trim().is_empty() {
                     truncate_chars(&m.text, 80).into_owned()
+                } else if let Some(ref url) = m.link_url {
+                    truncate_chars(url, 80).into_owned()
+                } else {
+                    "[Tin nhắn]".to_string()
                 }
             })
             .unwrap_or_default();
-        let query = self.forward_filter.to_lowercase();
+
+        let raw_query = if !self.forward_search_query.trim().is_empty() {
+            &self.forward_search_query
+        } else {
+            &self.forward_filter
+        };
+        let query = raw_query.trim().to_lowercase();
         let candidates: Vec<(String, String, bool)> = self
             .threads
             .iter()
-            .filter(|t| query.is_empty() || t.name.to_lowercase().contains(&query))
+            .filter(|t| {
+                if query.is_empty() {
+                    true
+                } else {
+                    t.name.to_lowercase().contains(&query) || t.id.to_lowercase().contains(&query)
+                }
+            })
             .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
             .collect();
+
         let mut open = true;
-        let mut chosen: Option<(String, bool)> = None;
+        let mut cancel_clicked = false;
+        let mut chosen: Option<(String, String, bool)> = None;
+
         egui::Window::new("Chuyển tiếp tin nhắn")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(360.0, 420.0))
+            .fixed_size(Vec2::new(380.0, 440.0))
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(format!("Nội dung: {preview}"))
@@ -5469,44 +5824,116 @@ impl ZaloGuiApp {
                         .color(pal.text_secondary),
                 );
                 ui.add_space(6.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.forward_filter)
-                        .hint_text("Tìm hội thoại…")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical()
-                    .max_height(320.0)
-                    .show(ui, |ui| {
-                        for (id, name, is_group) in &candidates {
-                            let label = if *is_group {
-                                format!("[Nhóm] {name}")
-                            } else {
-                                name.clone()
-                            };
-                            let btn = egui::Button::new(RichText::new(label).size(13.5))
-                                .fill(pal.bg_input);
-                            if ui
-                                .add_sized([ui.available_width(), 30.0], btn)
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .clicked()
-                            {
-                                chosen = Some((id.clone(), *is_group));
+
+                let search_edit = egui::TextEdit::singleline(&mut self.forward_filter)
+                    .hint_text("Tìm hội thoại hoặc ID…")
+                    .desired_width(f32::INFINITY);
+                if ui.add(search_edit).changed() {
+                    self.forward_search_query = self.forward_filter.clone();
+                }
+                ui.add_space(8.0);
+
+                if candidates.is_empty() {
+                    ui.add_space(30.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new("Không tìm thấy người dùng hoặc nhóm phù hợp")
+                                .size(13.0)
+                                .color(pal.text_secondary),
+                        );
+                    });
+                    ui.add_space(30.0);
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for (id, name, is_group) in &candidates {
+                                let display_name = if name.trim().is_empty() {
+                                    id.as_str()
+                                } else {
+                                    name.as_str()
+                                };
+                                ui.horizontal(|ui| {
+                                    if *is_group {
+                                        let badge = egui::Frame::none()
+                                            .fill(pal.bg_input)
+                                            .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                                            .rounding(4.0)
+                                            .inner_margin(egui::Margin::symmetric(4.0, 2.0));
+                                        badge.show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new("Nhóm")
+                                                    .size(11.0)
+                                                    .color(pal.primary)
+                                                    .strong(),
+                                            );
+                                        });
+                                        ui.add_space(2.0);
+                                    }
+                                    ui.label(
+                                        RichText::new(display_name)
+                                            .size(13.5)
+                                            .color(pal.text_primary),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let send_btn = egui::Button::new(
+                                                RichText::new("Chuyển tiếp")
+                                                    .size(12.0)
+                                                    .color(Color32::WHITE),
+                                            )
+                                            .fill(pal.primary)
+                                            .rounding(4.0);
+                                            if ui
+                                                .add(send_btn)
+                                                .on_hover_cursor(CursorIcon::PointingHand)
+                                                .clicked()
+                                            {
+                                                chosen = Some((
+                                                    id.clone(),
+                                                    display_name.to_string(),
+                                                    *is_group,
+                                                ));
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.add_space(4.0);
                             }
+                        });
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Đóng").clicked() {
+                            cancel_clicked = true;
                         }
                     });
+                });
             });
-        if let Some((target_id, target_is_group)) = chosen {
+
+        if let Some((target_id, target_name, target_is_group)) = chosen {
             if let (Some(msg), Some(tx)) = (self.forward_msg.take(), WORKER_TX.get()) {
                 let _ = tx.send(WorkerCmd::Forward {
                     target_id,
                     target_is_group,
                     msg,
                 });
-                self.status_msg = "Đang chuyển tiếp…".into();
+                self.show_toast(format!("Đã chuyển tiếp tin nhắn tới {target_name}"));
+                self.status_msg = format!("Đã chuyển tiếp tới {target_name}");
             }
-        } else if !open {
             self.forward_msg = None;
+            self.forward_filter.clear();
+            self.forward_search_query.clear();
+            ctx.request_repaint();
+        } else if !open || cancel_clicked {
+            self.forward_msg = None;
+            self.forward_filter.clear();
+            self.forward_search_query.clear();
+            ctx.request_repaint();
         }
     }
 
@@ -8009,5 +8436,50 @@ mod tests {
         let raw = "Hẹn giờ gửi tin nhắn ([#38](https://github.com/ctdoteam1110/ctdozlite/issues/38)), REST API ([#35](https://github.com/ctdoteam1110/ctdozlite/issues/35))";
         let cleaned = extract_markdown_links_inline(raw);
         assert_eq!(cleaned, "Hẹn giờ gửi tin nhắn (#38), REST API (#35)");
+    }
+
+    #[test]
+    fn download_directory_persistence_and_validation() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "zalo_dl_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir_str = temp_dir.display().to_string();
+
+        let mut settings = AppSettings::default();
+        assert!(
+            !settings.download_dir.is_empty(),
+            "Default download directory must not be empty"
+        );
+
+        // Simulate folder picker selection
+        let picked = std::path::PathBuf::from(&dir_str);
+        let _ = std::fs::create_dir_all(&picked);
+        assert!(
+            picked.is_dir(),
+            "Picked folder must be created as directory"
+        );
+
+        settings.download_dir = picked.display().to_string();
+        let serialized = serde_json::to_string_pretty(&settings).expect("Settings must serialize");
+        let deserialized: AppSettings =
+            serde_json::from_str(&serialized).expect("Settings must deserialize");
+        assert_eq!(deserialized.download_dir, dir_str);
+
+        let _ = std::fs::remove_dir_all(&picked);
+    }
+
+    #[test]
+    fn download_directory_truncation_preserves_short_paths_and_truncates_long() {
+        let short = "C:\\Downloads";
+        assert_eq!(truncate_chars(short, 36), short);
+
+        let long = "C:\\Users\\very_long_username_here\\Downloads\\Zalo Received Files\\Subfolder";
+        let truncated = truncate_chars(long, 36);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.chars().count() <= 37);
     }
 }

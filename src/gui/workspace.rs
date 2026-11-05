@@ -3584,7 +3584,11 @@ impl ZaloGuiApp {
                             .cloned();
                         if let Some(m) = target {
                             match action {
-                                BubbleAction::Reply => self.replying_to = Some(m),
+                                BubbleAction::Reply => {
+                                    self.replying_to = Some(m);
+                                    self.composer_focus_pending = true;
+                                    ctx.request_repaint();
+                                }
                                 BubbleAction::JumpToQuoted(reference) => {
                                     let index = self
                                         .threads
@@ -3610,6 +3614,7 @@ impl ZaloGuiApp {
                                 BubbleAction::Forward => {
                                     self.forward_msg = Some(m);
                                     self.forward_filter.clear();
+                                    self.forward_search_query.clear();
                                 }
                                 BubbleAction::React(r) => {
                                     if let Some(real) = self
@@ -3761,13 +3766,29 @@ impl ZaloGuiApp {
                     // 3b. Reply banner (quoted message preview above the composer)
                     if self.replying_to.is_some() {
                         let mut cancel = false;
+                        if ui.input(|i| i.key_pressed(Key::Escape)) {
+                            cancel = true;
+                        }
                         if let Some(q) = &self.replying_to {
                             let who = if q.is_outgoing {
                                 "chính bạn".to_string()
-                            } else if !q.sender.is_empty() && q.sender != "0" {
+                            } else if !q.sender.is_empty()
+                                && q.sender != "0"
+                                && !q.sender.chars().all(|c| c.is_ascii_digit())
+                            {
                                 q.sender.clone()
-                            } else {
+                            } else if let Some(friend) =
+                                self.threads.iter().find(|t| !t.is_group && t.id == q.sender)
+                            {
+                                friend.name.clone()
+                            } else if !is_group && !thread_name.is_empty() && !thread_name.chars().all(|c| c.is_ascii_digit()) {
                                 thread_name.clone()
+                            } else if !q.sender.is_empty() && q.sender != "0" {
+                                format!("Người dùng {}", q.sender)
+                            } else if !thread_name.is_empty() {
+                                thread_name.clone()
+                            } else {
+                                "Tin nhắn trích dẫn".to_string()
                             };
                             egui::Frame::none()
                                 .fill(pal.bg_elevated)
@@ -3775,6 +3796,10 @@ impl ZaloGuiApp {
                                 .stroke(Stroke::new(1.0_f32, pal.border))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
+                                        let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(3.0, 26.0), Sense::hover());
+                                        ui.painter()
+                                            .rect_filled(bar_rect, Rounding::same(1.5), pal.primary);
+                                        ui.add_space(4.0);
                                         ui.vertical(|ui| {
                                             ui.label(
                                                 RichText::new(format!("Đang trả lời {who}"))
@@ -3784,6 +3809,13 @@ impl ZaloGuiApp {
                                             );
                                             let preview = if q.sticker_id.is_some() {
                                                 "[Nhãn dán]".to_string()
+                                            } else if is_zalo_photo_message(q) {
+                                                "[Hình ảnh]".to_string()
+                                            } else if is_zalo_file_or_video_message(q) {
+                                                let fn_str = q.link_title.as_deref().unwrap_or("[Tập tin]");
+                                                format!("[Tập tin] {fn_str}")
+                                            } else if q.text.trim().is_empty() {
+                                                "[Tin nhắn]".to_string()
                                             } else {
                                                 truncate_chars(&q.text, 100).into_owned()
                                             };
@@ -3796,10 +3828,16 @@ impl ZaloGuiApp {
                                         ui.with_layout(
                                             Layout::right_to_left(Align::Center),
                                             |ui| {
+                                                let x_btn = egui::Button::new(
+                                                    RichText::new("✕").size(13.0).strong().color(pal.text_muted),
+                                                )
+                                                .fill(Color32::TRANSPARENT)
+                                                .stroke(Stroke::NONE)
+                                                .min_size(Vec2::splat(22.0));
                                                 if ui
-                                                    .small_button(lucide::X)
+                                                    .add(x_btn)
                                                     .on_hover_cursor(CursorIcon::PointingHand)
-                                                    .on_hover_text("Hủy trả lời")
+                                                    .on_hover_text("Hủy trả lời (Esc)")
                                                     .clicked()
                                                 {
                                                     cancel = true;
@@ -3811,6 +3849,7 @@ impl ZaloGuiApp {
                         }
                         if cancel {
                             self.replying_to = None;
+                            ctx.request_repaint();
                         }
                     }
                     // 3c. Clipboard Image Preview Banner (`Ctrl+V` / `Shift+Insert` screenshot or image file paste)
