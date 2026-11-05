@@ -7,6 +7,8 @@ use super::*;
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ThemePalette {
     pub(super) is_dark: bool,
+    /// Liquid Glass: translucent surfaces over a macOS vibrancy (blurred desktop) backdrop.
+    pub(super) is_glass: bool,
     pub(super) bg_app: Color32,
     pub(super) bg_sidebar: Color32,
     pub(super) bg_chat_canvas: Color32,
@@ -37,6 +39,7 @@ impl ThemePalette {
         // Official Atom One Dark (`one-dark-ui` + `one-dark-syntax`) color system
         Self {
             is_dark: true,
+            is_glass: false,
             bg_app: Color32::from_rgb(24, 26, 31), // #181A1F Activity Bar & Title Bar
             bg_sidebar: Color32::from_rgb(33, 37, 43), // #21252B Tree-View / Sidebar / Header
             bg_chat_canvas: Color32::from_rgb(40, 44, 52), // #282C34 Atom One Dark Editor Canvas
@@ -66,6 +69,7 @@ impl ThemePalette {
     pub(super) fn light() -> Self {
         Self {
             is_dark: false,
+            is_glass: false,
             bg_app: Color32::from_rgb(255, 255, 255), // #FFFFFF
             bg_sidebar: Color32::from_rgb(255, 255, 255), // #FFFFFF
             bg_chat_canvas: Color32::from_rgb(235, 240, 247), // Authentic Zalo PC cool blue-gray canvas
@@ -89,6 +93,50 @@ impl ThemePalette {
             bubble_in_border: Color32::from_rgb(216, 224, 236),
             bubble_in_text: Color32::from_rgb(15, 23, 42),
             bubble_in_meta: Color32::from_rgb(100, 116, 139),
+        }
+    }
+
+    /// Liquid Glass variant: surfaces become tinted, translucent layers so the macOS vibrancy
+    /// view behind the window (blurred desktop) shows through; edges get a light hairline
+    /// like the specular rim of glass. Text colors are kept for contrast.
+    pub(super) fn into_glass(self) -> Self {
+        let rgba = Color32::from_rgba_unmultiplied;
+        if self.is_dark {
+            Self {
+                is_glass: true,
+                bg_app: rgba(16, 18, 24, 150),
+                bg_sidebar: rgba(22, 25, 32, 140),
+                bg_chat_canvas: rgba(12, 14, 20, 105),
+                bg_elevated: rgba(38, 42, 52, 225),
+                bg_hover: rgba(255, 255, 255, 22),
+                bg_selected: rgba(82, 139, 255, 70),
+                bg_input: rgba(255, 255, 255, 18),
+                border: rgba(255, 255, 255, 34),
+                bubble_out_bg: rgba(64, 118, 255, 165),
+                bubble_out_text: Color32::WHITE,
+                bubble_out_meta: rgba(225, 235, 255, 200),
+                bubble_in_bg: rgba(255, 255, 255, 26),
+                bubble_in_border: rgba(255, 255, 255, 40),
+                ..self
+            }
+        } else {
+            Self {
+                is_glass: true,
+                bg_app: rgba(255, 255, 255, 120),
+                bg_sidebar: rgba(255, 255, 255, 140),
+                bg_chat_canvas: rgba(240, 245, 255, 80),
+                bg_elevated: rgba(255, 255, 255, 230),
+                bg_hover: rgba(0, 0, 0, 14),
+                bg_selected: rgba(0, 104, 255, 40),
+                bg_input: rgba(255, 255, 255, 150),
+                border: rgba(255, 255, 255, 170),
+                bubble_out_bg: rgba(0, 104, 255, 215),
+                bubble_out_text: Color32::WHITE,
+                bubble_out_meta: rgba(230, 240, 255, 215),
+                bubble_in_bg: rgba(255, 255, 255, 185),
+                bubble_in_border: rgba(255, 255, 255, 220),
+                ..self
+            }
         }
     }
 
@@ -133,6 +181,38 @@ impl ThemePalette {
         visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, self.primary);
         visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
         visuals.widgets.active.rounding = r;
+
+        if self.is_glass {
+            // Softer, rounder geometry and floating shadows for popups/modals over glass.
+            let g = Rounding::same(11.0);
+            for w in [
+                &mut visuals.widgets.noninteractive,
+                &mut visuals.widgets.inactive,
+                &mut visuals.widgets.hovered,
+                &mut visuals.widgets.active,
+                &mut visuals.widgets.open,
+            ] {
+                w.rounding = g;
+            }
+            visuals.widgets.noninteractive.bg_fill = Color32::TRANSPARENT;
+            visuals.widgets.inactive.bg_fill = self.bg_input;
+            visuals.widgets.inactive.weak_bg_fill = self.bg_input;
+            visuals.window_rounding = Rounding::same(18.0);
+            visuals.menu_rounding = Rounding::same(14.0);
+            visuals.window_stroke = Stroke::new(1.0_f32, self.border);
+            visuals.window_shadow = egui::epaint::Shadow {
+                offset: Vec2::new(0.0, 12.0),
+                blur: 40.0,
+                spread: 0.0,
+                color: Color32::from_black_alpha(if self.is_dark { 140 } else { 60 }),
+            };
+            visuals.popup_shadow = egui::epaint::Shadow {
+                offset: Vec2::new(0.0, 6.0),
+                blur: 20.0,
+                spread: 0.0,
+                color: Color32::from_black_alpha(if self.is_dark { 110 } else { 45 }),
+            };
+        }
 
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.button_padding = Vec2::new(10.0, 6.0);

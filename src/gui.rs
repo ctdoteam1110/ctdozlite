@@ -333,6 +333,8 @@ struct AppSettings {
     // 3. Giao diện
     theme_mode: String, // "light" | "dark" | "system"
     use_avatar_as_wallpaper: bool,
+    /// Liquid Glass: translucent UI over macOS vibrancy (blurred desktop).
+    liquid_glass: bool,
     // 4. Thông báo
     enable_notifications: bool,
     play_notification_sound: bool,
@@ -398,6 +400,7 @@ impl Default for AppSettings {
             friend_src_card: true,
             theme_mode: "dark".into(),
             use_avatar_as_wallpaper: false,
+            liquid_glass: cfg!(target_os = "macos"),
             enable_notifications: true,
             play_notification_sound: false,
             quick_messages_enabled: true,
@@ -484,6 +487,8 @@ pub struct ZaloGuiApp {
     // Theme state
     dark_mode: bool,
     theme_dirty: bool,
+    /// Whether the macOS vibrancy view is currently installed behind the window.
+    vibrancy_on: bool,
 
     // Session state
     is_logged_in: bool,
@@ -641,6 +646,78 @@ enum DevTab {
     CryptoState,
 }
 
+/// Liquid Glass relies on macOS `NSVisualEffectView`; other platforms keep opaque themes.
+fn glass_supported() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// Install (`on`) or remove the blurred-desktop vibrancy view behind the egui surface.
+/// Returns whether the requested state was applied.
+///
+/// `window_vibrancy` inserts its `NSVisualEffectView` as a *subview* of the given view. That
+/// suits webviews, but here the given view is winit's OpenGL content view: a subview always
+/// draws above its parent, so the blur covered the whole egui surface. We therefore move the
+/// blur view up to the window's frame view and order it *below* the content view.
+#[cfg(target_os = "macos")]
+fn set_window_vibrancy(window: &impl raw_window_handle::HasWindowHandle, on: bool) -> bool {
+    use objc2_app_kit::{NSView, NSWindowOrderingMode};
+    use raw_window_handle::RawWindowHandle;
+    use window_vibrancy::{NSVisualEffectMaterial, NSVisualEffectState};
+
+    /// Tag `window_vibrancy` assigns to its blur view (`NS_VIEW_TAG_BLUR_VIEW`, not exported).
+    const BLUR_VIEW_TAG: isize = 91_376_254;
+
+    let Ok(handle) = window.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return false;
+    };
+    // SAFETY: winit hands out a live `NSView*`; we are on the main thread (egui update / setup).
+    let gl_view: &NSView = unsafe { appkit.ns_view.cast().as_ref() };
+    let Some(frame_view) = (unsafe { gl_view.superview() }) else {
+        return false;
+    };
+    // SAFETY: plain AppKit view-hierarchy calls on the main thread.
+    unsafe {
+        if let Some(old) = frame_view.viewWithTag(BLUR_VIEW_TAG) {
+            old.removeFromSuperview();
+        }
+    }
+    if !on {
+        return true;
+    }
+    if window_vibrancy::apply_vibrancy(
+        window,
+        NSVisualEffectMaterial::UnderWindowBackground,
+        Some(NSVisualEffectState::Active),
+        Some(12.0),
+    )
+    .is_err()
+    {
+        return false;
+    }
+    // SAFETY: as above; `blur` is retained across the re-parenting.
+    unsafe {
+        let Some(blur) = gl_view.viewWithTag(BLUR_VIEW_TAG) else {
+            return false;
+        };
+        blur.removeFromSuperview();
+        blur.setFrame(gl_view.frame());
+        frame_view.addSubview_positioned_relativeTo(
+            &blur,
+            NSWindowOrderingMode::NSWindowBelow,
+            Some(gl_view),
+        );
+    }
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_window_vibrancy(_window: &impl raw_window_handle::HasWindowHandle, _on: bool) -> bool {
+    false
+}
+
 /// Every user-visible string in `threads` (names + message bodies), for font coverage checks.
 fn thread_texts(threads: &[Thread]) -> impl Iterator<Item = &str> {
     threads.iter().flat_map(|t| {
@@ -673,7 +750,14 @@ impl ZaloGuiApp {
             loaded_settings.block_seen,
         );
         let dark_mode = loaded_settings.theme_mode != "light";
-        ThemePalette::load_with_custom_override(dark_mode).apply_to_ctx(&cc.egui_ctx);
+        let glass = glass_supported() && loaded_settings.liquid_glass;
+        let base_palette = ThemePalette::load_with_custom_override(dark_mode);
+        if glass {
+            base_palette.into_glass().apply_to_ctx(&cc.egui_ctx);
+        } else {
+            base_palette.apply_to_ctx(&cc.egui_ctx);
+        }
+        let vibrancy_on = glass && set_window_vibrancy(cc, true);
 
         let (tx, rx) = channel();
 
@@ -732,6 +816,7 @@ impl ZaloGuiApp {
         let app = Self {
             dark_mode,
             theme_dirty: false,
+            vibrancy_on,
             is_logged_in,
             user_name,
             user_uin,
@@ -899,7 +984,18 @@ impl ZaloGuiApp {
     }
 
     fn palette(&self) -> ThemePalette {
-        ThemePalette::load_with_custom_override(self.dark_mode)
+        let base = ThemePalette::load_with_custom_override(self.dark_mode);
+        if self.glass_active() {
+            base.into_glass()
+        } else {
+            base
+        }
+    }
+
+    /// Liquid Glass needs the vibrancy backdrop; without it translucent panels would show
+    /// the raw (unblurred) desktop, so glass colors follow the installed vibrancy state.
+    fn glass_active(&self) -> bool {
+        self.vibrancy_on
     }
 
     pub(super) fn reload_custom_sticker_packs(&mut self) -> usize {
@@ -1826,7 +1922,20 @@ impl ZaloGuiApp {
 // ---------------------------------------------------------------------------
 
 impl eframe::App for ZaloGuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if self.glass_active() {
+            [0.0; 4] // let the vibrancy view show through
+        } else {
+            visuals.panel_fill.to_normalized_gamma_f32()
+        }
+    }
+
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let want_glass = glass_supported() && self.settings.liquid_glass;
+        if want_glass != self.vibrancy_on {
+            self.vibrancy_on = set_window_vibrancy(&*frame, want_glass) && want_glass;
+            self.theme_dirty = true;
+        }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
             || ctx.input(|i| i.viewport().close_requested())
         {

@@ -2065,6 +2065,28 @@ impl ZaloGuiApp {
                                                 });
                                             ui.add_space(16.0);
 
+                                            if cfg!(target_os = "macos") {
+                                                ui.label(RichText::new("Hiệu ứng kính").color(pal.text_primary).size(13.5).strong());
+                                                ui.add_space(6.0);
+                                                egui::Frame::none()
+                                                    .fill(pal.bg_elevated)
+                                                    .stroke(Stroke::new(1.0_f32, pal.border))
+                                                    .rounding(Rounding::same(8.0))
+                                                    .inner_margin(Margin::symmetric(14.0, 10.0))
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.vertical(|ui| {
+                                                                ui.label(RichText::new("Liquid Glass").color(pal.text_primary).size(13.2));
+                                                                ui.label(RichText::new("Nền trong suốt, làm mờ hình nền máy phía sau cửa sổ").color(pal.text_muted).size(11.5));
+                                                            });
+                                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                                render_toggle_switch(ui, &mut self.settings.liquid_glass, pal);
+                                                            });
+                                                        });
+                                                    });
+                                                ui.add_space(16.0);
+                                            }
+
                                             ui.label(RichText::new("Hình nền chat").color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(6.0);
                                             egui::Frame::none()
