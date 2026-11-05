@@ -140,8 +140,15 @@ pub enum GuiEvent {
     SessionUnreachable(String),
     /// Result of off-UI-thread download folder validation (#7, R1).
     DownloadDirValidated {
+        req_id: u64,
         path: std::path::PathBuf,
         writable: bool,
+    },
+    /// Result of off-UI-thread download folder settings persistence (#7, R1).
+    DownloadDirSaved {
+        req_id: u64,
+        download_dir: String,
+        success: bool,
     },
     /// `zalo_history.db` + `threads_cache.json` were removed on request (#21).
     LocalDataWiped,
@@ -464,9 +471,11 @@ impl AppSettings {
             .unwrap_or_default()
     }
 
-    fn save(&self) {
+    pub(crate) fn save(&self) -> bool {
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write("app_settings.json", json);
+            std::fs::write("app_settings.json", json).is_ok()
+        } else {
+            false
         }
     }
 }
@@ -553,6 +562,7 @@ pub struct ZaloGuiApp {
     /// "Xoá dữ liệu tin nhắn cục bộ" is pending confirmation (#21).
     wipe_confirm_open: bool,
     toast_notice: Option<(String, std::time::Instant)>,
+    download_dir_req_id: u64,
     phone_modal_open: bool,
     phone_modal_input: String,
     phone_lookup_loading: bool,
@@ -848,6 +858,7 @@ impl ZaloGuiApp {
             user_online_map: HashMap::new(),
             allow_quit: false,
             settings_modal_open: false,
+            download_dir_req_id: 0,
             settings_tab: SettingsTab::General,
             notification_authorization: Default::default(),
             settings: loaded_settings,
@@ -1617,19 +1628,42 @@ impl ZaloGuiApp {
                     }
                     self.status_msg = msg;
                 }
-                GuiEvent::DownloadDirValidated { path, writable } => {
+                GuiEvent::DownloadDirValidated {
+                    req_id,
+                    path,
+                    writable,
+                } => {
+                    if req_id != self.download_dir_req_id {
+                        continue;
+                    }
                     if writable {
                         self.settings.download_dir = path.display().to_string();
-                        self.settings.save();
-                        self.show_toast(format!(
-                            "Đã đổi thư mục lưu file: {}",
-                            self.settings.download_dir
-                        ));
+                        let settings_to_save = self.settings.clone();
+                        if let Some(tx) = WORKER_TX.get() {
+                            let _ = tx.send(WorkerCmd::SaveDownloadDirSettings {
+                                req_id,
+                                settings: settings_to_save,
+                            });
+                        }
                     } else {
                         self.show_toast(
                             "⚠️ Không thể ghi vào thư mục đã chọn. Giữ nguyên thư mục cũ."
                                 .to_string(),
                         );
+                    }
+                }
+                GuiEvent::DownloadDirSaved {
+                    req_id,
+                    download_dir,
+                    success,
+                } => {
+                    if req_id != self.download_dir_req_id {
+                        continue;
+                    }
+                    if success {
+                        self.show_toast(format!("Đã đổi thư mục lưu file: {}", download_dir));
+                    } else {
+                        self.show_toast("⚠️ Không thể lưu cài đặt thư mục tải về.".to_string());
                     }
                 }
                 GuiEvent::HistoryReachedStart(tid) => {

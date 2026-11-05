@@ -64,7 +64,13 @@ pub enum WorkerCmd {
     },
     /// Validate directory creation and probe writability off the UI thread (#7, R1).
     ValidateDownloadDir {
+        req_id: u64,
         path: std::path::PathBuf,
+    },
+    /// Save application settings (e.g. after download directory validation) off the UI thread.
+    SaveDownloadDirSettings {
+        req_id: u64,
+        settings: crate::gui::AppSettings,
     },
     RecallMessage {
         to_id: String,
@@ -2068,7 +2074,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 ctx_clone.request_repaint();
                             });
                         }
-                        WorkerCmd::ValidateDownloadDir { path } => {
+                        WorkerCmd::ValidateDownloadDir { req_id, path } => {
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tokio::task::spawn_blocking(move || {
@@ -2089,8 +2095,23 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     false
                                 };
                                 let _ = gui_tx_clone.send(GuiEvent::DownloadDirValidated {
+                                    req_id,
                                     path,
                                     writable,
+                                });
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::SaveDownloadDirSettings { req_id, settings } => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let download_dir = settings.download_dir.clone();
+                                let success = settings.save();
+                                let _ = gui_tx_clone.send(GuiEvent::DownloadDirSaved {
+                                    req_id,
+                                    download_dir,
+                                    success,
                                 });
                                 ctx_clone.request_repaint();
                             });

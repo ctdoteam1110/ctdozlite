@@ -3346,9 +3346,13 @@ impl ZaloGuiApp {
         }
         if pick_dl_dir {
             if let Some(folder) = pick_native_folder_dialog() {
+                self.download_dir_req_id = self.download_dir_req_id.wrapping_add(1);
+                let req_id = self.download_dir_req_id;
                 if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx
-                        .send(crate::gui::worker::WorkerCmd::ValidateDownloadDir { path: folder });
+                    let _ = tx.send(crate::gui::worker::WorkerCmd::ValidateDownloadDir {
+                        req_id,
+                        path: folder,
+                    });
                 }
             }
         }

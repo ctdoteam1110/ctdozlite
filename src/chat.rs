@@ -5322,10 +5322,20 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         .and_then(extract_content_text)
         .unwrap_or_default();
 
-    let is_photo_msg = matches!(msg_type.as_str(), "chat.photo" | "photo" | "2")
-        || link_src.as_deref() == Some("Hình ảnh Zalo")
-        || link_url.as_deref().is_some_and(is_zalo_photo_cdn_url)
-        || link_thumb.as_deref().is_some_and(is_zalo_photo_cdn_url);
+    let is_link_card_msg = matches!(msg_type.as_str(), "chat.link" | "link" | "6" | "share.link")
+        || (link_url.is_some()
+            && (link_title.is_some() || link_desc.is_some())
+            && link_src.as_deref() != Some("Hình ảnh Zalo")
+            && link_src.as_deref() != Some("Tập tin Zalo")
+            && !matches!(
+                msg_type.as_str(),
+                "chat.photo" | "photo" | "2" | "chat.file" | "file" | "19" | "share.file"
+            ));
+
+    let is_photo_msg = !is_link_card_msg
+        && (matches!(msg_type.as_str(), "chat.photo" | "photo" | "2")
+            || link_src.as_deref() == Some("Hình ảnh Zalo")
+            || link_url.as_deref().is_some_and(is_zalo_photo_cdn_url));
     let is_file_msg = matches!(
         msg_type.as_str(),
         "chat.file" | "file" | "19" | "share.file"
@@ -5532,10 +5542,12 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
 
     let msg_kind = if sticker_meta.is_some() {
         crate::message_model::MessageKind::Sticker
-    } else if is_photo_msg {
-        crate::message_model::MessageKind::Photo
     } else if is_file_msg {
         crate::message_model::MessageKind::File
+    } else if is_link_card_msg {
+        crate::message_model::MessageKind::Link
+    } else if is_photo_msg {
+        crate::message_model::MessageKind::Photo
     } else if link_url.is_some()
         && (link_title.is_some() || link_thumb.is_some() || link_desc.is_some())
     {
@@ -8237,6 +8249,55 @@ mod send_identity_tests {
         let msg_b = parse_chat_message(&raw_file_no_ext).expect("must parse file message");
         assert_eq!(msg_b.link_src.as_deref(), Some("Tập tin Zalo"));
         assert_eq!(msg_b.link_title.as_deref(), Some("De_cuong_mon_hoc.doc"));
+    }
+
+    #[test]
+    fn parse_chat_message_link_card_with_photo_cdn_thumbnail_classified_as_link() {
+        use crate::message_model::MessageKind;
+
+        let raw_link = json!({
+            "msgId": "link_msg_101",
+            "msgType": "chat.link",
+            "uidFrom": "1000001",
+            "ts": 1700000003000_i64,
+            "content": {
+                "title": "Rust Programming Language",
+                "description": "A language empowering everyone to build reliable and efficient software.",
+                "href": "https://www.rust-lang.org",
+                "thumb": "https://res-zalo.zdn.vn/photo/preview_thumb_123.jpg",
+                "src": "rust-lang.org"
+            }
+        });
+        let msg = parse_chat_message(&raw_link).expect("must parse link message");
+        assert_eq!(
+            msg.kind,
+            MessageKind::Link,
+            "Link card with Zalo photo thumbnail must be classified as Link, not Photo"
+        );
+        assert_eq!(msg.link_url.as_deref(), Some("https://www.rust-lang.org"));
+        assert_eq!(msg.link_title.as_deref(), Some("Rust Programming Language"));
+        assert_eq!(
+            msg.link_thumb.as_deref(),
+            Some("https://res-zalo.zdn.vn/photo/preview_thumb_123.jpg")
+        );
+
+        // Verify that genuine photo message is still classified as Photo
+        let raw_photo = json!({
+            "msgId": "photo_msg_102",
+            "msgType": "chat.photo",
+            "uidFrom": "1000001",
+            "ts": 1700000004000_i64,
+            "content": {
+                "href": "https://res-zalo.zdn.vn/photo/actual_full_photo.jpg",
+                "thumb": "https://res-zalo.zdn.vn/photo/actual_thumb.jpg"
+            }
+        });
+        let photo_msg = parse_chat_message(&raw_photo).expect("must parse photo message");
+        assert_eq!(
+            photo_msg.kind,
+            MessageKind::Photo,
+            "Actual photo message must be classified as Photo"
+        );
     }
 
     #[test]
