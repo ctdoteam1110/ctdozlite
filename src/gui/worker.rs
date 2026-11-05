@@ -62,6 +62,16 @@ pub enum WorkerCmd {
         is_group: bool,
         msg: ChatMessage,
     },
+    /// Validate directory creation and probe writability off the UI thread (#7, R1).
+    ValidateDownloadDir {
+        req_id: u64,
+        path: std::path::PathBuf,
+    },
+    /// Save application settings (e.g. after download directory validation) off the UI thread.
+    SaveDownloadDirSettings {
+        req_id: u64,
+        settings: crate::gui::AppSettings,
+    },
     RecallMessage {
         to_id: String,
         is_group: bool,
@@ -2032,15 +2042,16 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 sticker_type: msg.sticker_type.unwrap_or(7),
                                             });
                                         } else {
+                                            let forward_text = crate::chat::forward_content_for_message(&msg);
                                             let _ = gui_tx_clone.send(GuiEvent::MessageSent {
                                                 client_message_id: client_id.to_string(),
                                                 thread_id: target_id,
-                                                text: msg.text.clone(),
+                                                text: forward_text,
                                                 msg_id,
                                             });
                                         }
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
-                                            "Đã chuyển tiếp tin nhắn".into(),
+                                            "Đã chuyển tiếp tin nhắn thành công".into(),
                                         ));
                                     }
                                     Ok(resp) => {
@@ -2060,6 +2071,48 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         )));
                                     }
                                 }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::ValidateDownloadDir { req_id, path } => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let writable = if std::fs::create_dir_all(&path).is_ok() {
+                                    let pid = std::process::id();
+                                    let probe_name = format!(".zalo_write_probe_{pid}");
+                                    let probe_path = path.join(probe_name);
+                                    let file_res = std::fs::OpenOptions::new()
+                                        .write(true)
+                                        .create_new(true)
+                                        .open(&probe_path);
+                                    let created = file_res.is_ok();
+                                    if created {
+                                        let _ = std::fs::remove_file(&probe_path);
+                                    }
+                                    created
+                                } else {
+                                    false
+                                };
+                                let _ = gui_tx_clone.send(GuiEvent::DownloadDirValidated {
+                                    req_id,
+                                    path,
+                                    writable,
+                                });
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::SaveDownloadDirSettings { req_id, settings } => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let download_dir = settings.download_dir.clone();
+                                let success = settings.save();
+                                let _ = gui_tx_clone.send(GuiEvent::DownloadDirSaved {
+                                    req_id,
+                                    download_dir,
+                                    success,
+                                });
                                 ctx_clone.request_repaint();
                             });
                         }
@@ -3522,7 +3575,7 @@ async fn download_attachment_with_original_name(
         .map_err(|e| format!("Lỗi đọc dữ liệu tập tin: {e}"))?;
 
     let target_dir = if !download_dir.trim().is_empty() {
-        std::path::PathBuf::from(download_dir.trim())
+        std::path::PathBuf::from(download_dir)
     } else {
         std::env::var("USERPROFILE")
             .ok()

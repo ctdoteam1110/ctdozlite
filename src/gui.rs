@@ -138,6 +138,18 @@ pub enum GuiEvent {
     SessionExpired(String),
     /// The server could not be reached: the session is intact, show it and retry (#21).
     SessionUnreachable(String),
+    /// Result of off-UI-thread download folder validation (#7, R1).
+    DownloadDirValidated {
+        req_id: u64,
+        path: std::path::PathBuf,
+        writable: bool,
+    },
+    /// Result of off-UI-thread download folder settings persistence (#7, R1).
+    DownloadDirSaved {
+        req_id: u64,
+        download_dir: String,
+        success: bool,
+    },
     /// `zalo_history.db` + `threads_cache.json` were removed on request (#21).
     LocalDataWiped,
     CallStateChanged(String),
@@ -223,7 +235,11 @@ fn phone_sync_completion_message(
     if let Some(err) = error {
         return format!("⚠️ Đồng bộ thất bại: {err}");
     }
-    let prefix = if cancelled { "Đã dừng" } else { "Đã hoàn tất" };
+    let prefix = if cancelled {
+        "Đã dừng"
+    } else {
+        "Đã hoàn tất"
+    };
     format!(
         "{prefix} yêu cầu: {added} tin mới từ Cloud/Nhóm ({active_threads} hội thoại). Lịch sử điện thoại chưa được tải vào ứng dụng."
     )
@@ -310,7 +326,7 @@ enum SettingsTab {
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-struct AppSettings {
+pub struct AppSettings {
     // 1. Cài đặt chung
     show_all_contacts: bool,
     language: String,
@@ -331,8 +347,14 @@ struct AppSettings {
     friend_src_group: bool,
     friend_src_card: bool,
     // 3. Giao diện
-    theme_mode: String, // "light" | "dark" | "system"
-    use_avatar_as_wallpaper: bool,
+    pub theme_mode: String, // "light" | "dark" | "system"
+    pub use_avatar_as_wallpaper: bool,
+    pub font_family: String,
+    pub font_scale: f32,
+    pub custom_primary_color: Option<String>,
+    pub custom_accent_color: Option<String>,
+    pub custom_bubble_out_bg: Option<String>,
+    pub custom_bubble_in_bg: Option<String>,
     // 4. Thông báo
     enable_notifications: bool,
     play_notification_sound: bool,
@@ -398,6 +420,12 @@ impl Default for AppSettings {
             friend_src_card: true,
             theme_mode: "dark".into(),
             use_avatar_as_wallpaper: false,
+            font_family: "default".into(),
+            font_scale: 1.0,
+            custom_primary_color: None,
+            custom_accent_color: None,
+            custom_bubble_out_bg: None,
+            custom_bubble_in_bg: None,
             enable_notifications: true,
             play_notification_sound: false,
             quick_messages_enabled: true,
@@ -428,6 +456,14 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    pub fn normalized_font_scale(&self) -> f32 {
+        if self.font_scale.is_nan() || self.font_scale.is_infinite() || self.font_scale <= 0.0 {
+            1.0
+        } else {
+            self.font_scale.clamp(0.5, 3.0)
+        }
+    }
+
     fn load() -> Self {
         std::fs::read_to_string("app_settings.json")
             .ok()
@@ -435,9 +471,11 @@ impl AppSettings {
             .unwrap_or_default()
     }
 
-    fn save(&self) {
+    pub(crate) fn save(&self) -> bool {
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write("app_settings.json", json);
+            std::fs::write("app_settings.json", json).is_ok()
+        } else {
+            false
         }
     }
 }
@@ -503,7 +541,7 @@ pub struct ZaloGuiApp {
     qr_status: String,
 
     // Chat screen state
-    threads: Vec<Thread>,
+    pub threads: Vec<Thread>,
     selected_thread_index: usize,
     thread_filter: ThreadFilter,
     search_query: String,
@@ -512,8 +550,9 @@ pub struct ZaloGuiApp {
 
     // Reply / forward state
     replying_to: Option<ChatMessage>,
-    forward_msg: Option<ChatMessage>,
-    forward_filter: String,
+    pub forward_msg: Option<ChatMessage>,
+    pub forward_filter: String,
+    pub forward_search_query: String,
     filter_starred_only: bool,
     active_call: Option<ActiveCallOverlay>,
     image_viewer: Option<ImageViewerModal>,
@@ -523,6 +562,7 @@ pub struct ZaloGuiApp {
     /// "Xoá dữ liệu tin nhắn cục bộ" is pending confirmation (#21).
     wipe_confirm_open: bool,
     toast_notice: Option<(String, std::time::Instant)>,
+    download_dir_req_id: u64,
     phone_modal_open: bool,
     phone_modal_input: String,
     phone_lookup_loading: bool,
@@ -655,8 +695,10 @@ impl ZaloGuiApp {
         dev_mode: bool,
         initial_threads: Vec<Thread>,
     ) -> Self {
-        setup_custom_fonts(&cc.egui_ctx);
         let mut loaded_settings = AppSettings::load();
+        setup_custom_fonts_with_choice(&cc.egui_ctx, &loaded_settings.font_family);
+        let safe_scale = loaded_settings.normalized_font_scale();
+        cc.egui_ctx.set_zoom_factor(safe_scale);
         if session.proxy_url.is_none() && !loaded_settings.proxy_url.trim().is_empty() {
             let _ = session.set_proxy(Some(&loaded_settings.proxy_url));
         } else if let Some(ref p) = session.proxy_url {
@@ -673,7 +715,14 @@ impl ZaloGuiApp {
             loaded_settings.block_seen,
         );
         let dark_mode = loaded_settings.theme_mode != "light";
-        ThemePalette::load_with_custom_override(dark_mode).apply_to_ctx(&cc.egui_ctx);
+        let mut initial_palette = ThemePalette::load_with_custom_override(dark_mode);
+        initial_palette.apply_custom_colors(
+            loaded_settings.custom_primary_color.as_deref(),
+            loaded_settings.custom_accent_color.as_deref(),
+            loaded_settings.custom_bubble_out_bg.as_deref(),
+            loaded_settings.custom_bubble_in_bg.as_deref(),
+        );
+        initial_palette.apply_to_ctx(&cc.egui_ctx);
 
         let (tx, rx) = channel();
 
@@ -751,6 +800,7 @@ impl ZaloGuiApp {
             replying_to: None,
             forward_msg: None,
             forward_filter: String::new(),
+            forward_search_query: String::new(),
             filter_starred_only: false,
             active_call: None,
             image_viewer: None,
@@ -808,6 +858,7 @@ impl ZaloGuiApp {
             user_online_map: HashMap::new(),
             allow_quit: false,
             settings_modal_open: false,
+            download_dir_req_id: 0,
             settings_tab: SettingsTab::General,
             notification_authorization: Default::default(),
             settings: loaded_settings,
@@ -899,7 +950,14 @@ impl ZaloGuiApp {
     }
 
     fn palette(&self) -> ThemePalette {
-        ThemePalette::load_with_custom_override(self.dark_mode)
+        let mut pal = ThemePalette::load_with_custom_override(self.dark_mode);
+        pal.apply_custom_colors(
+            self.settings.custom_primary_color.as_deref(),
+            self.settings.custom_accent_color.as_deref(),
+            self.settings.custom_bubble_out_bg.as_deref(),
+            self.settings.custom_bubble_in_bg.as_deref(),
+        );
+        pal
     }
 
     pub(super) fn reload_custom_sticker_packs(&mut self) -> usize {
@@ -1240,6 +1298,26 @@ impl ZaloGuiApp {
                         } else {
                             msg_id
                         };
+                        let quote_text = if !quoted.text.trim().is_empty() {
+                            quoted.text.clone()
+                        } else if quoted.sticker_id.is_some() {
+                            "[Nhãn dán]".to_string()
+                        } else if quoted.link_url.is_some() {
+                            quoted
+                                .link_title
+                                .clone()
+                                .unwrap_or_else(|| "[Hình ảnh/Tập tin]".to_string())
+                        } else {
+                            "[Tin nhắn]".to_string()
+                        };
+                        let quote_sender =
+                            if !quoted.sender.trim().is_empty() && quoted.sender != "0" {
+                                quoted.sender.clone()
+                            } else if quoted.is_outgoing {
+                                "Tôi".to_string()
+                            } else {
+                                t.name.clone()
+                            };
                         merge_sent_message(
                             t,
                             ChatMessage {
@@ -1251,8 +1329,8 @@ impl ZaloGuiApp {
                                 is_outgoing: true,
                                 ts: (crate::login::unix_now() * 1000) as i64,
                                 reply_to_id: Some(quoted.id.clone()),
-                                reply_to_sender: Some(quoted.sender.clone()),
-                                reply_to_text: Some(quoted.text.clone()),
+                                reply_to_sender: Some(quote_sender),
+                                reply_to_text: Some(quote_text),
                                 ..Default::default()
                             },
                         );
@@ -1543,7 +1621,50 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::StatusUpdate(msg) => {
+                    if msg.starts_with("Đã chuyển tiếp") {
+                        self.show_toast(&msg);
+                    } else if msg.starts_with("Chuyển tiếp thất bại") {
+                        self.show_toast(format!("⚠️ {msg}"));
+                    }
                     self.status_msg = msg;
+                }
+                GuiEvent::DownloadDirValidated {
+                    req_id,
+                    path,
+                    writable,
+                } => {
+                    if req_id != self.download_dir_req_id {
+                        continue;
+                    }
+                    if writable {
+                        self.settings.download_dir = path.display().to_string();
+                        let settings_to_save = self.settings.clone();
+                        if let Some(tx) = WORKER_TX.get() {
+                            let _ = tx.send(WorkerCmd::SaveDownloadDirSettings {
+                                req_id,
+                                settings: settings_to_save,
+                            });
+                        }
+                    } else {
+                        self.show_toast(
+                            "⚠️ Không thể ghi vào thư mục đã chọn. Giữ nguyên thư mục cũ."
+                                .to_string(),
+                        );
+                    }
+                }
+                GuiEvent::DownloadDirSaved {
+                    req_id,
+                    download_dir,
+                    success,
+                } => {
+                    if req_id != self.download_dir_req_id {
+                        continue;
+                    }
+                    if success {
+                        self.show_toast(format!("Đã đổi thư mục lưu file: {}", download_dir));
+                    } else {
+                        self.show_toast("⚠️ Không thể lưu cài đặt thư mục tải về.".to_string());
+                    }
                 }
                 GuiEvent::HistoryReachedStart(tid) => {
                     self.history_reached_start.insert(tid);
@@ -1836,7 +1957,9 @@ impl eframe::App for ZaloGuiApp {
             }
             std::process::exit(0);
         }
-        if ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::P)) {
+        if ctx.input(|i| {
+            (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::P)
+        }) {
             self.settings_modal_open = true;
             self.settings_tab = SettingsTab::Privacy;
         }
@@ -2727,5 +2850,42 @@ mod tests {
 
         let failed = phone_sync_completion_message(0, 0, false, Some("network"));
         assert!(failed.contains("Đồng bộ thất bại: network"));
+    }
+
+    #[test]
+    fn test_app_settings_font_and_color_defaults_and_serde() {
+        let default_settings = super::AppSettings::default();
+        assert_eq!(default_settings.font_family, "default");
+        assert_eq!(default_settings.font_scale, 1.0);
+        assert_eq!(default_settings.custom_primary_color, None);
+        assert_eq!(default_settings.custom_accent_color, None);
+        assert_eq!(default_settings.custom_bubble_out_bg, None);
+        assert_eq!(default_settings.custom_bubble_in_bg, None);
+
+        // Test serde serialization & deserialization with custom values
+        let mut custom = default_settings.clone();
+        custom.font_family = "segoe_ui".into();
+        custom.font_scale = 1.15;
+        custom.custom_primary_color = Some("#0068FF".into());
+        custom.custom_accent_color = Some("#059669".into());
+        custom.custom_bubble_out_bg = Some("#25374D".into());
+        custom.custom_bubble_in_bg = Some("#323842".into());
+
+        let json = serde_json::to_string(&custom).expect("serialize settings");
+        let loaded: super::AppSettings = serde_json::from_str(&json).expect("deserialize settings");
+        assert_eq!(loaded.font_family, "segoe_ui");
+        assert_eq!(loaded.font_scale, 1.15);
+        assert_eq!(loaded.custom_primary_color.as_deref(), Some("#0068FF"));
+        assert_eq!(loaded.custom_accent_color.as_deref(), Some("#059669"));
+        assert_eq!(loaded.custom_bubble_out_bg.as_deref(), Some("#25374D"));
+        assert_eq!(loaded.custom_bubble_in_bg.as_deref(), Some("#323842"));
+
+        // Backwards compatibility test: legacy JSON without font and color fields
+        let legacy_json = r#"{"theme_mode":"light","download_dir":"C:\\Downloads"}"#;
+        let legacy_loaded: super::AppSettings =
+            serde_json::from_str(legacy_json).expect("deserialize legacy settings");
+        assert_eq!(legacy_loaded.font_family, "default");
+        assert_eq!(legacy_loaded.font_scale, 1.0);
+        assert_eq!(legacy_loaded.custom_primary_color, None);
     }
 }

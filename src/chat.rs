@@ -1350,7 +1350,7 @@ pub(crate) fn next_client_message_id() -> u64 {
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     let previous = LAST_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
             Some(now.max(last.saturating_add(1)))
         })
         .unwrap_or_else(|last| last);
@@ -1394,6 +1394,12 @@ pub fn extract_zalo_rtf_text_properties(raw: &str) -> (String, Option<String>) {
         let line_start_u16 = out_text.encode_utf16().count();
         let mut rest = line;
         while !rest.is_empty() {
+            if rest.starts_with("http://") || rest.starts_with("https://") {
+                let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+                out_text.push_str(&rest[..end]);
+                rest = &rest[end..];
+                continue;
+            }
             let mut matched_span = false;
             for (delim, st_tag) in [("`", ""), ("**", "b"), ("__", "u"), ("~~", "s"), ("*", "i")] {
                 if rest.starts_with(delim) {
@@ -1553,7 +1559,7 @@ pub(crate) async fn send_message_with_client_id(
         || s.domains.chat.contains("tt-chat2-wpa")
         || s.domains.chat.is_empty()
     {
-        "https://tt-chat3-wpa.api.zaloapp.com"
+        crate::endpoints::CHAT_FALLBACK
     } else {
         &s.domains.chat
     };
@@ -1579,7 +1585,101 @@ pub async fn send_group_message(s: &Session, grid: &str, text: &str) -> Result<V
     send_group_message_with_client_id(s, grid, text, next_client_message_id()).await
 }
 
-/// Preserve the request client ID for reconciliation with a later server echo.
+/// Send a raw 1-1 text/media payload bypassing RTF markdown formatting.
+///
+/// Preserves the provided request client ID for local echo reconciliation.
+///
+/// # Errors
+/// Returns an error if the session is not logged in, parameter encoding fails,
+/// network transport fails, or the server responds with a non-zero `error_code`.
+pub(crate) async fn send_raw_message_with_client_id(
+    s: &Session,
+    to_id: &str,
+    text: &str,
+    now: u64,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let body = obj(&[
+        ("toid", json!(to_id)),
+        ("message", json!(text)),
+        ("clientId", json!(now)),
+        ("imei", json!(s.imei)),
+    ]);
+    let params = s.encoded_params(&body)?;
+    let host = if s.domains.chat.contains("-msg-chat.")
+        || s.domains.chat.contains("tt-chat2-wpa")
+        || s.domains.chat.is_empty()
+    {
+        crate::endpoints::CHAT_FALLBACK
+    } else {
+        &s.domains.chat
+    };
+    let url = format!("{host}/api/message/sms?{}", s.common_params());
+    let form = format!("params={params}");
+    let resp = s.post_form(&url, form).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = resp
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Err(crate::session::SessionError::new(code, msg).into());
+        }
+    }
+    Ok(resp)
+}
+
+/// Send a raw group text/media payload bypassing RTF markdown formatting.
+///
+/// Preserves the provided request client ID for local echo reconciliation.
+///
+/// # Errors
+/// Returns an error if the session is not logged in, parameter encoding fails,
+/// network transport fails, or the server responds with a non-zero `error_code`.
+pub(crate) async fn send_raw_group_message_with_client_id(
+    s: &Session,
+    grid: &str,
+    text: &str,
+    now: u64,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let clean_grid = grid
+        .trim_start_matches("group_")
+        .trim_start_matches('g')
+        .trim_start_matches('G');
+    let body = obj(&[
+        ("grid", json!(clean_grid)),
+        ("message", json!(text)),
+        ("clientId", json!(now)),
+        ("imei", json!(s.imei)),
+        ("visibility", json!(0)),
+    ]);
+    let params = s.encoded_params(&body)?;
+    let url = format!(
+        "{}/api/group/sendmsg?{}",
+        s.domains.group,
+        s.common_params()
+    );
+    let form = format!("params={params}");
+    let resp = s.post_form(&url, form).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = resp
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Err(crate::session::SessionError::new(code, msg).into());
+        }
+    }
+    Ok(resp)
+}
+
 pub(crate) async fn send_group_message_with_client_id(
     s: &Session,
     grid: &str,
@@ -3479,7 +3579,80 @@ pub(crate) async fn send_quote_message_with_client_id(
     }
 }
 
+/// Resolve the forwarded payload text for a message.
+///
+/// For stickers, sticker ID takes precedence in dispatch.
+/// For media messages (image/photo, file, web content/links) where `link_url` is present,
+/// this ensures the media URL is preserved and forwarded rather than the placeholder
+/// label string (e.g. `"[Hình ảnh]"` or `"[Photo]"` or `"[Tập tin]"`).
+pub fn forward_content_for_message(msg: &ChatMessage) -> String {
+    if let Some(url) = msg.link_url.as_ref().filter(|u| !u.trim().is_empty()) {
+        let trimmed = msg.text.trim();
+        if trimmed.is_empty()
+            || trimmed == "[Hình ảnh]"
+            || trimmed == "[Photo]"
+            || trimmed == "[Tập tin]"
+            || trimmed == "[File]"
+            || trimmed == "[Nhãn dán]"
+            || trimmed == "[Chia sẻ]"
+            || trimmed == "[Video]"
+            || trimmed == "[Tin nhắn]"
+        {
+            url.clone()
+        } else if let Some(caption) = trimmed
+            .strip_prefix("[Hình ảnh] ")
+            .or_else(|| trimmed.strip_prefix("[Photo] "))
+        {
+            if caption.trim().is_empty() {
+                url.clone()
+            } else if caption.contains(url) {
+                caption.trim().to_string()
+            } else {
+                format!("{}\n{}", caption.trim(), url)
+            }
+        } else if let Some(caption) = trimmed
+            .strip_prefix("[Tập tin] ")
+            .or_else(|| trimmed.strip_prefix("[File] "))
+        {
+            if caption.trim().is_empty() {
+                url.clone()
+            } else if caption.contains(url) {
+                caption.trim().to_string()
+            } else {
+                format!("{}\n{}", caption.trim(), url)
+            }
+        } else if !trimmed.contains(url) {
+            format!("{trimmed}\n{url}")
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        msg.text.clone()
+    }
+}
+
+/// Filter thread candidates for forwarding by search keyword matching name or ID case-insensitively.
+pub fn filter_forward_candidates<'a>(threads: &'a [Thread], query: &str) -> Vec<&'a Thread> {
+    let q = query.trim().to_lowercase();
+    threads
+        .iter()
+        .filter(|t| {
+            if q.is_empty() {
+                true
+            } else {
+                t.name.to_lowercase().contains(&q) || t.id.to_lowercase().contains(&q)
+            }
+        })
+        .collect()
+}
+
 /// Forward a message or sticker to another conversation (`forwardMultiMessage` @ `compact-app-pc.js:14323900`).
+///
+/// Generates a fresh client message ID and delegates to [`forward_message_with_client_id`].
+///
+/// # Errors
+/// Returns an error if the session is unauthenticated, parameter encoding fails,
+/// network transport fails, or the server responds with a non-zero `error_code`.
 pub async fn forward_message(
     s: &Session,
     target_id: &str,
@@ -3490,8 +3663,20 @@ pub async fn forward_message(
         .await
 }
 
-/// Preserve the request client ID for reconciliation with a later server echo.
-pub(crate) async fn forward_message_with_client_id(
+/// Forward an existing chat message to a peer or group target with an explicit client message ID.
+///
+/// Preserves the provided request client ID for local echo reconciliation. Dispatches stickers
+/// via [`send_sticker_with_client_id`], raw media (photos, files, links) via
+/// [`send_raw_message_with_client_id`] or [`send_raw_group_message_with_client_id`] to preserve
+/// raw URLs without RTF parsing, or standard text messages via [`send_message_with_client_id`].
+///
+/// # Errors
+/// Returns an error if:
+/// - The session is not authenticated (`login` is `None`).
+/// - Request parameter serialization or AES-CBC encoding fails.
+/// - Network transport or HTTP POST fails.
+/// - The Zalo server responds with a non-zero `error_code`.
+pub async fn forward_message_with_client_id(
     s: &Session,
     target_id: &str,
     target_is_group: bool,
@@ -3514,10 +3699,48 @@ pub(crate) async fn forward_message_with_client_id(
             .await;
         }
     }
+
+    if (msg.kind == crate::message_model::MessageKind::Link
+        || msg.kind == crate::message_model::MessageKind::WebContent)
+        && msg.link_url.is_some()
+        && (msg.link_title.is_some() || msg.link_thumb.is_some())
+    {
+        let url = msg.link_url.as_deref().unwrap_or_default();
+        let meta = LinkMetadata {
+            url: url.to_string(),
+            title: msg.link_title.clone().unwrap_or_default(),
+            desc: msg.link_desc.clone().unwrap_or_default(),
+            thumb: msg.link_thumb.clone().unwrap_or_default(),
+            src: msg.link_src.clone().unwrap_or_default(),
+        };
+        let text =
+            if msg.text.trim().is_empty() || msg.text == "[Chia sẻ]" || msg.text == "[Tin nhắn]"
+            {
+                url
+            } else {
+                msg.text.trim()
+            };
+        if let Ok(resp) =
+            send_link_message_with_client_id(s, target_id, text, &meta, target_is_group, now).await
+        {
+            return Ok(resp);
+        }
+    }
+
+    let forward_text = forward_content_for_message(msg);
+    let is_media_url = msg.link_url.as_ref().is_some_and(|u| !u.trim().is_empty());
     if target_is_group {
-        send_group_message_with_client_id(s, target_id, &msg.text, now).await
+        if is_media_url {
+            send_raw_group_message_with_client_id(s, target_id, &forward_text, now).await
+        } else {
+            send_group_message_with_client_id(s, target_id, &forward_text, now).await
+        }
     } else {
-        send_message_with_client_id(s, target_id, &msg.text, now).await
+        if is_media_url {
+            send_raw_message_with_client_id(s, target_id, &forward_text, now).await
+        } else {
+            send_message_with_client_id(s, target_id, &forward_text, now).await
+        }
     }
 }
 
@@ -5099,10 +5322,20 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         .and_then(extract_content_text)
         .unwrap_or_default();
 
-    let is_photo_msg = matches!(msg_type.as_str(), "chat.photo" | "photo" | "2")
-        || link_src.as_deref() == Some("Hình ảnh Zalo")
-        || link_url.as_deref().is_some_and(is_zalo_photo_cdn_url)
-        || link_thumb.as_deref().is_some_and(is_zalo_photo_cdn_url);
+    let is_link_card_msg = matches!(msg_type.as_str(), "chat.link" | "link" | "6" | "share.link")
+        || (link_url.is_some()
+            && (link_title.is_some() || link_desc.is_some())
+            && link_src.as_deref() != Some("Hình ảnh Zalo")
+            && link_src.as_deref() != Some("Tập tin Zalo")
+            && !matches!(
+                msg_type.as_str(),
+                "chat.photo" | "photo" | "2" | "chat.file" | "file" | "19" | "share.file"
+            ));
+
+    let is_photo_msg = !is_link_card_msg
+        && (matches!(msg_type.as_str(), "chat.photo" | "photo" | "2")
+            || link_src.as_deref() == Some("Hình ảnh Zalo")
+            || link_url.as_deref().is_some_and(is_zalo_photo_cdn_url));
     let is_file_msg = matches!(
         msg_type.as_str(),
         "chat.file" | "file" | "19" | "share.file"
@@ -5307,6 +5540,22 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
             (None, None, None)
         };
 
+    let msg_kind = if sticker_meta.is_some() {
+        crate::message_model::MessageKind::Sticker
+    } else if is_file_msg {
+        crate::message_model::MessageKind::File
+    } else if is_link_card_msg {
+        crate::message_model::MessageKind::Link
+    } else if is_photo_msg {
+        crate::message_model::MessageKind::Photo
+    } else if link_url.is_some()
+        && (link_title.is_some() || link_thumb.is_some() || link_desc.is_some())
+    {
+        crate::message_model::MessageKind::Link
+    } else {
+        crate::message_model::MessageKind::Text
+    };
+
     Some(ChatMessage {
         id: msg_id,
         client_message_id: ["cliMsgId", "clientId", "client_message_id"]
@@ -5319,6 +5568,7 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         time,
         is_outgoing,
         ts,
+        kind: msg_kind,
         sticker_id: sticker_meta.map(|(sid, _, _)| sid),
         sticker_cate_id: sticker_meta.map(|(_, cid, _)| cid),
         sticker_type: sticker_meta.map(|(_, _, st)| st),
@@ -6128,11 +6378,7 @@ pub async fn update_pinned_conversation(
 
 /// Send a real-time "is typing" indicator to a 1-1 contact (`cmd 11144`, `/api/message/typing`)
 /// or a group (`cmd 11196`, `/api/group/typing`), unless blocked by `block_typing`.
-pub async fn send_typing_indicator(
-    s: &Session,
-    thread_id: &str,
-    is_group: bool,
-) -> Result<Value> {
+pub async fn send_typing_indicator(s: &Session, thread_id: &str, is_group: bool) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -6744,7 +6990,8 @@ pub fn extract_mobile_sync_controls(data_node: &Value) -> Vec<MobileSyncControlE
                 let is_last = parsed_data
                     .get("isLast")
                     .and_then(|v| v.as_i64())
-                    .unwrap_or(0) == 1;
+                    .unwrap_or(0)
+                    == 1;
                 if !url.is_empty() {
                     out.push(MobileSyncControlEvent::SyncV2Batch {
                         url,
@@ -8002,6 +8249,55 @@ mod send_identity_tests {
         let msg_b = parse_chat_message(&raw_file_no_ext).expect("must parse file message");
         assert_eq!(msg_b.link_src.as_deref(), Some("Tập tin Zalo"));
         assert_eq!(msg_b.link_title.as_deref(), Some("De_cuong_mon_hoc.doc"));
+    }
+
+    #[test]
+    fn parse_chat_message_link_card_with_photo_cdn_thumbnail_classified_as_link() {
+        use crate::message_model::MessageKind;
+
+        let raw_link = json!({
+            "msgId": "link_msg_101",
+            "msgType": "chat.link",
+            "uidFrom": "1000001",
+            "ts": 1700000003000_i64,
+            "content": {
+                "title": "Rust Programming Language",
+                "description": "A language empowering everyone to build reliable and efficient software.",
+                "href": "https://www.rust-lang.org",
+                "thumb": "https://res-zalo.zdn.vn/photo/preview_thumb_123.jpg",
+                "src": "rust-lang.org"
+            }
+        });
+        let msg = parse_chat_message(&raw_link).expect("must parse link message");
+        assert_eq!(
+            msg.kind,
+            MessageKind::Link,
+            "Link card with Zalo photo thumbnail must be classified as Link, not Photo"
+        );
+        assert_eq!(msg.link_url.as_deref(), Some("https://www.rust-lang.org"));
+        assert_eq!(msg.link_title.as_deref(), Some("Rust Programming Language"));
+        assert_eq!(
+            msg.link_thumb.as_deref(),
+            Some("https://res-zalo.zdn.vn/photo/preview_thumb_123.jpg")
+        );
+
+        // Verify that genuine photo message is still classified as Photo
+        let raw_photo = json!({
+            "msgId": "photo_msg_102",
+            "msgType": "chat.photo",
+            "uidFrom": "1000001",
+            "ts": 1700000004000_i64,
+            "content": {
+                "href": "https://res-zalo.zdn.vn/photo/actual_full_photo.jpg",
+                "thumb": "https://res-zalo.zdn.vn/photo/actual_thumb.jpg"
+            }
+        });
+        let photo_msg = parse_chat_message(&raw_photo).expect("must parse photo message");
+        assert_eq!(
+            photo_msg.kind,
+            MessageKind::Photo,
+            "Actual photo message must be classified as Photo"
+        );
     }
 
     #[test]

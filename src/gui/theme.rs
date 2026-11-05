@@ -23,6 +23,7 @@ pub(super) struct ThemePalette {
     pub(super) accent_online: Color32,
     pub(super) danger: Color32,
     pub(super) warning: Color32,
+    pub(super) primary_fg: Color32,
     pub(super) bubble_out_bg: Color32,
     pub(super) bubble_out_text: Color32,
     pub(super) bubble_out_meta: Color32,
@@ -30,6 +31,24 @@ pub(super) struct ThemePalette {
     pub(super) bubble_in_border: Color32,
     pub(super) bubble_in_text: Color32,
     pub(super) bubble_in_meta: Color32,
+}
+
+pub(crate) fn relative_luminance(c: Color32) -> f32 {
+    let srgb_to_linear = |v: u8| -> f32 {
+        let vf = v as f32 / 255.0;
+        if vf <= 0.04045 {
+            vf / 12.92
+        } else {
+            ((vf + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * srgb_to_linear(c.r()) + 0.7152 * srgb_to_linear(c.g()) + 0.0722 * srgb_to_linear(c.b())
+}
+
+pub(crate) fn contrast_ratio(c1: Color32, c2: Color32) -> f32 {
+    let l1 = relative_luminance(c1);
+    let l2 = relative_luminance(c2);
+    (l1.max(l2) + 0.05) / (l1.min(l2) + 0.05)
 }
 
 impl ThemePalette {
@@ -53,6 +72,7 @@ impl ThemePalette {
             accent_online: Color32::from_rgb(152, 195, 121), // #98C379 Atom @hue-4 Green
             danger: Color32::from_rgb(224, 108, 117), // #E06C75 Atom @hue-5 Coral Red
             warning: Color32::from_rgb(229, 192, 123), // #E5C07B Atom @hue-62 Warm Gold
+            primary_fg: Color32::WHITE,
             bubble_out_bg: Color32::from_rgb(37, 55, 77), // #25374D Zalo Dark Slate-Navy Outgoing Bubble
             bubble_out_text: Color32::from_rgb(235, 240, 246), // #EBF0F6
             bubble_out_meta: Color32::from_rgb(154, 171, 192), // #9AABC0
@@ -82,6 +102,7 @@ impl ThemePalette {
             accent_online: Color32::from_rgb(5, 150, 105),    // #059669 Emerald
             danger: Color32::from_rgb(220, 38, 38),           // #DC2626
             warning: Color32::from_rgb(217, 119, 6),          // #D97706
+            primary_fg: Color32::WHITE,
             bubble_out_bg: Color32::from_rgb(229, 239, 255), // Zalo Desktop Light Outgoing (#E5EFFF)
             bubble_out_text: Color32::from_rgb(15, 23, 42),  // Crisp dark text on light blue (14:1)
             bubble_out_meta: Color32::from_rgb(71, 92, 122),
@@ -131,7 +152,7 @@ impl ThemePalette {
         visuals.widgets.active.bg_fill = self.primary;
         visuals.widgets.active.weak_bg_fill = self.primary;
         visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, self.primary);
-        visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, self.primary_fg);
         visuals.widgets.active.rounding = r;
 
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
@@ -237,6 +258,82 @@ impl ThemePalette {
         let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
         std::fs::write(path, text)
     }
+
+    /// Apply custom color overrides (primary, accent, outbound/inbound bubble backgrounds) (#7, R2).
+    pub(super) fn apply_custom_colors(
+        &mut self,
+        primary_hex: Option<&str>,
+        accent_hex: Option<&str>,
+        bubble_out_hex: Option<&str>,
+        bubble_in_hex: Option<&str>,
+    ) {
+        if let Some(hex) = primary_hex {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
+                self.primary = c;
+                self.primary_hover = Color32::from_rgb(
+                    c.r().saturating_add(25),
+                    c.g().saturating_add(25),
+                    c.b().saturating_add(25),
+                );
+                self.primary_fg = if contrast_ratio(Color32::WHITE, c)
+                    >= contrast_ratio(Color32::from_rgb(15, 23, 42), c)
+                {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgb(15, 23, 42)
+                };
+            }
+        }
+        if let Some(hex) = accent_hex {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
+                self.accent_online = c;
+            }
+        }
+        if let Some(hex) = bubble_out_hex {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
+                self.bubble_out_bg = c;
+                let dark_text = Color32::from_rgb(15, 23, 42);
+                let light_text = Color32::from_rgb(235, 240, 246);
+                self.bubble_out_text =
+                    if contrast_ratio(dark_text, c) >= contrast_ratio(light_text, c) {
+                        dark_text
+                    } else {
+                        light_text
+                    };
+
+                let dark_meta = Color32::from_rgb(71, 92, 122);
+                let light_meta = Color32::from_rgb(154, 171, 192);
+                self.bubble_out_meta =
+                    if contrast_ratio(dark_meta, c) >= contrast_ratio(light_meta, c) {
+                        dark_meta
+                    } else {
+                        light_meta
+                    };
+            }
+        }
+        if let Some(hex) = bubble_in_hex {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
+                self.bubble_in_bg = c;
+                let dark_text = Color32::from_rgb(15, 23, 42);
+                let light_text = Color32::from_rgb(215, 218, 224);
+                self.bubble_in_text =
+                    if contrast_ratio(dark_text, c) >= contrast_ratio(light_text, c) {
+                        dark_text
+                    } else {
+                        light_text
+                    };
+
+                let dark_meta = Color32::from_rgb(100, 116, 139);
+                let light_meta = Color32::from_rgb(142, 150, 165);
+                self.bubble_in_meta =
+                    if contrast_ratio(dark_meta, c) >= contrast_ratio(light_meta, c) {
+                        dark_meta
+                    } else {
+                        light_meta
+                    };
+            }
+        }
+    }
 }
 
 pub(super) fn parse_hex_color(s: &str) -> Option<Color32> {
@@ -246,13 +343,24 @@ pub(super) fn parse_hex_color(s: &str) -> Option<Color32> {
         let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
         let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
         Some(Color32::from_rgb(r, g, b))
+    } else if hex.len() == 8 {
+        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+        let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
+        Some(Color32::from_rgba_unmultiplied(r, g, b, a))
     } else {
         None
     }
 }
 
 pub(super) fn format_hex_color(c: Color32) -> String {
-    format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    if a == 255 {
+        format!("#{:02X}{:02X}{:02X}", r, g, b)
+    } else {
+        format!("#{:02X}{:02X}{:02X}{:02X}", r, g, b, a)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1116,7 @@ pub(super) fn render_toggle_switch(
 }
 
 static CJK_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ACTIVE_FONT_CHOICE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 pub(crate) fn is_cjk(c: char) -> bool {
     matches!(c as u32,
@@ -1023,14 +1132,27 @@ pub(super) fn ensure_cjk_font<'a>(ctx: &egui::Context, mut texts: impl Iterator<
         return;
     }
     CJK_LOADED.store(true, Ordering::Relaxed);
-    build_fonts(ctx, true);
+    let choice = ACTIVE_FONT_CHOICE
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_else(|_| "default".into());
+    build_fonts(ctx, &choice, true);
 }
 
+pub(super) fn setup_custom_fonts_with_choice(ctx: &egui::Context, font_choice: &str) {
+    if let Ok(mut active) = ACTIVE_FONT_CHOICE.lock() {
+        *active = font_choice.to_string();
+    }
+    let with_cjk = CJK_LOADED.load(std::sync::atomic::Ordering::Relaxed);
+    build_fonts(ctx, font_choice, with_cjk);
+}
+
+#[allow(dead_code)]
 pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
-    build_fonts(ctx, false);
+    setup_custom_fonts_with_choice(ctx, "default");
 }
 
-fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
+pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool) {
     let mut fonts = egui::FontDefinitions::default();
 
     // 1. Embed official Lucide Icon Font (vector glyphs for all UI icons)
@@ -1048,6 +1170,76 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
         egui::FontData::from_static(BUNDLED_SANS),
     );
 
+    // 3. Optional user-selected system or custom font family (Requirement R2)
+    let mut selected_font_loaded = false;
+    let choice_norm = font_choice.trim().to_lowercase();
+    match choice_norm.as_str() {
+        "segoe_ui" | "segoe" => {
+            let candidates = [
+                "C:\\Windows\\Fonts\\segoeui.ttf",
+                "/usr/share/fonts/truetype/segoeui.ttf",
+            ];
+            for path in candidates {
+                if let Ok(font_data) = std::fs::read(path) {
+                    fonts.font_data.insert(
+                        "selected_font".to_owned(),
+                        egui::FontData::from_owned(font_data),
+                    );
+                    selected_font_loaded = true;
+                    break;
+                }
+            }
+        }
+        "arial" => {
+            let candidates = [
+                "C:\\Windows\\Fonts\\arial.ttf",
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/Library/Fonts/Arial.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ];
+            for path in candidates {
+                if let Ok(font_data) = std::fs::read(path) {
+                    fonts.font_data.insert(
+                        "selected_font".to_owned(),
+                        egui::FontData::from_owned(font_data),
+                    );
+                    selected_font_loaded = true;
+                    break;
+                }
+            }
+        }
+        "tahoma" => {
+            let candidates = [
+                "C:\\Windows\\Fonts\\tahoma.ttf",
+                "/System/Library/Fonts/Supplemental/Tahoma.ttf",
+            ];
+            for path in candidates {
+                if let Ok(font_data) = std::fs::read(path) {
+                    fonts.font_data.insert(
+                        "selected_font".to_owned(),
+                        egui::FontData::from_owned(font_data),
+                    );
+                    selected_font_loaded = true;
+                    break;
+                }
+            }
+        }
+        "default" | "" => {
+            // Uses bundled_sans directly at priority index 0
+        }
+        _custom_path => {
+            if let Ok(font_data) = std::fs::read(font_choice.trim()) {
+                fonts.font_data.insert(
+                    "selected_font".to_owned(),
+                    egui::FontData::from_owned(font_data),
+                );
+                selected_font_loaded = true;
+            }
+        }
+    }
+
+    // Also load generic system vietnamese_font as supplementary candidate if available
     let font_candidates = [
         "C:\\Windows\\Fonts\\segoeui.ttf",
         "C:\\Windows\\Fonts\\arial.ttf",
@@ -1075,7 +1267,7 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
         }
     }
 
-    // 3. Optional CJK (Chinese / Japanese / Korean) system font fallback (#5, #6)
+    // 4. Optional CJK (Chinese / Japanese / Korean) system font fallback (#5, #6)
     let cjk_candidates = [
         "C:\\Windows\\Fonts\\msyh.ttc",
         "C:\\Windows\\Fonts\\simsun.ttc",
@@ -1097,14 +1289,21 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
         }
     }
 
-    // Fallback order: bundled sans guarantees Vietnamese coverage, CJK supplies Han/Kana/Hangul, Lucide supplies icon glyphs
+    // 5. Fallback priority order:
+    // If a custom or system font is selected, place it at index 0.
+    // Index 1 (or 0 for default) is bundled_sans, guaranteeing full Vietnamese diacritic coverage.
     let prop = fonts
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default();
-    prop.insert(0, "bundled_sans".to_owned());
-    if fonts.font_data.contains_key("vietnamese_font") {
-        prop.insert(1, "vietnamese_font".to_owned());
+    if selected_font_loaded {
+        prop.insert(0, "selected_font".to_owned());
+        prop.insert(1, "bundled_sans".to_owned());
+    } else {
+        prop.insert(0, "bundled_sans".to_owned());
+    }
+    if fonts.font_data.contains_key("vietnamese_font") && !selected_font_loaded {
+        prop.push("vietnamese_font".to_owned());
     }
     if fonts.font_data.contains_key("cjk_font") {
         prop.push("cjk_font".to_owned());
@@ -1125,4 +1324,61 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
     mono.push("lucide_font".to_owned());
 
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_and_format_hex_color() {
+        assert_eq!(
+            parse_hex_color("#0068FF"),
+            Some(Color32::from_rgb(0, 104, 255))
+        );
+        assert_eq!(
+            parse_hex_color("528BFF"),
+            Some(Color32::from_rgb(82, 139, 255))
+        );
+        assert_eq!(
+            parse_hex_color("#0068FF80"),
+            Some(Color32::from_rgba_unmultiplied(0, 104, 255, 128))
+        );
+        assert_eq!(parse_hex_color("invalid"), None);
+        assert_eq!(parse_hex_color("#123"), None);
+
+        let col = Color32::from_rgb(0, 104, 255);
+        assert_eq!(format_hex_color(col), "#0068FF");
+    }
+
+    #[test]
+    fn test_palette_apply_custom_colors() {
+        let mut pal = ThemePalette::light();
+        pal.apply_custom_colors(
+            Some("#059669"),
+            Some("#7C3AED"),
+            Some("#E11D48"),
+            Some("#FFFFFF"),
+        );
+        assert_eq!(pal.primary, Color32::from_rgb(5, 150, 105));
+        assert_eq!(pal.accent_online, Color32::from_rgb(124, 58, 237));
+        assert_eq!(pal.bubble_out_bg, Color32::from_rgb(225, 29, 72));
+        assert_eq!(pal.bubble_in_bg, Color32::WHITE);
+        // White bubble background has luminance > 140 -> dark text
+        assert_eq!(pal.bubble_in_text, Color32::from_rgb(15, 23, 42));
+    }
+
+    #[test]
+    fn test_palette_dark_mode_bubble_contrast() {
+        let mut pal = ThemePalette::dark();
+        pal.apply_custom_colors(
+            None,
+            None,
+            Some("#1E293B"), // Dark slate outbound bubble
+            None,
+        );
+        assert_eq!(pal.bubble_out_bg, Color32::from_rgb(30, 41, 59));
+        // Dark bubble background has luminance <= 140 -> bright text
+        assert_eq!(pal.bubble_out_text, Color32::from_rgb(235, 240, 246));
+    }
 }
