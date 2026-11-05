@@ -2,7 +2,7 @@
 //!
 //! Notes: `re-notes/02_chat_data.md`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::session::{obj, Session};
@@ -6534,15 +6534,15 @@ pub async fn request_phone_sync_v2(s: &Session, _public_key: &str) -> Result<Val
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
+    // Only real zproto key pairs may reach the phone. The hashed placeholder from
+    // `generate_sync_v2_ed25519_public_key` is not a valid Curve25519 key, has no private half
+    // to decrypt the reply with, and makes the phone's Zalo app crash when the user confirms.
+    // Without real keys we skip v2 entirely; the v1 `pull_mobile_msg` request still goes out.
+    let keys = crate::history_sync::generate_sync_v2_keys()
+        .context("không tạo được khoá đồng bộ v2 (thiếu node/libzproto); bỏ qua yêu cầu v2")?;
+    let (ik_pub, ek_pub) = (keys.ik_pub, keys.ek_pub);
     let sync_id = crate::param_cipher::random_hex(32);
     let temp_key = crate::history_sync::latest_mobile_temp_key();
-    let (ik_pub, ek_pub) = match crate::history_sync::generate_sync_v2_keys() {
-        Ok(k) => (k.ik_pub, k.ek_pub),
-        Err(_) => (
-            crate::history_sync::generate_sync_v2_ed25519_public_key(0xA1),
-            crate::history_sync::generate_sync_v2_ed25519_public_key(0xB2),
-        ),
-    };
     // 1. Wake up mobile master device over WebSocket (`cmd 592`)
     let _ = crate::socket::send_mobile_wakeup(&sync_id);
 

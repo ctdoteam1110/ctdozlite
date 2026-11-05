@@ -117,6 +117,24 @@ impl MessageStore {
         Ok(rows > 0)
     }
 
+    /// Correct sender attribution of an already stored message (`INSERT OR IGNORE` in
+    /// `upsert_message` never rewrites it). Used when a phone backup re-import knows the
+    /// direction better than an earlier import did. Returns whether a row changed.
+    pub fn set_message_direction(
+        &mut self,
+        msg_id: &str,
+        is_outgoing: bool,
+        sender_id: &str,
+        sender_name: &str,
+    ) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE messages SET is_outgoing = ?2, sender_id = ?3, sender_name = ?4
+             WHERE msg_id = ?1 AND (is_outgoing != ?2 OR sender_id != ?3)",
+            params![msg_id, if is_outgoing { 1 } else { 0 }, sender_id, sender_name],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Delete a message from local SQLite store when user selects "Xóa chỉ ở phía tôi".
     pub fn delete_message(&mut self, thread_id: &str, msg_id: &str, ts: i64) -> Result<()> {
         if !msg_id.is_empty() {
