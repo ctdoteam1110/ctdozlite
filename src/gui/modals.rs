@@ -5293,8 +5293,11 @@ impl ZaloGuiApp {
                                     };
 
                                     // Participant Name Badge in bottom-left of tile
-                                    let lbl_w = (p_name.chars().count() as f32 * 7.2 + 34.0)
-                                        .clamp(76.0, tile_rect.width() - 20.0);
+                                    let lbl_w = super::messages::fit_between(
+                                        p_name.chars().count() as f32 * 7.2 + 34.0,
+                                        76.0,
+                                        tile_rect.width() - 20.0,
+                                    );
                                     let tag_rect = Rect::from_min_size(
                                         Pos2::new(
                                             tile_rect.left() + 10.0,

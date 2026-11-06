@@ -225,6 +225,12 @@ pub(super) fn extract_call_card_view(msg: &ChatMessage) -> Option<CallCardView> 
     })
 }
 
+/// `v` limited to `lo..=hi`, but never panics: when the space is narrower than `lo` (`hi < lo`),
+/// the available width `hi` wins. Use instead of `f32::clamp` whenever `hi` depends on layout.
+pub(super) fn fit_between(v: f32, lo: f32, hi: f32) -> f32 {
+    v.max(lo).min(hi)
+}
+
 pub(super) fn render_call_card_widget(
     ui: &mut egui::Ui,
     card: &CallCardView,
@@ -2296,9 +2302,9 @@ pub(super) fn render_chat_bubble(
             .size()
             .x
         });
-        (name_w.max(190.0) + 54.0 + 8.0)
-            .clamp(250.0, max_text_width.min(360.0))
-            .ceil()
+        // A narrow chat (small window, info panel open) makes the upper bound smaller than 250;
+        // `f32::clamp` panics on an inverted range and aborted the app inside AppKit's draw.
+        fit_between(name_w.max(190.0) + 54.0 + 8.0, 250.0, max_text_width.min(360.0)).ceil()
     } else if has_link_card {
         let has_loaded_thumb = msg
             .link_thumb
@@ -2343,7 +2349,7 @@ pub(super) fn render_chat_bubble(
                 .max(measure(desc, 12.3))
                 .max(measure(&dom, 12.6))
                 + 8.0;
-            w.clamp(135.0, max_text_width.min(340.0)).ceil()
+            fit_between(w, 135.0, max_text_width.min(340.0)).ceil()
         }
     } else {
         let display_str = if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
@@ -3527,6 +3533,15 @@ pub(super) fn reaction_corner_chip(
 #[cfg(test)]
 mod quote_navigation_tests {
     use super::*;
+
+    #[test]
+    fn fit_between_never_panics_when_space_is_narrower_than_minimum() {
+        // Crash 2026-11-07: file card in a 222 px chat column (min 250).
+        assert_eq!(fit_between(300.0, 250.0, 222.386_47), 222.386_47);
+        assert_eq!(fit_between(100.0, 250.0, 360.0), 250.0);
+        assert_eq!(fit_between(300.0, 250.0, 360.0), 300.0);
+        assert_eq!(fit_between(500.0, 250.0, 360.0), 360.0);
+    }
 
     #[test]
     fn quote_navigation_bubble_propagates_action_for_both_directions() {

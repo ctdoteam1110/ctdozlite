@@ -15,6 +15,8 @@ Xem thêm quy ước tại [ADR 0003 — Chính sách Changelog & Release Notes]
 - Cập nhật đi theo Releases của fork, không chọn DMG sai kiến trúc; thay thế app có giao dịch và hoàn tác.
 - Nâng bản vá Tokio khắc phục lỗi Interval.
 
+- Sửa lỗi ứng dụng thoát đột ngột (`abort` trong AppKit) khi khung chat hẹp hơn thẻ tệp/liên kết: `f32::clamp` với cận trên nhỏ hơn cận dưới gây panic; thay bằng `fit_between` không panic.
+
 ### Security
 - Đồng bộ tin nhắn từ điện thoại dùng RSA thời gian hằng số của AWS-LC (`aws-lc-rs`) thay cho crate `rsa` (RUSTSEC-2023-0071); định dạng khoá và đệm PKCS#1 v1.5 giữ nguyên ([ADR 0005](docs/adr/0005-constant-time-rsa-for-phone-sync.md)).
 - Nâng `ratatui` 0.30 / `crossterm` 0.29 để dùng `lru` 0.18.5 (RUSTSEC-2026-0253, RUSTSEC-2026-0002); `clipboard-win` lên 5.4.3 (bản 5.4.1 bị rút).
