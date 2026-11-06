@@ -109,6 +109,23 @@ impl MessageStore {
             ],
         )?;
         if rows == 0 && !msg.raw_json.is_empty() {
+            let from_server = !msg.raw_json.contains("\"phone_backup\"");
+            if from_server {
+                // The server copy is authoritative for who sent it. Rows imported from a phone
+                // backup could carry a guessed direction (own messages shown as the partner's
+                // or as the group's), so its sender replaces theirs.
+                let _ = self.conn.execute(
+                    "UPDATE messages SET is_outgoing = ?2, sender_id = ?3,
+                         sender_name = COALESCE(NULLIF(?4, ''), sender_name)
+                     WHERE msg_id = ?1 AND (raw_json = '' OR raw_json LIKE '%\"phone_backup\"%')",
+                    params![
+                        msg.msg_id,
+                        if msg.is_outgoing { 1 } else { 0 },
+                        msg.sender_id,
+                        msg.sender_name
+                    ],
+                );
+            }
             let _ = self.conn.execute(
                 "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3",
                 params![msg.raw_json, msg.msg_type, msg.msg_id, msg.text],
@@ -130,7 +147,12 @@ impl MessageStore {
         let rows = self.conn.execute(
             "UPDATE messages SET is_outgoing = ?2, sender_id = ?3, sender_name = ?4
              WHERE msg_id = ?1 AND (is_outgoing != ?2 OR sender_id != ?3)",
-            params![msg_id, if is_outgoing { 1 } else { 0 }, sender_id, sender_name],
+            params![
+                msg_id,
+                if is_outgoing { 1 } else { 0 },
+                sender_id,
+                sender_name
+            ],
         )?;
         Ok(rows > 0)
     }
@@ -138,10 +160,9 @@ impl MessageStore {
     /// Delete a message from local SQLite store when user selects "Xóa chỉ ở phía tôi".
     pub fn delete_message(&mut self, thread_id: &str, msg_id: &str, ts: i64) -> Result<()> {
         if !msg_id.is_empty() {
-            let _ = self.conn.execute(
-                "DELETE FROM messages WHERE msg_id = ?1",
-                params![msg_id],
-            );
+            let _ = self
+                .conn
+                .execute("DELETE FROM messages WHERE msg_id = ?1", params![msg_id]);
         }
         if ts > 0 && !thread_id.is_empty() {
             let _ = self.conn.execute(
@@ -299,7 +320,11 @@ impl MessageStore {
 
     /// Hydrate `threads` with persisted threads and message history from SQLite.
     /// Returns the total number of messages loaded into `threads`.
-    pub fn hydrate_threads(&self, threads: &mut Vec<Thread>, limit_per_thread: usize) -> Result<usize> {
+    pub fn hydrate_threads(
+        &self,
+        threads: &mut Vec<Thread>,
+        limit_per_thread: usize,
+    ) -> Result<usize> {
         crate::chat::deduplicate_threads(threads, None);
 
         let stored_threads = self.all_threads().unwrap_or_default();
@@ -308,9 +333,7 @@ impl MessageStore {
                 continue;
             }
             if let Some(existing) = threads.iter_mut().find(|t| t.id == st.thread_id) {
-                if crate::chat::is_generic_thread_name(&existing.name)
-                    && !st.name.is_empty()
-                {
+                if crate::chat::is_generic_thread_name(&existing.name) && !st.name.is_empty() {
                     existing.name = st.name;
                 }
                 existing.is_group = existing.is_group || st.is_group;
@@ -360,7 +383,9 @@ impl MessageStore {
         // around them: in autocommit every SELECT takes and drops the file lock, ~50 µs on
         // Windows, which made 62k lookups cost 3 s.
         let tx = self.conn.unchecked_transaction()?;
-        let mut owner_of = self.conn.prepare("SELECT thread_id FROM messages WHERE msg_id = ?1")?;
+        let mut owner_of = self
+            .conn
+            .prepare("SELECT thread_id FROM messages WHERE msg_id = ?1")?;
 
         let mut loaded_count = 0;
         for t in threads.iter_mut() {
@@ -410,10 +435,7 @@ impl MessageStore {
                             .get("cateId")
                             .or_else(|| val.get("catId"))
                             .and_then(|v| v.as_u64());
-                        sticker_type = val
-                            .get("type")
-                            .and_then(|v| v.as_u64())
-                            .map(|n| n as u32);
+                        sticker_type = val.get("type").and_then(|v| v.as_u64()).map(|n| n as u32);
                         reply_to_id = val
                             .get("reply_to_id")
                             .and_then(|v| v.as_str())
@@ -494,7 +516,10 @@ impl MessageStore {
                     (!existing.id.is_empty() && existing.id == cm.id)
                         || (existing.text == cm.text
                             && existing.is_outgoing == cm.is_outgoing
-                            && (existing.ts == cm.ts || (existing.ts != 0 && cm.ts != 0 && (existing.ts - cm.ts).abs() < 5000)))
+                            && (existing.ts == cm.ts
+                                || (existing.ts != 0
+                                    && cm.ts != 0
+                                    && (existing.ts - cm.ts).abs() < 5000)))
                 }) {
                     if existing.sticker_id.is_none() && cm.sticker_id.is_some() {
                         existing.sticker_id = cm.sticker_id;
@@ -601,7 +626,11 @@ impl From<&ChatMessage> for StoredMessage {
                 format!("msg_{}", m.ts)
             },
             thread_id: String::new(),
-            sender_id: if m.is_outgoing { "0".into() } else { m.sender.clone() },
+            sender_id: if m.is_outgoing {
+                "0".into()
+            } else {
+                m.sender.clone()
+            },
             sender_name: m.sender.clone(),
             text: m.text.clone(),
             msg_type,
@@ -666,10 +695,7 @@ pub struct ImportReport {
 
 /// Import / migrate message history from an existing SQLite database (`.db`/`.sqlite`),
 /// a JSON backup (`threads_cache.json` or export JSON), or a directory containing them (#9).
-pub fn import_history_from_path(
-    src: &std::path::Path,
-    dst_db_path: &str,
-) -> Result<ImportReport> {
+pub fn import_history_from_path(src: &std::path::Path, dst_db_path: &str) -> Result<ImportReport> {
     if !src.exists() {
         anyhow::bail!("Đường dẫn nguồn không tồn tại: {}", src.display());
     }
@@ -694,7 +720,10 @@ pub fn import_history_from_path(
                 let p = entry.path();
                 if p.is_file() && !files_to_import.contains(&p) {
                     if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                        if matches!(ext.to_ascii_lowercase().as_str(), "db" | "sqlite" | "sqlite3" | "json") {
+                        if matches!(
+                            ext.to_ascii_lowercase().as_str(),
+                            "db" | "sqlite" | "sqlite3" | "json"
+                        ) {
                             files_to_import.push(p);
                         }
                     }
@@ -763,9 +792,13 @@ pub fn import_history_from_path(
                     dst.conn.execute_batch("COMMIT")?;
                     report.threads_imported += tc;
                     report.messages_imported += mc;
-                    report
-                        .sources_read
-                        .push(file_path.file_name().unwrap_or_default().to_string_lossy().into());
+                    report.sources_read.push(
+                        file_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into(),
+                    );
                 }
                 Err(e) => {
                     let _ = dst.conn.execute_batch("ROLLBACK");
@@ -777,9 +810,13 @@ pub fn import_history_from_path(
                 let added = persist_threads(&mut dst, &threads)?;
                 report.threads_imported += threads.len();
                 report.messages_imported += added;
-                report
-                    .sources_read
-                    .push(file_path.file_name().unwrap_or_default().to_string_lossy().into());
+                report.sources_read.push(
+                    file_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into(),
+                );
             } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
                 if let Some(arr) = val.get("threads").and_then(|v| v.as_array()) {
                     let threads: Vec<Thread> = arr
@@ -790,20 +827,33 @@ pub fn import_history_from_path(
                         let added = persist_threads(&mut dst, &threads)?;
                         report.threads_imported += threads.len();
                         report.messages_imported += added;
-                        report
-                            .sources_read
-                            .push(file_path.file_name().unwrap_or_default().to_string_lossy().into());
+                        report.sources_read.push(
+                            file_path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into(),
+                        );
                     }
                 }
             }
         } else if bytes.len() >= 4096 {
             if let Some(decrypted_bytes) = try_decrypt_zalo_pc_database(&bytes) {
                 let tmp_dir = std::env::temp_dir();
-                let tmp_name = format!("ctdozlite_import_{}_{}.db", std::process::id(), report.sources_read.len());
+                let tmp_name = format!(
+                    "ctdozlite_import_{}_{}.db",
+                    std::process::id(),
+                    report.sources_read.len()
+                );
                 let tmp_path = tmp_dir.join(tmp_name);
                 if std::fs::write(&tmp_path, &decrypted_bytes).is_ok() {
                     if let Ok(src_conn) = Connection::open(&tmp_path) {
-                        let _ = import_official_zalo_pc_db(&src_conn, &mut dst, &file_path, &mut report);
+                        let _ = import_official_zalo_pc_db(
+                            &src_conn,
+                            &mut dst,
+                            &file_path,
+                            &mut report,
+                        );
                     }
                     let _ = std::fs::remove_file(&tmp_path);
                 }
@@ -856,7 +906,8 @@ fn scan_and_import_zalo_data_dir(
     }
 
     // 3. Build contact/group name dictionary from Index.db
-    let mut id_to_name: std::collections::HashMap<String, (String, bool)> = std::collections::HashMap::new();
+    let mut id_to_name: std::collections::HashMap<String, (String, bool)> =
+        std::collections::HashMap::new();
     for idx_path in index_files {
         if let Ok(bytes) = std::fs::read(&idx_path) {
             if let Some(dec) = decrypt_sqlcipher_bytes(&bytes, cipher_key.as_bytes()) {
@@ -877,20 +928,37 @@ fn scan_and_import_zalo_data_dir(
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.extension().and_then(|e| e.to_str()) == Some("db") {
-                    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+                    let stem = p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_string();
                     if let Ok(bytes) = std::fs::read(&p) {
                         if let Some(dec) = decrypt_sqlcipher_bytes(&bytes, cipher_key.as_bytes()) {
-                            let tmp_p = std::env::temp_dir().join(format!("msg_{}_{}.db", std::process::id(), stem));
+                            let tmp_p = std::env::temp_dir().join(format!(
+                                "msg_{}_{}.db",
+                                std::process::id(),
+                                stem
+                            ));
                             if std::fs::write(&tmp_p, &dec).is_ok() {
                                 if let Ok(conn) = Connection::open(&tmp_p) {
                                     let thread_id = stem.clone();
-                                    let (t_name, is_group) = id_to_name
-                                        .get(&thread_id)
-                                        .cloned()
-                                        .unwrap_or_else(|| {
-                                            (format!("Người dùng {thread_id}"), thread_id.starts_with('g'))
+                                    let (t_name, is_group) =
+                                        id_to_name.get(&thread_id).cloned().unwrap_or_else(|| {
+                                            (
+                                                format!("Người dùng {thread_id}"),
+                                                thread_id.starts_with('g'),
+                                            )
                                         });
-                                    let _ = import_message_table(&conn, dst, &thread_id, &t_name, is_group, &cipher_key, report);
+                                    let _ = import_message_table(
+                                        &conn,
+                                        dst,
+                                        &thread_id,
+                                        &t_name,
+                                        is_group,
+                                        &cipher_key,
+                                        report,
+                                    );
                                 }
                                 let _ = std::fs::remove_file(&tmp_p);
                             }
@@ -969,7 +1037,7 @@ fn import_message_table(
 ) -> Result<()> {
     let mut stmt = match src_conn.prepare(
         "SELECT msgId, cliMsgId, fromUid, toUid, dName, msgType, sendDttm, message, quote
-         FROM message ORDER BY CAST(sendDttm AS INTEGER) ASC"
+         FROM message ORDER BY CAST(sendDttm AS INTEGER) ASC",
     ) {
         Ok(s) => s,
         Err(_) => return Ok(()),
@@ -991,7 +1059,8 @@ fn import_message_table(
     })?;
 
     for r in rows.flatten() {
-        let (msg_id, cli_msg_id, from_uid, _to_uid, dname, mtype, send_dttm, raw_msg, quote_str) = r;
+        let (msg_id, cli_msg_id, from_uid, _to_uid, dname, mtype, send_dttm, raw_msg, quote_str) =
+            r;
         let ts: i64 = send_dttm.parse().unwrap_or(0);
         let is_outgoing = from_uid == "0" || from_uid.is_empty();
         let (text, mut meta) = decode_zalo_cipher_payload_with_meta(&raw_msg, cipher_key, mtype);
@@ -1010,15 +1079,31 @@ fn import_message_table(
             _ => "chat.text",
         };
         msgs.push(StoredMessage {
-            msg_id: if !msg_id.is_empty() { msg_id } else { cli_msg_id },
+            msg_id: if !msg_id.is_empty() {
+                msg_id
+            } else {
+                cli_msg_id
+            },
             thread_id: thread_id.to_string(),
             sender_id: from_uid,
-            sender_name: if !dname.is_empty() { dname } else { if is_outgoing { "Tôi".into() } else { thread_name.into() } },
+            sender_name: if !dname.is_empty() {
+                dname
+            } else {
+                if is_outgoing {
+                    "Tôi".into()
+                } else {
+                    thread_name.into()
+                }
+            },
             text,
             msg_type: msg_type_str.to_string(),
             ts,
             is_outgoing,
-            raw_json: if meta.is_empty() { String::new() } else { serde_json::Value::Object(meta).to_string() },
+            raw_json: if meta.is_empty() {
+                String::new()
+            } else {
+                serde_json::Value::Object(meta).to_string()
+            },
         });
     }
 
@@ -1045,28 +1130,44 @@ fn import_message_table(
 
     report.threads_imported += 1;
     report.messages_imported += added;
-    report.sources_read.push(format!("ZaloPC: {thread_name} ({thread_id})"));
+    report
+        .sources_read
+        .push(format!("ZaloPC: {thread_name} ({thread_id})"));
     Ok(())
 }
 
 /// Recover the 32-character XOR key from LevelDB in `Partitions/zalo/Local Storage/leveldb`.
 pub fn recover_zalo_localstorage_key(base_dir: &std::path::Path) -> String {
-    let cand_dirs = vec![base_dir.join("Partitions").join("zalo").join("Local Storage").join("leveldb")];
+    let cand_dirs = vec![base_dir
+        .join("Partitions")
+        .join("zalo")
+        .join("Local Storage")
+        .join("leveldb")];
 
     let mut key = vec![None; 32];
-    let u_pat = "z_ecrp_".encode_utf16().flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>();
+    let u_pat = "z_ecrp_"
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect::<Vec<u8>>();
 
     for ldb_dir in cand_dirs {
-        let Ok(entries) = std::fs::read_dir(ldb_dir) else { continue; };
+        let Ok(entries) = std::fs::read_dir(ldb_dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let p = entry.path();
             let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
             if ext != "ldb" && ext != "log" {
                 continue;
             }
-            let Ok(b) = std::fs::read(&p) else { continue; };
+            let Ok(b) = std::fs::read(&p) else {
+                continue;
+            };
             let mut pos = 0;
-            while let Some(rel) = b[pos..].windows(u_pat.len()).position(|w| w == u_pat.as_slice()) {
+            while let Some(rel) = b[pos..]
+                .windows(u_pat.len())
+                .position(|w| w == u_pat.as_slice())
+            {
                 let idx = pos + rel + u_pat.len();
                 pos = idx;
                 let mut chars = Vec::new();
@@ -1077,14 +1178,23 @@ pub fn recover_zalo_localstorage_key(base_dir: &std::path::Path) -> String {
                 }
                 if chars.len() >= 32 {
                     let prefix = b"{\"version\":";
-                    let cand: Vec<u32> = chars.iter().take(prefix.len()).zip(prefix.iter()).map(|(c, p)| c ^ (*p as u32)).collect();
+                    let cand: Vec<u32> = chars
+                        .iter()
+                        .take(prefix.len())
+                        .zip(prefix.iter())
+                        .map(|(c, p)| c ^ (*p as u32))
+                        .collect();
                     if cand.iter().all(|x| (*x as u8 as char).is_ascii_hexdigit()) {
                         for (i, v) in cand.iter().enumerate() {
                             key[i] = Some(*v as u8 as char);
                         }
                         let suffix = b",\"list_recent\":[{\"";
                         if chars.len() >= 14 + suffix.len() {
-                            let cand2: Vec<u32> = chars[14..14+suffix.len()].iter().zip(suffix.iter()).map(|(c, p)| c ^ (*p as u32)).collect();
+                            let cand2: Vec<u32> = chars[14..14 + suffix.len()]
+                                .iter()
+                                .zip(suffix.iter())
+                                .map(|(c, p)| c ^ (*p as u32))
+                                .collect();
                             if cand2.iter().all(|x| (*x as u8 as char).is_ascii_hexdigit()) {
                                 for (i, v) in cand2.iter().enumerate() {
                                     key[14 + i] = Some(*v as u8 as char);
@@ -1146,7 +1256,10 @@ pub fn decrypt_sqlcipher_bytes(bytes: &[u8], passphrase: &[u8]) -> Option<Vec<u8
         if p == 0 {
             dec_buf = page[16..page_size - reserve].to_vec();
             let decryptor = Aes256CbcDec::new((&derived_key).into(), iv.into());
-            if decryptor.decrypt_padded_mut::<NoPadding>(&mut dec_buf).is_err() {
+            if decryptor
+                .decrypt_padded_mut::<NoPadding>(&mut dec_buf)
+                .is_err()
+            {
                 return None;
             }
             // Check SQLite magic page size (offset 0..2 in decrypted buffer)
@@ -1155,15 +1268,18 @@ pub fn decrypt_sqlcipher_bytes(bytes: &[u8], passphrase: &[u8]) -> Option<Vec<u8
             }
             out.extend_from_slice(b"SQLite format 3\x00");
             out.extend_from_slice(&dec_buf);
-            out.extend(std::iter::repeat(0u8).take(reserve));
+            out.extend(std::iter::repeat_n(0u8, reserve));
         } else {
             dec_buf = page[0..page_size - reserve].to_vec();
             let decryptor = Aes256CbcDec::new((&derived_key).into(), iv.into());
-            if decryptor.decrypt_padded_mut::<NoPadding>(&mut dec_buf).is_err() {
+            if decryptor
+                .decrypt_padded_mut::<NoPadding>(&mut dec_buf)
+                .is_err()
+            {
                 return None;
             }
             out.extend_from_slice(&dec_buf);
-            out.extend(std::iter::repeat(0u8).take(reserve));
+            out.extend(std::iter::repeat_n(0u8, reserve));
         }
     }
     Some(out)
@@ -1185,9 +1301,9 @@ fn pbkdf2_hmac_sha512(password: &[u8], salt: &[u8], iterations: u32, output: &mu
         o_pad[i] ^= k[i];
     }
     let mut base_inner = Sha512::new();
-    base_inner.update(&i_pad);
+    base_inner.update(i_pad);
     let mut base_outer = Sha512::new();
-    base_outer.update(&o_pad);
+    base_outer.update(o_pad);
 
     let hmac = |data: &[u8]| -> [u8; 64] {
         let mut inner = base_inner.clone();
@@ -1195,7 +1311,7 @@ fn pbkdf2_hmac_sha512(password: &[u8], salt: &[u8], iterations: u32, output: &mu
         let inner_hash = inner.finalize();
 
         let mut outer = base_outer.clone();
-        outer.update(&inner_hash);
+        outer.update(inner_hash);
         let mut res = [0u8; 64];
         res.copy_from_slice(&outer.finalize());
         res
@@ -1293,7 +1409,9 @@ pub fn jxl_to_jpg_url(url: &str) -> String {
     if without_flag.contains("e2esession=") {
         return without_flag;
     }
-    without_flag.replace("/jxl/", "/jpg/").replace(".jxl", ".jpg")
+    without_flag
+        .replace("/jxl/", "/jpg/")
+        .replace(".jxl", ".jpg")
 }
 
 fn extract_zalo_message_text_and_meta(
@@ -1307,10 +1425,26 @@ fn extract_zalo_message_text_and_meta(
         }
         if let Some(arr) = val.as_array() {
             for item in arr {
-                let title = item.get("title").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or_default();
-                let desc = item.get("description").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or_default();
-                let href = item.get("href").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or_default();
-                let thumb = item.get("thumb").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or_default();
+                let title = item
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default();
+                let desc = item
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default();
+                let href = item
+                    .get("href")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default();
+                let thumb = item
+                    .get("thumb")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default();
                 if !title.is_empty() || !desc.is_empty() {
                     if !href.is_empty() {
                         meta.insert("link_url".into(), serde_json::json!(href));
@@ -1330,9 +1464,18 @@ fn extract_zalo_message_text_and_meta(
             }
         }
         if mtype == 4 || val.get("catId").is_some() {
-            if let Some(sid) = val.get("id").and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok())) {
-                let cid = val.get("catId").and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok())).unwrap_or(0);
-                let st = val.get("type").and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok())).unwrap_or(7);
+            if let Some(sid) = val
+                .get("id")
+                .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+            {
+                let cid = val
+                    .get("catId")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+                    .unwrap_or(0);
+                let st = val
+                    .get("type")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+                    .unwrap_or(7);
                 meta.insert("stickerId".into(), serde_json::json!(sid));
                 meta.insert("cateId".into(), serde_json::json!(cid));
                 meta.insert("type".into(), serde_json::json!(st));
@@ -1342,12 +1485,22 @@ fn extract_zalo_message_text_and_meta(
         // Photo (msgType == 2)
         if mtype == 2 || val.get("oriUrl").is_some() || val.get("thumbUrl").is_some() {
             let ori = jxl_to_jpg_url(
-                val.get("oriUrl").or_else(|| val.get("normalUrl")).and_then(|v| v.as_str()).unwrap_or_default(),
+                val.get("oriUrl")
+                    .or_else(|| val.get("normalUrl"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
             );
             let thumb = jxl_to_jpg_url(
-                val.get("thumbUrl").or_else(|| val.get("oriUrl")).and_then(|v| v.as_str()).unwrap_or_default(),
+                val.get("thumbUrl")
+                    .or_else(|| val.get("oriUrl"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
             );
-            let title = val.get("title").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("[Hình ảnh]");
+            let title = val
+                .get("title")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("[Hình ảnh]");
             if !ori.is_empty() {
                 meta.insert("link_url".into(), serde_json::json!(ori));
             }
@@ -1367,9 +1520,21 @@ fn extract_zalo_message_text_and_meta(
             }
         }
         let href = val.get("href").and_then(|v| v.as_str()).unwrap_or_default();
-        let title = val.get("title").and_then(|v| v.as_str()).filter(|s| !s.is_empty() && *s != "sendBubbleMessage").unwrap_or_default();
-        let desc = val.get("description").or_else(|| val.get("desc")).and_then(|v| v.as_str()).filter(|s| !s.is_empty() && *s != "Cuộc gọi").unwrap_or_default();
-        let thumb = val.get("thumb").and_then(|v| v.as_str()).unwrap_or_default();
+        let title = val
+            .get("title")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != "sendBubbleMessage")
+            .unwrap_or_default();
+        let desc = val
+            .get("description")
+            .or_else(|| val.get("desc"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != "Cuộc gọi")
+            .unwrap_or_default();
+        let thumb = val
+            .get("thumb")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         if !href.is_empty() {
             meta.insert("link_url".into(), serde_json::json!(href));
         }
@@ -1398,16 +1563,26 @@ fn extract_zalo_message_text_and_meta(
     (xored.to_string(), meta)
 }
 
-
 fn import_official_zalo_pc_db(
     src_conn: &Connection,
     dst: &mut MessageStore,
     file_path: &std::path::Path,
     report: &mut ImportReport,
 ) -> Result<()> {
-    let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("import_pc");
+    let stem = file_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("import_pc");
     let cipher_key = "de039414865b856ea650d3305b1f387f";
-    import_message_table(src_conn, dst, stem, stem, stem.starts_with('g'), cipher_key, report)
+    import_message_table(
+        src_conn,
+        dst,
+        stem,
+        stem,
+        stem.starts_with('g'),
+        cipher_key,
+        report,
+    )
 }
 
 #[cfg(test)]
@@ -1473,6 +1648,59 @@ mod tests {
     }
 
     #[test]
+    fn server_copy_fixes_direction_of_phone_imported_row() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        // Phone import guessed it as the group's (incoming).
+        let phone = StoredMessage {
+            msg_id: "8442608234965".into(),
+            thread_id: "g1".into(),
+            sender_id: "g1".into(),
+            sender_name: String::new(),
+            text: "Dạ, cháu gửi".into(),
+            msg_type: "webchat".into(),
+            ts: 1793600229162,
+            is_outgoing: false,
+            raw_json: r#"{"phone_backup":{"type":1,"status":0}}"#.into(),
+        };
+        assert!(store.upsert_message(&phone).unwrap());
+        // The server says the owner sent it.
+        let server = StoredMessage {
+            sender_id: "me".into(),
+            sender_name: "Lê Dũng Bá".into(),
+            is_outgoing: true,
+            raw_json: r#"{"link_src":null}"#.into(),
+            ..phone.clone()
+        };
+        assert!(!store.upsert_message(&server).unwrap());
+        let row = &store.messages_for("g1", 10).unwrap()[0];
+        assert!(row.is_outgoing);
+        assert_eq!(row.sender_id, "me");
+        assert_eq!(row.sender_name, "Lê Dũng Bá");
+
+        // A later phone re-import does not overwrite the server-backed row's raw JSON path.
+        let mut other = phone.clone();
+        other.msg_id = "m2".into();
+        other.raw_json = r#"{"is_pinned":true}"#.into();
+        assert!(store.upsert_message(&other).unwrap());
+        let flipped = StoredMessage {
+            is_outgoing: true,
+            sender_id: "me".into(),
+            ..other.clone()
+        };
+        store.upsert_message(&flipped).unwrap();
+        let row2 = store
+            .messages_for("g1", 10)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.msg_id == "m2")
+            .unwrap();
+        assert!(
+            !row2.is_outgoing,
+            "server-sourced rows keep their stored sender"
+        );
+    }
+
+    #[test]
     fn test_messages_for_returns_ordered_rows() {
         let mut store = MessageStore::open(":memory:").unwrap();
         let thread_id = "thread_order_test";
@@ -1526,7 +1754,10 @@ mod tests {
 
         // A limit keeps the *newest* rows, still returned oldest-first.
         let newest = store.messages_for(thread_id, 2).unwrap();
-        assert_eq!(newest.iter().map(|m| m.ts).collect::<Vec<_>>(), vec![200, 300]);
+        assert_eq!(
+            newest.iter().map(|m| m.ts).collect::<Vec<_>>(),
+            vec![200, 300]
+        );
     }
 
     #[test]
@@ -1596,7 +1827,7 @@ mod tests {
             ],
         };
 
-        let count1 = persist_threads(&mut store, &[thread.clone()]).unwrap();
+        let count1 = persist_threads(&mut store, std::slice::from_ref(&thread)).unwrap();
         assert_eq!(count1, 2);
 
         // Second persist returns 0 newly inserted
@@ -1711,7 +1942,9 @@ mod tests {
         let enc: String = plain
             .chars()
             .enumerate()
-            .map(|(i, c)| char::from_u32((c as u32) ^ (key_chars[i % key_chars.len()] as u32)).unwrap())
+            .map(|(i, c)| {
+                char::from_u32((c as u32) ^ (key_chars[i % key_chars.len()] as u32)).unwrap()
+            })
             .collect();
         assert_eq!(
             decode_zalo_cipher_payload(&enc, key),

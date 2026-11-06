@@ -45,24 +45,26 @@ impl ThemePalette {
             bg_chat_canvas: Color32::from_rgb(40, 44, 52), // #282C34 Atom One Dark Editor Canvas
             bg_elevated: Color32::from_rgb(44, 49, 58), // #2C313A Elevated Card / Modal / Popover
             bg_hover: Color32::from_rgb(50, 56, 66), // #323842 List Hover Surface
-            bg_selected: Color32::from_rgb(58, 63, 75), // #3A3F4B Active Selection Row
+            bg_selected: Color32::from_rgb(62, 62, 68), // graphite selection row
             bg_input: Color32::from_rgb(29, 31, 35), // #1D1F23 Input / Search Well
             border: Color32::from_rgb(52, 57, 66), // #343942 Subtle Panel Divider
             text_primary: Color32::from_rgb(215, 218, 224), // #D7DAE0 Bright Foreground
             text_secondary: Color32::from_rgb(171, 178, 191), // #ABB2BF Atom @mono-1
             text_muted: Color32::from_rgb(118, 126, 142), // #767E8E Atom @mono-3 (readable muted)
-            primary: Color32::from_rgb(82, 139, 255), // #528BFF Atom UI Accent Blue
-            primary_hover: Color32::from_rgb(97, 175, 239), // #61AFEF Atom @hue-2 Cyan-Blue
+            primary: Color32::from_rgb(112, 112, 120), // graphite accent (user: gray, no blue)
+            primary_hover: Color32::from_rgb(178, 178, 186),
             accent_online: Color32::from_rgb(152, 195, 121), // #98C379 Atom @hue-4 Green
-            danger: Color32::from_rgb(224, 108, 117), // #E06C75 Atom @hue-5 Coral Red
-            warning: Color32::from_rgb(229, 192, 123), // #E5C07B Atom @hue-62 Warm Gold
-            bubble_out_bg: Color32::from_rgb(37, 55, 77), // #25374D Zalo Dark Slate-Navy Outgoing Bubble
-            bubble_out_text: Color32::from_rgb(235, 240, 246), // #EBF0F6
-            bubble_out_meta: Color32::from_rgb(154, 171, 192), // #9AABC0
-            bubble_in_bg: Color32::from_rgb(50, 56, 66),  // #323842 Atom Elevated Incoming Bubble
+            danger: Color32::from_rgb(224, 108, 117),        // #E06C75 Atom @hue-5 Coral Red
+            warning: Color32::from_rgb(229, 192, 123),       // #E5C07B Atom @hue-62 Warm Gold
+            // Own messages: the app's graphite accent; others: neutral gray (user: like Zalo,
+            // the two sides must be told apart at a glance).
+            bubble_out_bg: Color32::from_rgb(92, 92, 100),
+            bubble_out_text: Color32::from_rgb(244, 244, 247),
+            bubble_out_meta: Color32::from_rgb(200, 200, 208),
+            bubble_in_bg: Color32::from_rgb(44, 46, 52),
             bubble_in_border: Color32::from_rgb(62, 68, 81), // #3E4451 Atom Gutter Border
             bubble_in_text: Color32::from_rgb(215, 218, 224), // #D7DAE0
-            bubble_in_meta: Color32::from_rgb(142, 150, 165), // #8E96A5
+            bubble_in_meta: Color32::from_rgb(150, 152, 162),
         }
     }
 
@@ -75,26 +77,81 @@ impl ThemePalette {
             bg_chat_canvas: Color32::from_rgb(235, 240, 247), // Authentic Zalo PC cool blue-gray canvas
             bg_elevated: Color32::from_rgb(255, 255, 255),    // #FFFFFF
             bg_hover: Color32::from_rgb(241, 245, 249),       // #F1F5F9
-            bg_selected: Color32::from_rgb(229, 241, 255),    // #E5F1FF Zalo active row
+            bg_selected: Color32::from_rgb(228, 228, 233),    // graphite active row
             bg_input: Color32::from_rgb(248, 250, 252),       // #F8FAFC
             border: Color32::from_rgb(226, 232, 240),         // #E2E8F0
             text_primary: Color32::from_rgb(15, 23, 42),      // #0F172A (16.1:1 contrast)
             text_secondary: Color32::from_rgb(71, 85, 105),   // #475569 (7.2:1 contrast)
             text_muted: Color32::from_rgb(100, 116, 139),     // #64748B (4.6:1 contrast)
-            primary: Color32::from_rgb(0, 104, 255),          // #0068FF Zalo Blue
-            primary_hover: Color32::from_rgb(37, 99, 235),    // #2563EB
-            accent_online: Color32::from_rgb(5, 150, 105),    // #059669 Emerald
-            danger: Color32::from_rgb(220, 38, 38),           // #DC2626
-            warning: Color32::from_rgb(217, 119, 6),          // #D97706
-            bubble_out_bg: Color32::from_rgb(229, 239, 255), // Zalo Desktop Light Outgoing (#E5EFFF)
-            bubble_out_text: Color32::from_rgb(15, 23, 42),  // Crisp dark text on light blue (14:1)
-            bubble_out_meta: Color32::from_rgb(71, 92, 122),
-            bubble_in_bg: Color32::WHITE,
+            primary: Color32::from_rgb(72, 72, 78), // graphite accent (user: gray, no blue)
+            primary_hover: Color32::from_rgb(58, 58, 64),
+            accent_online: Color32::from_rgb(5, 150, 105), // #059669 Emerald
+            danger: Color32::from_rgb(220, 38, 38),        // #DC2626
+            warning: Color32::from_rgb(217, 119, 6),       // #D97706
+            // Own messages: graphite accent with light text; others: light gray.
+            bubble_out_bg: Color32::from_rgb(84, 84, 92),
+            bubble_out_text: Color32::from_rgb(246, 246, 248),
+            bubble_out_meta: Color32::from_rgb(196, 196, 204),
+            bubble_in_bg: Color32::from_rgb(233, 233, 238),
             bubble_in_border: Color32::from_rgb(216, 224, 236),
             bubble_in_text: Color32::from_rgb(15, 23, 42),
-            bubble_in_meta: Color32::from_rgb(100, 116, 139),
+            bubble_in_meta: Color32::from_rgb(100, 100, 112),
         }
     }
+
+    /// Telegram-style grouped lists: a grey page behind white rounded section cards, so blocks
+    /// separate by colour instead of sharing one flat fill.
+    pub(super) fn group_bg(&self) -> Color32 {
+        if self.is_dark {
+            Color32::from_rgb(24, 25, 29)
+        } else {
+            Color32::from_rgb(239, 239, 244)
+        }
+    }
+
+    /// Card fill on top of [`Self::group_bg`].
+    pub(super) fn group_card(&self) -> Color32 {
+        if self.is_dark {
+            Color32::from_rgb(38, 40, 46)
+        } else {
+            Color32::WHITE
+        }
+    }
+
+    /// Rounded floating card used for the main surfaces (sidebars, chat area, panels).
+    pub(super) fn card(&self, fill: Color32) -> egui::Frame {
+        // No outline: cards separate by colour and spacing (Telegram-like), no light rim.
+        egui::Frame::none()
+            .fill(fill)
+            .rounding(Rounding::same(Self::CARD_RADIUS))
+            .outer_margin(Margin::same(Self::CARD_INSET))
+    }
+
+    /// Build a non-resizable sidebar whose rounded card stays inside the panel clip.
+    pub(super) fn card_side_panel(
+        &self,
+        id: &'static str,
+        width: f32,
+        inner_margin: Margin,
+    ) -> egui::SidePanel {
+        egui::SidePanel::left(id)
+            .show_separator_line(false)
+            .resizable(false)
+            // egui 0.29 subtracts inner margins from its minimum content width, but not
+            // outer margins. An exact width therefore paints the right radius past the clip.
+            .default_width(width)
+            .min_width((width - 2.0 * Self::CARD_INSET).max(0.0))
+            .max_width(width)
+            .frame(self.card(self.bg_sidebar).inner_margin(inner_margin))
+    }
+
+    /// Gap between the window edge and the floating cards (Telegram ~8 px).
+    pub(super) const CARD_INSET: f32 = 9.0;
+
+    /// Corner radius of [`Self::card`]; inner header/footer strips round to match.
+    /// Concentric with (and smaller than) the window corner: `WINDOW_RADIUS - CARD_INSET`, so
+    /// the band between card and window edge stays even all the way round.
+    pub(super) const CARD_RADIUS: f32 = 20.0;
 
     /// Liquid Glass variant: surfaces become tinted, translucent layers so the macOS vibrancy
     /// view behind the window (blurred desktop) shows through; edges get a light hairline
@@ -109,14 +166,12 @@ impl ThemePalette {
                 bg_chat_canvas: rgba(12, 14, 20, 105),
                 bg_elevated: rgba(38, 42, 52, 225),
                 bg_hover: rgba(255, 255, 255, 22),
-                bg_selected: rgba(82, 139, 255, 70),
+                bg_selected: rgba(150, 150, 160, 60),
                 bg_input: rgba(255, 255, 255, 18),
                 border: rgba(255, 255, 255, 34),
-                bubble_out_bg: rgba(64, 118, 255, 165),
-                bubble_out_text: Color32::WHITE,
-                bubble_out_meta: rgba(225, 235, 255, 200),
-                bubble_in_bg: rgba(255, 255, 255, 26),
-                bubble_in_border: rgba(255, 255, 255, 40),
+                // Message bubbles stay 100 % opaque over the wallpaper (user request); only the
+                // panels around them turn translucent.
+                bubble_in_border: rgba(255, 255, 255, 0),
                 ..self
             }
         } else {
@@ -127,14 +182,11 @@ impl ThemePalette {
                 bg_chat_canvas: rgba(240, 245, 255, 80),
                 bg_elevated: rgba(255, 255, 255, 230),
                 bg_hover: rgba(0, 0, 0, 14),
-                bg_selected: rgba(0, 104, 255, 40),
+                bg_selected: rgba(0, 0, 0, 26),
                 bg_input: rgba(255, 255, 255, 150),
                 border: rgba(255, 255, 255, 170),
-                bubble_out_bg: rgba(0, 104, 255, 215),
-                bubble_out_text: Color32::WHITE,
-                bubble_out_meta: rgba(230, 240, 255, 215),
-                bubble_in_bg: rgba(255, 255, 255, 185),
-                bubble_in_border: rgba(255, 255, 255, 220),
+                // Opaque bubbles, as in the dark variant.
+                bubble_in_border: rgba(255, 255, 255, 0),
                 ..self
             }
         }
@@ -176,14 +228,19 @@ impl ThemePalette {
         visuals.widgets.hovered.fg_stroke = Stroke::new(1.2_f32, self.text_primary);
         visuals.widgets.hovered.rounding = r;
 
-        visuals.widgets.active.bg_fill = self.primary;
-        visuals.widgets.active.weak_bg_fill = self.primary;
+        // `RichText::strong()` uses the *active* text colour everywhere, so it must be readable on
+        // normal surfaces: white here made bold labels vanish on light buttons. Pressed widgets
+        // get a light primary tint instead of a solid primary fill.
+        visuals.widgets.active.bg_fill =
+            self.primary
+                .linear_multiply(if self.is_dark { 0.45 } else { 0.22 });
+        visuals.widgets.active.weak_bg_fill = visuals.widgets.active.bg_fill;
         visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, self.primary);
-        visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, self.text_primary);
         visuals.widgets.active.rounding = r;
 
-        if self.is_glass {
-            // Softer, rounder geometry and floating shadows for popups/modals over glass.
+        {
+            // Rounded geometry and floating shadows for every block, popup and window.
             let g = Rounding::same(11.0);
             for w in [
                 &mut visuals.widgets.noninteractive,
@@ -194,9 +251,11 @@ impl ThemePalette {
             ] {
                 w.rounding = g;
             }
-            visuals.widgets.noninteractive.bg_fill = Color32::TRANSPARENT;
-            visuals.widgets.inactive.bg_fill = self.bg_input;
-            visuals.widgets.inactive.weak_bg_fill = self.bg_input;
+            if self.is_glass {
+                visuals.widgets.noninteractive.bg_fill = Color32::TRANSPARENT;
+                visuals.widgets.inactive.bg_fill = self.bg_input;
+                visuals.widgets.inactive.weak_bg_fill = self.bg_input;
+            }
             visuals.window_rounding = Rounding::same(18.0);
             visuals.menu_rounding = Rounding::same(14.0);
             visuals.window_stroke = Stroke::new(1.0_f32, self.border);
@@ -214,10 +273,40 @@ impl ThemePalette {
             };
         }
 
+        // macOS system text metrics (HIG: body 13 pt, small 11 pt, headline 15/17 pt).
+        {
+            use egui::{FontFamily, TextStyle};
+            style.text_styles = [
+                (
+                    TextStyle::Small,
+                    FontId::new(11.0, FontFamily::Proportional),
+                ),
+                (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
+                (
+                    TextStyle::Button,
+                    FontId::new(13.0, FontFamily::Proportional),
+                ),
+                (
+                    TextStyle::Heading,
+                    FontId::new(17.0, FontFamily::Proportional),
+                ),
+                (
+                    TextStyle::Monospace,
+                    FontId::new(12.0, FontFamily::Monospace),
+                ),
+            ]
+            .into();
+        }
+        // Smoother built-in transitions (hover, collapsing, scrolling); off for Reduce motion.
+        style.animation_time = if reduce_motion() { 0.0 } else { 0.16 };
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.button_padding = Vec2::new(10.0, 6.0);
-        style.spacing.scroll = egui::style::ScrollStyle::solid();
-        style.spacing.scroll.bar_width = 6.0;
+        // Thin overlay scrollbars (macOS/Telegram-like); the solid track looked like a stripe
+        // overlapping the chat area.
+        style.spacing.scroll = egui::style::ScrollStyle::floating();
+        // Fully hidden until scrolled/hovered (no dormant line at the list edge).
+        style.spacing.scroll.dormant_handle_opacity = 0.0;
+        style.spacing.scroll.dormant_background_opacity = 0.0;
         style.visuals = visuals;
         ctx.set_style(style);
     }
@@ -431,6 +520,7 @@ pub(super) fn matches_vn_query(haystack: &str, query_lower: &str, query_folded: 
     !query_folded.is_empty() && fold_vn_search(haystack).contains(query_folded)
 }
 
+#[allow(clippy::too_many_arguments)] // painter helper; callers pass borrowed caches
 fn paint_single_circle_avatar(
     painter: &egui::Painter,
     center: Pos2,
@@ -499,6 +589,7 @@ fn paint_single_circle_avatar(
 /// - For 1-1 contacts or groups with a custom uploaded group photo (`http(s)://...`), renders the circular image.
 /// - For groups without a single custom photo (`multi:...` or `None`), renders Zalo PC's `zavatar-multi`
 ///   composite layout (3-member triangle or 2x2 member grid with optional member count badge).
+#[allow(clippy::too_many_arguments)] // painter helper; callers pass borrowed caches
 pub(super) fn paint_user_avatar(
     painter: &egui::Painter,
     center: Pos2,
@@ -509,6 +600,12 @@ pub(super) fn paint_user_avatar(
     textures: &HashMap<String, TextureHandle>,
     loading: &mut HashSet<String>,
 ) {
+    // "Cloud của tôi" (Zalo's My Documents) gets Zalo's cloud badge, not a person's photo.
+    if name.contains("Cloud của tôi") || name.trim() == "My Documents" {
+        painter.circle_filled(center, radius, Color32::from_rgb(74, 144, 226));
+        draw_icon_cloud(painter, center, radius * 1.05, Color32::WHITE);
+        return;
+    }
     let raw_ava = avatar_url.map(str::trim).unwrap_or("");
     let has_single_custom_photo = !raw_ava.is_empty()
         && !raw_ava.starts_with("multi:")
@@ -732,6 +829,22 @@ pub mod lucide {
     pub const SLIDERS: &str = "\u{e29a}";
     pub const FOLDER_OPEN: &str = "\u{e247}";
     pub const CHEVRON_RIGHT: &str = "\u{e06f}";
+    // Verified against assets/fonts/lucide.ttf cmap (reply, forward, list-checks, info, trash-2,
+    // ellipsis, undo-2, download, circle).
+    pub const REPLY: &str = "\u{e22a}";
+    pub const FORWARD: &str = "\u{e229}";
+    pub const LIST_CHECKS: &str = "\u{e1d0}";
+    pub const INFO: &str = "\u{e0f9}";
+    pub const TRASH: &str = "\u{e18d}";
+    pub const ELLIPSIS: &str = "\u{e0b6}";
+    pub const UNDO: &str = "\u{e2a1}";
+    pub const DOWNLOAD: &str = "\u{e0b2}";
+    pub const CIRCLE: &str = "\u{e076}";
+    /// `pencil` (verified against the font cmap).
+    pub const PENCIL: &str = "\u{e1f9}";
+    pub const STICKER: &str = "\u{e302}";
+    pub const CLOCK: &str = "\u{e250}"; // clock-3
+    pub const FILE: &str = "\u{e0c0}";
     pub const CHEVRON_DOWN: &str = "\u{e06d}";
     pub const USER: &str = "\u{e19f}";
     pub const NEWSPAPER: &str = "\u{e124}";
@@ -763,10 +876,6 @@ pub(super) fn draw_icon_refresh(painter: &egui::Painter, center: Pos2, size: f32
 
 pub(super) fn draw_icon_sticker(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     draw_lucide_icon(painter, center, lucide::SMILE, size, color);
-}
-
-pub(super) fn draw_icon_send(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    draw_lucide_icon(painter, center, lucide::SEND, size, color);
 }
 
 pub(super) fn draw_icon_phone(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
@@ -817,10 +926,6 @@ pub(super) fn draw_icon_pin(painter: &egui::Painter, center: Pos2, size: f32, co
     draw_lucide_icon(painter, center, lucide::PIN, size, color);
 }
 
-pub(super) fn draw_icon_copy(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    draw_lucide_icon(painter, center, lucide::COPY, size, color);
-}
-
 pub(super) fn draw_icon_user_plus(
     painter: &egui::Painter,
     center: Pos2,
@@ -853,7 +958,7 @@ pub fn emoji_to_tex_key(emoji: &str) -> &'static str {
 
 pub(super) const APP_ICON_PNG: &[u8] = include_bytes!("../assets/app_icon.png");
 
-/// Decode the embedded 256x256 RGBA application icon for the OS window/taskbar (`ViewportBuilder::with_icon`).
+/// Decode the embedded RGBA application icon (1024 px master) for the OS window/taskbar (`ViewportBuilder::with_icon`).
 pub fn load_app_icon() -> Option<egui::IconData> {
     let img = image::load_from_memory(APP_ICON_PNG).ok()?.into_rgba8();
     let (width, height) = img.dimensions();
@@ -866,6 +971,7 @@ pub fn load_app_icon() -> Option<egui::IconData> {
 
 /// Render a dynamic 64x64 RGBA window/taskbar icon with a crisp anti-aliased red unread badge
 /// (`1`..`99+`) using a 3x5 bitmap pixel font renderer.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn load_app_icon_with_badge(unread_count: usize) -> Option<egui::IconData> {
     if unread_count == 0 {
         return load_app_icon();
@@ -1120,13 +1226,20 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
         egui::FontData::from_static(LUCIDE_BYTES),
     );
 
-    // 2. Bundled Vietnamese sans-serif so diacritics render identically on every OS.
-    //    System fonts below are only an optional aesthetic override, never a requirement.
+    // Keep Vietnamese coverage available when the preferred system font lacks a glyph.
     const BUNDLED_SANS: &[u8] = include_bytes!("../assets/fonts/BeVietnamPro-Regular.ttf");
     fonts.font_data.insert(
         "bundled_sans".to_owned(),
         egui::FontData::from_static(BUNDLED_SANS),
     );
+
+    // Load SF Pro from macOS at startup rather than redistributing Apple's font.
+    #[cfg(target_os = "macos")]
+    if let Ok(data) = std::fs::read("/System/Library/Fonts/SFNS.ttf") {
+        fonts
+            .font_data
+            .insert("macos_system".to_owned(), egui::FontData::from_owned(data));
+    }
 
     let font_candidates = [
         "C:\\Windows\\Fonts\\segoeui.ttf",
@@ -1177,7 +1290,7 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
         }
     }
 
-    // Fallback order: bundled sans guarantees Vietnamese coverage, CJK supplies Han/Kana/Hangul, Lucide supplies icon glyphs
+    // Prefer the native macOS face; bundled sans retains Vietnamese coverage on every OS.
     let prop = fonts
         .families
         .entry(egui::FontFamily::Proportional)
@@ -1185,6 +1298,9 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
     prop.insert(0, "bundled_sans".to_owned());
     if fonts.font_data.contains_key("vietnamese_font") {
         prop.insert(1, "vietnamese_font".to_owned());
+    }
+    if fonts.font_data.contains_key("macos_system") {
+        prop.insert(0, "macos_system".to_owned());
     }
     if fonts.font_data.contains_key("cjk_font") {
         prop.push("cjk_font".to_owned());
@@ -1205,4 +1321,52 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
     mono.push("lucide_font".to_owned());
 
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rounded_sidebar_when_outer_margin_is_present_fits_panel_clip() {
+        let pal = ThemePalette::light();
+        for (id, width, margin) in [
+            ("chat-card", 346.0, Margin::ZERO),
+            ("contacts-card", 318.0, Margin::symmetric(12.0, 14.0)),
+            ("feed-card", 310.0, Margin::symmetric(14.0, 14.0)),
+        ] {
+            let ctx = egui::Context::default();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1020.0, 700.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    pal.card_side_panel(id, width, margin).show(ctx, |ui| {
+                        ui.label("Danh sách hội thoại");
+                    });
+                },
+            );
+            let mut checked_card = false;
+            for clipped in output.shapes {
+                if let egui::epaint::Shape::Rect(rect) = clipped.shape {
+                    if rect.fill == pal.bg_sidebar {
+                        checked_card = true;
+                        assert!(
+                            rect.rect.right() <= clipped.clip_rect.right(),
+                            "{id}: rounded right edge {} exceeds panel clip {}",
+                            rect.rect.right(),
+                            clipped.clip_rect.right()
+                        );
+                        assert!(
+                            (rect.rect.right() - (width - ThemePalette::CARD_INSET)).abs() < 0.1
+                        );
+                        assert_eq!(rect.rounding.ne, ThemePalette::CARD_RADIUS);
+                        assert_eq!(rect.rounding.se, ThemePalette::CARD_RADIUS);
+                    }
+                }
+            }
+            assert!(checked_card, "{id}: card was not painted");
+        }
+    }
 }

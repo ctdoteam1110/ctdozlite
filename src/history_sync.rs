@@ -130,19 +130,32 @@ pub fn generate_sync_v2_ed25519_public_key(domain_tag: u8) -> String {
     base64::engine::general_purpose::STANDARD.encode(raw)
 }
 
-static CURRENT_SYNC_KEYS: std::sync::Mutex<Option<(rsa::RsaPrivateKey, String)>> =
-    std::sync::Mutex::new(None);
+/// Ephemeral RSA-2048 key for one phone-sync run: PKCS#8 DER of the private key (zeroed when
+/// dropped or cleared) and the SPKI Base64 public key sent to the server. The private key never
+/// leaves this mutex: `decrypt_with_sync_key` uses it in place.
+type SyncKeys = (zeroize::Zeroizing<Vec<u8>>, String);
+static CURRENT_SYNC_KEYS: std::sync::Mutex<Option<SyncKeys>> = std::sync::Mutex::new(None);
 
-/// Retrieve the active RSA 2048 keys used for mobile sync decryption without consuming them.
-pub fn get_sync_keys() -> Option<(rsa::RsaPrivateKey, String)> {
-    CURRENT_SYNC_KEYS.lock().ok().and_then(|g| g.clone())
+/// Unwrap `ciphertext` with the active sync private key without copying the key out of its slot.
+/// Returns the plaintext (zeroed on drop) and the matching public key.
+fn decrypt_with_sync_key(ciphertext: &[u8]) -> Result<(zeroize::Zeroizing<Vec<u8>>, String)> {
+    let guard = CURRENT_SYNC_KEYS
+        .lock()
+        .map_err(|_| anyhow::anyhow!("khoá RSA phiên đồng bộ không khả dụng"))?;
+    let (pkcs8, pub_key) = guard
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Không tìm thấy khoá RSA phiên đồng bộ hiện tại"))?;
+    Ok((rsa_pkcs1_v15_decrypt(pkcs8, ciphertext)?, pub_key.clone()))
 }
 
 /// Retrieve the active RSA 2048 public key.
 pub fn get_sync_public_key() -> Option<String> {
-    CURRENT_SYNC_KEYS.lock().ok().and_then(|g| g.as_ref().map(|(_, pub_k)| pub_k.clone()))
+    CURRENT_SYNC_KEYS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(_, pub_k)| pub_k.clone()))
 }
-/// Clear the active sync keys once sync is finalized.
+/// Clear the active sync keys once sync is finalized; `Zeroizing` wipes the private key bytes.
 pub fn clear_sync_keys() {
     if let Ok(mut g) = CURRENT_SYNC_KEYS.lock() {
         *g = None;
@@ -152,23 +165,50 @@ pub fn clear_sync_keys() {
 /// Generate a genuine 2048-bit RSA SubjectPublicKeyInfo (`SPKI`) DER Base64 key
 /// (`294 bytes` -> `392 chars` Base64 starting with `MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...`),
 /// matching `sync-message-key-generator` (`main-startup.js:598226`) for `pullMobileMsg` (`cmd 12000`).
+/// Keys come from AWS-LC (constant-time RSA, see ADR-0005); the wire format is unchanged.
 pub fn generate_sync_public_key() -> String {
-    use rsa::pkcs8::EncodePublicKey;
-    use rsa::{RsaPrivateKey, RsaPublicKey};
-    use base64::Engine;
-
-    let mut rng = rsa::rand_core::OsRng;
-    if let Ok(priv_key) = RsaPrivateKey::new(&mut rng, 2048) {
-        let pub_key = RsaPublicKey::from(&priv_key);
-        if let Ok(der) = pub_key.to_public_key_der() {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(der.as_bytes());
+    match generate_rsa_sync_keypair() {
+        Some((pkcs8, b64)) => {
             if let Ok(mut g) = CURRENT_SYNC_KEYS.lock() {
-                *g = Some((priv_key, b64.clone()));
+                *g = Some((pkcs8, b64.clone()));
             }
-            return b64;
+            b64
         }
+        None => String::new(),
     }
-    String::new()
+}
+
+/// New RSA-2048 key pair as (PKCS#8 DER private key, SPKI DER Base64 public key). aws-lc-rs zeroes
+/// its own DER buffer on drop; our copy is held in `Zeroizing` from the start.
+fn generate_rsa_sync_keypair() -> Option<(zeroize::Zeroizing<Vec<u8>>, String)> {
+    use aws_lc_rs::encoding::AsDer;
+    use aws_lc_rs::rsa::{KeySize, PrivateDecryptingKey};
+    use base64::Engine;
+    let key = PrivateDecryptingKey::generate(KeySize::Rsa2048).ok()?;
+    let spki = key.public_key().as_der().ok()?;
+    let pkcs8 = key.as_der().ok()?;
+    Some((
+        zeroize::Zeroizing::new(pkcs8.as_ref().to_vec()),
+        base64::engine::general_purpose::STANDARD.encode(spki.as_ref()),
+    ))
+}
+
+/// RSAES-PKCS1-v1_5 decryption of the backup key the phone encrypted to our sync public key.
+/// Same padding as before (`rsa::Pkcs1v15Encrypt`); AWS-LC performs it in constant time with
+/// blinding, which closes RUSTSEC-2023-0071 (Marvin) for this path.
+fn rsa_pkcs1_v15_decrypt(pkcs8: &[u8], ciphertext: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    use aws_lc_rs::rsa::{Pkcs1PrivateDecryptingKey, PrivateDecryptingKey};
+    let key = PrivateDecryptingKey::from_pkcs8(pkcs8)
+        .map_err(|_| anyhow::anyhow!("khoá RSA phiên đồng bộ không hợp lệ"))?;
+    let key = Pkcs1PrivateDecryptingKey::new(key)
+        .map_err(|_| anyhow::anyhow!("khoá RSA phiên đồng bộ không hợp lệ"))?;
+    let mut out = zeroize::Zeroizing::new(vec![0u8; key.min_output_size()]);
+    let n = key
+        .decrypt(ciphertext, &mut out)
+        .map_err(|_| anyhow::anyhow!("không giải mã được khoá bản sao lưu"))?
+        .len();
+    out.truncate(n);
+    Ok(out)
 }
 /// Synchronize 1-1 and group messages from the user's phone and Zalo cloud (`Đồng bộ tin nhắn từ điện thoại`, #68).
 ///
@@ -255,10 +295,7 @@ where
             let finish_deadline = std::time::Instant::now() + Duration::from_secs(45);
             while std::time::Instant::now() < finish_deadline {
                 if let Some(ref st) = last_mobile_sync_status() {
-                    if st.contains("thành công") {
-                        on_progress(1.0, st.clone());
-                        break;
-                    } else if st.contains("Không thể") || st.contains("thất bại") {
+                    if st.contains("thành công") || st.contains("Không thể") || st.contains("thất bại") {
                         on_progress(1.0, st.clone());
                         break;
                     } else {
@@ -414,7 +451,9 @@ where
     let added = db_added.max(after_total.saturating_sub(before_total));
     let active_threads = threads.iter().filter(|t| !t.messages.is_empty()).count();
     let final_msg = if let Some(phone_note) = last_mobile_sync_status() {
-        format!("{phone_note} · Đã đồng bộ Cloud/Nhóm: +{added} tin nhắn ({active_threads} hội thoại)")
+        format!(
+            "{phone_note} · Đã đồng bộ Cloud/Nhóm: +{added} tin nhắn ({active_threads} hội thoại)"
+        )
     } else {
         format!("✅ Đã gửi yêu cầu tới điện thoại & đồng bộ Cloud/Nhóm: +{added} tin nhắn ({active_threads} hội thoại). Hãy mở Zalo trên điện thoại để xác nhận nếu muốn kéo tin nhắn 1-1 cũ.")
     };
@@ -429,28 +468,23 @@ pub async fn import_mobile_backup_container(
     url: &str,
     encrypted_key: &str,
 ) -> Result<usize> {
+    use crate::store::StoredMessage;
     use aes::cipher::{BlockDecryptMut, KeyIvInit};
     use base64::Engine;
-    use rsa::Pkcs1v15Encrypt;
     use rusqlite::Connection;
     use serde_json::json;
     use std::collections::HashMap;
     use std::io::Cursor;
-    use crate::store::StoredMessage;
 
     if url.is_empty() {
         anyhow::bail!("empty backup url");
     }
 
-    let (priv_key, pub_key_b64) = get_sync_keys()
-        .ok_or_else(|| anyhow::anyhow!("Không tìm thấy khoá RSA phiên đồng bộ hiện tại"))?;
-
-    let raw_key = if !encrypted_key.is_empty() {
-        let enc_bytes = base64::engine::general_purpose::STANDARD.decode(encrypted_key)?;
-        priv_key.decrypt(Pkcs1v15Encrypt, &enc_bytes)?
-    } else {
+    if encrypted_key.is_empty() {
         anyhow::bail!("encrypted_key is empty");
-    };
+    }
+    let enc_bytes = base64::engine::general_purpose::STANDARD.decode(encrypted_key)?;
+    let (raw_key, pub_key_b64) = decrypt_with_sync_key(&enc_bytes)?;
 
     let uin = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
     let sek = s.zpw_sek.clone().unwrap_or_default();
@@ -530,8 +564,8 @@ pub async fn import_mobile_backup_container(
         offset += 4;
 
         let stem = name.trim_end_matches(".db");
-        if stem.starts_with("group_") {
-            if let Ok(gid) = stem[6..].parse::<i64>() {
+        if let Some(rest) = stem.strip_prefix("group_") {
+            if let Ok(gid) = rest.parse::<i64>() {
                 gids.push(gid);
             }
         } else if let Ok(fid) = stem.parse::<i64>() {
@@ -562,7 +596,9 @@ pub async fn import_mobile_backup_container(
     });
     let enc_params = s.encoded_params(&noise_body)?;
     let znoise_url = format!("https://zwid.api.zalo.me/api/znoise?{}", s.common_params());
-    let resp = s.post_form(&znoise_url, format!("params={enc_params}")).await?;
+    let resp = s
+        .post_form(&znoise_url, format!("params={enc_params}"))
+        .await?;
     let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
 
     let mut id_map: HashMap<String, String> = HashMap::new();
@@ -584,11 +620,18 @@ pub async fn import_mobile_backup_container(
     }
 
     let mut store = crate::store::MessageStore::open("zalo_history.db")?;
-    let temp_dir = std::env::temp_dir().join(format!("ctdozlite_sync_{}", crate::param_cipher::random_hex(8)));
+    let temp_dir = std::env::temp_dir().join(format!(
+        "ctdozlite_sync_{}",
+        crate::param_cipher::random_hex(8)
+    ));
     let _ = std::fs::create_dir_all(&temp_dir);
 
     let my_uid = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
-    let my_name = s.login.as_ref().map(|l| l.display_name.clone()).unwrap_or_else(|| "Tôi".into());
+    let my_name = s
+        .login
+        .as_ref()
+        .map(|l| l.display_name.clone())
+        .unwrap_or_else(|| "Tôi".into());
 
     // Pass 1: write every per-thread SQLite file out of the container.
     let mut curr_offset = 0;
@@ -616,6 +659,10 @@ pub async fn import_mobile_backup_container(
     let my_sender_id = infer_backup_owner_sender_id(extracted.iter().map(|(p, _)| p.as_path()));
 
     let mut total_imported = 0;
+    // Per phone `MsgType`: (rows, empty content, duration-like content). Numbers only — used
+    // to map call/other types from real backups without recording message content.
+    let mut type_stats: std::collections::BTreeMap<i64, (usize, usize, usize)> =
+        std::collections::BTreeMap::new();
 
     // Pass 2: import messages.
     for (temp_db_path, thread_id) in &extracted {
@@ -647,10 +694,39 @@ pub async fn import_mobile_backup_container(
         };
 
         for r in rows.flatten() {
-            let (sender_id_num, cli_msg_id, glb_msg_id, _status, msg_type_num, ts, content_opt, bin_net_opt) = r;
+            let (
+                sender_id_num,
+                cli_msg_id,
+                glb_msg_id,
+                status_num,
+                msg_type_num,
+                ts,
+                content_opt,
+                bin_net_opt,
+            ) = r;
+            {
+                let e = type_stats
+                    .entry(msg_type_num)
+                    .or_insert((0usize, 0usize, 0usize));
+                e.0 += 1;
+                let c = content_opt.as_deref().unwrap_or("").trim();
+                if c.is_empty() {
+                    e.1 += 1;
+                } else if looks_like_duration(c) {
+                    e.2 += 1;
+                }
+            }
             let is_outgoing = my_sender_id == Some(sender_id_num);
-            let sender_id = if is_outgoing { my_uid.clone() } else { thread_id.clone() };
-            let sender_name = if is_outgoing { my_name.clone() } else { String::new() };
+            let sender_id = if is_outgoing {
+                my_uid.clone()
+            } else {
+                thread_id.clone()
+            };
+            let sender_name = if is_outgoing {
+                my_name.clone()
+            } else {
+                String::new()
+            };
 
             let msg_id = if glb_msg_id > 0 {
                 glb_msg_id.to_string()
@@ -702,19 +778,38 @@ pub async fn import_mobile_backup_container(
                 msg_type,
                 ts,
                 is_outgoing,
-                raw_json: String::new(),
+                // Keep the phone's own type/status so later builds can render calls and other
+                // kinds this importer does not decode yet (nested: no clash with sticker keys).
+                raw_json: serde_json::json!({
+                    "phone_backup": { "type": msg_type_num, "status": status_num }
+                })
+                .to_string(),
             };
 
             if store.upsert_message(&sm).unwrap_or(false) {
                 total_imported += 1;
             } else if my_sender_id.is_some() {
                 // Repair rows stored by earlier imports that misattributed the owner's messages.
-                let _ = store.set_message_direction(&sm.msg_id, sm.is_outgoing, &sm.sender_id, &sm.sender_name);
+                let _ = store.set_message_direction(
+                    &sm.msg_id,
+                    sm.is_outgoing,
+                    &sm.sender_id,
+                    &sm.sender_name,
+                );
             }
         }
     }
 
     let _ = std::fs::remove_dir_all(&temp_dir);
+    // Local diagnostics next to zalo_history.db: counts per phone message type only.
+    let stats = serde_json::json!({
+        "owner_detected": my_sender_id.is_some(),
+        "types": type_stats
+            .iter()
+            .map(|(t, (n, empty, dur))| serde_json::json!({"type": t, "rows": n, "empty": empty, "duration_like": dur}))
+            .collect::<Vec<_>>(),
+    });
+    let _ = std::fs::write("phone_sync_types.json", stats.to_string());
 
     let mut cached_threads = crate::chat::load_threads_cache();
     let _ = store.hydrate_threads(&mut cached_threads, 50);
@@ -727,19 +822,29 @@ pub async fn import_mobile_backup_container(
     Ok(total_imported)
 }
 
+/// `m:ss` / `mm:ss` / `h:mm:ss` — how the phone backup stores call durations as content.
+fn looks_like_duration(text: &str) -> bool {
+    let parts: Vec<&str> = text.split(':').collect();
+    (2..=3).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 3 && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Pick the backup owner's mobile `SenderId`: the sender found in the most per-thread
 /// databases. Requires presence in at least two threads and a strict lead over the runner-up,
 /// otherwise returns `None` (messages are then imported as incoming rather than guessed).
-fn infer_backup_owner_sender_id<'a>(
-    dbs: impl Iterator<Item = &'a std::path::Path>,
-) -> Option<i64> {
+fn infer_backup_owner_sender_id<'a>(dbs: impl Iterator<Item = &'a std::path::Path>) -> Option<i64> {
     let mut threads_per_sender: std::collections::HashMap<i64, usize> =
         std::collections::HashMap::new();
+    // One-to-one conversations (exactly two senders) identify the owner unambiguously: the
+    // owner is in every one of them, each partner in only one.
+    let mut pairs_per_sender: std::collections::HashMap<i64, usize> =
+        std::collections::HashMap::new();
     for path in dbs {
-        let Ok(conn) = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ) else {
+        let Ok(conn) =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        else {
             continue;
         };
         let Ok(mut stmt) = conn.prepare("SELECT DISTINCT SenderId FROM ChatContent") else {
@@ -748,12 +853,28 @@ fn infer_backup_owner_sender_id<'a>(
         let Ok(rows) = stmt.query_map([], |row| row.get::<_, i64>(0)) else {
             continue;
         };
-        for sid in rows.flatten().filter(|sid| *sid > 0) {
+        // No `> 0` filter: the phone may store the owner's own rows with SenderId 0, and
+        // dropping it made a frequent group member win (their messages became "mine" and the
+        // owner's became incoming).
+        let senders: std::collections::HashSet<i64> = rows.flatten().collect();
+        if senders.len() == 2 {
+            for sid in &senders {
+                *pairs_per_sender.entry(*sid).or_default() += 1;
+            }
+        }
+        for sid in senders {
             *threads_per_sender.entry(sid).or_default() += 1;
         }
     }
+    let mut pairs: Vec<(i64, usize)> = pairs_per_sender.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    match pairs.as_slice() {
+        [(sid, n), (_, second), ..] if *n >= 2 && n > second => return Some(*sid),
+        [(sid, n)] if *n >= 2 => return Some(*sid),
+        _ => {}
+    }
     let mut ranked: Vec<(i64, usize)> = threads_per_sender.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.1));
     match ranked.as_slice() {
         [(sid, n), (_, second), ..] if *n >= 2 && n > second => Some(*sid),
         [(sid, n)] if *n >= 2 => Some(*sid),
@@ -773,7 +894,11 @@ pub struct SyncV2Keys {
 /// (`/usr/bin:/bin:...`), so the usual install locations are probed explicitly.
 fn find_node() -> Option<std::path::PathBuf> {
     let from_path = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).map(|d| d.join("node")).collect::<Vec<_>>())
+        .map(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("node"))
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let fixed = [
         "/opt/homebrew/bin/node",
@@ -789,7 +914,10 @@ fn find_node() -> Option<std::path::PathBuf> {
 fn find_sync_v2_helper() -> Option<std::path::PathBuf> {
     const NAME: &str = "sync_v2_helper.js";
     let mut candidates = Vec::new();
-    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+    {
         candidates.push(dir.join(NAME));
         candidates.push(dir.join("../Resources").join(NAME));
     }
@@ -803,13 +931,19 @@ fn find_sync_v2_helper() -> Option<std::path::PathBuf> {
 fn run_sync_v2_helper(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
     let node = find_node().context("không tìm thấy Node.js (cần để đồng bộ v2 với điện thoại)")?;
     let script = find_sync_v2_helper().context("không tìm thấy sync_v2_helper.js")?;
-    Ok(std::process::Command::new(node).arg(script).args(args).output()?)
+    Ok(std::process::Command::new(node)
+        .arg(script)
+        .args(args)
+        .output()?)
 }
 
 pub fn generate_sync_v2_keys() -> Result<SyncV2Keys> {
     let out = run_sync_v2_helper(&["gen-keys".as_ref()])?;
     if !out.status.success() {
-        anyhow::bail!("node sync_v2_helper.js gen-keys failed: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "node sync_v2_helper.js gen-keys failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     let keys: SyncV2Keys = serde_json::from_slice(&out.stdout)?;
     Ok(keys)
@@ -833,7 +967,8 @@ pub async fn import_sync_v2_meta(s: &Session, url: &str) -> Result<()> {
     }
 
     let bytes = resp.bytes().await?;
-    let temp_meta = std::env::temp_dir().join(format!("meta_{}.bin", crate::param_cipher::random_hex(6)));
+    let temp_meta =
+        std::env::temp_dir().join(format!("meta_{}.bin", crate::param_cipher::random_hex(6)));
     std::fs::write(&temp_meta, &bytes)?;
 
     let out = run_sync_v2_helper(&["decrypt-meta".as_ref(), temp_meta.as_os_str()])?;
@@ -841,7 +976,10 @@ pub async fn import_sync_v2_meta(s: &Session, url: &str) -> Result<()> {
     let _ = std::fs::remove_file(&temp_meta);
 
     if !out.status.success() {
-        anyhow::bail!("decrypt-meta failed: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "decrypt-meta failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(())
 }
@@ -874,7 +1012,9 @@ fn parse_vli(buf: &[u8], mut offset: usize) -> Option<(u64, usize)> {
             return Some((result, offset));
         }
         shift += 7;
-        if shift >= 64 { return None; }
+        if shift >= 64 {
+            return None;
+        }
     }
     None
 }
@@ -903,7 +1043,9 @@ fn parse_message(buf: &[u8]) -> Option<ParsedProtoMsg> {
                 let (len, next) = parse_vli(buf, offset)?;
                 offset = next;
                 let len = len as usize;
-                if offset + len > buf.len() { return None; }
+                if offset + len > buf.len() {
+                    return None;
+                }
                 let bytes = &buf[offset..offset + len];
                 offset += len;
                 match field_num {
@@ -934,7 +1076,9 @@ fn parse_partition(buf: &[u8]) -> Option<ParsedProtoPartition> {
                 let (len, next) = parse_vli(buf, offset)?;
                 offset = next;
                 let len = len as usize;
-                if offset + len > buf.len() { return None; }
+                if offset + len > buf.len() {
+                    return None;
+                }
                 part.id = String::from_utf8_lossy(&buf[offset..offset + len]).into_owned();
                 offset += len;
             }
@@ -942,7 +1086,9 @@ fn parse_partition(buf: &[u8]) -> Option<ParsedProtoPartition> {
                 let (len, next) = parse_vli(buf, offset)?;
                 offset = next;
                 let len = len as usize;
-                if offset + len > buf.len() { return None; }
+                if offset + len > buf.len() {
+                    return None;
+                }
                 if let Some(m) = parse_message(&buf[offset..offset + len]) {
                     part.messages.push(m);
                 }
@@ -975,7 +1121,9 @@ pub fn parse_sync_chunk(buf: &[u8]) -> Option<Vec<ParsedProtoPartition>> {
                 let (len, next) = parse_vli(buf, offset)?;
                 offset = next;
                 let len = len as usize;
-                if offset + len > buf.len() { return None; }
+                if offset + len > buf.len() {
+                    return None;
+                }
                 if let Some(p) = parse_partition(&buf[offset..offset + len]) {
                     parts.push(p);
                 }
@@ -1013,7 +1161,8 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
     }
 
     let bytes = resp.bytes().await?;
-    let temp_msg = std::env::temp_dir().join(format!("msg_{}.bin", crate::param_cipher::random_hex(6)));
+    let temp_msg =
+        std::env::temp_dir().join(format!("msg_{}.bin", crate::param_cipher::random_hex(6)));
     std::fs::write(&temp_msg, &bytes)?;
 
     let out = run_sync_v2_helper(&["decrypt-message".as_ref(), temp_msg.as_os_str()])?;
@@ -1021,7 +1170,10 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
     let _ = std::fs::remove_file(&temp_msg);
 
     if !out.status.success() {
-        anyhow::bail!("decrypt-message failed: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "decrypt-message failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     let decrypted_bytes = std::fs::read("sync_v2_message.bin")?;
@@ -1033,14 +1185,22 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
     let partitions = parse_sync_chunk(&decompressed).unwrap_or_default();
     let db_path = crate::store::db_path_for_account(&uin);
     let mut store = crate::store::MessageStore::open(&db_path)?;
-    let my_name = s.login.as_ref().map(|l| l.display_name.clone()).unwrap_or_else(|| "Tôi".into());
+    let my_name = s
+        .login
+        .as_ref()
+        .map(|l| l.display_name.clone())
+        .unwrap_or_else(|| "Tôi".into());
 
     let mut imported = 0;
     for part in partitions {
         let thread_id = part.id.clone();
         for m in part.messages {
             let is_outgoing = m.sender_id == uin;
-            let sender_name = if is_outgoing { my_name.clone() } else { String::new() };
+            let sender_name = if is_outgoing {
+                my_name.clone()
+            } else {
+                String::new()
+            };
             let msg_id = if !m.global_id.is_empty() && m.global_id != "0" {
                 m.global_id
             } else {
@@ -1050,7 +1210,11 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
             let sm = crate::store::StoredMessage {
                 msg_id,
                 thread_id: thread_id.clone(),
-                sender_id: if is_outgoing { uin.clone() } else { thread_id.clone() },
+                sender_id: if is_outgoing {
+                    uin.clone()
+                } else {
+                    thread_id.clone()
+                },
                 sender_name,
                 text: m.content,
                 msg_type: "webchat".into(),
@@ -1087,30 +1251,62 @@ mod tests {
     fn backup_thread_db(dir: &std::path::Path, name: &str, senders: &[i64]) -> std::path::PathBuf {
         let path = dir.join(name);
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute("CREATE TABLE ChatContent (SenderId INTEGER)", []).unwrap();
+        conn.execute("CREATE TABLE ChatContent (SenderId INTEGER)", [])
+            .unwrap();
         for s in senders {
-            conn.execute("INSERT INTO ChatContent VALUES (?1)", [s]).unwrap();
+            conn.execute("INSERT INTO ChatContent VALUES (?1)", [s])
+                .unwrap();
         }
         path
     }
 
     #[test]
     fn backup_owner_is_sender_present_in_most_threads() {
-        let dir = std::env::temp_dir().join(format!("owner_test_{}", crate::param_cipher::random_hex(6)));
+        let dir =
+            std::env::temp_dir().join(format!("owner_test_{}", crate::param_cipher::random_hex(6)));
         std::fs::create_dir_all(&dir).unwrap();
         let dbs = [
             backup_thread_db(&dir, "a.db", &[777, 101, 777]),
             backup_thread_db(&dir, "b.db", &[202, 777]),
             backup_thread_db(&dir, "c.db", &[303]),
         ];
-        assert_eq!(infer_backup_owner_sender_id(dbs.iter().map(|p| p.as_path())), Some(777));
+        assert_eq!(
+            infer_backup_owner_sender_id(dbs.iter().map(|p| p.as_path())),
+            Some(777)
+        );
+        // Owner rows stored with SenderId 0 while one member shows up in several groups.
+        let zero = [
+            backup_thread_db(&dir, "z1.db", &[0, 11]),
+            backup_thread_db(&dir, "z2.db", &[0, 12]),
+            backup_thread_db(&dir, "z3.db", &[0, 13]),
+            backup_thread_db(&dir, "g1.db", &[0, 99, 21, 22]),
+            backup_thread_db(&dir, "g2.db", &[0, 99, 23, 24]),
+            backup_thread_db(&dir, "g3.db", &[99, 25, 26]),
+        ];
+        assert_eq!(
+            infer_backup_owner_sender_id(zero.iter().map(|p| p.as_path())),
+            Some(0)
+        );
+        assert!(
+            looks_like_duration("0:43")
+                && looks_like_duration("31:55")
+                && looks_like_duration("1:02:03")
+        );
+        assert!(
+            !looks_like_duration("25 triệu")
+                && !looks_like_duration("a:b")
+                && !looks_like_duration("12")
+        );
 
         // A tie or a single thread is not enough evidence.
         let tie = [
             backup_thread_db(&dir, "d.db", &[1, 2]),
             backup_thread_db(&dir, "e.db", &[1, 2]),
         ];
-        assert_eq!(infer_backup_owner_sender_id(tie.iter().map(|p| p.as_path())), None);
+        assert_eq!(
+            infer_backup_owner_sender_id(tie.iter().map(|p| p.as_path())),
+            None
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1152,8 +1348,62 @@ mod tests {
         assert_eq!(next_cursor(&thread_with(&["", "out_2"]), "5"), None);
     }
 
+    /// Known-answer test for the RSA swap (ADR-0005): a PKCS#1 v1.5 ciphertext produced by
+    /// OpenSSL/LibreSSL (`pkeyutl -encrypt -pkeyopt rsa_padding_mode:pkcs1`) must decrypt to the
+    /// exact plaintext. The key below is a throwaway generated for this test only.
+    #[test]
+    fn rsa_pkcs1_v15_decrypt_matches_openssl_known_answer() {
+        use base64::Engine;
+        const TEST_ONLY_PKCS8: &str = "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC33TjF3BlOqjhMJvUqYn1+lJAifzo6qhOTnwNlYyUzBtTSkb9WLToqL9IqsCsMcQKqX6fayLXDnpcJcRaGrumBAlxwxU2HA/hS7280W25z56cvl403fQ26LbcZhjKR/3oXQIqX6sWUcuUKpVhWVXAKPdTm0IruxY/OEC6jX2omLwRvg03yFPGjENbGKVwo1HT7nK0WxwkxjjSO/0QhAzdHJBvvy8u7s2H4yL0gd4HglMgnAIz/bZJtQtqnhJJcy2StnIjovdEMSXI2UvHoRgtwTIIBer2v9tkygJKgiwwXgTex1nUPNaxNKM72xn/LXSl/Lom3gXEjmFhzPCnM/l4LAgMBAAECggEBAJ7T7igVcpMevhUijiR4AhpncX8rUny80L5z3XYmyEqk+xGPL67c0OMCflW76uQLd5b/nLuFKGb8x1Izq5ba4AE+reYIumkIh+n0xaZ/2REsqqKVEzs8vq/2r7XP1D2EaM5PRann95e+DJc+r+mcUnW2ZgShX3LVnN0P44njcYnbGu8iVSkG/P4v4kCQeQcHVQGhzTPSEfOuC/YWyyfJvbLCPlmpRNHmjG42h4+6+aTd4/RfF1nFUY/DEv6D216RHuNYo11tuY3p2MMMboXPdGC1qboZqA+fSDxL1ZROx1Gi6hO+2k9PyRoBFAFNEudHtDAwV7p9uaCnhJ9G5Y9e2xECgYEA2f7x6/Ht943IP6trmD9CKNcnpYzGAIvD6BIfUuk03ADPQgcGOyrlHqEUudZqLmXoVsC8wbGgg99LkjWN+YkJD81eIYBsnE5bwRgjQ3PzRWn5CmFhxRi24YqFbyZUtffW2iDY+xsFoAIPbmBOaSQO5YgZtvvHZ3fin7J61SfHhakCgYEA1+r+UJSbRZNyKbLo85kwIp4hK8ePUTwZY5JWQw/yG/coQWTguKNieOo7YeHgwHHhbDYtrJP5Sxt7O+c3syEb6K6hnKKDmA3dhwYUN5p5lsPpiyuUSbHkO05fx3pkOgXFmQyjWqStnHCaa2gzSnpPTayaTm+bZYqDgkmIPMzObpMCgYB+Ck3N4b95FlzlkzNOf6S9AElICrCguC65C2FZCsUpPr6WqoELzK1UnEXjfPk/gmRnZGC+jPkFxiFnk9dWo8i9fjwimqIxbYzXhCE/atcJF1CKk+t3jeaPWQv1S/BGldl/nOZXqTQDY62QX9Z2LAcA50QW7FRKmqJJO2SRwcI2oQKBgQDB8j+GOjZPBOajNiWxyoRGVCwPmy3NFmLn4ebCTmx3Wkc6llaVA43MdvnoLnEn7CNEhFX6kuB26rSDVmnd6XucQmDAxenWh33Zb0hxubxGBKyfagHFQJl1/CxkjjfBNrYLiCKjpRCdWTgcCnkoCT160/O3SOEZEJaYTVym4ID9KQKBgBOjKF6buXYCr9D9UejL8t0KUtsZKWMFrVKaqDWO/nVUB66rqzlapeIMM219fxssStobZpf7sCrFOF3DVXUvYS0uNOi9LHAd8PXVMhPIOgWkWGKZrjtXHLNkf55vJaPv5YEoCa2wacoe66VdmhlkBXtZ4Ujldofz/tcbrot88bRb";
+        const CIPHERTEXT: &str = "Ph/sL5YFrDAnYTb0xk+9Ti3BOKreP9/KP31AcJpYiStGQRfcS1MYxfG4audb48SDc7e2hs0kHVxgKyabduooxEZXljJNTvlTdkW5r7CTwPPFlkOnJi7gx7QTwjzLjgd8uGIQk5N6FLS2s4vlsaGRbAqb1G0IkOgHnwhRCUdIadUzJ+xMWqT2bLDQxC5g9muXVdAszhObMcmvbk2B4eC1lSze0+0eR4LOtXcw8ePYzxsX9DMpXBFz7upnN+C9pcbEq6EVkU7z+qGVIApTeJR48ZmU85Brbw9fUgjkJV/85Yms8aYN3pCVAUq8Nu7zTPk0yUJJ4K3MUX490fTT9oS5EQ==";
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let key = b64.decode(TEST_ONLY_PKCS8).unwrap();
+        let ct = b64.decode(CIPHERTEXT).unwrap();
+        let pt = rsa_pkcs1_v15_decrypt(&key, &ct).expect("decrypts");
+        assert_eq!(pt.as_slice(), b"ctdozlite-kat:32-byte-aes-key!!!");
+        // Tampered ciphertext must be rejected, not yield garbage.
+        let mut bad = ct.clone();
+        bad[0] ^= 0x01;
+        assert!(rsa_pkcs1_v15_decrypt(&key, &bad).map(|p| *p != *pt).unwrap_or(true));
+    }
+
+    #[test]
+    fn sync_keypair_round_trips_through_public_key() {
+        use aws_lc_rs::rsa::{Pkcs1PublicEncryptingKey, PublicEncryptingKey};
+        use base64::Engine;
+        let (pkcs8, spki_b64) = generate_rsa_sync_keypair().unwrap();
+        let spki = base64::engine::general_purpose::STANDARD.decode(spki_b64).unwrap();
+        let pub_key = Pkcs1PublicEncryptingKey::new(PublicEncryptingKey::from_der(&spki).unwrap()).unwrap();
+        let msg = b"0123456789abcdef0123456789abcdef";
+        let mut ct = vec![0u8; pub_key.ciphertext_size()];
+        let ct = pub_key.encrypt(msg, &mut ct).unwrap().to_vec();
+        assert_eq!(rsa_pkcs1_v15_decrypt(&pkcs8, &ct).unwrap().as_slice(), msg);
+    }
+
+    /// Tests that touch the process-wide sync key slot run one at a time.
+    static SYNC_KEY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn stored_sync_key_decrypts_in_place_and_clear_removes_it() {
+        let _serial = SYNC_KEY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use aws_lc_rs::rsa::{Pkcs1PublicEncryptingKey, PublicEncryptingKey};
+        use base64::Engine;
+        let spki_b64 = generate_sync_public_key();
+        let spki = base64::engine::general_purpose::STANDARD.decode(&spki_b64).unwrap();
+        let pub_key = Pkcs1PublicEncryptingKey::new(PublicEncryptingKey::from_der(&spki).unwrap()).unwrap();
+        let mut buf = vec![0u8; pub_key.ciphertext_size()];
+        let ct = pub_key.encrypt(b"backup-key", &mut buf).unwrap().to_vec();
+        let (pt, pk) = decrypt_with_sync_key(&ct).unwrap();
+        assert_eq!(pt.as_slice(), b"backup-key");
+        assert_eq!(pk, spki_b64);
+        clear_sync_keys();
+        assert!(decrypt_with_sync_key(&ct).is_err());
+        assert!(get_sync_public_key().is_none());
+    }
+
     #[test]
     fn generate_sync_public_key_produces_valid_rsa2048_spki_der_base64() {
+        let _serial = SYNC_KEY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use base64::Engine;
         let k1 = generate_sync_public_key();
         let k2 = generate_sync_public_key();
@@ -1175,7 +1425,10 @@ mod tests {
         let ik = generate_sync_v2_ed25519_public_key(0xA1);
         let ek = generate_sync_v2_ed25519_public_key(0xB2);
         assert_ne!(ik, ek);
-        assert!(ik.starts_with("B"), "DJB 0x05 prefix must base64-encode to 'B': {ik}");
+        assert!(
+            ik.starts_with("B"),
+            "DJB 0x05 prefix must base64-encode to 'B': {ik}"
+        );
         let raw = base64::engine::general_purpose::STANDARD
             .decode(&ik)
             .expect("valid base64");

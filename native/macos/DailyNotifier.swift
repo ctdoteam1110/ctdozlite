@@ -8,8 +8,8 @@ struct Payload: Decodable {
     let id: String
     let sound: Bool
     func validate() -> Bool {
-        // Never accept chat content, names, or other caller-controlled notification text.
-        title == "Zalo" && body == "You have a new message." && id.count == 64 && id.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+        // Bound preview text while keeping routing identifiers opaque.
+        !title.isEmpty && title.count <= 120 && body.count <= 320 && id.count == 64 && id.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
     }
 }
 func statusName(_ status: UNAuthorizationStatus) -> String {
@@ -30,8 +30,13 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         let helper = Bundle.main.bundleURL
         let parent = helper.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         guard parent.pathExtension == "app", parent != helper else { completionHandler(); exit(0) }
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("ctdozlite", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+            try response.notification.request.identifier.write(to: support.appendingPathComponent("notification-click"), atomically: true, encoding: .utf8)
+        } catch { completionHandler(); return }
         let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = false
+        configuration.activates = true
         configuration.addsToRecentItems = false
         NSWorkspace.shared.openApplication(at: parent, configuration: configuration) { _, _ in
             completionHandler()
@@ -44,8 +49,8 @@ if args == ["--self-test"] {
     guard Bundle.main.bundleIdentifier == bundleID, Bundle.main.bundleURL.pathExtension == "app" else { exit(1) }
     let valid = Payload(title: "Zalo", body: "You have a new message.", id: String(repeating: "a", count: 64), sound: false)
     let invalid = Payload(title: "Private Name", body: "Chat content", id: "raw-message", sound: true)
-    guard valid.validate(), !invalid.validate(), authorized(.authorized), !authorized(.denied), statusName(.notDetermined) == "notDetermined" else { exit(1) }
-    print("SELF_TEST: bundle identity, generic-only payload, opaque identity, and authorization gates PASS")
+    guard valid.validate(), Payload(title: "Người gửi thử", body: "Tin nhắn thử", id: String(repeating: "b", count: 64), sound: false).validate(), !Payload(title: String(repeating: "x", count: 121), body: "", id: String(repeating: "b", count: 64), sound: false).validate(), !invalid.validate(), authorized(.authorized), !authorized(.denied), statusName(.notDetermined) == "notDetermined" else { exit(1) }
+    print("SELF_TEST: bundle identity, bounded preview payload, opaque identity, and authorization gates PASS")
     exit(0)
 }
 guard Bundle.main.bundleIdentifier == bundleID, Bundle.main.bundleURL.pathExtension == "app" else {

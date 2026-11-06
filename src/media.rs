@@ -9,7 +9,10 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use opus::{Channels as OpusChannels, Decoder, Encoder};
 use std::collections::VecDeque;
 use std::net::UdpSocket;
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -19,12 +22,9 @@ const FRAME_SAMPLES: usize = 320; // 20 ms @ 16 kHz
 static SELECTED_MIC_DEVICE: Mutex<String> = Mutex::new(String::new());
 static SELECTED_CAMERA_DEVICE: Mutex<String> = Mutex::new(String::new());
 static CACHED_DEVICES: Mutex<Option<(Vec<String>, Vec<String>)>> = Mutex::new(None);
-static SHARED_CAM_H264: Mutex<(u64, Vec<u8>, Vec<u8>)> =
-    Mutex::new((0, Vec::new(), Vec::new()));
-static MIC_GAIN_PERCENT: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(100);
-static MIC_LEVEL_PERMILLE: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static SHARED_CAM_H264: Mutex<(u64, Vec<u8>, Vec<u8>)> = Mutex::new((0, Vec::new(), Vec::new()));
+static MIC_GAIN_PERCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+static MIC_LEVEL_PERMILLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static REMOTE_AUDIO_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -70,13 +70,18 @@ pub fn set_selected_camera_device(name: &str) {
 }
 
 pub fn selected_mic_device() -> String {
-    SELECTED_MIC_DEVICE.lock().map(|g| g.clone()).unwrap_or_default()
+    SELECTED_MIC_DEVICE
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
 }
 
 pub fn selected_camera_device() -> String {
-    SELECTED_CAMERA_DEVICE.lock().map(|g| g.clone()).unwrap_or_default()
+    SELECTED_CAMERA_DEVICE
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
 }
-
 
 /// Check whether `ffmpeg` is installed and reachable in `PATH` (cached after first probe).
 pub fn is_ffmpeg_available() -> bool {
@@ -95,6 +100,13 @@ pub fn is_ffmpeg_available() -> bool {
     });
     *FFMPEG_OK
 }
+/// The last enumerated `(mic_devices, camera_devices)` without touching the hardware. Settings
+/// uses this so merely opening it never probes the mic/camera (which made macOS ask for
+/// microphone access every time).
+pub fn cached_media_devices() -> Option<(Vec<String>, Vec<String>)> {
+    CACHED_DEVICES.lock().ok().and_then(|g| g.clone())
+}
+
 /// Return cached `(mic_devices, camera_devices)` or enumerate once (with `refresh=true` to rescan).
 pub fn list_media_devices(refresh: bool) -> (Vec<String>, Vec<String>) {
     if !refresh {
@@ -132,8 +144,16 @@ fn enumerate_ffmpeg_cameras() -> Vec<String> {
     {
         use std::os::windows::process::CommandExt;
         let mut cmd = std::process::Command::new("ffmpeg");
-        cmd.args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
-            .creation_flags(0x08000000);
+        cmd.args([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ])
+        .creation_flags(0x08000000);
         if let Ok(out) = cmd.output() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let mut cams = Vec::new();
@@ -179,7 +199,15 @@ fn enumerate_ffmpeg_cameras() -> Vec<String> {
     #[cfg(target_os = "macos")]
     {
         let mut cmd = std::process::Command::new("ffmpeg");
-        cmd.args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""]);
+        cmd.args([
+            "-hide_banner",
+            "-f",
+            "avfoundation",
+            "-list_devices",
+            "true",
+            "-i",
+            "",
+        ]);
         if let Ok(out) = cmd.output() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let mut cams = Vec::new();
@@ -380,7 +408,10 @@ pub fn push_rtcp_inbox(pkt: &[u8]) {
 }
 
 fn drain_rtcp_inbox() -> Vec<Vec<u8>> {
-    RTCP_INBOX.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default()
+    RTCP_INBOX
+        .lock()
+        .map(|mut q| q.drain(..).collect())
+        .unwrap_or_default()
 }
 
 fn clear_rtcp_inbox() {
@@ -441,7 +472,8 @@ fn mix_peer_bridge_audio(for_slot: u16, frame: &mut [f32]) {
 fn wire_requests_keyframe(wire: &[u8]) -> bool {
     match unwrap_zalo_relay_rtp(wire) {
         Some(inner) => {
-            matches!(inner.get(1), Some(b) if (200..=207).contains(b)) && rtcp_requests_keyframe(inner)
+            matches!(inner.get(1), Some(b) if (200..=207).contains(b))
+                && rtcp_requests_keyframe(inner)
         }
         None => false,
     }
@@ -572,6 +604,7 @@ fn build_group_audio_rtp_packet(
 /// - Extension ID 5 (`transport-wide-cc-02`, len=2): `0x51, twcc_hi, twcc_lo`
 /// - Extension ID 12 (`Zalo simulcast layer info`, len=3): `0xC2, layer_byte, pic_hi, pic_lo`
 /// - Extension ID 13 (`Zalo 56-bit NTP timestamp`, len=7): `0xD6, sec24_be[0..3], frac32_be[0..4], 0x00`
+#[allow(clippy::too_many_arguments)] // wire/layout fields map one-to-one; a struct would only rename them
 fn build_group_video_rtp_packet(
     pt: u8,
     marker: bool,
@@ -659,7 +692,11 @@ fn packetize_zalo_au(au: &[u8], max_payload: usize) -> Vec<(u8, Vec<u8>)> {
     if au.is_empty() {
         return Vec::new();
     }
-    let pt = if au_has_idr(au) { VIDEO_PT_FRAG } else { VIDEO_PT };
+    let pt = if au_has_idr(au) {
+        VIDEO_PT_FRAG
+    } else {
+        VIDEO_PT
+    };
     if au.len() <= max_payload || max_payload < 3 {
         return vec![(pt, au.to_vec())];
     }
@@ -981,7 +1018,10 @@ fn spawn_camera_capture_thread(
             if !is_ffmpeg_available() {
                 if !warned_missing {
                     warned_missing = true;
-                    crate::voip_log::line("VCAM", "ffmpeg not found in PATH; camera capture unavailable");
+                    crate::voip_log::line(
+                        "VCAM",
+                        "ffmpeg not found in PATH; camera capture unavailable",
+                    );
                     if let Some(ref gtx) = gui_tx {
                         let _ = gtx.send(crate::gui::GuiEvent::StatusUpdate(
                             "⚠️ Không tìm thấy ffmpeg trong PATH để bật Camera (cài bằng: winget install Gyan.FFmpeg)".into(),
@@ -1087,12 +1127,18 @@ fn spawn_camera_capture_thread(
 
                 match cmd.spawn() {
                     Ok(c) => {
-                        crate::voip_log::line("VCAM", format!("started webcam capture: {current_dev}"));
+                        crate::voip_log::line(
+                            "VCAM",
+                            format!("started webcam capture: {current_dev}"),
+                        );
                         let _ = want_keyframe.swap(false, Ordering::Relaxed);
                         child_opt = Some(c);
                     }
                     Err(e) => {
-                        crate::voip_log::line("VCAM", format!("webcam spawn failed ({current_dev}): {e}"));
+                        crate::voip_log::line(
+                            "VCAM",
+                            format!("webcam spawn failed ({current_dev}): {e}"),
+                        );
                         thread::sleep(Duration::from_millis(500));
                         continue;
                     }
@@ -1110,8 +1156,16 @@ fn spawn_camera_capture_thread(
                 Ok(0) | Err(_) => {
                     let _ = child.kill();
                     child_opt = None;
-                    if stream_acc.is_empty() && !current_dev.is_empty() && !failed_devs.contains(&current_dev) {
-                        crate::voip_log::line("VCAM", format!("webcam device produced 0 bytes, marking failed: {current_dev}"));
+                    if stream_acc.is_empty()
+                        && !current_dev.is_empty()
+                        && !failed_devs.contains(&current_dev)
+                    {
+                        crate::voip_log::line(
+                            "VCAM",
+                            format!(
+                                "webcam device produced 0 bytes, marking failed: {current_dev}"
+                            ),
+                        );
                         failed_devs.push(current_dev.clone());
                     }
                     thread::sleep(Duration::from_millis(250));
@@ -1150,12 +1204,9 @@ fn find_aud_delimiter(buf: &[u8], start_from: usize) -> Option<usize> {
     if buf.len() < start_from + 6 {
         return None;
     }
-    for i in start_from..=buf.len() - 6 {
-        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1 && (buf[i + 4] & 0x1F) == 9 {
-            return Some(i);
-        }
-    }
-    None
+    (start_from..=buf.len() - 6).find(|&i| {
+        buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1 && (buf[i + 4] & 0x1F) == 9
+    })
 }
 
 fn strip_leading_aud(au: &[u8]) -> Vec<u8> {
@@ -1271,7 +1322,12 @@ struct TxStats {
 }
 
 /// Send one datagram and record the outcome.
-fn send_dgram(sock: &tokio::net::UdpSocket, data: &[u8], target: std::net::SocketAddr, st: &mut TxStats) {
+fn send_dgram(
+    sock: &tokio::net::UdpSocket,
+    data: &[u8],
+    target: std::net::SocketAddr,
+    st: &mut TxStats,
+) {
     match sock.try_send_to(data, target) {
         Ok(n) if n == data.len() => st.ok += 1,
         Ok(_) => st.short += 1,
@@ -1518,11 +1574,17 @@ fn run_media_loop(
     // Opus codecs
     let mut encoder = match Encoder::new(SAMPLE_RATE, OpusChannels::Mono, opus::Application::Voip) {
         Ok(e) => e,
-        Err(e) => { eprintln!("media: encoder err {e}"); return; }
+        Err(e) => {
+            eprintln!("media: encoder err {e}");
+            return;
+        }
     };
     let mut decoder = match Decoder::new(SAMPLE_RATE, OpusChannels::Mono) {
         Ok(d) => d,
-        Err(e) => { eprintln!("media: decoder err {e}"); return; }
+        Err(e) => {
+            eprintln!("media: decoder err {e}");
+            return;
+        }
     };
 
     let mut seq: u16 = 0;
@@ -1659,7 +1721,7 @@ fn run_media_loop(
             last_video_tx = std::time::Instant::now();
             let force_kf = vid_frame_no == 0
                 || vid_gop_pos >= H264_PSLICES.len()
-                || vid_frame_no % VIDEO_IDR_INTERVAL_FRAMES == 0
+                || vid_frame_no.is_multiple_of(VIDEO_IDR_INTERVAL_FRAMES)
                 || want_keyframe.swap(false, Ordering::Relaxed);
 
             // Drain latest live webcam access unit if available
@@ -1854,10 +1916,24 @@ fn run_media_loop(
                                 send_dgram(rtcp_sender, &wire, rtarget, &mut txs);
                             }
                         }
-                        wl.rtcp(">", crate::voip_log::Via::RtcpSock, rtcp_type, wire.len(), &rtcp_addr, &rtcp_pkt);
+                        wl.rtcp(
+                            ">",
+                            crate::voip_log::Via::RtcpSock,
+                            rtcp_type,
+                            wire.len(),
+                            &rtcp_addr,
+                            &rtcp_pkt,
+                        );
                     } else {
                         send_dgram(rtcp_sender, &rtcp_pkt, target, &mut txs);
-                        wl.rtcp(">", crate::voip_log::Via::RtcpSock, rtcp_pkt[0], rtcp_pkt.len(), &rtcp_addr, &rtcp_pkt);
+                        wl.rtcp(
+                            ">",
+                            crate::voip_log::Via::RtcpSock,
+                            rtcp_pkt[0],
+                            rtcp_pkt.len(),
+                            &rtcp_addr,
+                            &rtcp_pkt,
+                        );
                     }
                 }
             }
@@ -1881,7 +1957,11 @@ fn run_media_loop(
             let Some((n, peer)) = recv_info else {
                 break;
             };
-            incoming_dgrams.push((crate::voip_log::Via::RtpSock, peer.to_string(), buf[..n].to_vec()));
+            incoming_dgrams.push((
+                crate::voip_log::Via::RtpSock,
+                peer.to_string(),
+                buf[..n].to_vec(),
+            ));
         }
         for (via, peer_s, raw_pkt) in incoming_dgrams {
             let n = raw_pkt.len();
@@ -1891,7 +1971,8 @@ fn run_media_loop(
                 && matches!(raw_pkt[1], 0x00 | 0x7E)
                 && u16::from_le_bytes([raw_pkt[18], raw_pkt[19]]) == 0x0032
             {
-                let res_code = i32::from_le_bytes([raw_pkt[21], raw_pkt[22], raw_pkt[23], raw_pkt[24]]);
+                let res_code =
+                    i32::from_le_bytes([raw_pkt[21], raw_pkt[22], raw_pkt[23], raw_pkt[24]]);
                 if res_code == 0 {
                     let mut idx = 25usize;
                     let mut added = false;
@@ -1945,7 +2026,11 @@ fn run_media_loop(
                 {
                     room_partners.push(sender_uid);
                 }
-                if sub_cmd_20 == 0x0C && sender_uid != 0 && sender_uid != from_uid_u32 && relay_token != 0 {
+                if sub_cmd_20 == 0x0C
+                    && sender_uid != 0
+                    && sender_uid != from_uid_u32
+                    && relay_token != 0
+                {
                     // Partner just announced video spatial layers: immediately subscribe to their video!
                     if let (Some(tsock), Some(rtarget)) = (&udp_rtp_sock, rtp_sock_addr) {
                         let sub_pkt = crate::call::build_zrtp_group_subscribe_video_packet(
@@ -1995,7 +2080,10 @@ fn run_media_loop(
                     }
                     if wl.rtcp("<", via, raw_pkt[0], n, &peer_s, inner_rtp) {
                         want_keyframe.store(true, Ordering::Relaxed);
-                        crate::call::trace_line("RTCP<", format!("from={peer_s} PLI/FIR -> force IDR"));
+                        crate::call::trace_line(
+                            "RTCP<",
+                            format!("from={peer_s} PLI/FIR -> force IDR"),
+                        );
                     }
                     continue;
                 }
@@ -2015,13 +2103,10 @@ fn run_media_loop(
                 static LOGGED_RX: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
                 let cnt = LOGGED_RX.fetch_add(1, Ordering::Relaxed);
-                if cnt < 16 || cnt % 100 == 0 {
+                if cnt < 16 || cnt.is_multiple_of(100) {
                     crate::call::trace_line(
                         "RTP<",
-                        format!(
-                            "from={peer_s} len={n} outer=0x{:02x} pt={pt}",
-                            raw_pkt[0]
-                        ),
+                        format!("from={peer_s} len={n} outer=0x{:02x} pt={pt}", raw_pkt[0]),
                     );
                 }
                 if pt == 112 {
@@ -2056,8 +2141,7 @@ fn run_media_loop(
                                 if let (Some(tx), Some(ctx)) =
                                     (gui_tx_extra.clone(), egui_ctx_extra.clone())
                                 {
-                                    let (tx2, rx2) =
-                                        std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+                                    let (tx2, rx2) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
                                     let stop_v2 = stop.clone();
                                     let synced_v2 = Arc::new(AtomicBool::new(false));
                                     thread::spawn(move || {
@@ -2073,9 +2157,10 @@ fn run_media_loop(
                                     h264_tx_secondary = Some(tx2);
                                 }
                             }
-                            if let (Some(payload), Some(tx2)) =
-                                (extract_rtp_opus_payload(inner_rtp), h264_tx_secondary.as_ref())
-                            {
+                            if let (Some(payload), Some(tx2)) = (
+                                extract_rtp_opus_payload(inner_rtp),
+                                h264_tx_secondary.as_ref(),
+                            ) {
                                 depacketize_h264(payload, &mut fu_a_buf_secondary, tx2);
                             }
                         }
@@ -2114,10 +2199,24 @@ fn run_media_loop(
                             send_dgram(rtcp_sender, &wire, rtarget, &mut txs);
                         }
                     }
-                    wl.rtcp(">", crate::voip_log::Via::RtcpSock, rtcp_type, wire.len(), &rtcp_addr, &pkt);
+                    wl.rtcp(
+                        ">",
+                        crate::voip_log::Via::RtcpSock,
+                        rtcp_type,
+                        wire.len(),
+                        &rtcp_addr,
+                        &pkt,
+                    );
                 } else {
                     send_dgram(rtcp_sender, &pkt, target, &mut txs);
-                    wl.rtcp(">", crate::voip_log::Via::RtcpSock, pkt[0], pkt.len(), &rtcp_addr, &pkt);
+                    wl.rtcp(
+                        ">",
+                        crate::voip_log::Via::RtcpSock,
+                        pkt[0],
+                        pkt.len(),
+                        &rtcp_addr,
+                        &pkt,
+                    );
                 }
                 pli_sent += 1;
             }
@@ -2231,22 +2330,38 @@ fn trim_black_borders(rgba: &[u8], w: usize, h: usize) -> (usize, usize, Vec<u8>
     let y1 = h / 4;
     let y2 = (h * 3) / 4;
     let mut left = 0usize;
-    while left < w / 2 && !is_non_black(left, mid_y) && !is_non_black(left, y1) && !is_non_black(left, y2) {
+    while left < w / 2
+        && !is_non_black(left, mid_y)
+        && !is_non_black(left, y1)
+        && !is_non_black(left, y2)
+    {
         left += 1;
     }
     let mut right = w;
-    while right > w / 2 && !is_non_black(right - 1, mid_y) && !is_non_black(right - 1, y1) && !is_non_black(right - 1, y2) {
+    while right > w / 2
+        && !is_non_black(right - 1, mid_y)
+        && !is_non_black(right - 1, y1)
+        && !is_non_black(right - 1, y2)
+    {
         right -= 1;
     }
     let mid_x = w / 2;
     let x1 = w / 4;
     let x2 = (w * 3) / 4;
     let mut top = 0usize;
-    while top < h / 2 && !is_non_black(mid_x, top) && !is_non_black(x1, top) && !is_non_black(x2, top) {
+    while top < h / 2
+        && !is_non_black(mid_x, top)
+        && !is_non_black(x1, top)
+        && !is_non_black(x2, top)
+    {
         top += 1;
     }
     let mut bottom = h;
-    while bottom > h / 2 && !is_non_black(mid_x, bottom - 1) && !is_non_black(x1, bottom - 1) && !is_non_black(x2, bottom - 1) {
+    while bottom > h / 2
+        && !is_non_black(mid_x, bottom - 1)
+        && !is_non_black(x1, bottom - 1)
+        && !is_non_black(x2, bottom - 1)
+    {
         bottom -= 1;
     }
     let sym_x = left.min(w.saturating_sub(right));
@@ -2373,10 +2488,12 @@ fn run_h264_ffmpeg_decoder(
                             );
                         } else {
                             dropped += 1;
-                            if dropped == 1 || dropped % 100 == 0 {
+                            if dropped == 1 || dropped.is_multiple_of(100) {
                                 crate::voip_log::line(
                                     "VDEC",
-                                    format!("waiting for SPS/IDR, dropped {dropped} P access units"),
+                                    format!(
+                                        "waiting for SPS/IDR, dropped {dropped} P access units"
+                                    ),
                                 );
                             }
                             continue;
@@ -2385,12 +2502,15 @@ fn run_h264_ffmpeg_decoder(
                     // The AUD marks the access-unit boundary so the parser can emit the previous
                     // frame immediately instead of waiting for the next slice header.
                     if stdin.write_all(H264_AUD).is_err() || stdin.write_all(&nal).is_err() {
-                        crate::voip_log::line("VDEC", format!("ffmpeg stdin closed after {fed} access units"));
+                        crate::voip_log::line(
+                            "VDEC",
+                            format!("ffmpeg stdin closed after {fed} access units"),
+                        );
                         break;
                     }
                     let _ = stdin.flush();
                     fed += 1;
-                    if fed == 1 || fed % 100 == 0 {
+                    if fed == 1 || fed.is_multiple_of(100) {
                         crate::voip_log::line("VDEC", format!("fed {fed} access units to ffmpeg"));
                     }
                 }
@@ -2405,12 +2525,11 @@ fn run_h264_ffmpeg_decoder(
     while !stop.load(Ordering::Relaxed) {
         if stdout.read_exact(&mut raw_frame).is_ok() {
             decoded += 1;
-            if decoded == 1 || decoded % 100 == 0 {
+            if decoded == 1 || decoded.is_multiple_of(100) {
                 crate::voip_log::line("VDEC", format!("decoded frame #{decoded}"));
             }
             let (cw, ch, cropped) = trim_black_borders(&raw_frame, VID_W, VID_H);
-            let color_img =
-                eframe::egui::ColorImage::from_rgba_unmultiplied([cw, ch], &cropped);
+            let color_img = eframe::egui::ColorImage::from_rgba_unmultiplied([cw, ch], &cropped);
             let _ = gui_tx.send(crate::gui::GuiEvent::StickerImageReady {
                 key: tex_key.clone(),
                 image: color_img,
@@ -2430,30 +2549,44 @@ mod tests {
 
     #[test]
     fn test_unwrap_zalo_relay_rtp_all_formats() {
-        let mut sample_rtp = vec![0x80, 112, 0x00, 0x01, 0x00, 0x00, 0x01, 0x40, 0x12, 0x34, 0x56, 0x78];
+        let mut sample_rtp = vec![
+            0x80, 112, 0x00, 0x01, 0x00, 0x00, 0x01, 0x40, 0x12, 0x34, 0x56, 0x78,
+        ];
         sample_rtp.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
 
         // 1. Raw RTP (0x80)
         let r1 = unwrap_zalo_relay_rtp(&sample_rtp).expect("raw rtp");
-        assert_eq!(extract_rtp_opus_payload(r1), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+        assert_eq!(
+            extract_rtp_opus_payload(r1),
+            Some(&[0xAA, 0xBB, 0xCC, 0xDD][..])
+        );
 
         // 2. 1-byte relay header (0x04 incoming RTP)
         let mut p4 = vec![0x04];
         p4.extend_from_slice(&sample_rtp);
         let r2 = unwrap_zalo_relay_rtp(&p4).expect("0x04 relay rtp");
-        assert_eq!(extract_rtp_opus_payload(r2), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+        assert_eq!(
+            extract_rtp_opus_payload(r2),
+            Some(&[0xAA, 0xBB, 0xCC, 0xDD][..])
+        );
 
         // 3. 5-byte relay header (0x03 caller / 0x05 callee + 4-byte token LE)
         let mut p5 = vec![0x03, 0x78, 0x56, 0x34, 0x12];
         p5.extend_from_slice(&sample_rtp);
         let r3 = unwrap_zalo_relay_rtp(&p5).expect("0x03 relay rtp");
-        assert_eq!(extract_rtp_opus_payload(r3), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+        assert_eq!(
+            extract_rtp_opus_payload(r3),
+            Some(&[0xAA, 0xBB, 0xCC, 0xDD][..])
+        );
 
         // 4. 9-byte 0x7F relay header (cmd = 6)
         let mut p9 = vec![0x7F, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x06, 0x00];
         p9.extend_from_slice(&sample_rtp);
         let r4 = unwrap_zalo_relay_rtp(&p9).expect("0x7F relay rtp");
-        assert_eq!(extract_rtp_opus_payload(r4), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+        assert_eq!(
+            extract_rtp_opus_payload(r4),
+            Some(&[0xAA, 0xBB, 0xCC, 0xDD][..])
+        );
     }
 
     #[test]
@@ -2489,7 +2622,9 @@ mod tests {
         let mut c = vec![0x80, 201, 0, 1, 0, 0, 0, 1];
         c.extend_from_slice(&[0x81, 206, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2]);
         assert!(rtcp_requests_keyframe(&c));
-        let fir = [0x84, 206, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0];
+        let fir = [
+            0x84, 206, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0,
+        ];
         assert!(rtcp_requests_keyframe(&fir));
         let rr = [0x80, 201, 0, 1, 0, 0, 0, 1];
         assert!(!rtcp_requests_keyframe(&rr));
@@ -2544,9 +2679,15 @@ mod tests {
     #[test]
     fn small_au_uses_pt97_for_p_and_pt98_for_idr() {
         let p_au = annexb_au(&[H264_PSLICE]);
-        assert_eq!(packetize_zalo_au(&p_au, RTP_MAX_PAYLOAD), vec![(VIDEO_PT, p_au)]);
+        assert_eq!(
+            packetize_zalo_au(&p_au, RTP_MAX_PAYLOAD),
+            vec![(VIDEO_PT, p_au)]
+        );
         let idr_au = annexb_au(&[H264_SPS, H264_PPS, H264_IDR]);
-        assert_eq!(packetize_zalo_au(&idr_au, RTP_MAX_PAYLOAD), vec![(VIDEO_PT_FRAG, idr_au)]);
+        assert_eq!(
+            packetize_zalo_au(&idr_au, RTP_MAX_PAYLOAD),
+            vec![(VIDEO_PT_FRAG, idr_au)]
+        );
     }
 
     #[test]
@@ -2555,7 +2696,9 @@ mod tests {
         let parts = packetize_zalo_au(&au, RTP_MAX_PAYLOAD);
         assert!(parts.len() >= 3);
         // keyframe (has an IDR slice) -> PT 98 fragments, each within the payload limit
-        assert!(parts.iter().all(|(pt, p)| *pt == VIDEO_PT_FRAG && p.len() <= RTP_MAX_PAYLOAD));
+        assert!(parts
+            .iter()
+            .all(|(pt, p)| *pt == VIDEO_PT_FRAG && p.len() <= RTP_MAX_PAYLOAD));
         // header bytes exactly as captured: 1c 80 / 1c 00 / 1c 40
         assert_eq!(&parts[0].1[..2], &[0x1C, 0x80]);
         assert_eq!(&parts[1].1[..2], &[0x1C, 0x00]);
@@ -2623,7 +2766,10 @@ mod tests {
         assert_eq!(parts[0].1[..2], [0x1C, 0x80]);
         assert_eq!(parts[2].1[..2], [0x1C, 0x40]);
         let sizes: Vec<usize> = parts.iter().map(|(_, p)| p.len()).collect();
-        assert!(sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 2, "{sizes:?}");
+        assert!(
+            sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 2,
+            "{sizes:?}"
+        );
         // AU exactly at the limit stays whole
         let whole = vec![0u8; RTP_MAX_PAYLOAD];
         assert_eq!(packetize_zalo_au(&whole, RTP_MAX_PAYLOAD).len(), 1);
@@ -2640,7 +2786,9 @@ mod tests {
 
     #[test]
     fn sync_point_needs_sps_or_idr() {
-        assert!(au_is_sync_point(&annexb_au(&[H264_SPS, H264_PPS, H264_IDR])));
+        assert!(au_is_sync_point(&annexb_au(&[
+            H264_SPS, H264_PPS, H264_IDR
+        ])));
         assert!(au_is_sync_point(&annexb_au(&[H264_IDR])));
         assert!(!au_is_sync_point(&annexb_au(&[H264_PSLICE])));
     }
@@ -2693,8 +2841,14 @@ mod tests {
 
     #[test]
     fn sender_report_has_peer_shape_and_parses() {
-        let blk = RxStats { started: true, base_seq: 1, max_seq: 1, received: 1, ..Default::default() }
-            .block(9, 0, 0);
+        let blk = RxStats {
+            started: true,
+            base_seq: 1,
+            max_seq: 1,
+            received: 1,
+            ..Default::default()
+        }
+        .block(9, 0, 0);
         let sr = build_sender_report(0x1111_2222, (0xAABB_CCDD, 0x1122_3344), 90000, 5, 600, blk);
         assert_eq!(sr.len(), 52); // same length as the peer's SR (len=52)
         assert_eq!(&sr[..4], &[0x81, 200, 0, 12]);
@@ -2719,9 +2873,13 @@ mod tests {
         assert_eq!(&remb[12..16], b"REMB");
         assert_eq!(remb[16], 1);
         let exp = remb[17] >> 2;
-        let mant = (((remb[17] & 0x03) as u32) << 16) | (u16::from_be_bytes([remb[18], remb[19]]) as u32);
+        let mant =
+            (((remb[17] & 0x03) as u32) << 16) | (u16::from_be_bytes([remb[18], remb[19]]) as u32);
         let decoded_bps = mant << exp;
-        assert!((1_490_000..=1_500_000).contains(&decoded_bps), "decoded={decoded_bps}");
+        assert!(
+            (1_490_000..=1_500_000).contains(&decoded_bps),
+            "decoded={decoded_bps}"
+        );
         assert_eq!(&remb[20..24], &0x1bba1962u32.to_be_bytes());
 
         let nego = build_zrtp_incall_negotiate_packet(0x1bba1962, 0x3955e3d2, 7);
@@ -2729,8 +2887,14 @@ mod tests {
         assert_eq!(&nego[0..2], &[0x01, 0x01]);
         assert_eq!(u16::from_le_bytes([nego[18], nego[19]]), 0x0020);
         assert_eq!(nego[20], 0x14);
-        assert_eq!(u32::from_le_bytes([nego[21], nego[22], nego[23], nego[24]]), 11);
-        assert_eq!(&nego[25..36], &[0, 0, 0, 7, 2, 0x0B, 0x02, 0xD0, 0x1E, 0x29, 0x01]);
+        assert_eq!(
+            u32::from_le_bytes([nego[21], nego[22], nego[23], nego[24]]),
+            11
+        );
+        assert_eq!(
+            &nego[25..36],
+            &[0, 0, 0, 7, 2, 0x0B, 0x02, 0xD0, 0x1E, 0x29, 0x01]
+        );
 
         let gvid = build_group_video_rtp_packet(
             97,
@@ -2775,7 +2939,10 @@ mod tests {
         fake_stream.extend_from_slice(H264_AUD);
         fake_stream.extend_from_slice(&[0, 0, 0, 1, 0x41, 9, 9]);
         assert_eq!(find_aud_delimiter(&fake_stream, 6), Some(second_offset));
-        assert_eq!(strip_leading_aud(&fake_stream[..second_offset]), vec![0, 0, 0, 1, 0x67, 1, 2, 3]);
+        assert_eq!(
+            strip_leading_aud(&fake_stream[..second_offset]),
+            vec![0, 0, 0, 1, 0x67, 1, 2, 3]
+        );
         // Pillarboxed 64x48 with 16px black bars on left and right -> crops to 32x48
         let mut padded = vec![0u8; 64 * 48 * 4];
         for y in 0..48 {

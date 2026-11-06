@@ -44,11 +44,18 @@ pub(super) fn render_sticker_widget(
         return false;
     };
 
-    let key = format!("stk_{cid}_{sid}");
-    let url = if cid == 0 && (1..=30).contains(&sid) {
-        format!("https://stc-chat.zdn.vn/images/stickers/default/thumb/{sid}.png")
+    // Store stickers load their animation frame strip (`stks_` keeps it apart from the static
+    // `stk_` thumbnails cached by older builds).
+    let (key, url) = if cid == 0 && (1..=30).contains(&sid) {
+        (
+            format!("stk_{cid}_{sid}"),
+            format!("https://stc-chat.zdn.vn/images/stickers/default/thumb/{sid}.png"),
+        )
     } else {
-        format!("https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={sid}&size=130")
+        (
+            format!("stks_{cid}_{sid}"),
+            format!("{}?eid={sid}&size=130", crate::endpoints::STICKER_SPRITE),
+        )
     };
 
     if !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
@@ -61,11 +68,43 @@ pub(super) fn render_sticker_widget(
     }
 
     if let Some(tex) = sticker_textures.get(&key) {
-        ui.image((tex.id(), Vec2::new(116.0, 116.0)));
+        paint_sticker_frames(ui, tex, Vec2::splat(116.0));
         true
     } else {
         false
     }
+}
+
+/// Draw a sticker texture; a horizontal frame strip plays at Zalo's 250 ms per frame
+/// (first frame only with Reduce Motion).
+pub(super) fn paint_sticker_frames(
+    ui: &mut egui::Ui,
+    tex: &TextureHandle,
+    size: Vec2,
+) -> egui::Response {
+    let [w, h] = tex.size();
+    let frames = if h > 0 && w >= 2 * h {
+        (w / h).max(1)
+    } else {
+        1
+    };
+    let frame = if frames > 1 && !reduce_motion() {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(250));
+        ((ui.input(|i| i.time) * 4.0) as usize) % frames
+    } else {
+        0
+    };
+    let step = 1.0 / frames as f32;
+    let uv = Rect::from_min_max(
+        Pos2::new(frame as f32 * step, 0.0),
+        Pos2::new((frame + 1) as f32 * step, 1.0),
+    );
+    // Painted directly: `egui::Image` keeps the *texture's* aspect ratio, so a 16:1 frame
+    // strip squeezed into the square slot came out as a thin 116×7 band.
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().image(tex.id(), rect, uv, Color32::WHITE);
+    resp
 }
 
 #[derive(Debug, Clone)]
@@ -191,98 +230,90 @@ pub(super) fn render_call_card_widget(
     card: &CallCardView,
     pal: &ThemePalette,
     card_width: f32,
+    outgoing: bool,
 ) -> Option<BubbleAction> {
     let mut action = None;
-    let accent = if card.is_missed_or_failed {
-        Color32::from_rgb(239, 68, 68)
+    // Ink of the bubble the card sits in (own bubbles are dark graphite with light text).
+    let (ink, meta) = if outgoing {
+        (pal.bubble_out_text, pal.bubble_out_meta)
     } else {
-        Color32::from_rgb(34, 197, 94)
+        (pal.bubble_in_text, pal.bubble_in_meta)
+    };
+    // Only a missed / failed call keeps a red accent; everything else follows the palette.
+    let missed = Color32::from_rgb(239, 68, 68);
+    let icon_col = if card.is_missed_or_failed {
+        missed
+    } else {
+        ink
+    };
+    let status_col = if card.is_missed_or_failed {
+        missed
+    } else {
+        meta
     };
 
     ui.set_width(card_width);
-    let text_col_w = (card_width - 52.0).max(110.0);
     ui.vertical(|ui| {
         ui.set_width(card_width);
+        ui.spacing_mut().item_spacing = Vec2::new(10.0, 2.0);
+        let text_col_w = (card_width - 40.0 - 10.0).max(110.0);
         ui.horizontal(|ui| {
-            let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 40.0), Sense::hover());
-            ui.painter().circle_filled(
-                icon_rect.center(),
-                20.0,
-                accent.linear_multiply(if pal.is_dark { 0.18 } else { 0.14 }),
-            );
-            ui.painter().circle_stroke(
-                icon_rect.center(),
-                20.0,
-                Stroke::new(1.2_f32, accent.linear_multiply(0.55)),
-            );
+            let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+            ui.painter()
+                .circle_filled(icon_rect.center(), 20.0, ink.gamma_multiply(0.12));
             if card.is_video {
-                draw_icon_video(ui.painter(), icon_rect.center(), 18.0, accent);
+                draw_icon_video(ui.painter(), icon_rect.center(), 17.0, icon_col);
             } else {
-                draw_icon_phone(ui.painter(), icon_rect.center(), 18.0, accent);
+                draw_icon_phone(ui.painter(), icon_rect.center(), 17.0, icon_col);
             }
-
-            ui.add_space(6.0);
-            ui.vertical(|ui| {
-                ui.set_width(text_col_w);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(&card.title)
-                            .size(13.8)
-                            .color(pal.text_primary)
-                            .strong(),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(2.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(&card.status_badge)
-                            .size(11.8)
-                            .color(accent)
-                            .strong(),
-                    )
-                    .wrap(),
-                );
-                if let Some(reason) = &card.reason {
-                    ui.add_space(3.0);
+            // Title and status centred on the icon.
+            ui.allocate_ui_with_layout(
+                Vec2::new(text_col_w, 40.0),
+                Layout::top_down(Align::Min).with_main_align(Align::Center),
+                |ui| {
+                    ui.set_width(text_col_w);
+                    ui.add(
+                        egui::Label::new(RichText::new(&card.title).size(13.5).color(ink).strong())
+                            .wrap(),
+                    );
                     ui.add(
                         egui::Label::new(
-                            RichText::new(reason).size(11.2).color(pal.text_secondary),
+                            RichText::new(&card.status_badge)
+                                .size(12.0)
+                                .color(status_col),
                         )
                         .wrap(),
                     );
-                }
-            });
+                    if let Some(reason) = &card.reason {
+                        ui.add(
+                            egui::Label::new(RichText::new(reason).size(11.2).color(meta)).wrap(),
+                        );
+                    }
+                },
+            );
         });
         ui.add_space(8.0);
-        let (sep_rect, _) = ui.allocate_exact_size(Vec2::new(card_width, 1.0), Sense::hover());
-        ui.painter().line_segment(
-            [sep_rect.left_center(), sep_rect.right_center()],
-            Stroke::new(1.0_f32, pal.border),
-        );
-        ui.add_space(6.0);
 
-        let btn_label = if card.is_video {
+        let label = if card.is_video {
             format!("{}  Gọi video lại", lucide::VIDEO)
         } else {
             format!("{}  Gọi lại", lucide::PHONE)
         };
-        let call_btn = egui::Button::new(
-            RichText::new(btn_label)
-                .size(12.5)
-                .color(Color32::WHITE)
-                .strong(),
-        )
-        .fill(pal.primary)
-        .stroke(Stroke::new(1.0_f32, pal.primary_hover))
-        .rounding(Rounding::same(7.0))
-        .min_size(Vec2::new(card_width, 30.0));
-
-        if ui
-            .add(call_btn)
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .clicked()
-        {
+        let (r, resp) = ui.allocate_exact_size(Vec2::new(card_width, 32.0), Sense::click());
+        let hot = resp.hovered();
+        ui.painter().rect_filled(
+            r,
+            Rounding::same(16.0),
+            ink.gamma_multiply(if hot { 0.18 } else { 0.10 }),
+        );
+        ui.painter().text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            FontId::proportional(13.0),
+            ink,
+        );
+        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
             action = Some(BubbleAction::CallAgain {
                 is_video: card.is_video,
             });
@@ -510,7 +541,30 @@ pub(super) fn is_clipboard_paste_triggered(ctx: &egui::Context) -> bool {
         return egui_paste || edge_triggered;
     }
 
-    #[cfg(not(target_os = "windows"))]
+    // macOS: egui-winit turns ⌘V into a `Paste` event only when the clipboard holds *text*.
+    // A screenshot copied to the clipboard is image-only, so nothing arrived and pasting it
+    // did nothing (Finder copies worked because they also carry the path as text).
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
+        }
+        static WAS_PASTE_DOWN: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let (focused, cmd) = ctx.input(|i| (i.focused, i.modifiers.command));
+        if cmd && focused {
+            // Poll while ⌘ is held so the V press is seen even without a winit event.
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        // SAFETY: read-only key state query; 0 = combined session state, 9 = kVK_ANSI_V.
+        let v_down = unsafe { CGEventSourceKeyState(0, 9) };
+        let down = focused && cmd && v_down;
+        let prev = WAS_PASTE_DOWN.swap(down, std::sync::atomic::Ordering::SeqCst);
+        egui_paste || (down && !prev)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         egui_paste
     }
@@ -737,7 +791,19 @@ pub(super) fn read_clipboard_image_to_png(
             None
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        // Screenshots and copied images land on NSPasteboard as PNG and/or TIFF.
+        for uti in ["public.png", "public.tiff"] {
+            if let Some(bytes) = macos_pasteboard::data_for_type(uti) {
+                if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                    return finalize_clipboard_rgba_image(dyn_img.to_rgba8());
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         // Wayland (`wl-paste --type image/png`) or X11 (`xclip -selection clipboard -t image/png -o`)
         for (prog, args) in [
@@ -756,6 +822,68 @@ pub(super) fn read_clipboard_image_to_png(
             }
         }
         None
+    }
+}
+
+/// Whether a pasted file should go out as a photo (image upload) rather than a file.
+pub(super) fn is_image_path(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp"))
+}
+
+/// Files copied in the OS file manager (Finder `⌘C`), in clipboard order. Checked before the
+/// image reader: a copied file also puts its *icon* on the pasteboard as TIFF.
+pub(super) fn read_clipboard_file_paths() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_pasteboard::file_paths()
+            .into_iter()
+            .filter(|p| p.is_file())
+            .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos_pasteboard {
+    use objc2_app_kit::NSPasteboard;
+    use objc2_foundation::{NSString, NSURL};
+
+    /// Raw bytes of the first pasteboard item carrying `uti`.
+    pub(super) fn data_for_type(uti: &str) -> Option<Vec<u8>> {
+        // SAFETY: read-only queries on the general pasteboard; AppKit allows this off-main too.
+        unsafe {
+            let pb = NSPasteboard::generalPasteboard();
+            let data = pb.dataForType(&NSString::from_str(uti))?;
+            Some(data.bytes().to_vec())
+        }
+    }
+
+    /// `public.file-url` of every pasteboard item, converted to local paths.
+    pub(super) fn file_paths() -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        // SAFETY: as above.
+        unsafe {
+            let pb = NSPasteboard::generalPasteboard();
+            let Some(items) = pb.pasteboardItems() else {
+                return out;
+            };
+            let file_url = NSString::from_str("public.file-url");
+            for item in items.iter() {
+                let Some(s) = item.stringForType(&file_url) else {
+                    continue;
+                };
+                if let Some(path) = NSURL::URLWithString(&s).and_then(|u| u.path()) {
+                    out.push(std::path::PathBuf::from(path.to_string()));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -827,6 +955,7 @@ pub(super) fn extract_message_link_view(msg: &ChatMessage) -> Option<(String, St
                 || line == desc_trim
                 || line == "[Chia sẻ]"
                 || line == "[Liên kết]"
+                || line == "[Hình ảnh]"
                 || (!desc_trim.is_empty() && desc_trim.contains(&line))
                 || (!title_trim.is_empty() && title_trim.contains(&line))
             {
@@ -842,7 +971,7 @@ pub(super) fn extract_message_link_view(msg: &ChatMessage) -> Option<(String, St
     let pos = text.find("https://").or_else(|| text.find("http://"))?;
     let after = &text[pos..];
     let end = after.find(char::is_whitespace).unwrap_or(after.len());
-    let url = after[..end].trim_end_matches(|c: char| matches!(c, ')' | ']' | ',' | ';'));
+    let url = after[..end].trim_end_matches([')', ']', ',', ';']);
     if url.len() < 10 {
         return None;
     }
@@ -915,7 +1044,7 @@ pub(super) fn format_time_divider_label(msg: &ChatMessage) -> String {
     let hh = sec_of_day / 3600;
     let mm = (sec_of_day % 3600) / 60;
 
-    let now_sec = (crate::login::unix_now() as i64) + tz_offset_sec;
+    let now_sec = crate::login::unix_now() + tz_offset_sec;
     let today_day = now_sec.div_euclid(86_400);
     let (y, m, d) = civil_from_days(msg_day);
 
@@ -1034,6 +1163,104 @@ fn strip_markdown_syntax_for_width(s: &str) -> String {
         .replace('`', "")
 }
 
+/// Names that render as an `@mention` in the open group (members, their aliases, the account
+/// owner and "All"), longest first so "@Lê Dũng Bá" wins over "@Lê".
+static MENTION_NAMES: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Set the mention names for the conversation being drawn (empty outside groups).
+pub(super) fn set_mention_names(mut names: Vec<String>) {
+    names.retain(|n| !n.trim().is_empty());
+    names.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    names.dedup();
+    if let Ok(mut g) = MENTION_NAMES.write() {
+        *g = names;
+    }
+}
+
+/// Byte ranges of `@Name` tags in `text` for the given names (longest match at each `@`).
+pub(super) fn find_mentions(text: &str, names: &[String]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = text[i..].find('@') {
+        let at = i + rel;
+        let after = &text[at + 1..];
+        let prev_ok =
+            at == 0 || text[..at].ends_with(|c: char| c.is_whitespace() || "([{".contains(c));
+        let hit = names.iter().find(|n| {
+            after.starts_with(n.as_str())
+                && after[n.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric())
+        });
+        match hit {
+            Some(n) if prev_ok => {
+                let end = at + 1 + n.len();
+                out.push((at, end));
+                i = end;
+            }
+            _ => i = at + 1,
+        }
+    }
+    out
+}
+
+/// Append plain text, colouring `@mentions` like Zalo (blue, medium weight).
+fn append_with_mentions(
+    job: &mut egui::text::LayoutJob,
+    ctx: &egui::Context,
+    text: &str,
+    size: f32,
+    color: Color32,
+    pal: &ThemePalette,
+) {
+    let plain = |job: &mut egui::text::LayoutJob, t: &str| {
+        if !t.is_empty() {
+            super::emoji_picker::append_text_with_emoji(
+                job,
+                ctx,
+                t,
+                FontId::proportional(size),
+                color,
+            );
+        }
+    };
+    let spans = MENTION_NAMES
+        .read()
+        .map(|names| {
+            if names.is_empty() {
+                Vec::new()
+            } else {
+                find_mentions(text, &names)
+            }
+        })
+        .unwrap_or_default();
+    if spans.is_empty() {
+        plain(job, text);
+        return;
+    }
+    let mention_col = if pal.is_dark {
+        Color32::from_rgb(97, 175, 239)
+    } else {
+        Color32::from_rgb(0, 104, 255)
+    };
+    let mut last = 0;
+    for (a, b) in spans {
+        plain(job, &text[last..a]);
+        job.append(
+            &text[a..b],
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::proportional(size),
+                color: mention_col,
+                ..Default::default()
+            },
+        );
+        last = b;
+    }
+    plain(job, &text[last..]);
+}
+
 fn render_markdown_inline_rich(
     ui: &mut egui::Ui,
     text: &str,
@@ -1071,28 +1298,12 @@ fn render_markdown_inline_rich(
         .flatten()
         .min();
         let Some(pos) = min_pos else {
-            job.append(
-                rest,
-                0.0,
-                egui::TextFormat {
-                    font_id: FontId::proportional(base_size),
-                    color: base_color,
-                    ..Default::default()
-                },
-            );
+            append_with_mentions(&mut job, ui.ctx(), rest, base_size, base_color, pal);
             break;
         };
 
         if pos > 0 {
-            job.append(
-                &rest[..pos],
-                0.0,
-                egui::TextFormat {
-                    font_id: FontId::proportional(base_size),
-                    color: base_color,
-                    ..Default::default()
-                },
-            );
+            append_with_mentions(&mut job, ui.ctx(), &rest[..pos], base_size, base_color, pal);
             rest = &rest[pos..];
             continue;
         }
@@ -1229,8 +1440,12 @@ fn render_markdown_inline_rich(
         }
     }
 
+    // Lay the job out here so the colour emoji can be painted into their slots.
+    job.wrap.max_width = ui.available_width();
+    let galley = ui.fonts(|f| f.layout_job(job));
     if let Some(url) = first_link {
-        let resp = ui.add(egui::Label::new(job).wrap().sense(Sense::click()));
+        let resp = ui.add(egui::Label::new(galley.clone()).sense(Sense::click()));
+        super::emoji_picker::paint_emoji_overlay(ui.painter(), ui.ctx(), &galley, resp.rect.min);
         if resp
             .on_hover_cursor(CursorIcon::PointingHand)
             .on_hover_text(&url)
@@ -1239,7 +1454,8 @@ fn render_markdown_inline_rich(
             open_external_url(&url);
         }
     } else {
-        ui.add(egui::Label::new(job).wrap());
+        let resp = ui.add(egui::Label::new(galley.clone()));
+        super::emoji_picker::paint_emoji_overlay(ui.painter(), ui.ctx(), &galley, resp.rect.min);
     }
 }
 
@@ -1262,7 +1478,7 @@ pub(super) fn render_chat_markdown_block(
                 egui::Frame::none()
                     .fill(pal.bg_input)
                     .stroke(Stroke::new(1.0_f32, pal.border))
-                    .rounding(Rounding::same(6.0))
+                    .rounding(Rounding::same(10.0))
                     .inner_margin(Margin::symmetric(10.0, 7.0))
                     .show(ui, |ui| {
                         ui.add(
@@ -1312,7 +1528,7 @@ pub(super) fn render_chat_markdown_block(
         egui::Frame::none()
             .fill(pal.bg_input)
             .stroke(Stroke::new(1.0_f32, pal.border))
-            .rounding(Rounding::same(6.0))
+            .rounding(Rounding::same(10.0))
             .inner_margin(Margin::symmetric(10.0, 7.0))
             .show(ui, |ui| {
                 ui.add(
@@ -1345,6 +1561,7 @@ pub(super) fn same_message_cluster(a: &ChatMessage, b: &ChatMessage) -> bool {
     true
 }
 
+#[allow(clippy::too_many_arguments)] // UI render entry point; shares state borrowed from the app
 pub(super) fn render_message_body(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
@@ -1368,7 +1585,7 @@ pub(super) fn render_message_body(
             RichText::new(format!("{} Tin nhắn đã được thu hồi", lucide::BAN))
                 .color(meta_col)
                 .italics()
-                .size(13.8),
+                .size(13.0),
         );
         return None;
     }
@@ -1530,51 +1747,139 @@ pub(super) fn render_message_body(
         } else {
             resolved_file_name.clone()
         };
-        let sub_str = if is_vid {
-            "Video đính kèm · Bấm để mở"
-        } else {
-            "Tập tin Zalo · Bấm để lưu về máy"
-        };
         let link_col = if pal.is_dark {
             Color32::from_rgb(97, 175, 239)
         } else {
             pal.primary
         };
-        let resp = ui
-            .add(
-                egui::Label::new(
-                    RichText::new(&title_str)
-                        .size(13.8)
-                        .color(text_col)
-                        .strong(),
-                )
-                .wrap()
-                .sense(Sense::click()),
-            )
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text(if is_vid {
-                "Bấm để mở video"
-            } else {
-                "Bấm để tải và lưu tập tin với tên gốc"
-            });
-        ui.add_space(2.0);
-        let dom_resp = ui
-            .add(
-                egui::Label::new(RichText::new(sub_str).size(12.5).color(link_col))
-                    .sense(Sense::click()),
-            )
-            .on_hover_cursor(CursorIcon::PointingHand);
-        if resp.clicked() || dom_resp.clicked() {
-            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-                if is_vid && !url.to_ascii_lowercase().contains("/renewmedia") {
-                    open_external_url(url);
-                } else {
-                    return Some(BubbleAction::DownloadFile {
-                        url: url.to_string(),
-                        file_name: resolved_file_name,
+        let url = msg
+            .link_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .map(str::to_string);
+        // Zalo-style: badge, name, then size + "Đã có trên máy" and folder / save buttons.
+        let saved = url.as_deref().and_then(crate::gui::downloaded_path);
+        let size = super::conv_info::size_from_title(msg.link_title.as_deref());
+        let opens_externally = is_vid
+            && url
+                .as_deref()
+                .is_some_and(|u| !u.to_ascii_lowercase().contains("/renewmedia"));
+        let mut act: Option<BubbleAction> = None;
+        let download = |url: &str| BubbleAction::DownloadFile {
+            url: url.to_string(),
+            file_name: resolved_file_name.clone(),
+        };
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let (badge, badge_resp) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
+            super::conv_info::paint_file_badge(ui.painter(), badge, &title_str, is_vid);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                let name_resp = ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new(&title_str)
+                                .size(13.0)
+                                .color(text_col)
+                                .strong(),
+                        )
+                        .wrap()
+                        .sense(Sense::click()),
+                    )
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text(if saved.is_some() {
+                        "Bấm để mở tệp"
+                    } else if opens_externally {
+                        "Bấm để mở video"
+                    } else {
+                        "Bấm để tải và lưu tập tin với tên gốc"
                     });
+                if name_resp.clicked() || badge_resp.clicked() {
+                    if let Some(path) = saved.clone() {
+                        act = Some(BubbleAction::OpenFile(path));
+                    } else if let Some(u) = url.as_deref() {
+                        if opens_externally {
+                            open_external_url(u);
+                        } else {
+                            act = Some(download(u));
+                        }
+                    }
                 }
-            }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if !size.is_empty() {
+                        ui.label(RichText::new(&size).size(11.5).color(meta_col));
+                    }
+                    if saved.is_some() {
+                        ui.label(
+                            RichText::new(format!("{} Đã có trên máy", lucide::CHECK))
+                                .size(11.5)
+                                .color(pal.accent_online),
+                        );
+                    } else if thread_name.contains("Cloud của tôi") {
+                        // Like Zalo's My Documents: the file lives in the account's cloud.
+                        ui.label(
+                            RichText::new(format!("{} Đã có trên Cloud", lucide::CLOUD))
+                                .size(11.5)
+                                .color(meta_col),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(if is_vid {
+                                "Video đính kèm"
+                            } else {
+                                "Tập tin Zalo"
+                            })
+                            .size(11.5)
+                            .color(link_col),
+                        );
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let icon_btn = |ui: &mut egui::Ui, icon: &str, tip: &str| {
+                            let (r, resp) =
+                                ui.allocate_exact_size(Vec2::new(28.0, 24.0), Sense::click());
+                            let hot = resp.hovered();
+                            ui.painter().rect_stroke(
+                                r,
+                                Rounding::same(6.0),
+                                Stroke::new(1.0_f32, if hot { link_col } else { meta_col }),
+                            );
+                            draw_lucide_icon(
+                                ui.painter(),
+                                r.center(),
+                                icon,
+                                14.0,
+                                if hot { link_col } else { text_col },
+                            );
+                            resp.on_hover_text(tip)
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .clicked()
+                        };
+                        if let Some(u) = url.as_deref() {
+                            if icon_btn(
+                                ui,
+                                lucide::DOWNLOAD,
+                                if saved.is_some() {
+                                    "Lưu lại về máy"
+                                } else {
+                                    "Lưu về máy"
+                                },
+                            ) {
+                                act = Some(download(u));
+                            }
+                        }
+                        if let Some(path) = saved.clone() {
+                            if icon_btn(ui, lucide::FOLDER_OPEN, "Hiển thị trong thư mục") {
+                                act = Some(BubbleAction::RevealFile(path));
+                            }
+                        }
+                    });
+                });
+            });
+        });
+        if act.is_some() {
+            return act;
         }
         return None;
     }
@@ -1591,7 +1896,12 @@ pub(super) fn render_message_body(
     };
 
     // Auto-enrich link metadata if title or thumbnail is missing/expired
+    let title_is_url = msg
+        .link_title
+        .as_deref()
+        .is_some_and(|t| t.trim().starts_with("http://") || t.trim().starts_with("https://"));
     let needs_meta_enrich = msg.link_title.is_none()
+        || title_is_url
         || msg.link_thumb.is_none()
         || msg
             .link_thumb
@@ -1616,6 +1926,24 @@ pub(super) fn render_message_body(
         render_chat_markdown_block(ui, &caption, text_col, pal);
         ui.add_space(4.0);
     }
+
+    // 1b. The raw URL as a blue link, like Zalo PC shows it above the preview.
+    let url_resp = ui
+        .add(
+            egui::Label::new(
+                RichText::new(truncate_chars(&url, 140))
+                    .size(13.0)
+                    .color(link_col)
+                    .underline(),
+            )
+            .wrap()
+            .sense(Sense::click()),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand);
+    if url_resp.clicked() {
+        open_external_url(&url);
+    }
+    ui.add_space(5.0);
 
     // 2. Optional compact thumbnail directly inside the bubble (no nested card box)
     if let Some(thumb_url) = msg.link_thumb.as_deref().filter(|u| !u.is_empty()) {
@@ -1642,7 +1970,7 @@ pub(super) fn render_message_body(
             let img_h = (thumb_w * aspect).min(132.0);
             let img = egui::Image::new(tex)
                 .fit_to_exact_size(Vec2::new(thumb_w, img_h))
-                .rounding(Rounding::same(6.0))
+                .rounding(Rounding::same(10.0))
                 .sense(Sense::click());
             if ui
                 .add(img)
@@ -1661,27 +1989,27 @@ pub(super) fn render_message_body(
         .link_title
         .as_deref()
         .map(str::trim)
-        .filter(|t| !t.is_empty() && *t != domain)
-        .unwrap_or_else(|| {
-            url.strip_prefix("https://")
-                .or_else(|| url.strip_prefix("http://"))
-                .unwrap_or(&url)
-        });
-    let title_resp = ui
-        .add(
-            egui::Label::new(
-                RichText::new(truncate_chars(header_title, 95))
-                    .size(13.8)
-                    .color(text_col)
-                    .strong(),
+        .filter(|t| {
+            !t.is_empty() && *t != domain && !t.starts_with("http://") && !t.starts_with("https://")
+        })
+        .unwrap_or("");
+    if !header_title.is_empty() {
+        let title_resp = ui
+            .add(
+                egui::Label::new(
+                    RichText::new(truncate_chars(header_title, 95))
+                        .size(13.0)
+                        .color(text_col)
+                        .strong(),
+                )
+                .wrap()
+                .sense(Sense::click()),
             )
-            .wrap()
-            .sense(Sense::click()),
-        )
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_text(&url);
-    if title_resp.clicked() {
-        open_external_url(&url);
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text(&url);
+        if title_resp.clicked() {
+            open_external_url(&url);
+        }
     }
 
     // 4. Optional short description (only if concise and distinct)
@@ -1754,6 +2082,22 @@ pub(super) fn is_zalo_photo_message(msg: &ChatMessage) -> bool {
     if is_sticker_message(msg).is_some() || is_zalo_file_or_video_message(msg) {
         return false;
     }
+    // A shared web link (e.g. Google Docs) whose preview thumbnail Zalo re-hosts on its photo
+    // CDN is a link card, not a photo: only its thumbnail lives on the CDN.
+    // Older builds stored such links with `link_src = "Hình ảnh Zalo"` / "[Hình ảnh]", so the
+    // URL decides, not the stored label.
+    let text_has_web_url = msg
+        .text
+        .split_whitespace()
+        .any(|w| crate::chat::is_shared_web_link(w.trim()));
+    if msg
+        .link_url
+        .as_deref()
+        .is_some_and(crate::chat::is_shared_web_link)
+        || text_has_web_url
+    {
+        return false;
+    }
     let trimmed = msg.text.trim();
     msg.link_src.as_deref() == Some("Hình ảnh Zalo")
         || trimmed == "[Hình ảnh]"
@@ -1795,6 +2139,43 @@ pub(super) fn extract_photo_user_caption(msg: &ChatMessage) -> Option<&str> {
     }
 }
 
+/// Lay out ordinary text with metadata tucked into the last line, as in Telegram.
+fn render_compact_text(
+    ui: &mut egui::Ui,
+    text: &str,
+    metadata: &str,
+    width: f32,
+    color: Color32,
+    meta_color: Color32,
+) {
+    let mut job = egui::text::LayoutJob::default();
+    super::emoji_picker::append_text_with_emoji(
+        &mut job,
+        ui.ctx(),
+        text,
+        FontId::proportional(14.0),
+        color,
+    );
+    job.wrap.max_width = width;
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let meta =
+        ui.fonts(|f| f.layout_no_wrap(metadata.to_owned(), FontId::proportional(9.5), meta_color));
+    let end = galley.pos_from_ccursor(egui::text::CCursor::new(text.chars().count()));
+    let fits = metadata.is_empty() || end.min.x + 7.0 + meta.size().x <= width;
+    let height = galley.size().y + if fits { 0.0 } else { 11.0 };
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    ui.painter().galley(rect.min, galley.clone(), color);
+    super::emoji_picker::paint_emoji_overlay(ui.painter(), ui.ctx(), &galley, rect.min);
+    if !metadata.is_empty() {
+        ui.painter().galley(
+            Pos2::new(rect.right() - meta.size().x, rect.bottom() - meta.size().y),
+            meta,
+            meta_color,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // UI render entry point; shares state borrowed from the app
 pub(super) fn render_chat_bubble(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
@@ -1822,13 +2203,23 @@ pub(super) fn render_chat_bubble(
         !has_sticker && !is_photo_card && !is_file_card && extract_message_link_view(msg).is_some();
     let has_interactive_card = is_call_card || has_link_card || is_photo_card || is_file_card;
 
-    let show_timestamp = !msg.time.is_empty()
-        && (!next_same_sender
-            || is_latest_outgoing
-            || has_interactive_card
-            || !msg.reactions.is_empty()
-            || msg.is_pinned
-            || msg.is_starred);
+    let compact_text = !has_sticker
+        && !has_interactive_card
+        && msg.reply_to_text.is_none()
+        && msg.reactions.is_empty()
+        && !msg.is_pinned
+        && !msg.is_starred
+        && !msg.text.contains(['`', '*', '[', ']'])
+        && !msg.text.contains("http")
+        && !msg.text.trim().is_empty();
+    let show_timestamp = !msg.time.is_empty();
+    let metadata = if !show_timestamp {
+        String::new()
+    } else if msg.is_outgoing && is_latest_outgoing {
+        format!("{} · Đã nhận", msg.time)
+    } else {
+        msg.time.clone()
+    };
 
     let photo_caption = if is_photo_card {
         extract_photo_user_caption(msg)
@@ -1841,9 +2232,16 @@ pub(super) fn render_chat_bubble(
         && msg.reply_to_text.is_none()
         && (msg.is_outgoing || !is_group);
 
-    let sender_is_name = !msg.sender.is_empty()
-        && msg.sender != "0"
-        && !msg.sender.chars().all(|c| c.is_ascii_digit());
+    // Zalo shows the alias (tên gợi nhớ) you set for a friend in place of their group name.
+    let sender_alias = if is_group && !msg.is_outgoing {
+        crate::chat::sidebar_sender_id(msg).and_then(|uid| crate::gui::alias_for(&uid))
+    } else {
+        None
+    };
+    let sender_label: &str = sender_alias.as_deref().unwrap_or(&msg.sender);
+    let sender_is_name = !sender_label.is_empty()
+        && sender_label != "0"
+        && !sender_label.chars().all(|c| c.is_ascii_digit());
     let show_group_sender = !msg.is_outgoing && !prev_same_sender && is_group && sender_is_name;
 
     // Pre-measure exact content width for both outgoing and incoming bubbles so every bubble,
@@ -1870,7 +2268,7 @@ pub(super) fn render_chat_bubble(
             let cap_w = ui.fonts(|f| {
                 f.layout(
                     cap_str.to_string(),
-                    FontId::proportional(14.2),
+                    FontId::proportional(13.0),
                     Color32::WHITE,
                     max_text_width,
                 )
@@ -1881,7 +2279,27 @@ pub(super) fn render_chat_bubble(
         } else {
             photo_w
         }
-    } else if is_file_card || has_link_card {
+    } else if is_file_card {
+        // Badge (44) + gap + name, and room for size/status + the two buttons underneath.
+        let name = crate::chat::resolve_attachment_file_name(
+            msg.link_title.as_deref(),
+            msg.text.trim(),
+            msg.link_url.as_deref().unwrap_or_default(),
+        );
+        let name_w = ui.fonts(|f| {
+            f.layout(
+                truncate_chars(&name, 90).into_owned(),
+                FontId::proportional(13.0),
+                Color32::WHITE,
+                max_text_width.min(340.0) - 54.0,
+            )
+            .size()
+            .x
+        });
+        (name_w.max(190.0) + 54.0 + 8.0)
+            .clamp(250.0, max_text_width.min(360.0))
+            .ceil()
+    } else if has_link_card {
         let has_loaded_thumb = msg
             .link_thumb
             .as_deref()
@@ -1933,16 +2351,20 @@ pub(super) fn render_chat_bubble(
         } else {
             strip_markdown_syntax_for_width(&msg.text)
         };
-        let text_w = ui.fonts(|f| {
-            f.layout(
-                display_str,
-                FontId::proportional(14.2),
+        // Must match the size the body is drawn with (`render_markdown_inline_rich(.., 14.0, ..)`);
+        // measuring at 13 made bubbles narrower than their text, so the last word wrapped.
+        let text_w = {
+            let mut job = egui::text::LayoutJob::default();
+            super::emoji_picker::append_text_with_emoji(
+                &mut job,
+                ui.ctx(),
+                &display_str,
+                FontId::proportional(14.0),
                 Color32::WHITE,
-                max_text_width,
-            )
-            .size()
-            .x
-        });
+            );
+            job.wrap.max_width = max_text_width;
+            ui.fonts(|f| f.layout_job(job)).size().x
+        };
         let quote_w = match msg.reply_to_text.as_ref() {
             Some(qt) => {
                 let q_body_w = ui.fonts(|f| {
@@ -1972,7 +2394,7 @@ pub(super) fn render_chat_bubble(
         let sender_w = if show_group_sender {
             ui.fonts(|f| {
                 f.layout_no_wrap(
-                    truncate_chars(&msg.sender, 22).into_owned(),
+                    truncate_chars(sender_label, 22).into_owned(),
                     FontId::proportional(12.0),
                     Color32::WHITE,
                 )
@@ -1992,6 +2414,17 @@ pub(super) fn render_chat_bubble(
         } else {
             44.0_f32
         };
+        let text_w = if compact_text && show_timestamp {
+            let meta_w = ui
+                .fonts(|f| {
+                    f.layout_no_wrap(metadata.clone(), FontId::proportional(9.5), Color32::WHITE)
+                })
+                .size()
+                .x;
+            (text_w + meta_w + 8.0).min(max_text_width)
+        } else {
+            text_w
+        };
         text_w
             .max(quote_w)
             .max(sender_w)
@@ -2005,12 +2438,12 @@ pub(super) fn render_chat_bubble(
     let h_margin = if has_sticker || is_frameless_photo {
         2.0_f32
     } else {
-        12.0_f32
+        10.0_f32
     };
     let v_margin = if has_sticker || is_frameless_photo {
         2.0_f32
     } else {
-        8.5_f32
+        5.0_f32
     };
     let total_bubble_w = content_width + h_margin * 2.0;
 
@@ -2024,34 +2457,23 @@ pub(super) fn render_chat_bubble(
 
                 let fill = if has_sticker || is_frameless_photo {
                     Color32::TRANSPARENT
-                } else if let Some(card) = &call_card_opt {
-                    if card.is_missed_or_failed {
-                        if pal.is_dark {
-                            Color32::from_rgb(38, 23, 30)
-                        } else {
-                            Color32::from_rgb(254, 242, 242)
-                        }
-                    } else {
-                        pal.bg_elevated
-                    }
                 } else {
+                    // Call cards use the normal bubble colour (system palette), no tint.
                     pal.bubble_out_bg
                 };
                 let stroke = if has_sticker || is_frameless_photo {
                     Stroke::NONE
-                } else if let Some(card) = &call_card_opt {
-                    let border_col = if card.is_missed_or_failed {
-                        Color32::from_rgb(239, 68, 68).linear_multiply(0.55)
-                    } else {
-                        Color32::from_rgb(34, 197, 94).linear_multiply(0.55)
-                    };
-                    Stroke::new(1.2_f32, border_col)
-                } else if !pal.is_dark {
-                    Stroke::new(1.0_f32, Color32::from_rgb(186, 214, 255))
                 } else {
-                    Stroke::new(1.0_f32, Color32::from_rgb(53, 76, 104))
+                    // Telegram-like: no outline on bubbles, call cards included.
+                    Stroke::NONE
                 };
-                let rounding = Rounding::same(8.0);
+                // 16 px corners with a small "tail" corner on the sender's side.
+                let rounding = Rounding {
+                    nw: 12.0,
+                    ne: 12.0,
+                    sw: 12.0,
+                    se: if next_same_sender { 10.0 } else { 4.0 },
+                };
 
                 let mut card_action = None;
                 let mut quote_action = None;
@@ -2061,12 +2483,31 @@ pub(super) fn render_chat_bubble(
                     .rounding(rounding)
                     .inner_margin(Margin::symmetric(h_margin, v_margin))
                     .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
                         ui.set_min_width(content_width);
                         ui.set_max_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             quote_action = render_quote_block(ui, msg, pal, true, content_width);
-                            if let Some(card) = &call_card_opt {
-                                card_action = render_call_card_widget(ui, card, pal, content_width);
+                            if compact_text {
+                                render_compact_text(
+                                    ui,
+                                    msg.text.trim(),
+                                    &metadata,
+                                    content_width,
+                                    if msg.is_outgoing {
+                                        pal.bubble_out_text
+                                    } else {
+                                        pal.bubble_in_text
+                                    },
+                                    if msg.is_outgoing {
+                                        pal.bubble_out_meta
+                                    } else {
+                                        pal.bubble_in_meta
+                                    },
+                                );
+                            } else if let Some(card) = &call_card_opt {
+                                card_action =
+                                    render_call_card_widget(ui, card, pal, content_width, true);
                             } else if !render_sticker_widget(
                                 ui,
                                 msg,
@@ -2085,7 +2526,11 @@ pub(super) fn render_chat_bubble(
                                 );
                             }
                             render_reactions(ui, msg, pal, emoji_textures);
-                            if show_timestamp && !has_sticker && !is_frameless_photo {
+                            if show_timestamp
+                                && !compact_text
+                                && !has_sticker
+                                && !is_frameless_photo
+                            {
                                 ui.add_space(3.5);
                                 let ts_txt = if is_latest_outgoing {
                                     format!("{} · Đã nhận", msg.time)
@@ -2101,7 +2546,10 @@ pub(super) fn render_chat_bubble(
                 if fr.response.double_clicked() {
                     return Some(BubbleAction::Reply);
                 }
-                quote_action.or(card_action).or_else(|| {
+                reaction_corner_chip(ui, fr.response.rect, msg, pal);
+                let quick =
+                    quick_react_overlay(ui, &fr.response, msg, idx, true, pal, emoji_textures);
+                quote_action.or(card_action).or(quick).or_else(|| {
                     bubble_context_menu(
                         ui,
                         &fr.response,
@@ -2120,15 +2568,25 @@ pub(super) fn render_chat_bubble(
     } else {
         ui.horizontal_top(|ui| {
             let display_sender = if sender_is_name {
-                &msg.sender
+                sender_label
             } else {
                 thread_name
             };
             let sender_accent = avatar_color_for(display_sender, false);
 
-            // Sender Avatar (only on first message of a consecutive group)
+            // Sender Avatar (only on first message of a consecutive group); clicking it opens
+            // the sender's account card.
+            let mut avatar_action = None;
             if !prev_same_sender {
-                let (av_rect, _) = ui.allocate_exact_size(Vec2::new(30.0, 30.0), Sense::hover());
+                let (av_rect, av_resp) =
+                    ui.allocate_exact_size(Vec2::new(30.0, 30.0), Sense::click());
+                if av_resp
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text("Xem thông tin tài khoản")
+                    .clicked()
+                {
+                    avatar_action = Some(BubbleAction::OpenSenderProfile);
+                }
                 paint_user_avatar(
                     ui.painter(),
                     av_rect.center(),
@@ -2140,37 +2598,23 @@ pub(super) fn render_chat_bubble(
                     loading_stickers,
                 );
             } else {
-                ui.add_space(30.0);
+                // Same allocation as the avatar so the item spacing after it matches and every
+                // bubble of the run lines up (`add_space` skipped that spacing).
+                ui.allocate_exact_size(Vec2::new(30.0, 1.0), Sense::hover());
             }
 
             let fill = if has_sticker || is_frameless_photo {
                 Color32::TRANSPARENT
-            } else if let Some(card) = &call_card_opt {
-                if card.is_missed_or_failed {
-                    if pal.is_dark {
-                        Color32::from_rgb(38, 23, 30)
-                    } else {
-                        Color32::from_rgb(254, 242, 242)
-                    }
-                } else {
-                    pal.bg_elevated
-                }
             } else {
                 pal.bubble_in_bg
             };
-            let stroke = if has_sticker || is_frameless_photo {
-                Stroke::NONE
-            } else if let Some(card) = &call_card_opt {
-                let border_col = if card.is_missed_or_failed {
-                    Color32::from_rgb(239, 68, 68).linear_multiply(0.55)
-                } else {
-                    Color32::from_rgb(34, 197, 94).linear_multiply(0.55)
-                };
-                Stroke::new(1.2_f32, border_col)
-            } else {
-                Stroke::new(1.0_f32, pal.bubble_in_border)
+            let stroke = Stroke::NONE;
+            let rounding = Rounding {
+                nw: 12.0,
+                ne: 12.0,
+                sw: if next_same_sender { 10.0 } else { 4.0 },
+                se: 12.0,
             };
-            let rounding = Rounding::same(8.0);
 
             ui.vertical(|ui| {
                 ui.set_max_width(total_bubble_w);
@@ -2182,12 +2626,13 @@ pub(super) fn render_chat_bubble(
                     .rounding(rounding)
                     .inner_margin(Margin::symmetric(h_margin, v_margin))
                     .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
                         ui.set_min_width(content_width);
                         ui.set_max_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             if show_group_sender {
                                 ui.label(
-                                    RichText::new(truncate_chars(&msg.sender, 22))
+                                    RichText::new(truncate_chars(sender_label, 22))
                                         .color(sender_accent)
                                         .size(12.0)
                                         .strong(),
@@ -2195,8 +2640,26 @@ pub(super) fn render_chat_bubble(
                                 ui.add_space(2.0);
                             }
                             quote_action = render_quote_block(ui, msg, pal, false, content_width);
-                            if let Some(card) = &call_card_opt {
-                                card_action = render_call_card_widget(ui, card, pal, content_width);
+                            if compact_text {
+                                render_compact_text(
+                                    ui,
+                                    msg.text.trim(),
+                                    &metadata,
+                                    content_width,
+                                    if msg.is_outgoing {
+                                        pal.bubble_out_text
+                                    } else {
+                                        pal.bubble_in_text
+                                    },
+                                    if msg.is_outgoing {
+                                        pal.bubble_out_meta
+                                    } else {
+                                        pal.bubble_in_meta
+                                    },
+                                );
+                            } else if let Some(card) = &call_card_opt {
+                                card_action =
+                                    render_call_card_widget(ui, card, pal, content_width, false);
                             } else if !render_sticker_widget(
                                 ui,
                                 msg,
@@ -2215,7 +2678,11 @@ pub(super) fn render_chat_bubble(
                                 );
                             }
                             render_reactions(ui, msg, pal, emoji_textures);
-                            if show_timestamp && !has_sticker && !is_frameless_photo {
+                            if show_timestamp
+                                && !compact_text
+                                && !has_sticker
+                                && !is_frameless_photo
+                            {
                                 ui.add_space(3.5);
                                 ui.label(
                                     RichText::new(&msg.time)
@@ -2228,17 +2695,24 @@ pub(super) fn render_chat_bubble(
                 if fr.response.double_clicked() {
                     return Some(BubbleAction::Reply);
                 }
-                quote_action.or(card_action).or_else(|| {
-                    bubble_context_menu(
-                        ui,
-                        &fr.response,
-                        msg,
-                        idx,
-                        pal,
-                        emoji_textures,
-                        has_interactive_card,
-                    )
-                })
+                reaction_corner_chip(ui, fr.response.rect, msg, pal);
+                let quick =
+                    quick_react_overlay(ui, &fr.response, msg, idx, false, pal, emoji_textures);
+                avatar_action
+                    .or(quote_action)
+                    .or(card_action)
+                    .or(quick)
+                    .or_else(|| {
+                        bubble_context_menu(
+                            ui,
+                            &fr.response,
+                            msg,
+                            idx,
+                            pal,
+                            emoji_textures,
+                            has_interactive_card,
+                        )
+                    })
             })
             .inner
         })
@@ -2249,6 +2723,8 @@ pub(super) fn render_chat_bubble(
 #[derive(Clone, PartialEq)]
 pub(super) enum BubbleAction {
     Reply,
+    /// Click on the sender's avatar beside an incoming bubble: open their account card.
+    OpenSenderProfile,
     JumpToQuoted(String),
     Forward,
     React(&'static str),
@@ -2270,158 +2746,557 @@ pub(super) enum BubbleAction {
         url: String,
         file_name: String,
     },
+    /// Open a saved attachment with its default app.
+    OpenFile(String),
+    /// Show a saved attachment in Finder / Explorer.
+    RevealFile(String),
+    /// Enter multi-select mode starting with this message.
+    SelectMany,
+    /// Show the "Chi tiết tin nhắn" dialog.
+    ShowDetails,
 }
 
-/// Right-click menu on a chat bubble: reactions, reply, forward, copy, delete-for-me.
+/// One Zalo-style context-menu row: icon + label (full width, rounded hover). Returns clicked;
+/// copy-only rows close the menu themselves.
+pub(super) fn menu_item(
+    ui: &mut egui::Ui,
+    icon: &str,
+    label: &str,
+    color: Option<Color32>,
+) -> bool {
+    let fg = color.unwrap_or_else(|| ui.visuals().text_color());
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width().max(220.0), 34.0),
+        Sense::click(),
+    );
+    if resp.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            Rounding::same(8.0),
+            ui.visuals().widgets.hovered.weak_bg_fill,
+        );
+    }
+    ui.painter().text(
+        rect.left_center() + Vec2::new(14.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        icon,
+        FontId::proportional(14.0),
+        fg,
+    );
+    ui.painter().text(
+        rect.left_center() + Vec2::new(40.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.5),
+        fg,
+    );
+    let clicked = resp.on_hover_cursor(CursorIcon::PointingHand).clicked();
+    if clicked {
+        ui.close_menu();
+    }
+    clicked
+}
+
+/// Zalo-style quick reactions: while the pointer is over a bubble, a 👍 button sits on its
+/// bottom edge (click = 👍). Hovering the button opens the six-reaction strip *below* the
+/// bubble, beside the button, so it never covers the message text.
+/// Screen rects floating over the message list (composer, chat header): the hover reaction
+/// button must not open through them.
+static REACT_BLOCKERS: std::sync::RwLock<Vec<Rect>> = std::sync::RwLock::new(Vec::new());
+
+pub(super) fn set_react_blockers(rects: Vec<Rect>) {
+    if let Ok(mut g) = REACT_BLOCKERS.write() {
+        *g = rects;
+    }
+}
+
+pub(super) fn quick_react_overlay(
+    ui: &mut egui::Ui,
+    bubble: &egui::Response,
+    msg: &ChatMessage,
+    idx: usize,
+    outgoing: bool,
+    pal: &ThemePalette,
+    emoji_textures: &HashMap<String, TextureHandle>,
+) -> Option<BubbleAction> {
+    let ctx = ui.ctx().clone();
+    let chat_clip = ui.clip_rect();
+    let id = Id::new(("quick_react", idx, msg.ts, &msg.id));
+    let picker_open = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    let pointer = ctx.pointer_hover_pos();
+    // Like / reply / forward sit in a row beside the bubble, centred on it vertically and
+    // 8 pt away (Zalo): the like button nearest the bubble.
+    const BTN: f32 = 28.0;
+    const GAP: f32 = 6.0;
+    const OFFSET: f32 = 8.0;
+    let group_w = BTN * 3.0 + GAP * 2.0;
+    let cy = bubble.rect.center().y.min(bubble.rect.top() + 26.0);
+    let group_rect = if outgoing {
+        Rect::from_min_size(
+            Pos2::new(bubble.rect.left() - OFFSET - group_w, cy - BTN / 2.0),
+            Vec2::new(group_w, BTN),
+        )
+    } else {
+        Rect::from_min_size(
+            Pos2::new(bubble.rect.right() + OFFSET, cy - BTN / 2.0),
+            Vec2::new(group_w, BTN),
+        )
+    };
+    let btn_rect = if outgoing {
+        Rect::from_min_size(
+            Pos2::new(group_rect.right() - BTN, group_rect.top()),
+            Vec2::splat(BTN),
+        )
+    } else {
+        Rect::from_min_size(group_rect.min, Vec2::splat(BTN))
+    };
+    // The gap between bubble and buttons counts as "still hovering".
+    let hover_zone = bubble.rect.union(group_rect).expand(4.0);
+    // Only when the bubble is actually under the pointer: modals, the floating drawer and the
+    // chat header sit on higher layers and must not trigger the strip through them.
+    let own_layers = [
+        ui.layer_id(),
+        egui::LayerId::new(egui::Order::Foreground, id.with("btn")),
+        egui::LayerId::new(egui::Order::Tooltip, id.with("picker")),
+    ];
+    let blocked = |p: Pos2| {
+        REACT_BLOCKERS
+            .read()
+            .map(|r| r.iter().any(|b| b.is_positive() && b.contains(p)))
+            .unwrap_or(false)
+    };
+    // While scrolling (and briefly after) the strip stays shut: it popped up under the moving
+    // pointer and then swallowed the scroll.
+    let scroll_key = Id::new("quick_react_last_scroll");
+    let now = ctx.input(|i| i.time);
+    if ctx.input(|i| i.smooth_scroll_delta != Vec2::ZERO || i.raw_scroll_delta != Vec2::ZERO) {
+        ctx.data_mut(|d| d.insert_temp(scroll_key, now));
+    }
+    let scrolling = ctx
+        .data(|d| d.get_temp::<f64>(scroll_key))
+        .is_some_and(|t| now - t < 0.4);
+    if scrolling {
+        ctx.data_mut(|d| d.insert_temp(id, false));
+        return None;
+    }
+    let near = pointer.is_some_and(|p| {
+        let top = ctx.layer_id_at(p);
+        top.is_none_or(|l| own_layers.contains(&l)) && !blocked(p) && hover_zone.contains(p)
+    });
+    if !near && !picker_open {
+        return None;
+    }
+    let mut action = None;
+    let mut reply_clicked = false;
+    let mut forward_clicked = false;
+    let shown = appear(&ctx, id.with("btns"), 0.16);
+    // Solid chips (a translucent hover fill let the wallpaper darken them).
+    let chip_fill = if pal.is_dark {
+        Color32::from_rgb(52, 54, 62)
+    } else {
+        Color32::WHITE
+    };
+    let chip_hover = if pal.is_dark {
+        Color32::from_rgb(66, 68, 78)
+    } else {
+        Color32::from_rgb(244, 244, 247)
+    };
+    let shadow = egui::epaint::Shadow {
+        offset: Vec2::new(0.0, 2.0),
+        blur: 8.0,
+        spread: 0.0,
+        color: Color32::from_black_alpha(if pal.is_dark { 90 } else { 40 }),
+    };
+    let slide = if outgoing { 6.0 } else { -6.0 } * (1.0 - shown);
+    let btn_resp = egui::Area::new(id.with("btn"))
+        .order(egui::Order::Foreground)
+        // A new area's first (sizing) frame spans the rest of the screen; pin its size so it
+        // never lies over the bubble and steals its clicks.
+        .default_size(Vec2::new(group_w, BTN))
+        .fixed_pos(group_rect.min + Vec2::new(slide, 0.0))
+        .show(&ctx, |ui| {
+            ui.set_opacity(shown);
+            ui.spacing_mut().item_spacing = Vec2::new(GAP, 0.0);
+            // One round chip: grows and lifts while hovered.
+            let chip = |ui: &mut egui::Ui,
+                        key: &str,
+                        tip: &str,
+                        paint: &dyn Fn(&egui::Painter, Pos2, f32, bool)| {
+                let (r, resp) = ui.allocate_exact_size(Vec2::splat(BTN), Sense::click());
+                let t = ui.ctx().animate_bool_with_time(
+                    resp.id.with(("chip_hover", key)),
+                    resp.hovered(),
+                    if reduce_motion() { 0.0 } else { 0.12 },
+                );
+                let rad = BTN / 2.0 * (1.0 + 0.12 * t);
+                let c = r.center() - Vec2::new(0.0, 2.0 * t);
+                let circle = Rect::from_center_size(c, Vec2::splat(rad * 2.0));
+                ui.painter()
+                    .add(shadow.as_shape(circle, Rounding::same(rad)));
+                ui.painter()
+                    .circle_filled(c, rad, if t > 0.5 { chip_hover } else { chip_fill });
+                paint(ui.painter(), c, 1.0 + 0.12 * t, t > 0.5);
+                resp.on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text(tip)
+            };
+            let icon = |glyph: &'static str| {
+                move |p: &egui::Painter, c: Pos2, k: f32, hot: bool| {
+                    draw_lucide_icon(
+                        p,
+                        c,
+                        glyph,
+                        14.0 * k,
+                        if hot {
+                            pal.text_primary
+                        } else {
+                            pal.text_secondary
+                        },
+                    );
+                }
+            };
+            // Zalo's reply glyph is a closing quotation mark.
+            let quote_paint = |p: &egui::Painter, c: Pos2, k: f32, hot: bool| {
+                p.text(
+                    c + Vec2::new(0.0, 5.0 * k),
+                    egui::Align2::CENTER_CENTER,
+                    "\u{201D}",
+                    FontId::proportional(26.0 * k),
+                    if hot {
+                        pal.text_primary
+                    } else {
+                        pal.text_secondary
+                    },
+                );
+            };
+            let like_paint = |p: &egui::Painter, c: Pos2, k: f32, _hot: bool| {
+                if let Some(tex) = emoji_textures.get("like") {
+                    p.image(
+                        tex.id(),
+                        Rect::from_center_size(c, Vec2::splat(17.0 * k)),
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                } else {
+                    p.text(
+                        c,
+                        egui::Align2::CENTER_CENTER,
+                        "👍",
+                        FontId::proportional(14.0 * k),
+                        pal.text_primary,
+                    );
+                }
+            };
+            // Exact-size row: `ui.horizontal` would stretch the area across the bubble and
+            // swallow clicks meant for it (e.g. the quote block).
+            ui.set_max_width(group_w);
+            ui.allocate_ui_with_layout(
+                Vec2::new(group_w, BTN),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    if outgoing {
+                        forward_clicked =
+                            chip(ui, "fwd", "Chia sẻ", &icon(lucide::FORWARD)).clicked();
+                        reply_clicked = chip(ui, "reply", "Trả lời", &quote_paint).clicked();
+                        chip(ui, "like", "Thích", &like_paint)
+                    } else {
+                        let like = chip(ui, "like", "Thích", &like_paint);
+                        reply_clicked = chip(ui, "reply", "Trả lời", &quote_paint).clicked();
+                        forward_clicked =
+                            chip(ui, "fwd", "Chia sẻ", &icon(lucide::FORWARD)).clicked();
+                        like
+                    }
+                },
+            )
+            .inner
+        })
+        .inner;
+    if btn_resp.clicked() {
+        action = Some(BubbleAction::React(REACTION_LIST[0].0));
+    } else if reply_clicked {
+        action = Some(BubbleAction::Reply);
+    } else if forward_clicked {
+        action = Some(BubbleAction::Forward);
+    }
+    let mut keep_open = btn_resp.hovered();
+    if btn_resp.hovered() || picker_open {
+        // Reaction strip pops up above the like button.
+        let (pivot, pos) = (
+            egui::Align2::CENTER_BOTTOM,
+            Pos2::new(btn_rect.center().x, btn_rect.top() - 6.0),
+        );
+        let pop = appear(&ctx, id.with("picker"), 0.35);
+        let picker = egui::Area::new(id.with("picker"))
+            .order(egui::Order::Tooltip)
+            // Stay inside the conversation: near the left edge it spilled over the chat list.
+            .constrain_to(chat_clip)
+            .pivot(pivot)
+            .fixed_pos(pos + Vec2::new(0.0, (1.0 - pop) * -6.0))
+            .show(&ctx, |ui| {
+                ui.set_opacity(pop);
+                egui::Frame::none()
+                    .fill(pal.bg_elevated)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding::same(17.0))
+                    .shadow(ctx.style().visuals.popup_shadow)
+                    .inner_margin(Margin::symmetric(6.0, 3.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+                            // Zalo-like: emojis pop in one after another (back-out overshoot)
+                            // and grow + lift while hovered.
+                            let back_out = |t: f32| {
+                                let (c1, c3) = (1.70158_f32, 2.70158_f32);
+                                1.0 + c3 * (t - 1.0).powi(3) + c1 * (t - 1.0).powi(2)
+                            };
+                            for (i, &(code, key, tooltip)) in REACTION_LIST.iter().enumerate() {
+                                let (slot, resp) =
+                                    ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+                                let ti = (pop * 1.75 - i as f32 * 0.15).clamp(0.0, 1.0);
+                                let grow = back_out(ti).max(0.0);
+                                let hover = ui.ctx().animate_bool_with_time(
+                                    resp.id.with("react_hover"),
+                                    resp.hovered(),
+                                    if reduce_motion() { 0.0 } else { 0.12 },
+                                );
+                                let size = 22.0 * grow + 8.0 * hover;
+                                let center = slot.center() - Vec2::new(0.0, 5.0 * hover);
+                                if size > 0.5 {
+                                    if let Some(tex) = emoji_textures.get(key) {
+                                        ui.painter().image(
+                                            tex.id(),
+                                            Rect::from_center_size(center, Vec2::splat(size)),
+                                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                            Color32::WHITE,
+                                        );
+                                    } else {
+                                        ui.painter().text(
+                                            center,
+                                            egui::Align2::CENTER_CENTER,
+                                            code,
+                                            FontId::proportional(size * 0.8),
+                                            pal.text_primary,
+                                        );
+                                    }
+                                }
+                                if resp
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text(tooltip)
+                                    .clicked()
+                                {
+                                    action = Some(BubbleAction::React(code));
+                                }
+                            }
+                        });
+                    });
+            });
+        // Stay open only over the strip, the like button or the short corridor between them;
+        // the strip's bounding box used to cover the reply/share buttons, so moving there kept
+        // it open.
+        let strip = picker.response.rect.expand(4.0);
+        let corridor = Rect::from_min_max(
+            Pos2::new(btn_rect.left(), strip.bottom() - 2.0),
+            Pos2::new(btn_rect.right(), btn_rect.top() + 2.0),
+        );
+        keep_open |= pointer.is_some_and(|p| {
+            strip.contains(p) || btn_rect.expand(3.0).contains(p) || corridor.contains(p)
+        });
+    }
+    if action.is_some() {
+        keep_open = false;
+    }
+    ctx.data_mut(|d| d.insert_temp(id, keep_open));
+    action
+}
+
+/// Right-click menu on a chat bubble (Zalo layout). Reactions live on the hover 👍 button.
 pub(super) fn bubble_context_menu(
     ui: &mut egui::Ui,
     bubble: &egui::Response,
     msg: &ChatMessage,
     idx: usize,
     _pal: &ThemePalette,
-    emoji_textures: &HashMap<String, TextureHandle>,
+    _emoji_textures: &HashMap<String, TextureHandle>,
     _has_interactive_card: bool,
 ) -> Option<BubbleAction> {
-    let secondary_or_popup = ui.input(|i| {
-        i.pointer.button_down(egui::PointerButton::Secondary)
-            || i.pointer.button_clicked(egui::PointerButton::Secondary)
-            || i.pointer.button_released(egui::PointerButton::Secondary)
-    }) || ui.memory(|m| m.any_popup_open());
-    if !secondary_or_popup {
-        return None;
-    }
-    let resp = ui.interact(
-        bubble.rect,
-        Id::new(("bubble_ctx", idx, msg.ts, &msg.id)),
-        Sense::click(),
-    );
-    let mut action = None;
-
-    resp.context_menu(|ui| {
-        ui.set_min_width(210.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-            for &(code, key, tooltip) in &REACTION_LIST {
-                if let Some(tex) = emoji_textures.get(key) {
-                    let img = egui::Image::new(tex).fit_to_exact_size(Vec2::splat(24.0));
-                    let btn = egui::ImageButton::new(img).rounding(Rounding::same(6.0));
-                    if ui.add(btn).on_hover_text(tooltip).clicked() {
-                        action = Some(BubbleAction::React(code));
-                        ui.close_menu();
-                    }
-                } else if ui.button(RichText::new(code).size(18.0)).clicked() {
-                    action = Some(BubbleAction::React(code));
-                    ui.close_menu();
-                }
-            }
-        });
-        ui.separator();
-        if is_zalo_photo_message(msg) {
-            if let Some(thumb_url) = photo_primary_url(msg) {
-                if ui
-                    .button(format!("{} Xem ảnh phóng to", lucide::SEARCH))
-                    .clicked()
-                {
-                    action = Some(BubbleAction::OpenImagePopup {
-                        tex_key: format!("thumb_{}", crate::crypto::md5_hex(thumb_url)),
-                        full_url: msg
-                            .link_url
-                            .clone()
-                            .filter(|u| !u.is_empty())
-                            .unwrap_or_else(|| thumb_url.to_string()),
-                        title: msg
-                            .link_title
-                            .clone()
-                            .filter(|t| {
-                                !t.is_empty()
-                                    && !t.starts_with("http://")
-                                    && !t.starts_with("https://")
-                            })
-                            .unwrap_or_else(|| "Hình ảnh".to_string()),
-                        sender: if msg.is_outgoing {
-                            "Bạn".to_string()
-                        } else {
-                            msg.sender.clone()
-                        },
-                        time: msg.time.clone(),
-                    });
-                    ui.close_menu();
-                }
-            }
-        }
-        if is_zalo_file_or_video_message(msg) {
-            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-                let resolved_name = crate::chat::resolve_attachment_file_name(
-                    msg.link_title.as_deref(),
-                    msg.text.trim(),
-                    url,
-                );
-                if ui
-                    .button(format!("📥 Lưu tập tin \"{resolved_name}\""))
-                    .clicked()
-                {
-                    action = Some(BubbleAction::DownloadFile {
-                        url: url.to_string(),
-                        file_name: resolved_name,
-                    });
-                    ui.close_menu();
-                }
-            }
-        }
-        if ui.button("Trả lời").clicked() {
-            action = Some(BubbleAction::Reply);
-            ui.close_menu();
-        }
-        if ui.button("Chuyển tiếp").clicked() {
-            action = Some(BubbleAction::Forward);
-            ui.close_menu();
-        }
-        if ui.button("Copy tin nhắn").clicked() {
-            ui.ctx().copy_text(msg.text.clone());
-            ui.close_menu();
-        }
-        if ui
-            .button(if msg.is_pinned {
-                "Bỏ ghim tin nhắn"
-            } else {
-                "Ghim tin nhắn"
-            })
-            .clicked()
-        {
-            action = Some(BubbleAction::TogglePin);
-            ui.close_menu();
-        }
-        if ui
-            .button(if msg.is_starred {
-                "Bỏ đánh dấu tin nhắn"
-            } else {
-                "Đánh dấu tin nhắn"
-            })
-            .clicked()
-        {
-            action = Some(BubbleAction::ToggleStar);
-            ui.close_menu();
-        }
-        ui.separator();
-        if msg.is_outgoing && msg.text.trim() != "[Tin nhắn đã thu hồi]" {
-            if ui
-                .button(
-                    RichText::new("Thu hồi với mọi người").color(Color32::from_rgb(249, 115, 22)),
-                )
-                .clicked()
-            {
-                action = Some(BubbleAction::RecallForEveryone);
-                ui.close_menu();
-            }
-        }
-        if ui
-            .button(RichText::new("Xóa chỉ ở phía tôi").color(Color32::from_rgb(220, 60, 60)))
-            .clicked()
-        {
-            action = Some(BubbleAction::DeleteForMe);
-            ui.close_menu();
-        }
+    // egui attributes a click to widgets laid out on the *previous* frame, so a response that
+    // only exists once the secondary button is down never receives it (the menu never opened
+    // on right-click / two-finger tap). Detect the click from raw input instead and draw the
+    // menu ourselves at the pointer.
+    let ctx = ui.ctx().clone();
+    let menu_id = Id::new(("bubble_menu", idx, msg.ts, &msg.id));
+    let open_key = Id::new("bubble_menu_open");
+    let more_key = menu_id.with("more");
+    let sec = ui.input(|i| {
+        i.pointer
+            .button_clicked(egui::PointerButton::Secondary)
+            .then(|| i.pointer.interact_pos())
+            .flatten()
     });
+    if let Some(p) = sec.filter(|p| bubble.rect.contains(*p)) {
+        ctx.data_mut(|d| {
+            d.insert_temp(open_key, (menu_id, p));
+            d.insert_temp(more_key, false);
+        });
+    }
+    let (_, at) = ctx
+        .data(|d| d.get_temp::<(Id, Pos2)>(open_key))
+        .filter(|(id, _)| *id == menu_id)?;
+    let mut action = None;
+    let close = false;
+    let mut show_more = ctx.data(|d| d.get_temp::<bool>(more_key)).unwrap_or(false);
+    let fade = appear(&ctx, menu_id, 0.14);
+    let area = egui::Area::new(menu_id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(at + Vec2::new(0.0, (1.0 - fade) * -6.0))
+        .constrain(true)
+        .show(&ctx, |ui| {
+            ui.set_opacity(fade);
+            egui::Frame::popup(ui.style())
+                .rounding(Rounding::same(14.0))
+                .inner_margin(Margin::same(6.0))
+                .show(ui, |ui| {
+                    // Zalo-style menu: icon rows grouped by separators.
+                    ui.set_min_width(230.0);
+                    ui.set_max_width(260.0);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    if menu_item(ui, lucide::REPLY, "Trả lời", None) {
+                        action = Some(BubbleAction::Reply);
+                    }
+                    if menu_item(ui, lucide::FORWARD, "Chia sẻ", None) {
+                        action = Some(BubbleAction::Forward);
+                    }
+                    ui.separator();
+                    if menu_item(ui, lucide::COPY, "Copy tin nhắn", None) {
+                        ui.ctx().copy_text(msg.text.clone());
+                    }
+                    ui.separator();
+                    let pin_label = if msg.is_pinned {
+                        "Bỏ ghim tin nhắn"
+                    } else {
+                        "Ghim tin nhắn"
+                    };
+                    if menu_item(ui, lucide::PIN, pin_label, None) {
+                        action = Some(BubbleAction::TogglePin);
+                    }
+                    let star_label = if msg.is_starred {
+                        "Bỏ đánh dấu tin nhắn"
+                    } else {
+                        "Đánh dấu tin nhắn"
+                    };
+                    if menu_item(ui, lucide::STAR, star_label, None) {
+                        action = Some(BubbleAction::ToggleStar);
+                    }
+                    if menu_item(ui, lucide::LIST_CHECKS, "Chọn nhiều tin nhắn", None) {
+                        action = Some(BubbleAction::SelectMany);
+                    }
+                    if menu_item(ui, lucide::INFO, "Xem chi tiết", None) {
+                        action = Some(BubbleAction::ShowDetails);
+                    }
+                    if menu_item(
+                        ui,
+                        lucide::ELLIPSIS,
+                        if show_more {
+                            "Tuỳ chọn khác ▾"
+                        } else {
+                            "Tuỳ chọn khác ›"
+                        },
+                        None,
+                    ) {
+                        show_more = !show_more;
+                    }
+                    if show_more {
+                        ui.indent("more_opts", |ui| {
+                            ui.set_min_width(220.0);
+                            let mut any = false;
+                            if is_zalo_photo_message(msg) {
+                                if let Some(thumb_url) = photo_primary_url(msg) {
+                                    any = true;
+                                    if menu_item(ui, lucide::SEARCH, "Xem ảnh phóng to", None) {
+                                        action = Some(BubbleAction::OpenImagePopup {
+                                            tex_key: format!(
+                                                "thumb_{}",
+                                                crate::crypto::md5_hex(thumb_url)
+                                            ),
+                                            full_url: msg
+                                                .link_url
+                                                .clone()
+                                                .filter(|u| !u.is_empty())
+                                                .unwrap_or_else(|| thumb_url.to_string()),
+                                            title: msg
+                                                .link_title
+                                                .clone()
+                                                .filter(|t| {
+                                                    !t.is_empty()
+                                                        && !t.starts_with("http://")
+                                                        && !t.starts_with("https://")
+                                                })
+                                                .unwrap_or_else(|| "Hình ảnh".to_string()),
+                                            sender: if msg.is_outgoing {
+                                                "Bạn".to_string()
+                                            } else {
+                                                msg.sender.clone()
+                                            },
+                                            time: msg.time.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                            if is_zalo_file_or_video_message(msg) {
+                                if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty())
+                                {
+                                    any = true;
+                                    let resolved_name = crate::chat::resolve_attachment_file_name(
+                                        msg.link_title.as_deref(),
+                                        msg.text.trim(),
+                                        url,
+                                    );
+                                    if menu_item(ui, lucide::DOWNLOAD, "Lưu tập tin về máy", None)
+                                    {
+                                        action = Some(BubbleAction::DownloadFile {
+                                            url: url.to_string(),
+                                            file_name: resolved_name,
+                                        });
+                                    }
+                                }
+                            }
+                            if msg.is_outgoing && msg.text.trim() != "[Tin nhắn đã thu hồi]" {
+                                any = true;
+                                if menu_item(
+                                    ui,
+                                    lucide::UNDO,
+                                    "Thu hồi với mọi người",
+                                    Some(Color32::from_rgb(249, 115, 22)),
+                                ) {
+                                    action = Some(BubbleAction::RecallForEveryone);
+                                }
+                            }
+                            if !any {
+                                ui.label(RichText::new("Không có tuỳ chọn khác").size(12.5).weak());
+                            }
+                        });
+                    }
+                    ui.separator();
+                    if menu_item(
+                        ui,
+                        lucide::TRASH,
+                        "Xóa chỉ ở phía tôi",
+                        Some(Color32::from_rgb(220, 60, 60)),
+                    ) {
+                        action = Some(BubbleAction::DeleteForMe);
+                    }
+                });
+        });
+    let outside = ui.input(|i| {
+        i.pointer.any_pressed()
+            && i.pointer
+                .interact_pos()
+                .is_some_and(|q| !area.response.rect.contains(q))
+    });
+    if action.is_some() || close || outside || ui.input(|i| i.key_pressed(Key::Escape)) {
+        ctx.data_mut(|d| d.remove::<(Id, Pos2)>(open_key));
+    } else {
+        ctx.data_mut(|d| d.insert_temp(more_key, show_more));
+    }
     action
 }
 
@@ -2439,15 +3314,14 @@ pub(super) fn render_quote_block(
     } else {
         (pal.bubble_in_text, pal.bubble_in_meta)
     };
-    let bar_col = if outgoing && pal.is_dark {
-        Color32::from_rgb(147, 197, 253)
+    // Own bubbles are dark graphite in both themes, so their quote uses light ink.
+    let bar_col = if outgoing {
+        Color32::from_rgb(226, 226, 232)
     } else {
         pal.primary
     };
-    let bg_col = if outgoing && pal.is_dark {
-        Color32::from_rgba_unmultiplied(0, 0, 0, 42)
-    } else if outgoing {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 150)
+    let bg_col = if outgoing {
+        Color32::from_rgba_unmultiplied(0, 0, 0, 46)
     } else {
         text_col.linear_multiply(0.06)
     };
@@ -2500,11 +3374,20 @@ pub(super) fn render_reactions(
     pal: &ThemePalette,
     emoji_textures: &HashMap<String, TextureHandle>,
 ) {
+    let _ = emoji_textures;
     let has_pin = msg.is_pinned;
     let has_star = msg.is_starred;
     let has_react = !msg.reactions.is_empty();
 
     if !has_pin && !has_star && !has_react {
+        return;
+    }
+    // Reactions are drawn on the bubble's bottom edge (`reaction_corner_chip`); keep room so the
+    // chip does not cover the last line or the time.
+    if has_react {
+        ui.add_space(8.0);
+    }
+    if !has_pin && !has_star {
         return;
     }
 
@@ -2543,28 +3426,102 @@ pub(super) fn render_reactions(
                     );
                 });
         }
-
-        if has_react {
-            egui::Frame::none()
-                .fill(pal.bg_elevated)
-                .stroke(Stroke::new(1.0_f32, pal.border))
-                .rounding(Rounding::same(12.0))
-                .inner_margin(Margin::symmetric(6.0, 2.0))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
-                        for r in &msg.reactions {
-                            let key = emoji_to_tex_key(r);
-                            if let Some(tex) = emoji_textures.get(key) {
-                                ui.add(egui::Image::new(tex).fit_to_exact_size(Vec2::splat(18.0)));
-                            } else {
-                                ui.label(RichText::new(r).size(13.0));
-                            }
-                        }
-                    });
-                });
-        }
     });
+}
+
+/// Zalo-style reaction chip straddling the bubble's bottom-right edge (half inside, half
+/// outside): up to three emoji plus the total count. Clicking it lists who reacted.
+pub(super) fn reaction_corner_chip(
+    ui: &mut egui::Ui,
+    bubble: Rect,
+    msg: &ChatMessage,
+    pal: &ThemePalette,
+) {
+    if msg.reactions.is_empty() {
+        return;
+    }
+    let items: Vec<(String, u64)> = if msg.reaction_summaries.is_empty() {
+        msg.reactions.iter().map(|r| (r.clone(), 1)).collect()
+    } else {
+        msg.reaction_summaries
+            .iter()
+            .map(|r| (r.emoji.clone(), r.count))
+            .collect()
+    };
+    let total: u64 = items.iter().map(|(_, n)| *n).sum();
+    let shown: Vec<&String> = items.iter().map(|(e, _)| e).take(3).collect();
+    let count_txt = total.to_string();
+    let galley =
+        ui.fonts(|f| f.layout_no_wrap(count_txt, FontId::proportional(11.0), pal.text_secondary));
+    let h = 22.0;
+    let w = 8.0 + shown.len() as f32 * 16.0 + 4.0 + galley.size().x + 8.0;
+    let rect = Rect::from_min_size(
+        Pos2::new(bubble.right() - 10.0 - w, bubble.bottom() - h / 2.0),
+        Vec2::new(w, h),
+    );
+    let resp = ui.interact(
+        rect,
+        Id::new(("reaction_chip", &msg.id, msg.ts)),
+        Sense::click(),
+    );
+    let fill = if pal.is_dark {
+        Color32::from_rgb(52, 54, 62)
+    } else {
+        Color32::WHITE
+    };
+    let shadow = egui::epaint::Shadow {
+        offset: Vec2::new(0.0, 1.0),
+        blur: 6.0,
+        spread: 0.0,
+        color: Color32::from_black_alpha(if pal.is_dark { 90 } else { 40 }),
+    };
+    let rounding = Rounding::same(h / 2.0);
+    ui.painter().add(shadow.as_shape(rect, rounding));
+    ui.painter().rect_filled(
+        rect,
+        rounding,
+        if resp.hovered() {
+            if pal.is_dark {
+                Color32::from_rgb(66, 68, 78)
+            } else {
+                Color32::from_rgb(244, 244, 247)
+            }
+        } else {
+            fill
+        },
+    );
+    let mut x = rect.left() + 8.0 + 8.0;
+    for e in &shown {
+        if let Some(tex) = super::emoji_picker::emoji_texture_shared(ui.ctx(), e) {
+            ui.painter().image(
+                tex.id(),
+                Rect::from_center_size(Pos2::new(x, rect.center().y), Vec2::splat(15.0)),
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            ui.ctx().request_repaint();
+        }
+        x += 16.0;
+    }
+    ui.painter().galley(
+        Pos2::new(x - 8.0 + 4.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        pal.text_secondary,
+    );
+    if resp
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Xem ai đã thả biểu cảm")
+        .clicked()
+    {
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(Id::new("reaction_people_message"), msg.clone());
+            d.insert_temp(
+                Id::new("reaction_people_message").with("filter"),
+                String::new(),
+            );
+        });
+    }
 }
 
 #[cfg(test)]
@@ -2639,9 +3596,80 @@ mod quote_navigation_tests {
                 }
             }
             assert!(
-                matches!(action, Some(BubbleAction::JumpToQuoted(reference)) if reference == "original-1")
+                matches!(action, Some(BubbleAction::JumpToQuoted(ref reference)) if reference == "original-1"),
+                "outgoing={is_outgoing} some={} react={} reply={}",
+                action.is_some(),
+                matches!(action, Some(BubbleAction::React(_))),
+                matches!(action, Some(BubbleAction::Reply))
             );
         }
+    }
+
+    #[test]
+    fn secondary_click_on_bubble_opens_context_menu() {
+        let ctx = egui::Context::default();
+        let msg = ChatMessage {
+            id: "m1".into(),
+            text: "hello".into(),
+            sender: "A".into(),
+            ..Default::default()
+        };
+        let pos = egui::pos2(60.0, 30.0);
+        let frames: [Option<bool>; 4] = [None, Some(true), Some(false), None];
+        let mut opened = false;
+        let mut drew_reply = false;
+        for pressed in frames {
+            let mut events = vec![egui::Event::PointerMoved(pos)];
+            if let Some(pressed) = pressed {
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(600.0, 400.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = render_chat_bubble(
+                            ui,
+                            &msg,
+                            false,
+                            false,
+                            false,
+                            false,
+                            "Thread",
+                            None,
+                            &ThemePalette::light(),
+                            &HashMap::new(),
+                            &mut HashSet::new(),
+                            &HashMap::new(),
+                            0,
+                        );
+                    });
+                },
+            );
+            opened |= ctx.data(|d| {
+                d.get_temp::<(Id, egui::Pos2)>(Id::new("bubble_menu_open"))
+                    .is_some()
+            });
+            drew_reply |= out.shapes.iter().any(
+                |cs| matches!(&cs.shape, egui::Shape::Text(t) if t.galley.job.text == "Trả lời"),
+            );
+        }
+        assert!(
+            opened,
+            "right-click / two-finger tap must open the bubble menu"
+        );
+        assert!(drew_reply, "the opened menu must render its items");
     }
 
     #[test]
@@ -2705,5 +3733,59 @@ mod quote_navigation_tests {
             }
         }
         panic!("Quote with an exact reference must advertise a clickable target");
+    }
+}
+
+#[cfg(test)]
+mod link_card_tests {
+    use super::*;
+
+    #[test]
+    fn web_link_with_cdn_thumbnail_is_a_link_card_not_a_photo() {
+        // Zalo re-hosts link preview thumbnails on its photo CDN; the message is still a link.
+        let msg = ChatMessage {
+            id: "l1".into(),
+            text: "https://docs.google.com/document/d/abc/edit".into(),
+            link_url: Some("https://docs.google.com/document/d/abc/edit".into()),
+            link_title: Some("Nội dung Thiết kế Landing page".into()),
+            link_thumb: Some("https://photo-stal-12.zdn.vn/jpg/preview.jpg".into()),
+            ..Default::default()
+        };
+        assert!(!is_zalo_photo_message(&msg));
+        let (_, url, domain) = extract_message_link_view(&msg).expect("link view");
+        assert_eq!(url, "https://docs.google.com/document/d/abc/edit");
+        assert_eq!(domain, "docs.google.com");
+    }
+
+    #[test]
+    fn zalo_photo_stays_a_photo() {
+        let msg = ChatMessage {
+            id: "p1".into(),
+            text: "[Hình ảnh]".into(),
+            link_url: Some("https://photo-stal-12.zdn.vn/jpg/full.jpg".into()),
+            link_thumb: Some("https://photo-stal-12.zdn.vn/jpg/thumb.jpg".into()),
+            ..Default::default()
+        };
+        assert!(is_zalo_photo_message(&msg));
+    }
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::find_mentions;
+
+    #[test]
+    fn finds_longest_known_name_after_at() {
+        let names = vec![
+            "Lê Dũng Bá".to_string(),
+            "Lê".to_string(),
+            "All".to_string(),
+        ];
+        let t = "@Lê Dũng Bá cảm ơn phòng HTCN, mail a@b.com @All";
+        let spans = find_mentions(t, &names);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(&t[spans[0].0..spans[0].1], "@Lê Dũng Bá");
+        assert_eq!(&t[spans[1].0..spans[1].1], "@All");
+        assert!(find_mentions("@Lênin", &names).is_empty());
     }
 }

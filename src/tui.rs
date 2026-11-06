@@ -127,6 +127,7 @@ struct StickerState {
     loaded_name: String,
 }
 
+#[allow(clippy::large_enum_variant)] // short-lived channel message; boxing buys nothing measurable
 enum BgEvent {
     PollDone {
         threads: Vec<Thread>,
@@ -1275,11 +1276,10 @@ impl<'a> TuiApp<'a> {
                 KeyCode::Backspace => {
                     self.input_text.pop();
                 }
-                KeyCode::Char(c) => {
-                    if !c.is_control() && !mods.contains(KeyModifiers::CONTROL) {
+                KeyCode::Char(c)
+                    if !c.is_control() && !mods.contains(KeyModifiers::CONTROL) => {
                         self.input_text.push(c);
                     }
-                }
                 _ => {}
             },
         }
@@ -1843,7 +1843,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
     app.chat_view_h = inner_h;
 
     let pct = if lines.len() <= inner_h {
-        format!("100%")
+        "100%".to_string()
     } else {
         format!(
             "{}%",
@@ -2264,6 +2264,7 @@ fn help_line(keys: &str, desc: &str) -> Line<'static> {
     ])
 }
 
+#[allow(clippy::vec_init_then_push)] // one push per help line reads better than a giant vec![]
 fn render_help(f: &mut Frame, area: Rect) {
     let modal_area = centered_rect(80, 80, area);
     f.render_widget(Clear, modal_area);

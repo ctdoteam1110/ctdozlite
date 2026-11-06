@@ -192,6 +192,7 @@ fn inflate(buf: &[u8]) -> Result<Vec<u8>> {
         let head: String = buf.iter().take(12).map(|b| format!("{b:02x}")).collect();
         trace(format!("inflate input {} bytes head={head}", buf.len()));
     }
+    #[allow(clippy::type_complexity)] // two named decoder constructors
     let attempts: [(&str, fn(&[u8]) -> Box<dyn Read + '_>); 2] = [
         ("gzip", |b| Box::new(flate2::read::GzDecoder::new(b))),
         ("zlib", |b| Box::new(flate2::read::ZlibDecoder::new(b))),
@@ -470,13 +471,13 @@ async fn run_once(
                 if authed {
                     let body = json!({ "eventId": now_ms() });
                     let f = encode_frame(CMD_PING, SUB_KEEP_CONNECTION, 1, Some(&body));
-                    ws.send(Message::Binary(f.into())).await?;
+                    ws.send(Message::Binary(f)).await?;
                     trace("-> ping");
                 }
             }
             Some(frame) = out_rx.recv() => {
                 if authed {
-                    ws.send(Message::Binary(frame.into())).await?;
+                    ws.send(Message::Binary(frame)).await?;
                     trace("-> outbound ws frame");
                 }
             }
@@ -535,7 +536,7 @@ async fn run_once(
                     for (qcmd, qsub) in queues_from_auth(&auth) {
                         let id = format!("req_{req_id}");
                         req_id += 1;
-                        ws.send(Message::Binary(pull_frame(qcmd, qsub, &id).into())).await?;
+                        ws.send(Message::Binary(pull_frame(qcmd, qsub, &id))).await?;
                         trace(format!("-> pull {qcmd}_{qsub} {id}"));
                     }
                     continue;
@@ -567,7 +568,7 @@ async fn run_once(
                         });
                         let _ = ws
                             .send(Message::Binary(
-                                encode_frame(CMD_GET_MSG, 0, 1, Some(&get_req)).into(),
+                                encode_frame(CMD_GET_MSG, 0, 1, Some(&get_req)),
                             ))
                             .await;
                         trace(format!("-> get_msg 570_0 {id}"));
@@ -588,7 +589,7 @@ async fn run_once(
                     req_id += 1;
                     let _ = ws
                         .send(Message::Binary(
-                            pull_next_frame(cmd, sub_cmd, &id, last_id, pre_ids).into(),
+                            pull_next_frame(cmd, sub_cmd, &id, last_id, pre_ids),
                         ))
                         .await;
                     trace(format!("-> pull next {qkey} {id}"));

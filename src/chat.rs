@@ -401,10 +401,53 @@ pub struct Thread {
     pub unread: crate::unread::UnreadState,
 }
 
+/// Server posting restriction and the users exempt from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct GroupPostingPolicy {
+    /// Whether ordinary members are forbidden to post.
+    pub locked: bool,
+    /// Creator and deputy identifiers, as supplied by group metadata.
+    pub leaders: Vec<String>,
+}
+impl GroupPostingPolicy {
+    /// Only group leaders may post when the server locks member posting.
+    pub fn allows(&self, uid: &str) -> bool {
+        !self.locked || (!uid.is_empty() && self.leaders.iter().any(|id| id == uid))
+    }
+    /// Parse the confirmed `setting.lockSendMsg`, `creatorId`, and `adminIds` fields.
+    pub fn from_info(info: &Value) -> Self {
+        let locked = info.pointer("/setting/lockSendMsg").is_some_and(|v| {
+            v.as_bool() == Some(true) || v.as_u64() == Some(1) || v.as_str() == Some("1")
+        });
+        let mut leaders = Vec::new();
+        if let Some(id) = pick_str(info, &["creatorId"]) {
+            leaders.push(id);
+        }
+        for value in info
+            .get("adminIds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(id) = value
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| value.as_u64().map(|n| n.to_string()))
+            {
+                leaders.push(id);
+            }
+        }
+        Self { locked, leaders }
+    }
+}
+
 /// Durable sidebar metadata, including metadata-only startup snapshots.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SidebarPresentation {
+    /// Server-confirmed group posting rules.
+    pub posting: GroupPostingPolicy,
     pub members: Vec<SidebarMember>,
     /// Server totalMember only; never inferred from message senders or avatar samples.
     pub member_count: Option<u64>,
@@ -548,6 +591,7 @@ impl Thread {
 
     /// Parse only group roster metadata observed in the original getmg-v2 consumer.
     pub fn apply_group_sidebar_metadata(&mut self, info: &Value) {
+        self.presentation.posting = GroupPostingPolicy::from_info(info);
         if let Some(count) = info
             .get("totalMember")
             .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
@@ -1350,7 +1394,7 @@ pub(crate) fn next_client_message_id() -> u64 {
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     let previous = LAST_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
             Some(now.max(last.saturating_add(1)))
         })
         .unwrap_or_else(|last| last);
@@ -2228,7 +2272,7 @@ pub fn extract_first_url(text: &str) -> Option<String> {
         .or_else(|| trimmed.find("http://"))?;
     let after = &trimmed[pos..];
     let end = after.find(char::is_whitespace).unwrap_or(after.len());
-    let url = after[..end].trim_end_matches(|c: char| matches!(c, ')' | ']' | ',' | ';'));
+    let url = after[..end].trim_end_matches([')', ']', ',', ';']);
     if url.len() >= 10 {
         Some(url.to_string())
     } else {
@@ -2815,7 +2859,7 @@ pub async fn fetch_sticker_store_packs(s: &Session) -> Result<Vec<StickerPackInf
     }
 
     // Sort newest packs first (`id` descending) so modern Zalo packs appear at the top of the store
-    packs.sort_by(|a, b| b.id.cmp(&a.id));
+    packs.sort_by_key(|p| std::cmp::Reverse(p.id));
     if let Ok(txt) = serde_json::to_string(&packs) {
         let _ = std::fs::write(&cache_path, txt);
     }
@@ -3199,7 +3243,7 @@ async fn query_sticker_endpoints_once(
     // Merge and boost stickers that matched across multiple endpoints/queries
     let mut score_map: std::collections::HashMap<u64, (u64, u32, u8)> =
         std::collections::HashMap::new();
-    for batch in sugg_batches.into_iter().chain(search_batches.into_iter()) {
+    for batch in sugg_batches.into_iter().chain(search_batches) {
         for (cid, sid, stype, weight) in batch {
             score_map
                 .entry(sid)
@@ -3337,6 +3381,7 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
 /// Send a quote/reply message (`sendQuoteMessage` / `sendGroupQuoteMessage` in `compact-app-pc.b7bec208c4c8f73e09f8.js:14317494`):
 /// - 1-1 (`cmd 11771`): `POST {domains.chat}/api/message/quote?{common}`
 /// - Group (`cmd 11197`): `POST {domains.group}/api/group/quote?{common}`
+///
 /// Automatically falls back to `send_message` / `send_group_message` if the quoted message lacks a server ID.
 pub async fn send_quote_message(
     s: &Session,
@@ -3815,6 +3860,283 @@ pub async fn get_last_msgs(s: &Session, thread_ids: &[String]) -> Result<Value> 
     Ok(resp)
 }
 
+/// One message pinned inside a conversation (Zalo "pin topic").
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PinnedTopic {
+    pub topic_id: String,
+    pub sender_name: String,
+    pub text: String,
+    /// Server message id of the pinned message, when the topic carries one.
+    pub msg_id: String,
+}
+
+/// Parse `data.topics[]` from `/api/board/pin/list`. Each topic's `params` is a JSON string
+/// describing the pinned message (`getListPinTopics` in the PC bundle). Field names vary by
+/// message type, so several spellings are accepted.
+pub fn parse_pinned_topics(resp: &Value) -> Vec<PinnedTopic> {
+    let data = resp.get("data").unwrap_or(resp);
+    let Some(topics) = data.get("topics").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let pick = |v: &Value, keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|k| match v.get(*k) {
+                Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                Some(Value::Number(n)) => Some(n.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
+    topics
+        .iter()
+        .map(|t| {
+            let params = match t.get("params") {
+                Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+                Some(v) => v.clone(),
+                None => Value::Null,
+            };
+            let mut text = pick(
+                &params,
+                &["title", "content", "msg", "message", "description"],
+            );
+            if text.is_empty() {
+                text = match params.get("msg_type").and_then(Value::as_str).unwrap_or("") {
+                    t if t.contains("photo") || t.contains("doodle") => "[Hình ảnh]".into(),
+                    t if t.contains("sticker") => "[Nhãn dán]".into(),
+                    t if t.contains("link") => "[Liên kết]".into(),
+                    t if t.contains("file") || t.contains("share.file") => "[Tệp tin]".into(),
+                    _ => pick(t, &["title", "content"]),
+                };
+            }
+            PinnedTopic {
+                topic_id: pick(t, &["id", "topicId", "topic_id"]),
+                sender_name: pick(&params, &["senderName", "sender_name", "dName", "fromName"]),
+                text,
+                msg_id: pick(
+                    &params,
+                    &["global_msg_id", "globalMsgId", "msgId", "msg_id"],
+                ),
+            }
+        })
+        .filter(|p| !p.text.is_empty())
+        .collect()
+}
+
+/// `GET /api/board/pin/list` (cmd 12001, `getListPinTopics`): messages pinned in a group or
+/// 1-1 conversation. `conv_id` is the group id (without the `g` prefix) or the peer uid.
+pub async fn get_pinned_topics(s: &Session, conv_id: &str) -> Result<Vec<PinnedTopic>> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let id = conv_id
+        .trim_start_matches("group_")
+        .trim_start_matches('g')
+        .trim_start_matches('G');
+    let body = json!({ "groupId": id, "boardVersion": 0, "imei": s.imei });
+    let params = s.encoded_params(&body)?;
+    let path = format!("/api/board/pin/list?{}&params={params}", s.common_params());
+    let resp = s.get_endpoint("group_board", &path).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    // Raw shape in the Dev Inspector (`--dev`): topic `params` keys are not documented.
+    crate::logger::log_request(
+        "GET",
+        "/api/board/pin/list",
+        Some(200),
+        0,
+        "",
+        Some(&resp.to_string()),
+        None,
+    );
+    if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = resp
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Err(crate::session::SessionError::new(code, msg).into());
+        }
+    }
+    Ok(parse_pinned_topics(&resp))
+}
+
+/// Parse one page of `/api/alias/list` (`{items:[{userId, alias}], hasMore}`).
+/// Returns the `(uid, alias)` pairs (empty aliases skipped) and whether more pages exist.
+pub fn parse_alias_page(resp: &Value) -> (Vec<(String, String)>, bool) {
+    let data = resp.get("data").unwrap_or(resp);
+    let items = data
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|it| {
+                    let uid = match it.get("userId")? {
+                        Value::String(s) => s.clone(),
+                        Value::Number(n) => n.to_string(),
+                        _ => return None,
+                    };
+                    let alias = it.get("alias")?.as_str()?.trim().to_string();
+                    (!uid.is_empty() && !alias.is_empty()).then_some((uid, alias))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_more = match data.get("hasMore") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        _ => false,
+    };
+    (items, has_more)
+}
+
+fn alias_api_error(resp: &Value) -> Option<anyhow::Error> {
+    let code = resp.get("error_code").and_then(Value::as_i64)?;
+    (code != 0).then(|| {
+        let msg = resp
+            .get("error_message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        crate::session::SessionError::new(code, msg).into()
+    })
+}
+
+/// Every friend alias (biệt danh) the account has set, keyed by friend uid.
+/// Mirrors the PC bundle's `getAlias(page, count)` (cmd 12200, `{page, count, imei}`).
+pub async fn get_aliases(s: &Session) -> Result<std::collections::HashMap<String, String>> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let mut out = std::collections::HashMap::new();
+    // 100 per page is the bundle's `request_items_per_page` default; cap pages defensively.
+    for page in 1..=50 {
+        let body = json!({ "page": page, "count": 100, "imei": s.imei });
+        let params = s.encoded_params(&body)?;
+        let path = format!("/api/alias/list?{}&params={params}", s.common_params());
+        let resp = s.get_endpoint("alias", &path).await?;
+        let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+        if let Some(e) = alias_api_error(&resp) {
+            return Err(e);
+        }
+        let (items, has_more) = parse_alias_page(&resp);
+        let empty = items.is_empty();
+        out.extend(items);
+        if !has_more || empty {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Set (or, with an empty `alias`, remove) the alias for one friend.
+/// `/api/alias/update` takes `{friendId, alias, imei}` (cmd 12201); `/api/alias/remove`
+/// takes `{friendId}` (cmd 12202) — both GET with encoded params, per the PC bundle.
+pub async fn update_alias(s: &Session, friend_id: &str, alias: &str) -> Result<()> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let alias = alias.trim();
+    let (api, body) = if alias.is_empty() {
+        ("/api/alias/remove", json!({ "friendId": friend_id }))
+    } else {
+        (
+            "/api/alias/update",
+            json!({ "friendId": friend_id, "alias": alias, "imei": s.imei }),
+        )
+    };
+    let params = s.encoded_params(&body)?;
+    let path = format!("{api}?{}&params={params}", s.common_params());
+    let resp = s.get_endpoint("alias", &path).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    crate::logger::log_request("GET", api, Some(200), 0, "", Some(&resp.to_string()), None);
+    match alias_api_error(&resp) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// `mentionInfo` uid that tags the whole group ("@All"), per the PC bundle's MENTION_ALL_ID.
+pub const MENTION_ALL_UID: &str = "-1";
+
+/// A tagged member inside an outgoing group message (`mentionInfo` item).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mention {
+    pub uid: String,
+    /// Offset and length in UTF-16 code units, as the JS client computes them.
+    pub pos: usize,
+    pub len: usize,
+}
+
+/// Locate each `@Name` in `text` (in order) and return UTF-16 spans for the members still
+/// present after editing. `tags` are `(uid, display name)` picked from the @ popup.
+pub fn resolve_mentions(text: &str, tags: &[(String, String)]) -> Vec<Mention> {
+    let mut out = Vec::new();
+    let mut from_byte = 0usize;
+    for (uid, name) in tags {
+        let needle = format!("@{name}");
+        let Some(rel) = text[from_byte..].find(&needle) else {
+            continue;
+        };
+        let start = from_byte + rel;
+        out.push(Mention {
+            uid: uid.clone(),
+            pos: text[..start].encode_utf16().count(),
+            len: needle.encode_utf16().count(),
+        });
+        from_byte = start + needle.len();
+    }
+    out
+}
+
+/// `POST /api/group/mention` (cmd 11198, `sendMentionMessage`): group text with tagged members.
+pub async fn send_group_mention(
+    s: &Session,
+    grid: &str,
+    text: &str,
+    mentions: &[Mention],
+    client_id: u64,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let clean_grid = grid
+        .trim_start_matches("group_")
+        .trim_start_matches('g')
+        .trim_start_matches('G');
+    let info: Vec<Value> = mentions
+        .iter()
+        // uid "-1" is @All (MENTION_ALL_ID, type 1); members are type 0. re-notes/36_mentions_alias.md
+        .map(|m| {
+            let kind = if m.uid == MENTION_ALL_UID { 1 } else { 0 };
+            json!({ "pos": m.pos, "uid": m.uid, "len": m.len, "type": kind })
+        })
+        .collect();
+    let body = json!({
+        "grid": clean_grid,
+        "message": text,
+        "clientId": client_id,
+        "mentionInfo": Value::Array(info).to_string(),
+        "imei": s.imei,
+        "visibility": 0,
+    });
+    let params = s.encoded_params(&body)?;
+    let url = format!(
+        "{}/api/group/mention?{}",
+        s.domains.group,
+        s.common_params()
+    );
+    let resp = s.post_form(&url, format!("params={params}")).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = resp
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Err(crate::session::SessionError::new(code, msg).into());
+        }
+    }
+    Ok(resp)
+}
+
 /// `GET /api/pinconvers/list` (cmd 12120) — pinned threads.
 pub async fn get_pinned(s: &Session) -> Result<Value> {
     if s.login.is_none() {
@@ -4043,8 +4365,8 @@ fn format_multi_group_avatar(
                 }
             }
         }
-        let clean_name = m_name.replace(';', " ").replace('|', " ");
-        let clean_ava = m_ava.replace(';', "").replace('|', "");
+        let clean_name = m_name.replace([';', '|'], " ");
+        let clean_ava = m_ava.replace([';', '|'], "");
         slots.push(format!("{clean_name}|{clean_ava}"));
     }
     if slots.is_empty() {
@@ -4216,6 +4538,92 @@ pub async fn get_mini_profiles(
     Ok(serde_json::Map::new())
 }
 
+/// One group member with role, for the members panel, `@` picker and bubble avatars.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GroupMember {
+    pub id: String,
+    pub name: String,
+    pub avatar: Option<String>,
+    /// 2 = creator (Trưởng nhóm), 1 = admin (Phó nhóm), 0 = member.
+    pub role: u8,
+}
+
+/// Every member of `grid`: ids from `getmg-v2` (`memVerList`, untruncated), names/avatars from
+/// `/api/social/group/members` in chunks. Order: creator, admins, then the rest by name.
+pub async fn get_group_members(s: &Session, grid: &str) -> Result<Vec<GroupMember>> {
+    let clean = grid
+        .trim_start_matches("group_")
+        .trim_start_matches('g')
+        .trim_start_matches('G')
+        .to_string();
+    let (info_map, _) = fetch_group_profiles(s, std::slice::from_ref(&clean)).await?;
+    let Some(info) = info_map.get(&clean) else {
+        return Ok(Vec::new());
+    };
+    let mut ids: Vec<String> = Vec::new();
+    for item in info
+        .get("memVerList")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(uid) = item.as_str().and_then(|s| s.split('_').next()) {
+            let uid = uid.trim();
+            if !uid.is_empty() && !ids.iter().any(|x| x == uid) {
+                ids.push(uid.to_string());
+            }
+        }
+    }
+    let creator = pick_str(info, &["creatorId"]).unwrap_or_default();
+    let admins: Vec<String> = info
+        .get("adminIds")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .or_else(|| v.as_u64().map(|n| n.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut profiles = serde_json::Map::new();
+    for chunk in ids.chunks(50) {
+        if let Ok(mp) = get_mini_profiles(s, chunk).await {
+            profiles.extend(mp);
+        }
+    }
+    let mut out: Vec<GroupMember> = ids
+        .into_iter()
+        .map(|id| {
+            let p = profiles.get(&id);
+            let name = p
+                .and_then(|p| pick_str(p, &["displayName", "zaloName", "name", "display_name"]))
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| "Thành viên".into());
+            let avatar = p
+                .and_then(|p| pick_str(p, &["avatar", "avt", "profile_avatar"]))
+                .filter(|a| !a.is_empty() && !a.ends_with("/default"));
+            let role = if id == creator {
+                2
+            } else if admins.contains(&id) {
+                1
+            } else {
+                0
+            };
+            GroupMember {
+                id,
+                name,
+                avatar,
+                role,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| b.role.cmp(&a.role).then_with(|| a.name.cmp(&b.name)));
+    Ok(out)
+}
+
 /// Automatically resolve real display names and avatars for 1-1 and group threads that only have placeholder names.
 pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
     let unknown_ids: Vec<String> = threads
@@ -4379,7 +4787,7 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
                     .unwrap_or("");
                 slots.push(format!(
                     "{}|{}",
-                    p.replace(';', " ").replace('|', " "),
+                    p.replace([';', '|'], " "),
                     matched_url
                 ));
             }
@@ -4850,6 +5258,15 @@ fn extract_sticker_info(v: &Value) -> Option<(u64, u64, u32)> {
 }
 
 /// Check whether `url` points to a Zalo photo CDN asset (`photo-stal`, `photo-zmp`, `zpcloud.zdn.vn`, etc., #72).
+/// An http(s) URL to a web page rather than a Zalo-hosted photo or attachment.
+pub fn is_shared_web_link(url: &str) -> bool {
+    let u = url.trim();
+    (u.starts_with("http://") || u.starts_with("https://"))
+        && !is_zalo_photo_cdn_url(u)
+        && !u.to_ascii_lowercase().contains("/renewmedia")
+        && !u.to_ascii_lowercase().contains(".zdn.vn/")
+}
+
 pub fn is_zalo_photo_cdn_url(url: &str) -> bool {
     let u = url.trim().to_ascii_lowercase();
     if (!u.starts_with("http://") && !u.starts_with("https://")) || u.contains("/renewmedia") {
@@ -4947,6 +5364,7 @@ pub fn resolve_attachment_file_name(title: Option<&str>, text: &str, url: &str) 
 
 /// Extract rich link/media card metadata (`link_url`, `link_title`, `link_desc`, `link_thumb`, `link_src`)
 /// from a Zalo `chat.recommended` (`recommened.link`) or rich-object `content`.
+#[allow(clippy::type_complexity)] // protocol tuple kept as-is for existing callers
 fn extract_link_info(
     v: &Value,
 ) -> (
@@ -5099,10 +5517,14 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         .and_then(extract_content_text)
         .unwrap_or_default();
 
+    // A shared web page (Google Docs/Sheets, articles, …) keeps its preview thumbnail on
+    // Zalo's photo CDN; only the thumbnail is an image, the message is a link.
+    let is_web_link = link_url.as_deref().is_some_and(is_shared_web_link);
     let is_photo_msg = matches!(msg_type.as_str(), "chat.photo" | "photo" | "2")
-        || link_src.as_deref() == Some("Hình ảnh Zalo")
-        || link_url.as_deref().is_some_and(is_zalo_photo_cdn_url)
-        || link_thumb.as_deref().is_some_and(is_zalo_photo_cdn_url);
+        || (!is_web_link
+            && (link_src.as_deref() == Some("Hình ảnh Zalo")
+                || link_url.as_deref().is_some_and(is_zalo_photo_cdn_url)
+                || link_thumb.as_deref().is_some_and(is_zalo_photo_cdn_url)));
     let is_file_msg = matches!(
         msg_type.as_str(),
         "chat.file" | "file" | "19" | "share.file"
@@ -5862,7 +6284,7 @@ pub async fn get_user_online_status(s: &Session, uid: &str) -> Result<(bool, Str
     } else {
         last_onl_raw
     };
-    let now_sec = crate::login::unix_now() as i64;
+    let now_sec = crate::login::unix_now();
     let diff_sec = (now_sec - last_sec).max(0);
     if diff_sec <= 300 {
         return Ok((true, "Vừa mới truy cập".into()));
@@ -6128,11 +6550,7 @@ pub async fn update_pinned_conversation(
 
 /// Send a real-time "is typing" indicator to a 1-1 contact (`cmd 11144`, `/api/message/typing`)
 /// or a group (`cmd 11196`, `/api/group/typing`), unless blocked by `block_typing`.
-pub async fn send_typing_indicator(
-    s: &Session,
-    thread_id: &str,
-    is_group: bool,
-) -> Result<Value> {
+pub async fn send_typing_indicator(s: &Session, thread_id: &str, is_group: bool) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -6744,7 +7162,8 @@ pub fn extract_mobile_sync_controls(data_node: &Value) -> Vec<MobileSyncControlE
                 let is_last = parsed_data
                     .get("isLast")
                     .and_then(|v| v.as_i64())
-                    .unwrap_or(0) == 1;
+                    .unwrap_or(0)
+                    == 1;
                 if !url.is_empty() {
                     out.push(MobileSyncControlEvent::SyncV2Batch {
                         url,
@@ -6887,9 +7306,174 @@ pub async fn delete_conversation(
     }
 }
 
+/// Body of the PC bundle's `leaveGroup(groupId, silent)` (cmd 11189): `{grids, imei, silent,
+/// language}`. `silent` = 1 leaves without the "X đã rời nhóm" notice to ordinary members.
+fn leave_group_body(group_id: &str, imei: &str, silent: bool) -> Value {
+    let clean = group_id
+        .trim_start_matches("group_")
+        .trim_start_matches('g')
+        .trim_start_matches('G')
+        .trim();
+    json!({
+        "grids": [clean],
+        "imei": imei,
+        "silent": if silent { 1 } else { 0 },
+        "language": "vi",
+    })
+}
+
+/// True when a group call failed with server code 166 (`STR_GROUP_NO_PERMISION`).
+pub fn is_no_permission_error(res: &Result<()>) -> bool {
+    match res {
+        Err(e) => e
+            .downcast_ref::<crate::session::SessionError>()
+            .map(|se| se.code == 166)
+            .unwrap_or_else(|| e.to_string().contains("166")),
+        Ok(()) => false,
+    }
+}
+
+/// Leave a group: `POST {domains.group}/api/group/leave?{common}` with `params=encodeAES(body)`
+/// (see `re-notes/37_leave_group.md`). A non-zero `error_code` (e.g. the owner must hand the
+/// group over first) comes back as an error carrying the server's message.
+pub async fn leave_group(s: &Session, group_id: &str, silent: bool) -> Result<()> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let params = s.encoded_params(&leave_group_body(group_id, &s.imei, silent))?;
+    let url = format!("{}/api/group/leave?{}", s.domains.group, s.common_params());
+    let resp = s.post_form(&url, format!("params={params}")).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    crate::logger::log_request(
+        "POST",
+        "/api/group/leave",
+        Some(200),
+        0,
+        "",
+        Some(&resp.to_string()),
+        None,
+    );
+    match alias_api_error(&resp) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leave_group_body_matches_pc_bundle() {
+        let b = leave_group_body("group_2576214780450068931", "imei-x", false);
+        assert_eq!(b["grids"], json!(["2576214780450068931"]));
+        assert_eq!(b["imei"], "imei-x");
+        assert_eq!(b["silent"], 0);
+        assert_eq!(b["language"], "vi");
+        assert_eq!(leave_group_body("g123", "i", true)["silent"], 1);
+    }
+
+    #[test]
+    fn web_link_with_cdn_thumbnail_parses_as_link_not_photo() {
+        let url = "https://docs.google.com/spreadsheets/d/abc/edit?gid=1";
+        let it = json!({
+            "msgId": "1",
+            "uidFrom": "2",
+            "msgType": "chat.recommended",
+            "ts": "1700000000000",
+            "content": {
+                "title": "Nội dung Thiết kế Landing page",
+                "href": url,
+                "thumb": "https://photo-stal-16.zdn.vn/no/5a94/preview.jpg",
+                "description": ""
+            }
+        });
+        let msg = parse_chat_message(&it).expect("parsed");
+        assert_ne!(msg.link_src.as_deref(), Some("Hình ảnh Zalo"));
+        assert_ne!(msg.text.trim(), "[Hình ảnh]");
+        assert_eq!(msg.link_url.as_deref(), Some(url));
+    }
+
+    #[test]
+    fn mention_all_resolves_to_group_wide_uid() {
+        let tags = vec![(MENTION_ALL_UID.to_string(), "All".to_string())];
+        let spans = resolve_mentions("Mọi người @All họp nhé", &tags);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].uid, "-1");
+        assert_eq!(spans[0].pos, "Mọi người ".encode_utf16().count());
+        assert_eq!(spans[0].len, "@All".encode_utf16().count());
+    }
+
+    #[test]
+    fn parse_alias_page_reads_items_and_has_more() {
+        let resp = json!({
+            "data": {
+                "items": [
+                    { "userId": "123", "alias": "Anh Du" },
+                    { "userId": 456, "alias": " Chị Ba " },
+                    { "userId": "789", "alias": "" }
+                ],
+                "hasMore": true,
+                "updateTime": 1
+            }
+        });
+        let (items, more) = parse_alias_page(&resp);
+        assert!(more);
+        assert_eq!(
+            items,
+            vec![
+                ("123".to_string(), "Anh Du".to_string()),
+                ("456".to_string(), "Chị Ba".to_string()),
+            ]
+        );
+        let (none, more) = parse_alias_page(&json!({ "items": [] }));
+        assert!(none.is_empty() && !more);
+    }
+
+    #[test]
+    fn mention_spans_use_utf16_offsets_and_skip_removed_tags() {
+        let tags = vec![
+            ("1".to_string(), "Thu Hương".to_string()),
+            ("2".to_string(), "Gone".to_string()),
+            ("3".to_string(), "An".to_string()),
+        ];
+        // "😀" is two UTF-16 units; Vietnamese letters are one each.
+        let text = "😀 chào @Thu Hương và @An nhé";
+        let m = resolve_mentions(text, &tags);
+        assert_eq!(
+            m,
+            vec![
+                Mention {
+                    uid: "1".into(),
+                    pos: 8,
+                    len: 10
+                },
+                Mention {
+                    uid: "3".into(),
+                    pos: 22,
+                    len: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pinned_topics_parse_params_json_string() {
+        let resp = json!({
+            "error_code": 0,
+            "data": { "topics": [
+                { "id": 11, "params": "{\"title\":\"Link https://a.b\",\"senderName\":\"Lê Dũng Bá\",\"global_msg_id\":\"77\"}" },
+                { "id": 12, "params": "{\"msg_type\":\"chat.photo\"}" },
+                { "id": 13, "params": "{}" }
+            ]}
+        });
+        let pins = parse_pinned_topics(&resp);
+        assert_eq!(pins.len(), 2);
+        assert_eq!(pins[0].sender_name, "Lê Dũng Bá");
+        assert_eq!(pins[0].text, "Link https://a.b");
+        assert_eq!(pins[0].msg_id, "77");
+        assert_eq!(pins[1].text, "[Hình ảnh]");
+    }
 
     #[test]
     fn local_time_when_parsing_millisecond_timestamps() {
@@ -8054,5 +8638,29 @@ mod send_identity_tests {
                 checksum: "md5_123".into(),
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod posting_policy_tests {
+    use super::*;
+    #[test]
+    fn locked_group_allows_creator_and_deputy_but_not_member() {
+        let policy = GroupPostingPolicy::from_info(
+            &json!({"setting":{"lockSendMsg":1},"creatorId":"owner","adminIds":["deputy",42]}),
+        );
+        assert!(policy.allows("owner"));
+        assert!(policy.allows("deputy"));
+        assert!(policy.allows("42"));
+        assert!(!policy.allows("member"));
+        assert!(!policy.allows(""));
+    }
+    #[test]
+    fn ordinary_group_allows_members_and_old_cache_deserializes() {
+        assert!(
+            GroupPostingPolicy::from_info(&json!({"setting":{"lockSendMsg":0}})).allows("member")
+        );
+        let cached: SidebarPresentation = serde_json::from_str("{}").unwrap();
+        assert!(cached.posting.allows("member"));
     }
 }

@@ -1,11 +1,13 @@
 [package]
 name = "ctdozlite"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2021"
+# Lowest toolchain the code builds with (AtomicU64::try_update needs 1.95); checked in CI.
+rust-version = "1.95"
 authors = ["TIPC1110 <tienichpc1110@gmail.com>"]
 description = "Lightweight, high-performance native Zalo PC client written in Rust (zero Node.js, zero Electron)"
 homepage = "https://ctdozlite.ctdo.net/"
-repository = "https://github.com/ctdoteam1110/ctdozlite"
+repository = "https://github.com/lebad280324/ctdozlite"
 license = "MIT OR Apache-2.0"
 default-run = "ctdozlite"
 
@@ -28,14 +30,17 @@ generic-array = "0.14"
 anyhow = "1"
 qrcode = { version = "0.14.1", default-features = false }
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
-ratatui = "0.29"
-crossterm = "0.28"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "tiff"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
+crossterm = "0.29"
 rusqlite = { version = "0.32", features = ["bundled"] }
 cpal = "0.15"
 opus = "0.3"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
-rsa = "0.9.10"
+# Constant-time RSA (PKCS#1 v1.5) for phone-sync key unwrapping; replaces `rsa` (ADR-0005).
+aws-lc-rs = "1.16"
+# Wipes the ephemeral RSA private key and the unwrapped backup key from memory (ADR-0005).
+zeroize = "1"
 lzma-rs = "0.3.0"
 zstd = "0.14.3"
 raw-window-handle = "0.6"
@@ -103,5 +108,6 @@ debug = 0
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
-objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSResponder", "NSView", "NSGraphics"] }
+objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSResponder", "NSView", "NSGraphics", "NSPasteboard", "NSPasteboardItem", "NSWorkspace", "NSAccessibility"] }
+objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSString", "NSData", "NSArray", "NSURL"] }
 window-vibrancy = "0.5"

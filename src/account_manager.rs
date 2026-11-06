@@ -72,7 +72,7 @@ pub fn list_saved_accounts(current_uin: &str) -> Vec<AccountProfile> {
             }
         }
     }
-    out.sort_by(|a, b| b.last_active_ts.cmp(&a.last_active_ts));
+    out.sort_by_key(|a| std::cmp::Reverse(a.last_active_ts));
     out
 }
 

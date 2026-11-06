@@ -11,9 +11,9 @@
 use anyhow::Result;
 use session::Session;
 pub use zalo_rust::{
-    account_manager, api_mcp, audio, call, chat, clock, crypto, data_dir, endpoints, feed, gui, history_sync,
-    logger, login, media, media_resources, message_model, param_cipher, qr, reactions, scheduler,
-    session, socket, store, tui, ui, unread, updater, voip_log,
+    account_manager, api_mcp, audio, call, chat, clock, crypto, data_dir, endpoints, feed, gui,
+    history_sync, logger, login, media, media_resources, message_model, param_cipher, qr,
+    reactions, scheduler, session, socket, store, tui, ui, unread, updater, voip_log,
 };
 
 pub const POLL_SECS: u64 = 4;
@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
 
     // Attempt to restore persistent session from disk
     let session_restored = if !force_logout {
-        if let Ok(_) = s.load_from_file("session.json") {
+        if s.load_from_file("session.json").is_ok() {
             if let Some(li) = &s.login {
                 let name = if li.display_name.is_empty() {
                     "Zalo User"
@@ -209,12 +209,26 @@ async fn main() -> Result<()> {
         }
         let mut viewport = eframe::egui::ViewportBuilder::default()
             .with_app_id("ctdozlite")
+            // Custom rounded chrome avoids AppKit's straight white frame around the window.
             .with_decorations(false)
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false)
+            // Traffic lights are drawn inside the list card alongside the drag region.
+            .with_titlebar_buttons_shown(false)
             // Needed for Liquid Glass: the macOS vibrancy view must show through the GL surface.
             .with_transparent(cfg!(target_os = "macos"))
             .with_inner_size([1020.0, 700.0])
             .with_min_inner_size([480.0, 360.0])
             .with_title("ctdozlite");
+        // macOS takes the icon from the app bundle. Passing no icon is not enough: eframe then
+        // installs egui's default "e" icon in the Dock. An empty `IconData` is eframe's signal to
+        // leave the application icon alone.
+        #[cfg(target_os = "macos")]
+        {
+            viewport = viewport.with_icon(std::sync::Arc::new(eframe::egui::IconData::default()));
+        }
+        #[cfg(not(target_os = "macos"))]
         if let Some(icon) = gui::load_app_icon() {
             viewport = viewport.with_icon(std::sync::Arc::new(icon));
         }

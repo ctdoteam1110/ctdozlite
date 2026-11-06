@@ -18,7 +18,6 @@ pub const ZPW_VER: &str = "694";
 pub const ZPW_TYPE: &str = "30";
 pub const CONFIG_DOMAIN: &str = "zaloapp.com";
 
-
 // ---------------------------------------------------------------------------
 // Client-Side Privacy Blocker (block outbound typing / delivered / seen)
 // ---------------------------------------------------------------------------
@@ -301,6 +300,13 @@ impl Domains {
                 self.conversation = v;
             }
         }
+        // Services without a primary slot: keep server-returned hosts as candidates only.
+        for key in ["group_board", "alias"] {
+            let urls = map.get(key).map(all_urls).unwrap_or_default();
+            if !urls.is_empty() {
+                self.service_map_candidates.insert(key.into(), urls);
+            }
+        }
     }
 
     /// Primary slot value for a named endpoint key.
@@ -359,6 +365,9 @@ impl Domains {
         }
         if canonical == "friend" {
             push_unique_host(&mut list, &self.profile);
+        }
+        if canonical == "group_board" {
+            push_unique_host(&mut list, crate::endpoints::GROUP_BOARD_LEGACY);
         }
         list
     }
@@ -1408,6 +1417,7 @@ fn random_imei() -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)] // tests tweak one field of a default fixture
 mod tests {
     use super::*;
 

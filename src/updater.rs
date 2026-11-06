@@ -416,10 +416,8 @@ pub fn select_platform_asset_score(name: &str, target_os: &str, target_arch: &st
             if !n_low.ends_with(".dmg") {
                 return 0;
             }
-            if target_arch == "aarch64" && (n_low.contains("arm64") || n_low.contains("aarch64")) {
-                110
-            } else if target_arch == "x86_64"
-                && (n_low.contains("x86_64") || n_low.contains("intel"))
+            if (target_arch == "aarch64" && (n_low.contains("arm64") || n_low.contains("aarch64")))
+                || (target_arch == "x86_64" && (n_low.contains("x86_64") || n_low.contains("intel")))
             {
                 110
             } else if !n_low.contains("arm64")
@@ -429,7 +427,7 @@ pub fn select_platform_asset_score(name: &str, target_os: &str, target_arch: &st
             {
                 100
             } else {
-                50
+                0
             }
         }
         _ => {
@@ -753,6 +751,27 @@ mod github_api_tests {
             mac_meta.expected_sha256.as_deref(),
             Some("2222222222222222222222222222222222222222222222222222222222222222")
         );
+    }
+
+    #[test]
+    fn arm64_only_release_does_not_offer_a_download_to_intel() {
+        let release = serde_json::json!({
+            "tag_name": "v0.0.9",
+            "assets": [{
+                "name": "ctdozlite-0.0.9-macos-arm64.dmg",
+                "browser_download_url": "https://github.com/lebad280324/ctdozlite/releases/download/v0.0.9/ctdozlite-0.0.9-macos-arm64.dmg"
+            }]
+        });
+        let meta = parse_github_release_value(
+            &release,
+            "0.0.8",
+            "lebad280324/ctdozlite",
+            "macos",
+            "x86_64",
+        );
+        assert!(meta.has_update);
+        assert!(meta.download_url.is_none());
+        assert!(meta.asset_name.is_none());
     }
 
     #[test]

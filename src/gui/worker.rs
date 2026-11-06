@@ -6,6 +6,10 @@ pub(super) static KNOWN_THREADS: std::sync::Mutex<Vec<(String, String, bool)>> =
     std::sync::Mutex::new(Vec::new());
 
 pub enum WorkerCmd {
+    /// Refresh server posting permissions when a group opens.
+    FetchGroupPosting {
+        thread_id: String,
+    },
     /// Read OS authorization without prompting.
     ReadNotificationAuthorization {
         request_id: u64,
@@ -212,6 +216,47 @@ pub enum WorkerCmd {
     SwitchAccount {
         target_uin: String,
     },
+    /// Group text with `@` tags picked in the composer: `(uid, display name)` in insert order.
+    SendGroupMention {
+        to_id: String,
+        text: String,
+        tags: Vec<(String, String)>,
+    },
+    /// Load messages pinned inside a conversation (`/api/board/pin/list`).
+    FetchPinnedTopics {
+        thread_id: String,
+    },
+    /// Ask for a wallpaper image, copy it into the data dir and decode it.
+    PickBackgroundImage,
+    /// Decode the saved wallpaper at startup.
+    LoadBackgroundImage {
+        path: String,
+    },
+    /// Load every member (name, avatar, role) of a group.
+    FetchGroupMembers {
+        thread_id: String,
+    },
+    /// Load a user's profile for the "Thông tin tài khoản" card.
+    FetchAccountInfo {
+        uid: String,
+    },
+    /// Load every friend alias (biệt danh) set by this account.
+    FetchAliases,
+    /// Set a friend's alias; an empty `alias` removes it.
+    SetAlias {
+        friend_id: String,
+        alias: String,
+    },
+    /// Ask `getmg-v2` which of these groups the account is no longer in (`removedsGroup`).
+    CheckGroupMembership {
+        thread_ids: Vec<String>,
+    },
+    /// Leave a group (`/api/group/leave`); `silent` skips the notice to ordinary members.
+    LeaveGroup {
+        thread_id: String,
+        name: String,
+        silent: bool,
+    },
 }
 
 pub(super) static WORKER_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<WorkerCmd>> =
@@ -388,7 +433,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
                             tick.tick().await;
-                            let now_ts = crate::login::unix_now() as i64;
+                            let now_ts = crate::login::unix_now();
                             let due = crate::scheduler::claim_due_scheduled_messages(
                                 "zalo_history.db",
                                 now_ts,
@@ -520,7 +565,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             crate::chat::dispatch_file_done_controls(data_node);
                                             let mute_evs = crate::chat::extract_mute_controls(
                                                 data_node,
-                                                crate::login::unix_now() as i64,
+                                                crate::login::unix_now(),
                                             );
                                             if !mute_evs.is_empty() {
                                                 let _ = gui_tx_ws
@@ -641,6 +686,20 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                     }
                                                 }
                                             }
+                                            // Live reactions: cmd 612 `reacts` / `reactGroups`
+                                            // and reaction items inside message pulls. Parsed
+                                            // here, applied on the UI side (they were dropped).
+                                            {
+                                                let data = ev.payload.get("data").unwrap_or(&ev.payload);
+                                                let mut reacts = crate::reactions::parse_reaction_events(data);
+                                                if reacts.is_empty() && ev.payload.get("data").is_some() {
+                                                    reacts = crate::reactions::parse_reaction_events(&ev.payload);
+                                                }
+                                                if !reacts.is_empty() {
+                                                    let _ = gui_tx_ws.send(GuiEvent::ReactionsReceived(reacts));
+                                                    ctx_ws.request_repaint();
+                                                }
+                                            }
                                             if ev.is_chat_ish() {
                                                 let mut ws_threads = Vec::new();
                                                 if let Some(li) = s_snap.login.as_ref() {
@@ -753,7 +812,76 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                 let mut current_qr_task: Option<tokio::task::JoinHandle<()>> = None;
 
                 while let Some(cmd) = cmd_rx.recv().await {
+                    // Check all composer send paths, including forwards and attachments.
+                    let target = match &cmd {
+                        WorkerCmd::SendMessage { to_id, is_group: true, .. }
+                        | WorkerCmd::SendQuote { to_id, is_group: true, .. }
+                        | WorkerCmd::SendSticker { to_id, is_group: true, .. }
+                        | WorkerCmd::PickAndSendAttachment { to_id, is_group: true, .. } => Some(to_id.clone()),
+                        WorkerCmd::Forward { target_id, target_is_group: true, .. } => Some(target_id.clone()),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        let s = session.lock().await.clone();
+                        let clean = target.trim_start_matches("group_").trim_start_matches(['g', 'G']).to_owned();
+                        let result = tokio::time::timeout(std::time::Duration::from_secs(10), crate::chat::fetch_group_profiles(&s, std::slice::from_ref(&clean))).await;
+                        let allowed = match result {
+                            Ok(Ok((map, _))) => map.get(&clean).map(|info| crate::chat::GroupPostingPolicy::from_info(info).allows(s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or_default())),
+                            _ => None,
+                        };
+                        if allowed != Some(true) {
+                            let text = match &cmd { WorkerCmd::SendMessage { text, .. } | WorkerCmd::SendQuote { text, .. } => text.clone(), _ => String::new() };
+                            let error = if allowed == Some(false) { "Chỉ trưởng/phó cộng đồng được gửi tin nhắn." } else { "Chưa kiểm tra được quyền gửi tin của nhóm. Hãy thử lại." };
+                            let _ = gui_tx.send(GuiEvent::SendFailed { thread_id: target, text, error: error.into() });
+                            egui_ctx.request_repaint();
+                            continue;
+                        }
+                    }
                     match cmd {
+                        WorkerCmd::CheckGroupMembership { thread_ids } => {
+                            let s = session.lock().await.clone();
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let mut gone: Vec<String> = Vec::new();
+                                for chunk in thread_ids.chunks(50) {
+                                    let Ok(Ok((_, removed))) = tokio::time::timeout(
+                                        std::time::Duration::from_secs(15),
+                                        crate::chat::fetch_group_profiles(&s, chunk),
+                                    )
+                                    .await
+                                    else {
+                                        continue;
+                                    };
+                                    for tid in chunk {
+                                        let clean = tid.trim_start_matches("group_").trim_start_matches(['g', 'G']);
+                                        if removed.contains(clean) {
+                                            gone.push(tid.clone());
+                                        }
+                                    }
+                                }
+                                if !gone.is_empty() {
+                                    let _ = tx.send(GuiEvent::GroupsRemoved(gone));
+                                    ctx.request_repaint();
+                                }
+                            });
+                        }
+                        WorkerCmd::FetchGroupPosting { thread_id } => {
+                            let s = session.lock().await.clone();
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let clean = thread_id.trim_start_matches("group_").trim_start_matches(['g', 'G']).to_owned();
+                                let result = tokio::time::timeout(std::time::Duration::from_secs(10), crate::chat::fetch_group_profiles(&s, std::slice::from_ref(&clean))).await;
+                                let removed = matches!(&result, Ok(Ok((_, rem))) if rem.contains(&clean));
+                                let policy = match result { Ok(Ok((map, _))) => map.get(&clean).map(crate::chat::GroupPostingPolicy::from_info), _ => None };
+                                if removed {
+                                    let _ = tx.send(GuiEvent::GroupsRemoved(vec![thread_id.clone()]));
+                                }
+                                let _ = tx.send(GuiEvent::GroupPostingLoaded { thread_id, policy });
+                                ctx.request_repaint();
+                            });
+                        }
                         WorkerCmd::ReadNotificationAuthorization { request_id }
                         | WorkerCmd::RequestNotificationAuthorization { request_id } => {
                             let request = matches!(
@@ -892,7 +1020,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 {
                                     if let Some(mute_map) = crate::unread::extract_mute_map(
                                         &mute_resp,
-                                        crate::login::unix_now() as i64,
+                                        crate::login::unix_now(),
                                     ) {
                                         let _ = gui_tx_clone
                                             .send(GuiEvent::MuteSnapshotSynced(mute_map));
@@ -1136,7 +1264,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                             if let Some(mute_map) =
                                                                 crate::unread::extract_mute_map(
                                                                     &mute_resp,
-                                                                    crate::login::unix_now() as i64,
+                                                                    crate::login::unix_now(),
                                                                 )
                                                             {
                                                                 let _ = gui_tx_clone.send(
@@ -1339,7 +1467,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         crate::unread::merge_mute_metadata(&mut list, &mute_resp);
                                         if let Some(mute_map) = crate::unread::extract_mute_map(
                                             &mute_resp,
-                                            crate::login::unix_now() as i64,
+                                            crate::login::unix_now(),
                                         ) {
                                             let _ = gui_tx_clone
                                                 .send(GuiEvent::MuteSnapshotSynced(mute_map));
@@ -1874,7 +2002,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 text,
                                                 time: now,
                                                 is_outgoing: true,
-                                                ts: (crate::login::unix_now() * 1000) as i64,
+                                                ts: (crate::login::unix_now() * 1000),
                                                 link_url: Some(meta.url),
                                                 link_title: if meta.title.is_empty() {
                                                     None
@@ -1960,6 +2088,195 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             }
                                         }
                                         ctx_clone.request_repaint();
+                                    }
+                                }
+                            });
+                        }
+                        WorkerCmd::SendGroupMention { to_id, text, tags } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let client_id = crate::chat::next_client_message_id();
+                                let mentions = crate::chat::resolve_mentions(&text, &tags);
+                                // Tags deleted while editing leave plain text: use the normal path.
+                                let res = if mentions.is_empty() {
+                                    crate::chat::send_group_message_with_client_id(
+                                        &s, &to_id, &text, client_id,
+                                    )
+                                    .await
+                                } else {
+                                    crate::chat::send_group_mention(
+                                        &s, &to_id, &text, &mentions, client_id,
+                                    )
+                                    .await
+                                };
+                                match res {
+                                    Ok(resp) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                            client_message_id: client_id.to_string(),
+                                            msg_id: extract_msg_id(&resp),
+                                            thread_id: to_id,
+                                            text,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let err_s = e.to_string();
+                                        crate::logger::log_error("gui::send_mention", &err_s);
+                                        let _ = gui_tx_clone.send(GuiEvent::SendFailed {
+                                            thread_id: to_id,
+                                            text,
+                                            error: err_s,
+                                        });
+                                    }
+                                }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::PickBackgroundImage => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let Some(src) = pick_native_file_dialog(true) else {
+                                    return;
+                                };
+                                let ext = src
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .unwrap_or("png")
+                                    .to_ascii_lowercase();
+                                // Copy into the data dir (cwd) so the wallpaper survives the
+                                // original file being moved or deleted.
+                                let dest = format!("app_background.{ext}");
+                                let image = std::fs::copy(&src, &dest)
+                                    .ok()
+                                    .and_then(|_| decode_wallpaper(&dest));
+                                let _ = gui_tx_clone.send(GuiEvent::BackgroundImageReady {
+                                    path: dest,
+                                    image,
+                                    picked: true,
+                                });
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::LoadBackgroundImage { path } => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let image = decode_wallpaper(&path);
+                                let _ = gui_tx_clone.send(GuiEvent::BackgroundImageReady {
+                                    path,
+                                    image,
+                                    picked: false,
+                                });
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchAliases => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                match crate::chat::get_aliases(&s).await {
+                                    Ok(map) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::AliasesLoaded(map));
+                                        ctx_clone.request_repaint();
+                                    }
+                                    Err(e) => {
+                                        crate::logger::log_error("gui::aliases", &e.to_string());
+                                    }
+                                }
+                            });
+                        }
+                        WorkerCmd::SetAlias { friend_id, alias } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let res = crate::chat::update_alias(&s, &friend_id, &alias)
+                                    .await
+                                    .map_err(|e| e.to_string());
+                                let _ = gui_tx_clone.send(GuiEvent::AliasUpdated {
+                                    friend_id,
+                                    alias,
+                                    res,
+                                });
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::LeaveGroup { thread_id, name, silent } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let mut res = crate::chat::leave_group(&s, &thread_id, silent).await;
+                                // 166 = "không đủ quyền". Silent leave may not be allowed in this
+                                // group: retry once as a normal leave.
+                                if silent && crate::chat::is_no_permission_error(&res) {
+                                    res = crate::chat::leave_group(&s, &thread_id, false).await;
+                                }
+                                let denied = crate::chat::is_no_permission_error(&res);
+                                let res = res.map_err(|e| {
+                                    if denied {
+                                        "Zalo từ chối (mã 166: không đủ quyền). Nhóm/cộng đồng này có thể không cho thành viên tự rời từ máy tính — hãy thử rời trên điện thoại.".to_string()
+                                    } else {
+                                        e.to_string()
+                                    }
+                                });
+                                let _ = gui_tx_clone.send(GuiEvent::GroupLeft { thread_id, name, res });
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchGroupMembers { thread_id } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                match crate::chat::get_group_members(&s, &thread_id).await {
+                                    Ok(members) => {
+                                        let _ = gui_tx_clone
+                                            .send(GuiEvent::GroupMembersLoaded { thread_id, members });
+                                        ctx_clone.request_repaint();
+                                    }
+                                    Err(e) => {
+                                        crate::logger::log_error("gui::group_members", &e.to_string());
+                                    }
+                                }
+                            });
+                        }
+                        WorkerCmd::FetchAccountInfo { uid } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let res = s
+                                    .get_friend_social_profile(&uid)
+                                    .await
+                                    .map_err(|e| e.to_string());
+                                let _ = gui_tx_clone.send(GuiEvent::AccountInfoLoaded { uid, res });
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchPinnedTopics { thread_id } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                match crate::chat::get_pinned_topics(&s, &thread_id).await {
+                                    Ok(topics) => {
+                                        let _ = gui_tx_clone
+                                            .send(GuiEvent::PinnedTopicsLoaded { thread_id, topics });
+                                        ctx_clone.request_repaint();
+                                    }
+                                    Err(e) => {
+                                        crate::logger::log_error("gui::pinned_topics", &e.to_string());
                                     }
                                 }
                             });
@@ -2413,7 +2730,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 };
 
                                 let _ = tokio::task::spawn_blocking(move || {
-                                    let Ok(mut dyn_img) = image::load_from_memory(&bytes) else {
+                                    // Zalo PC's own photo cache is mostly JPEG XL, which `image`
+                                    // cannot read: fall back to the OS decoder.
+                                    let decoded = image::load_from_memory(&bytes).ok().or_else(|| {
+                                        crate::zalo_pc_media::decode_to_png_with_imageio(&bytes)
+                                            .and_then(|png| image::load_from_memory(&png).ok())
+                                    });
+                                    let Some(mut dyn_img) = decoded else {
                                         if !from_network {
                                             // Corrupt cache entry: drop it so the next request refetches.
                                             let _ = std::fs::remove_file(&cache_path);
@@ -2426,7 +2749,15 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     // Bubbles draw images up to 360 pt wide; resize large photos to 720px max
                                     // so inline thumbnails stay crisp on Retina/HiDPI displays (#72).
                                     // The viewer's `hd_` textures stay full size.
-                                    if !key.starts_with("ava_")
+                                    if key.starts_with("stks_") {
+                                        // Sticker frame strip: keep it unscaled, but drop frames
+                                        // past a safe GPU texture width.
+                                        let h = dyn_img.height().max(1);
+                                        let max_w = (8000 / h) * h;
+                                        if dyn_img.width() > max_w && max_w > 0 {
+                                            dyn_img = dyn_img.crop_imm(0, 0, max_w, h);
+                                        }
+                                    } else if !key.starts_with("ava_")
                                         && !key.starts_with("hd_")
                                         && (dyn_img.width() > 720 || dyn_img.height() > 720)
                                     {
@@ -2993,7 +3324,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                     if let Some(mute_map) =
                                                         crate::unread::extract_mute_map(
                                                             &mute_resp,
-                                                            crate::login::unix_now() as i64,
+                                                            crate::login::unix_now(),
                                                         )
                                                     {
                                                         let _ = gui_tx_clone.send(
@@ -3230,7 +3561,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     &download_dir,
                                 )
                                 .await;
-                                let _ = gui_tx_clone.send(GuiEvent::FileDownloaded(res));
+                                let _ = gui_tx_clone.send(GuiEvent::FileDownloaded { url, res });
                                 ctx_clone.request_repaint();
                             });
                         }
@@ -3262,7 +3593,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
         .expect("Failed to spawn zalo-worker thread");
 }
 
-const GITHUB_REPO: &str = "ctdoteam1110/ctdozlite";
+/// Repository whose GitHub Releases feed in-app updates (this fork's own builds).
+const GITHUB_REPO: &str = "lebad280324/ctdozlite";
 
 pub(crate) async fn fetch_github_latest_release() -> Result<UpdateCheckResult, String> {
     let current_ver = env!("CARGO_PKG_VERSION").to_string();
@@ -3274,6 +3606,7 @@ pub(crate) async fn fetch_github_latest_release() -> Result<UpdateCheckResult, S
 
     let latest_url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
     let mut rel_json: Option<serde_json::Value> = None;
+    let mut no_release_found = false;
 
     if let Ok(resp) = client
         .get(&latest_url)
@@ -3282,6 +3615,7 @@ pub(crate) async fn fetch_github_latest_release() -> Result<UpdateCheckResult, S
         .send()
         .await
     {
+        no_release_found = resp.status() == reqwest::StatusCode::NOT_FOUND;
         if resp.status().is_success() {
             if let Ok(v) = resp.json::<serde_json::Value>().await {
                 rel_json = Some(v);
@@ -3303,11 +3637,13 @@ pub(crate) async fn fetch_github_latest_release() -> Result<UpdateCheckResult, S
                     if let Some(first) = arr
                         .as_array()
                         .and_then(|a| {
-                            a.iter()
-                                .find(|r| {
-                                    !r.get("draft").and_then(|v| v.as_bool()).unwrap_or(false)
-                                })
-                                .or_else(|| a.first())
+                            a.iter().find(|r| {
+                                !r.get("draft").and_then(|v| v.as_bool()).unwrap_or(false)
+                                    && !r
+                                        .get("prerelease")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false)
+                            })
                         })
                         .cloned()
                     {
@@ -3332,7 +3668,12 @@ pub(crate) async fn fetch_github_latest_release() -> Result<UpdateCheckResult, S
     }
 
     let Some(rel) = rel_json else {
-        return Err("Không truy cập được máy chủ GitHub Releases API".into());
+        return Err(if no_release_found {
+            "Kho GitHub chưa có bản phát hành công khai. Vui lòng thử lại sau.".into()
+        } else {
+            "Không truy cập được máy chủ GitHub Releases API. Kiểm tra kết nối mạng rồi thử lại."
+                .into()
+        });
     };
 
     let mut meta = crate::updater::parse_github_release_value(
@@ -3368,9 +3709,32 @@ pub(crate) async fn fetch_github_latest_release() -> Result<UpdateCheckResult, S
     })
 }
 
-/// Stream-download the release asset from GitHub Releases with real-time progress reporting,
-/// verify binary integrity (PE/ELF magic + SHA-256 checksum when provided) via [`crate::updater`],
-/// and atomically replace the running executable in-place with automatic rollback on failure.
+/// Launch a detached, rollback-capable replacement after the UI closes its worker.
+#[cfg(target_os = "macos")]
+fn spawn_macos_bundle_swap(
+    dmg: &std::path::Path,
+    app: &std::path::Path,
+    version: &str,
+) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    std::process::Command::new("/bin/bash")
+        .arg("-c")
+        .arg(include_str!("../../packaging/macos/install-update.sh"))
+        .arg("ctdozlite-updater")
+        .arg(std::process::id().to_string())
+        .arg(dmg)
+        .arg(app)
+        .arg(version)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Không chạy được trình cài cập nhật: {e}"))
+}
+
+/// Download with integrity checks before launching the platform-specific installer.
 async fn apply_github_release_update(
     download_url: &str,
     asset_name: &str,
@@ -3451,6 +3815,33 @@ async fn apply_github_release_update(
                     return Ok(true);
                 }
             }
+        }
+    }
+
+    // macOS: replace the running .app bundle in place, then relaunch. Only with a verified
+    // SHA-256 (GitHub's asset digest); otherwise fall back to opening the .dmg for the user.
+    #[cfg(target_os = "macos")]
+    if name_low.ends_with(".dmg") && expected_sha256.is_some() {
+        if let Some(app) = std::env::current_exe().ok().and_then(|exe| {
+            let app = exe.parent()?.parent()?.parent()?.to_path_buf();
+            (app.extension().and_then(|e| e.to_str()) == Some("app")).then_some(app)
+        }) {
+            use std::os::unix::fs::DirBuilderExt;
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| format!("Không tạo được thư mục cập nhật: {e}"))?
+                .as_nanos();
+            let directory = std::env::temp_dir()
+                .join(format!("ctdozlite-update-{}-{nonce}", std::process::id()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&directory)
+                .map_err(|e| format!("Không tạo được thư mục cập nhật: {e}"))?;
+            let dmg = directory.join("update.dmg");
+            std::fs::write(&dmg, &bytes)
+                .map_err(|e| format!("Không lưu được bản cập nhật: {e}"))?;
+            spawn_macos_bundle_swap(&dmg, &app, target_version)?;
+            return Ok(true);
         }
     }
 
@@ -3569,4 +3960,19 @@ async fn download_attachment_with_original_name(
     })
     .await
     .map_err(|e| format!("Lỗi tác vụ lưu file: {e}"))?
+}
+
+/// Decode a wallpaper file and cap its longest side at 2560 px to bound texture memory.
+fn decode_wallpaper(path: &str) -> Option<egui::ColorImage> {
+    let img = image::open(path).ok()?;
+    let img = if img.width().max(img.height()) > 2560 {
+        img.resize(2560, 2560, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgba = img.to_rgba8();
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    ))
 }

@@ -21,7 +21,19 @@ pub const SERVICE_MAP_V3: &[(&str, &str)] = &[
     ("zcloud", "https://zcld.chat.zalo.me"),
     ("file", "https://tt-files-wpa.chat.zalo.me"),
     ("voice_call", "https://voicecall-wpa.chat.zalo.me"),
+    // `getGroupBoardDomain()` — pinned topics (`/api/board/pin/list`, cmd 12001). The PC
+    // bundle's legacy host is `groupboard-wpa.api.zaloapp.com` (re-notes/01_login.md).
+    ("group_board", "https://groupboard-wpa.chat.zalo.me"),
 ];
+
+/// Animated sticker frame strip: `?eid={sticker_id}&size=130` returns one PNG with the frames
+/// side by side (width = frames × height; 130×130 for static stickers). Zalo PC plays them at
+/// `duration || 250` ms per frame (`_getStickerUrl` / `start()` in the PC bundle). Verified
+/// against live responses, e.g. eid 32063 → 3120×130 (24 frames).
+pub const STICKER_SPRITE: &str = "https://zalo-api.zadn.vn/api/emoticon/sprite";
+
+/// Legacy fallback for [`SERVICE_MAP_V3`]'s `group_board` entry.
+pub const GROUP_BOARD_LEGACY: &str = "https://groupboard-wpa.api.zaloapp.com";
 
 /// `zpw_ctrs_new[0]` — conversation control plane.
 pub const CONVERS_CTL: &str = "https://p5-ctl-chat.zaloapp.com";
