@@ -1,5 +1,12 @@
 # ctdozlite
 
+> **Bản tùy biến macOS Apple Silicon — miễn phí.** Fork của [ctdoteam1110/ctdozlite](https://github.com/ctdoteam1110/ctdozlite), giữ giấy phép MIT OR Apache-2.0 và ghi công tác giả gốc.
+> Bản này phát hành riêng cho Mac chip Apple (`arm64`, M1 trở lên), gồm giao diện Liquid Glass và các cải tiến đang có trong bản phát triển. Đây là bản cộng đồng độc lập.
+>
+> **Tải bản macOS:** [GitHub Releases của fork](https://github.com/lebad280324/ctdozlite/releases/latest) · **Cài đặt và cập nhật:** [Hướng dẫn Apple Silicon](docs/MACOS_APPLE_SILICON.md).
+> Ứng dụng kiểm tra cập nhật từ `lebad280324/ctdozlite`, tránh tự chuyển về giao diện của upstream. Các tài liệu/bảng nền tảng upstream bên dưới được giữ để tham khảo dự án gốc.
+
+
 **[Tiếng Việt](README.md)** · **[English](docs/i18n/README_EN.md)** · **[한국어](docs/i18n/README_KO.md)** · **[日本語](docs/i18n/README_JA.md)** · **[简体中文](docs/i18n/README_ZH.md)**
 
 
@@ -21,7 +28,7 @@ Client Zalo Desktop viết bằng Rust (`eframe`/`egui` + `ratatui`), giao tiế
 [![Website](https://img.shields.io/badge/website-ctdozlite.ctdo.net-0068FF.svg)](https://ctdozlite.ctdo.net/)
 [![Release](https://img.shields.io/github/v/release/ctdoteam1110/ctdozlite?label=release)](https://github.com/ctdoteam1110/ctdozlite/releases)
 [![CI & Release](https://github.com/ctdoteam1110/ctdozlite/actions/workflows/ci-release.yml/badge.svg)](https://github.com/ctdoteam1110/ctdozlite/actions/workflows/ci-release.yml)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue.svg)](https://github.com/ctdoteam1110/ctdozlite/releases)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
@@ -140,7 +147,7 @@ Hướng dẫn cài đặt chi tiết (Linux, Windows, macOS Apple Silicon `arm6
 ## Tự biên dịch từ mã nguồn (Windows / Linux / macOS)
 
 ### 1. Yêu cầu chung
-- **Rust** 1.75 trở lên ([rustup.rs](https://rustup.rs/))
+- **Rust** 1.95 trở lên ([rustup.rs](https://rustup.rs/))
 - **CMake** (3.15+), `pkg-config` và trình biên dịch C/C++ (để biên dịch tĩnh `libopus` và `sqlite3`)
 - **FFmpeg** trong `PATH` (tùy chọn — chỉ cần khi sử dụng tính năng gọi video H.264)
 

@@ -22,10 +22,13 @@ class NativePackagingTests(unittest.TestCase):
         self.assertNotIn("prepare-history-assets", script)
         self.assertIn("HistoryCodec", script)
         workflow = (ROOT / ".github/workflows/ci-release.yml").read_text()
-        self.assertIn('env -u HISTORY_CODEC_ASSETS SWIFT_TARGETS=', workflow)
-        self.assertIn('Contents/MacOS/ctdozlite', workflow)
-        self.assertNotIn('zalo-rust', workflow)
-        self.assertLess(workflow.index("validate-native-bundle.py"), workflow.index('codesign --force --sign - "$stage_dir/ctdozlite.app/Contents/Helpers/DailyNotifier.app"'))
+        self.assertIn("bash packaging/package-local.sh", workflow)
+        packaging = (ROOT / "packaging/package-local.sh").read_text()
+        self.assertIn('env -u HISTORY_CODEC_ASSETS SWIFT_TARGETS=', packaging)
+        self.assertIn('Contents/MacOS/ctdozlite', packaging)
+        self.assertNotIn('zalo-rust', packaging)
+        self.assertIn('"aws-lc-sys": "AWS-LC-LICENSE"', packaging)
+        self.assertLess(packaging.index("validate-native-bundle.py"), packaging.index('codesign --force --sign -'))
 
     def test_asset_download_requires_explicit_local_use(self):
         result = subprocess.run(["python3", str(ROOT / "native/macos/prepare-history-assets.py")], capture_output=True, text=True)
@@ -33,7 +36,7 @@ class NativePackagingTests(unittest.TestCase):
         self.assertIn("--local-use", result.stderr)
 
     def test_relocated_bundle_architecture_matrix(self):
-        for arches in [{"arm64"}, {"x86_64"}, {"arm64", "x86_64"}]:
+        for arches in [set(group.split(",")) for group in os.environ.get("NATIVE_TEST_ARCHES", "arm64;x86_64;arm64,x86_64").split(";")]:
             with self.subTest(arches=arches), tempfile.TemporaryDirectory(prefix="native-package-test-") as temporary:
                 app = Path(temporary) / "Synthetic.app"
                 paths = dict(validator.HELPERS)
@@ -44,7 +47,11 @@ class NativePackagingTests(unittest.TestCase):
                     destination = app / "Contents" / path
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     if len(arches) == 1:
-                        subprocess.run(["lipo", str(binary), "-thin", next(iter(arches)), "-output", str(destination)], check=True)
+                        actual = set(validator.output("lipo", "-archs", str(binary)).split())
+                        if actual == arches:
+                            shutil.copy2(binary, destination)
+                        else:
+                            subprocess.run(["lipo", str(binary), "-thin", next(iter(arches)), "-output", str(destination)], check=True)
                     else:
                         shutil.copy2(binary, destination)
                     destination.chmod(0o755)
@@ -52,6 +59,8 @@ class NativePackagingTests(unittest.TestCase):
                 licenses = app / "Contents/Resources/ThirdPartyLicenses"
                 licenses.mkdir()
                 shutil.copy2(BUILD / "zstd-1.5.7/arm64/source/LICENSE", licenses / "zstd-LICENSE")
+                for notice in ("AWS-LC-LICENSE", "aws-lc-rs-LICENSE"):
+                    (licenses / notice).write_text("fixture notice\n")
                 validator.validate(app, arches)
                 with self.assertRaisesRegex(AssertionError, "Architecture mismatch"):
                     validator.validate(app, {"invalid-architecture"})

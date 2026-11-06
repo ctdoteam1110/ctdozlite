@@ -35,6 +35,10 @@ What we will do, in one paragraph, present tense.
 
 | ADR | Title | Status |
 | :--- | :--- | :--- |
-| — | No decisions recorded yet | — |
+| [0001](0001-history-sync.md) | History sync | accepted |
+| [0002](0002-self-updater.md) | Self-updater contract | accepted |
+| [0003](0003-changelog-policy.md) | Changelog policy | accepted |
+| [0004](0004-apple-silicon-fork-release.md) | Apple Silicon fork distribution and update channel | proposed |
+| [0005](0005-constant-time-rsa-for-phone-sync.md) | Constant-time RSA for phone-sync key unwrapping | proposed |
 
 Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).

@@ -28,6 +28,8 @@ def validate(app, arches):
         assert binary.is_file() and binary.stat().st_mode & 0o111, f"Missing executable: {binary}"
     assert not (contents / "Resources/HistoryCodecAssets").exists(), "Public bundle contains external codec assets"
     assert (contents / "Resources/ThirdPartyLicenses/zstd-LICENSE").is_file(), "Missing zstd license"
+    for notice in ("AWS-LC-LICENSE", "aws-lc-rs-LICENSE"):
+        assert (contents / "Resources/ThirdPartyLicenses" / notice).is_file(), f"Missing {notice}"
     for binary in contents.rglob("*"):
         if not binary.is_file() or "Mach-O" not in output("file", "-b", str(binary)):
             continue

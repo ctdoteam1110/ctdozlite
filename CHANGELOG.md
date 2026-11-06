@@ -5,6 +5,20 @@ Xem thêm quy ước tại [ADR 0003 — Chính sách Changelog & Release Notes]
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-11-06
+
+### Added
+- Bản cộng đồng miễn phí riêng cho macOS Apple Silicon với giao diện Liquid Glass và các cải tiến hiện có trong bản phát triển.
+- GitHub Actions tạo DMG arm64, checksum và manifest từ nguồn trong fork; giữ ghi công và giấy phép gốc.
+
+### Fixed
+- Cập nhật đi theo Releases của fork, không chọn DMG sai kiến trúc; thay thế app có giao dịch và hoàn tác.
+- Nâng bản vá Tokio khắc phục lỗi Interval.
+
+### Security
+- Đồng bộ tin nhắn từ điện thoại dùng RSA thời gian hằng số của AWS-LC (`aws-lc-rs`) thay cho crate `rsa` (RUSTSEC-2023-0071); định dạng khoá và đệm PKCS#1 v1.5 giữ nguyên ([ADR 0005](docs/adr/0005-constant-time-rsa-for-phone-sync.md)).
+- Nâng `ratatui` 0.30 / `crossterm` 0.29 để dùng `lru` 0.18.5 (RUSTSEC-2026-0253, RUSTSEC-2026-0002); `clipboard-win` lên 5.4.3 (bản 5.4.1 bị rút).
+
 ### Fixed (Sửa lỗi)
 - **Gửi tập tin / video đính kèm thất bại với HTTP 405 ([#75](https://github.com/ctdoteam1110/ctdozlite/issues/75)):** `send_attachment` (`src/chat.rs`) chờ sự kiện điều khiển `file_done` (WebSocket `cmd 601`/`603` hoặc `lp_control`) để lấy `fileUrl` trước khi gọi `asyncfile/msg`, thay vì gửi thiếu `fileUrl` rồi rơi vào endpoint `sharefile_full` đã bị khai tử. Lỗi tải lên từng phần (chunk) nay được báo rõ thay vì bị bỏ qua.
 

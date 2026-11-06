@@ -44,6 +44,22 @@ if [[ "$OS_NAME" == "Darwin" ]]; then
 
   # Phone sync v2 helper (run with the user's Node.js; loads libzproto from their Zalo PC install).
   cp sync_v2_helper.js zproto_lib.js "$STAGE_DIR/ctdozlite.app/Contents/Resources/"
+  cp LICENSE-MIT LICENSE-APACHE src/assets/fonts/BeVietnamPro-OFL.txt "$STAGE_DIR/ctdozlite.app/Contents/Resources/ThirdPartyLicenses/"
+  # AWS-LC (constant-time RSA, ADR-0005) is linked into the binary: ship its notices verbatim,
+  # taken from the exact locked crate sources.
+  python3 - "$STAGE_DIR/ctdozlite.app/Contents/Resources/ThirdPartyLicenses" <<'PY'
+import json, pathlib, shutil, subprocess, sys
+dest = pathlib.Path(sys.argv[1])
+meta = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--format-version", "1"]))
+want = {"aws-lc-sys": "AWS-LC-LICENSE", "aws-lc-rs": "aws-lc-rs-LICENSE"}
+for package in meta["packages"]:
+    if package["name"] in want:
+        source = pathlib.Path(package["manifest_path"]).parent / "LICENSE"
+        shutil.copy2(source, dest / want.pop(package["name"]))
+if want:
+    sys.exit(f"Missing license sources for: {', '.join(sorted(want))}")
+PY
+  python3 packaging/macos/validate-native-bundle.py "$STAGE_DIR/ctdozlite.app" --arches "$ARCH"
   cp packaging/macos/Info.plist "$STAGE_DIR/ctdozlite.app/Contents/Info.plist"
   plutil -replace CFBundleShortVersionString -string "$VER" "$STAGE_DIR/ctdozlite.app/Contents/Info.plist"
   plutil -replace CFBundleVersion -string "$VER" "$STAGE_DIR/ctdozlite.app/Contents/Info.plist"
@@ -51,17 +67,26 @@ if [[ "$OS_NAME" == "Darwin" ]]; then
 
   ICONSET_DIR="$STAGE_DIR/AppIcon.iconset"
   mkdir -p "$ICONSET_DIR"
+  # macOS icon grid: the rounded square is 824 px inside a transparent 1024 px canvas. The source
+  # PNG fills its whole canvas, which made the Dock icon larger than every other app's.
+  MAC_ICON="$STAGE_DIR/app_icon_macos.png"
+  sips -s format png -z 824 824 src/assets/app_icon.png --out "$STAGE_DIR/app_icon_824.png" >/dev/null
+  sips --padToHeightWidth 1024 1024 "$STAGE_DIR/app_icon_824.png" --out "$MAC_ICON" >/dev/null
   for sz in 16 32 128 256 512; do
-    sips -s format png -z "$sz" "$sz" src/assets/app_icon.png --out "$ICONSET_DIR/icon_${sz}x${sz}.png" >/dev/null
+    sips -s format png -z "$sz" "$sz" "$MAC_ICON" --out "$ICONSET_DIR/icon_${sz}x${sz}.png" >/dev/null
     sz2=$((sz * 2))
-    sips -s format png -z "$sz2" "$sz2" src/assets/app_icon.png --out "$ICONSET_DIR/icon_${sz}x${sz}@2x.png" >/dev/null
+    sips -s format png -z "$sz2" "$sz2" "$MAC_ICON" --out "$ICONSET_DIR/icon_${sz}x${sz}@2x.png" >/dev/null
   done
-  iconutil -c icns "$ICONSET_DIR" -o "$STAGE_DIR/ctdozlite.app/Contents/Resources/AppIcon.icns" || true
+  iconutil -c icns "$ICONSET_DIR" -o "$STAGE_DIR/ctdozlite.app/Contents/Resources/AppIcon.icns"
+  mkdir -p "$STAGE_DIR/ctdozlite.app/Contents/Helpers/DailyNotifier.app/Contents/Resources"
+  cp "$STAGE_DIR/ctdozlite.app/Contents/Resources/AppIcon.icns" "$STAGE_DIR/ctdozlite.app/Contents/Helpers/DailyNotifier.app/Contents/Resources/AppIcon.icns"
+  plutil -replace CFBundleIconFile -string AppIcon "$STAGE_DIR/ctdozlite.app/Contents/Helpers/DailyNotifier.app/Contents/Info.plist"
   rm -rf "$ICONSET_DIR"
 
   xattr -cr "$STAGE_DIR/ctdozlite.app" || true
   codesign --force --sign - "$STAGE_DIR/ctdozlite.app/Contents/Helpers/DailyNotifier.app"
   codesign --force --deep --sign - "$STAGE_DIR/ctdozlite.app"
+  codesign --verify --deep --strict "$STAGE_DIR/ctdozlite.app"
   ln -s /Applications "$STAGE_DIR/Applications"
 
   hdiutil create -volname "ctdozlite" -srcfolder "$STAGE_DIR" -ov -fs HFS+ -format UDZO "$DMG_OUT"

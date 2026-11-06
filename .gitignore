@@ -89,3 +89,8 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local agent state and generated design/release reports
+.serena/
+output/
+phone_sync_types.json
