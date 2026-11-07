@@ -2,14 +2,62 @@ const fs = require('fs');
 const path = require('path');
 const zproto = require('./zproto_lib.js');
 
-const WASM_PATH = path.resolve(__dirname, '../asar_extracted/pc-dist/libs/libzproto_wasm_bg.ecc0555ba9d0f8867a4699ce943ec745.wasm');
+// Legacy location used by the original developers (an extracted Zalo PC `app.asar`).
+const LEGACY_WASM_PATH = path.resolve(__dirname, '../asar_extracted/pc-dist/libs/libzproto_wasm_bg.ecc0555ba9d0f8867a4699ce943ec745.wasm');
+
+// Zalo PC installs that may hold `libzproto_wasm_bg.*.wasm` inside `app.asar`.
+// The wasm is read from the user's own install at runtime and is never redistributed.
+const DEFAULT_ASAR_PATHS = [
+    '/Applications/Zalo.app/Contents/Resources/app.asar',
+    path.join(process.env.HOME || '', 'Applications/Zalo.app/Contents/Resources/app.asar'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs/Zalo/resources/app.asar'),
+];
+
+// Read one file out of an Electron asar archive without extracting it.
+// Layout: u32 4 | u32 headerPickleSize | u32 | u32 jsonLen | json | file data...
+function readZprotoWasmFromAsar(asarPath) {
+    const fd = fs.openSync(asarPath, 'r');
+    try {
+        const head = Buffer.alloc(16);
+        fs.readSync(fd, head, 0, 16, 0);
+        const headerSize = head.readUInt32LE(4);
+        const jsonLen = head.readUInt32LE(12);
+        const jsonBuf = Buffer.alloc(jsonLen);
+        fs.readSync(fd, jsonBuf, 0, jsonLen, 16);
+        const header = JSON.parse(jsonBuf.toString('utf8'));
+        const libs = header.files && header.files['pc-dist'] && header.files['pc-dist'].files
+            && header.files['pc-dist'].files.libs && header.files['pc-dist'].files.libs.files;
+        if (!libs) return null;
+        const name = Object.keys(libs).find(n => /^libzproto_wasm_bg\..*\.wasm$/.test(n));
+        if (!name || libs[name].unpacked) return null;
+        const entry = libs[name];
+        const data = Buffer.alloc(entry.size);
+        fs.readSync(fd, data, 0, entry.size, 8 + headerSize + Number(entry.offset));
+        return data;
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
+function loadWasmBytes() {
+    const explicit = process.env.ZPROTO_WASM_PATH;
+    if (explicit) return fs.readFileSync(explicit);
+    if (fs.existsSync(LEGACY_WASM_PATH)) return fs.readFileSync(LEGACY_WASM_PATH);
+    const asars = process.env.ZALO_ASAR_PATH ? [process.env.ZALO_ASAR_PATH] : DEFAULT_ASAR_PATHS;
+    for (const asar of asars) {
+        if (asar && fs.existsSync(asar)) {
+            const bytes = readZprotoWasmFromAsar(asar);
+            if (bytes) return bytes;
+        }
+    }
+    throw new Error('libzproto_wasm not found: install Zalo PC or set ZPROTO_WASM_PATH');
+}
 
 let wasmReady = false;
 
 async function initWasm() {
     if (!wasmReady) {
-        const wasmBuf = fs.readFileSync(WASM_PATH);
-        await zproto.b(wasmBuf);
+        await zproto.b(loadWasmBytes());
         wasmReady = true;
     }
 }

@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::chat::{self, Thread};
 use crate::session::Session;
@@ -606,13 +606,12 @@ pub async fn import_mobile_backup_container(
     let temp_dir = std::env::temp_dir().join(format!("ctdozlite_sync_{}", crate::param_cipher::random_hex(8)));
     let _ = std::fs::create_dir_all(&temp_dir);
 
-    let my_uin = 435550501_i64;
     let my_uid = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
     let my_name = s.login.as_ref().map(|l| l.display_name.clone()).unwrap_or_else(|| "Tôi".into());
 
+    // Pass 1: write every per-thread SQLite file out of the container.
     let mut curr_offset = 0;
-    let mut total_imported = 0;
-
+    let mut extracted: Vec<(std::path::PathBuf, String)> = Vec::new();
     for (name, size) in toc {
         if curr_offset + size > payload.len() {
             break;
@@ -628,8 +627,19 @@ pub async fn import_mobile_backup_container(
         if std::fs::write(&temp_db_path, db_bytes).is_err() {
             continue;
         }
+        extracted.push((temp_db_path, thread_id.clone()));
+    }
 
-        let Ok(conn) = Connection::open(&temp_db_path) else {
+    // The phone stores the owner's numeric mobile id as `SenderId`, which is not the web
+    // `uin`. The owner is the one sender present in (nearly) every conversation.
+    let my_sender_id = infer_backup_owner_sender_id(extracted.iter().map(|(p, _)| p.as_path()));
+
+    let mut total_imported = 0;
+
+    // Pass 2: import messages.
+    for (temp_db_path, thread_id) in &extracted {
+        let thread_id = thread_id.clone();
+        let Ok(conn) = Connection::open(temp_db_path) else {
             continue;
         };
 
@@ -657,7 +667,7 @@ pub async fn import_mobile_backup_container(
 
         for r in rows.flatten() {
             let (sender_id_num, cli_msg_id, glb_msg_id, _status, msg_type_num, ts, content_opt, bin_net_opt) = r;
-            let is_outgoing = sender_id_num == my_uin;
+            let is_outgoing = my_sender_id == Some(sender_id_num);
             let sender_id = if is_outgoing { my_uid.clone() } else { thread_id.clone() };
             let sender_name = if is_outgoing { my_name.clone() } else { String::new() };
 
@@ -716,6 +726,9 @@ pub async fn import_mobile_backup_container(
 
             if store.upsert_message(&sm).unwrap_or(false) {
                 total_imported += 1;
+            } else if my_sender_id.is_some() {
+                // Repair rows stored by earlier imports that misattributed the owner's messages.
+                let _ = store.set_message_direction(&sm.msg_id, sm.is_outgoing, &sm.sender_id, &sm.sender_name);
             }
         }
     }
@@ -733,6 +746,40 @@ pub async fn import_mobile_backup_container(
     Ok(total_imported)
 }
 
+/// Pick the backup owner's mobile `SenderId`: the sender found in the most per-thread
+/// databases. Requires presence in at least two threads and a strict lead over the runner-up,
+/// otherwise returns `None` (messages are then imported as incoming rather than guessed).
+fn infer_backup_owner_sender_id<'a>(
+    dbs: impl Iterator<Item = &'a std::path::Path>,
+) -> Option<i64> {
+    let mut threads_per_sender: std::collections::HashMap<i64, usize> =
+        std::collections::HashMap::new();
+    for path in dbs {
+        let Ok(conn) = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) else {
+            continue;
+        };
+        let Ok(mut stmt) = conn.prepare("SELECT DISTINCT SenderId FROM ChatContent") else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, i64>(0)) else {
+            continue;
+        };
+        for sid in rows.flatten().filter(|sid| *sid > 0) {
+            *threads_per_sender.entry(sid).or_default() += 1;
+        }
+    }
+    let mut ranked: Vec<(i64, usize)> = threads_per_sender.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    match ranked.as_slice() {
+        [(sid, n), (_, second), ..] if *n >= 2 && n > second => Some(*sid),
+        [(sid, n)] if *n >= 2 => Some(*sid),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct SyncV2Keys {
     pub ik_pub: String,
@@ -741,11 +788,45 @@ pub struct SyncV2Keys {
     pub ek_priv: String,
 }
 
+/// Locate a Node.js binary. Apps launched from Finder get a minimal `PATH`
+/// (`/usr/bin:/bin:...`), so the usual install locations are probed explicitly.
+fn find_node() -> Option<std::path::PathBuf> {
+    let from_path = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).map(|d| d.join("node")).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let fixed = [
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+    ]
+    .map(std::path::PathBuf::from);
+    from_path.into_iter().chain(fixed).find(|p| p.is_file())
+}
+
+/// Locate `sync_v2_helper.js`: next to the binary, in the macOS bundle's `Resources`,
+/// in the working directory, or in the source tree for `cargo run` builds.
+fn find_sync_v2_helper() -> Option<std::path::PathBuf> {
+    const NAME: &str = "sync_v2_helper.js";
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+        candidates.push(dir.join(NAME));
+        candidates.push(dir.join("../Resources").join(NAME));
+    }
+    candidates.push(std::path::PathBuf::from(NAME));
+    candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(NAME));
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Run `node sync_v2_helper.js <args>` from the data directory (the process cwd), where the
+/// helper keeps `sync_v2_keys.json` / `sync_v2_session.bin` between calls.
+fn run_sync_v2_helper(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
+    let node = find_node().context("không tìm thấy Node.js (cần để đồng bộ v2 với điện thoại)")?;
+    let script = find_sync_v2_helper().context("không tìm thấy sync_v2_helper.js")?;
+    Ok(std::process::Command::new(node).arg(script).args(args).output()?)
+}
+
 pub fn generate_sync_v2_keys() -> Result<SyncV2Keys> {
-    let out = std::process::Command::new("node")
-        .arg("sync_v2_helper.js")
-        .arg("gen-keys")
-        .output()?;
+    let out = run_sync_v2_helper(&["gen-keys".as_ref()])?;
     if !out.status.success() {
         anyhow::bail!("node sync_v2_helper.js gen-keys failed: {}", String::from_utf8_lossy(&out.stderr));
     }
@@ -774,11 +855,7 @@ pub async fn import_sync_v2_meta(s: &Session, url: &str) -> Result<()> {
     let temp_meta = std::env::temp_dir().join(format!("meta_{}.bin", crate::param_cipher::random_hex(6)));
     std::fs::write(&temp_meta, &bytes)?;
 
-    let out = std::process::Command::new("node")
-        .arg("sync_v2_helper.js")
-        .arg("decrypt-meta")
-        .arg(&temp_meta)
-        .output()?;
+    let out = run_sync_v2_helper(&["decrypt-meta".as_ref(), temp_meta.as_os_str()])?;
 
     let _ = std::fs::remove_file(&temp_meta);
 
@@ -958,11 +1035,7 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
     let temp_msg = std::env::temp_dir().join(format!("msg_{}.bin", crate::param_cipher::random_hex(6)));
     std::fs::write(&temp_msg, &bytes)?;
 
-    let out = std::process::Command::new("node")
-        .arg("sync_v2_helper.js")
-        .arg("decrypt-message")
-        .arg(&temp_msg)
-        .output()?;
+    let out = run_sync_v2_helper(&["decrypt-message".as_ref(), temp_msg.as_os_str()])?;
 
     let _ = std::fs::remove_file(&temp_msg);
 
@@ -1029,6 +1102,36 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::chat::ChatMessage;
+
+    fn backup_thread_db(dir: &std::path::Path, name: &str, senders: &[i64]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE ChatContent (SenderId INTEGER)", []).unwrap();
+        for s in senders {
+            conn.execute("INSERT INTO ChatContent VALUES (?1)", [s]).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn backup_owner_is_sender_present_in_most_threads() {
+        let dir = std::env::temp_dir().join(format!("owner_test_{}", crate::param_cipher::random_hex(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dbs = [
+            backup_thread_db(&dir, "a.db", &[777, 101, 777]),
+            backup_thread_db(&dir, "b.db", &[202, 777]),
+            backup_thread_db(&dir, "c.db", &[303]),
+        ];
+        assert_eq!(infer_backup_owner_sender_id(dbs.iter().map(|p| p.as_path())), Some(777));
+
+        // A tie or a single thread is not enough evidence.
+        let tie = [
+            backup_thread_db(&dir, "d.db", &[1, 2]),
+            backup_thread_db(&dir, "e.db", &[1, 2]),
+        ];
+        assert_eq!(infer_backup_owner_sender_id(tie.iter().map(|p| p.as_path())), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn thread_with(ids: &[&str]) -> Thread {
         Thread {

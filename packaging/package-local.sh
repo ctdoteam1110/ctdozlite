@@ -42,6 +42,8 @@ if [[ "$OS_NAME" == "Darwin" ]]; then
   env -u HISTORY_CODEC_ASSETS SWIFT_TARGETS="$SWIFT_TARGETS" \
     bash native/macos/build-native-helpers.sh "$STAGE_DIR/ctdozlite.app"
 
+  # Phone sync v2 helper (run with the user's Node.js; loads libzproto from their Zalo PC install).
+  cp sync_v2_helper.js zproto_lib.js "$STAGE_DIR/ctdozlite.app/Contents/Resources/"
   cp packaging/macos/Info.plist "$STAGE_DIR/ctdozlite.app/Contents/Info.plist"
   plutil -replace CFBundleShortVersionString -string "$VER" "$STAGE_DIR/ctdozlite.app/Contents/Info.plist"
   plutil -replace CFBundleVersion -string "$VER" "$STAGE_DIR/ctdozlite.app/Contents/Info.plist"

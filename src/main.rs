@@ -210,6 +210,8 @@ async fn main() -> Result<()> {
         let mut viewport = eframe::egui::ViewportBuilder::default()
             .with_app_id("ctdozlite")
             .with_decorations(false)
+            // Needed for Liquid Glass: the macOS vibrancy view must show through the GL surface.
+            .with_transparent(cfg!(target_os = "macos"))
             .with_inner_size([1020.0, 700.0])
             .with_min_inner_size([480.0, 360.0])
             .with_title("ctdozlite");
