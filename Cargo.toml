@@ -9,6 +9,9 @@ repository = "https://github.com/ctdoteam1110/ctdozlite"
 license = "MIT OR Apache-2.0"
 default-run = "ctdozlite"
 
+[patch.crates-io]
+egui-winit = { path = "vendor/egui-winit" }
+
 [dependencies]
 aes = "0.8"
 cbc = "0.1"

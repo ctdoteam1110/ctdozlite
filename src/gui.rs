@@ -2289,10 +2289,11 @@ impl eframe::App for ZaloGuiApp {
                             && !mouse_clicked;
                         if (space_pressed || inferred_macos_space_commit)
                             && !text.is_empty()
-                            && !text.ends_with(' ')
                             && !text.chars().any(crate::gui::theme::is_cjk)
                         {
-                            text.push(' ');
+                            if !text.ends_with(' ') {
+                                text.push(' ');
+                            }
                             ime_space_commit = true;
                         }
                         self.ime_active = false;
