@@ -1289,7 +1289,8 @@ pub(super) fn render_message_body(
     max_text_width: f32,
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
-    album: &[&ChatMessage],
+    emoji_textures: &HashMap<String, TextureHandle>,
+    album: &[(usize, &ChatMessage)],
 ) -> Option<BubbleAction> {
     let mut body_action = None;
     let (text_col, meta_col) = if outgoing {
@@ -1342,6 +1343,7 @@ pub(super) fn render_message_body(
             max_text_width,
             sticker_textures,
             loading_stickers,
+            emoji_textures,
         );
     }
     if is_zalo_photo {
@@ -1874,17 +1876,18 @@ fn cover_uv(tw: f32, th: f32) -> Rect {
 #[allow(clippy::too_many_arguments)]
 fn render_photo_album_grid(
     ui: &mut egui::Ui,
-    album: &[&ChatMessage],
+    album: &[(usize, &ChatMessage)],
     sender_label: &str,
     pal: &ThemePalette,
     text_col: Color32,
     max_text_width: f32,
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
+    emoji_textures: &HashMap<String, TextureHandle>,
 ) -> Option<BubbleAction> {
     let mut action = None;
-    let mut members: Vec<&ChatMessage> = album.to_vec();
-    members.sort_by_key(|m| m.media_group.as_ref().map(|g| g.index).unwrap_or(0));
+    let mut members: Vec<(usize, &ChatMessage)> = album.to_vec();
+    members.sort_by_key(|(_, m)| m.media_group.as_ref().map(|g| g.index).unwrap_or(0));
     let cols = album_columns(members.len());
     let gap = 3.0_f32;
     let grid_w = album_grid_width(max_text_width);
@@ -1893,7 +1896,7 @@ fn render_photo_album_grid(
     ui.spacing_mut().item_spacing = Vec2::splat(gap);
     for row in members.chunks(cols) {
         ui.horizontal(|ui| {
-            for m in row {
+            for &(member_idx, m) in row {
                 let Some(thumb_url) = photo_primary_url(m) else {
                     continue;
                 };
@@ -1947,6 +1950,23 @@ fn render_photo_album_grid(
                         Stroke::new(1.6_f32, pal.primary),
                     );
                 }
+                // Each tile has its own menu so reply / delete / recall hit this photo,
+                // not the album's first one.
+                if let Some(tile_action) = bubble_context_menu(
+                    ui,
+                    &resp,
+                    m,
+                    member_idx,
+                    pal,
+                    emoji_textures,
+                    true,
+                    sender_label,
+                ) {
+                    action = Some(BubbleAction::AlbumMember {
+                        idx: member_idx,
+                        action: Box::new(tile_action),
+                    });
+                }
                 if resp
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text("Bấm để xem ảnh phóng to trong ứng dụng")
@@ -1963,7 +1983,7 @@ fn render_photo_album_grid(
             }
         });
     }
-    if let Some(cap) = members.iter().find_map(|m| extract_photo_user_caption(m)) {
+    if let Some(cap) = members.iter().find_map(|(_, m)| extract_photo_user_caption(m)) {
         ui.add_space(5.0);
         render_chat_markdown_block(ui, cap, text_col, pal);
     }
@@ -2055,7 +2075,7 @@ pub(super) fn render_chat_bubble(
     loading_stickers: &mut HashSet<String>,
     emoji_textures: &HashMap<String, TextureHandle>,
     idx: usize,
-    album: &[&ChatMessage],
+    album: &[(usize, &ChatMessage)],
 ) -> Option<BubbleAction> {
     let avail_w = ui.available_width();
     let max_bubble_width = (avail_w * 0.72).clamp(140.0, 520.0);
@@ -2337,6 +2357,7 @@ pub(super) fn render_chat_bubble(
                                     content_width,
                                     sticker_textures,
                                     loading_stickers,
+                                    emoji_textures,
                                     album,
                                 );
                             }
@@ -2374,7 +2395,8 @@ pub(super) fn render_chat_bubble(
                 reaction_action
                     .or(quote_action)
                     .or(card_action)
-                    .or_else(|| {
+                    // Album tiles open their own menus; a row-wide one would target photo 1.
+                    .or_else(|| if album.len() >= 2 { None } else {
                         bubble_context_menu(
                             ui,
                             &fr.response,
@@ -2487,6 +2509,7 @@ pub(super) fn render_chat_bubble(
                                     content_width,
                                     sticker_textures,
                                     loading_stickers,
+                                    emoji_textures,
                                     album,
                                 );
                             }
@@ -2509,7 +2532,8 @@ pub(super) fn render_chat_bubble(
                 reaction_action
                     .or(quote_action)
                     .or(card_action)
-                    .or_else(|| {
+                    // Album tiles open their own menus; a row-wide one would target photo 1.
+                    .or_else(|| if album.len() >= 2 { None } else {
                         bubble_context_menu(
                             ui,
                             &fr.response,
@@ -2556,6 +2580,11 @@ pub(super) enum BubbleAction {
     DownloadFile {
         url: String,
         file_name: String,
+    },
+    /// An action picked on one photo of an album row; `idx` is that photo's message index.
+    AlbumMember {
+        idx: usize,
+        action: Box<BubbleAction>,
     },
 }
 
@@ -3457,6 +3486,66 @@ mod album_grid_tests {
             media_group: group.map(|(g, i)| crate::chat::MediaGroupLayout::new(g, i, 3)),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn album_tile_right_click_targets_that_photo() {
+        let msgs = [
+            album_photo("a", Some(("L1", 0)), true),
+            album_photo("b", Some(("L1", 1)), true),
+            album_photo("c", Some(("L1", 2)), true),
+        ];
+        let album: Vec<(usize, &ChatMessage)> =
+            msgs.iter().enumerate().map(|(i, m)| (10 + i, m)).collect();
+        let ctx = egui::Context::default();
+        let mut second_tile = None;
+        for frame in 0..4 {
+            let mut events = Vec::new();
+            if let Some(pos) = second_tile {
+                events.push(egui::Event::PointerMoved(pos));
+                if frame >= 2 {
+                    events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed: frame == 2,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+            }
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(600.0, 400.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let origin = ui.cursor().min;
+                        let _ = render_photo_album_grid(
+                            ui,
+                            &album,
+                            "Bạn",
+                            &ThemePalette::light(),
+                            Color32::BLACK,
+                            300.0,
+                            &HashMap::new(),
+                            &mut HashSet::new(),
+                            &HashMap::new(),
+                        );
+                        // Three 98 pt tiles with 3 pt gaps; aim at the middle of the second.
+                        second_tile = Some(origin + Vec2::new(98.0 + 3.0 + 49.0, 49.0));
+                    });
+                },
+            );
+        }
+        let active: Option<(String, Pos2, usize)> =
+            ctx.data(|d| d.get_temp(Id::new("active_bubble_context_menu")));
+        let (key, _, idx) = active.expect("right-click opens a tile menu");
+        assert_eq!(idx, 11);
+        assert!(key.starts_with("b_"), "menu belongs to photo b, got {key}");
     }
 
     #[test]

@@ -3980,10 +3980,13 @@ impl ZaloGuiApp {
                                                 if run_len == 0 {
                                                     continue;
                                                 }
-                                                let album: &[&crate::chat::ChatMessage] = if run_len >= 2 {
-                                                    &visible_msgs[pos..pos + run_len]
+                                                let album: Vec<(usize, &crate::chat::ChatMessage)> = if run_len >= 2 {
+                                                    visible_indices[pos..pos + run_len]
+                                                        .iter()
+                                                        .map(|&i| (i, &thread.messages[i]))
+                                                        .collect()
                                                 } else {
-                                                    &[]
+                                                    Vec::new()
                                                 };
                                                 let msg = &thread.messages[idx];
                                                 let prev_msg = pos
@@ -4060,7 +4063,7 @@ impl ZaloGuiApp {
                                                         &mut self.loading_stickers,
                                                         &self.emoji_textures,
                                                         idx,
-                                                        album,
+                                                        &album,
                                                     ) {
                                                         pending_action = Some((idx, action));
                                                     }
@@ -4150,6 +4153,11 @@ impl ZaloGuiApp {
                         self.show_toast("Đang kiểm tra tin nhắn cũ từ máy chủ Zalo…");
                     }
                     if let Some((idx, action)) = pending_action {
+                        // A tile inside an album row targets its own photo.
+                        let (idx, action) = match action {
+                            BubbleAction::AlbumMember { idx, action } => (idx, *action),
+                            other => (idx, other),
+                        };
                         let target = self
                             .threads
                             .get(self.selected_thread_index)
@@ -4157,6 +4165,8 @@ impl ZaloGuiApp {
                             .cloned();
                         if let Some(m) = target {
                             match action {
+                                // Unwrapped above; albums never nest.
+                                BubbleAction::AlbumMember { .. } => {}
                                 BubbleAction::Reply => {
                                     self.replying_to = Some(m);
                                     self.composer_focus_pending = true;
