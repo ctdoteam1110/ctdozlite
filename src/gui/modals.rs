@@ -3575,8 +3575,7 @@ impl ZaloGuiApp {
             }
         }
         if pick_dl_dir {
-            if let Some(folder) = pick_native_file_dialog(false) {
-                let dir_path = folder.parent().unwrap_or(&folder).to_path_buf();
+            if let Some(dir_path) = super::attachments::pick_folder() {
                 self.settings.download_dir = dir_path.display().to_string();
                 self.settings.save();
                 self.show_toast(format!(
@@ -3603,7 +3602,7 @@ impl ZaloGuiApp {
         }
 
         if pick_migrate_file {
-            if let Some(src_path) = pick_native_file_dialog(false) {
+            if let Some(src_path) = super::attachments::pick_single_file() {
                 match crate::store::import_history_from_path(&src_path, "zalo_history.db") {
                     Ok(summary) => {
                         let t_cnt = summary.threads_imported;

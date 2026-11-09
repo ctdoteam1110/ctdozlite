@@ -5,6 +5,14 @@ Xem thêm quy ước tại [ADR 0003 — Chính sách Changelog & Release Notes]
 
 ## [Unreleased]
 
+### Added (Tính năng mới & Cập nhật)
+- **Đính kèm nhiều tệp và cả thư mục trong khung soạn tin (`src/gui/attachments.rs`, `src/gui/workspace.rs`):** Nút đính kèm mở menu "Chọn File" / "Chọn Thư mục"; hộp thoại chọn file và chọn ảnh cho phép chọn nhiều tệp cùng lúc; chọn thư mục sẽ đính kèm toàn bộ tệp hiển thị ở cấp đầu (bỏ tệp ẩn, tệp rỗng, thư mục con). Mọi nguồn (dán `Ctrl+V`, kéo-thả, chụp màn hình, hộp thoại) đều đưa tệp vào hàng chờ tối đa 50 tệp phía trên khung nhập, có ảnh thu nhỏ, bấm để bỏ từng tệp, `Esc` để hủy tất cả; nhấn `Enter` để gửi lần lượt theo đúng thứ tự (chú thích gắn vào tệp đầu tiên).
+- **Gửi nhiều ảnh thành một album (`src/chat.rs`, `re-notes/38_photo_album_group_layout.md`):** Từ 2 ảnh PNG/JPG/WEBP/BMP trở lên trong hàng chờ được gửi kèm `groupLayoutId` chung nên Zalo trên điện thoại/PC hiển thị thành một album; GIF, video và tệp khác vẫn gửi riêng.
+- **Hiển thị album ảnh dạng lưới (`src/gui/messages.rs`, `src/gui/workspace.rs`):** Các ảnh liên tiếp cùng album (đọc `group_layout_id` trong `content.params` của tin đến, lưu vào lịch sử SQLite) được gom vào một bong bóng lưới 2–3 cột, bấm từng ô để phóng to.
+
+### Fixed (Sửa lỗi & Tinh chỉnh giao diện)
+- **Dán nhiều tệp không còn ghi đè tệp trước:** Dán lần thứ hai cộng thêm vào hàng chờ thay vì thay thế; sao chép nhiều tệp từ Explorer (`CF_HDROP`), Finder hoặc trình quản lý tệp Linux (`text/uri-list`) sẽ dán đủ tất cả, kể cả tệp không phải ảnh (PDF, DOCX, ZIP…).
+
 ## [0.1.0] - 2026-11-09
 
 ### Added (Tính năng mới & Cập nhật)

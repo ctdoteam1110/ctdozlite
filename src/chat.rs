@@ -72,6 +72,9 @@ pub struct ChatMessage {
     pub history_source: Option<Value>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub resolved_mention_uids: std::collections::BTreeMap<String, String>,
+    /// Photo album membership (`group_layout_id`); consecutive photos sharing it render as one grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_group: Option<MediaGroupLayout>,
 }
 
 impl ChatMessage {
@@ -102,8 +105,13 @@ impl ChatMessage {
         if incoming.history_source.is_some() {
             self.history_source = incoming.history_source.clone();
         }
+        let gained_media_group = self.media_group.is_none() && incoming.media_group.is_some();
+        if gained_media_group {
+            self.media_group = incoming.media_group.clone();
+        }
         self.delivery = self.delivery.merge(incoming.delivery);
-        previous_mentions != self.resolved_mention_uids
+        gained_media_group
+            || previous_mentions != self.resolved_mention_uids
             || before
                 != (
                     self.kind,
@@ -1856,6 +1864,74 @@ pub async fn send_attachment(
     send_attachment_ext(s, to_id, is_group, file_path, caption, true).await
 }
 
+/// Album ("group layout") membership for one photo in a multi-photo send.
+///
+/// Field names follow zca-js `sendMessage.ts` (Zalo Web); see
+/// `re-notes/38_photo_album_group_layout.md`. Every photo of one album shares `id`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MediaGroupLayout {
+    /// Shared album identifier; zca-js uses the send-time Unix milliseconds.
+    pub id: String,
+    /// Zero-based position of this photo inside the album.
+    pub index: u32,
+    /// Number of photos in the album.
+    pub total: u32,
+}
+
+impl MediaGroupLayout {
+    /// Build the layout for photo `index` of `total`, all sharing `id`.
+    pub fn new(id: impl Into<String>, index: u32, total: u32) -> Self {
+        Self {
+            id: id.into(),
+            index,
+            total,
+        }
+    }
+
+    /// Read album membership from an incoming photo's `content` (object or JSON string), whose
+    /// `params` carries `group_layout_id`, `is_group_layout` and `id_in_group`. Returns `None`
+    /// for photos sent on their own.
+    pub fn from_content(content: &Value) -> Option<Self> {
+        let parse_json = |v: &Value| -> Option<Value> {
+            match v {
+                Value::String(s) if s.trim_start().starts_with('{') => serde_json::from_str(s).ok(),
+                Value::Object(_) => Some(v.clone()),
+                _ => None,
+            }
+        };
+        let content = parse_json(content)?;
+        let params = content.get("params").and_then(parse_json)?;
+        let as_u64 = |key_snake: &str, key_camel: &str| -> Option<u64> {
+            let v = params.get(key_snake).or_else(|| params.get(key_camel))?;
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                .or_else(|| v.as_bool().map(u64::from))
+        };
+        if as_u64("is_group_layout", "isGroupLayout").unwrap_or(0) == 0 {
+            return None;
+        }
+        let id = pick_str(&params, &["group_layout_id", "groupLayoutId"])
+            .or_else(|| as_u64("group_layout_id", "groupLayoutId").map(|n| n.to_string()))
+            .filter(|s| !s.is_empty() && s != "0")?;
+        let index = as_u64("id_in_group", "idInGroup").unwrap_or(0) as u32;
+        let total = as_u64("total_item_in_group", "totalItemInGroup").unwrap_or(0) as u32;
+        Some(Self { id, index, total })
+    }
+
+    /// Insert the album fields into a `photo_original/send` params object.
+    pub fn apply_to(&self, params: &mut serde_json::Map<String, Value>) {
+        params.insert("groupLayoutId".into(), json!(self.id));
+        params.insert("isGroupLayout".into(), json!(1));
+        params.insert("idInGroup".into(), json!(self.index));
+        params.insert("totalItemInGroup".into(), json!(self.total));
+        params.insert(
+            "extMsgProp".into(),
+            json!(json!({ "groupMediaMsg": { "groupLayoutId": self.id } }).to_string()),
+        );
+    }
+}
+
+/// [`send_attachment`] with an explicit HD flag and no album membership.
 pub async fn send_attachment_ext(
     s: &Session,
     to_id: &str,
@@ -1863,6 +1939,25 @@ pub async fn send_attachment_ext(
     file_path: &std::path::Path,
     caption: &str,
     is_original_hd: bool,
+) -> Result<(Value, ChatMessage)> {
+    send_attachment_in_layout(s, to_id, is_group, file_path, caption, is_original_hd, None).await
+}
+
+/// Upload and send one attachment; when `layout` is set and the file is a photo sent via
+/// `photo_original/send`, it joins that album. Videos, files and the single-shot photo
+/// fallback ignore `layout`.
+///
+/// # Errors
+/// Returns an error when not logged in, the file is unreadable or empty, or every upload
+/// and send path fails.
+pub async fn send_attachment_in_layout(
+    s: &Session,
+    to_id: &str,
+    is_group: bool,
+    file_path: &std::path::Path,
+    caption: &str,
+    is_original_hd: bool,
+    layout: Option<&MediaGroupLayout>,
 ) -> Result<(Value, ChatMessage)> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
@@ -2004,6 +2099,9 @@ pub async fn send_attachment_ext(
             send_obj.insert("zsource".into(), json!(-1));
             send_obj.insert("jcp".into(), json!("{\"convertible\":true}"));
             send_obj.insert("imei".into(), json!(s.imei));
+            if let Some(layout) = layout {
+                layout.apply_to(&mut send_obj);
+            }
             if is_group {
                 send_obj.insert("grid".into(), json!(clean_target));
                 send_obj.insert("visibility".into(), json!(0));
@@ -2115,6 +2213,7 @@ pub async fn send_attachment_ext(
             },
             link_thumb: Some(final_thumb),
             link_src: Some("Hình ảnh Zalo".into()),
+            media_group: layout.cloned(),
             ..Default::default()
         };
         return Ok((send_resp, cm));
@@ -5717,6 +5816,11 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         link_desc,
         link_thumb,
         link_src,
+        media_group: if is_photo_msg {
+            raw_content_val.and_then(MediaGroupLayout::from_content)
+        } else {
+            None
+        },
 
         ..Default::default()
     })
@@ -7923,6 +8027,46 @@ pub async fn delete_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_group_layout_reads_incoming_params() {
+        let content = json!({
+            "href": "https://b-f17-zpcloud.zdn.vn/1/a.jpg",
+            "params": "{\"width\":1280,\"group_layout_id\":\"1731100000000\",\"is_group_layout\":1,\"id_in_group\":2,\"total_item_in_group\":4}"
+        });
+        assert_eq!(
+            MediaGroupLayout::from_content(&content),
+            Some(MediaGroupLayout::new("1731100000000", 2, 4))
+        );
+        let as_string = Value::String(content.to_string());
+        assert_eq!(
+            MediaGroupLayout::from_content(&as_string),
+            Some(MediaGroupLayout::new("1731100000000", 2, 4))
+        );
+    }
+
+    #[test]
+    fn media_group_layout_ignores_standalone_photos() {
+        let single = json!({ "params": "{\"width\":800,\"is_group_layout\":0,\"group_layout_id\":\"9\"}" });
+        assert_eq!(MediaGroupLayout::from_content(&single), None);
+        assert_eq!(MediaGroupLayout::from_content(&json!({ "href": "x" })), None);
+        assert_eq!(MediaGroupLayout::from_content(&json!("plain text")), None);
+    }
+
+    #[test]
+    fn media_group_layout_adds_album_fields() {
+        let mut params = serde_json::Map::new();
+        params.insert("photoId".into(), json!(42));
+        MediaGroupLayout::new("1731100000000", 1, 3).apply_to(&mut params);
+        assert_eq!(params["groupLayoutId"], json!("1731100000000"));
+        assert_eq!(params["isGroupLayout"], json!(1));
+        assert_eq!(params["idInGroup"], json!(1));
+        assert_eq!(params["totalItemInGroup"], json!(3));
+        let ext: Value = serde_json::from_str(params["extMsgProp"].as_str().expect("string"))
+            .expect("extMsgProp is JSON");
+        assert_eq!(ext, json!({ "groupMediaMsg": { "groupLayoutId": "1731100000000" } }));
+        assert_eq!(params["photoId"], json!(42));
+    }
 
     #[test]
     fn group_posting_restriction_respects_member_roles() {

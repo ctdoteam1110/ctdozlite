@@ -333,145 +333,6 @@ pub(super) fn open_external_url(url: &str) {
         let _ = std::process::Command::new("xdg-open").arg(trimmed).spawn();
     }
 }
-/// Open a native OS file-picker dialog on a worker thread and return the selected path.
-pub(super) fn pick_native_file_dialog(images_only: bool) -> Option<std::path::PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        #[repr(C)]
-        struct OpenFileNameW {
-            l_struct_size: u32,
-            hwnd_owner: *mut std::ffi::c_void,
-            h_instance: *mut std::ffi::c_void,
-            lpstr_filter: *const u16,
-            lpstr_custom_filter: *mut u16,
-            n_max_cust_filter: u32,
-            n_filter_index: u32,
-            lpstr_file: *mut u16,
-            n_max_file: u32,
-            lpstr_file_title: *mut u16,
-            n_max_file_title: u32,
-            lpstr_initial_dir: *const u16,
-            lpstr_title: *const u16,
-            flags: u32,
-            n_file_offset: u16,
-            n_file_extension: u16,
-            lpstr_def_ext: *const u16,
-            l_cust_data: usize,
-            lpfn_hook: *const std::ffi::c_void,
-            lp_template_name: *const u16,
-            pv_reserved: *mut std::ffi::c_void,
-            dw_reserved: u32,
-            flags_ex: u32,
-        }
-        #[link(name = "comdlg32")]
-        extern "system" {
-            fn GetOpenFileNameW(lpofn: *mut OpenFileNameW) -> i32;
-        }
-        let filter_raw = if images_only {
-            "Image Files (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp)\0*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp\0All Files (*.*)\0*.*\0\0"
-        } else {
-            "All Files (*.*)\0*.*\0Video & Media (*.mp4;*.mov;*.mkv;*.mp3;*.wav)\0*.mp4;*.mov;*.mkv;*.mp3;*.wav\0Documents (*.pdf;*.zip;*.docx;*.xlsx;*.txt)\0*.pdf;*.zip;*.docx;*.xlsx;*.txt\0\0"
-        };
-        let title_raw = if images_only {
-            "Chọn hình ảnh để gửi qua Zalo\0"
-        } else {
-            "Chọn video hoặc tập tin đính kèm để gửi qua Zalo\0"
-        };
-        let filter_u16: Vec<u16> = filter_raw.encode_utf16().collect();
-        let title_u16: Vec<u16> = title_raw.encode_utf16().collect();
-        let mut file_buf = vec![0u16; 1024];
-        // OFN_EXPLORER (0x00080000) | OFN_FILEMUSTEXIST (0x00001000) | OFN_PATHMUSTEXIST (0x00000800) | OFN_NOCHANGEDIR (0x00000008)
-        let mut ofn = OpenFileNameW {
-            l_struct_size: std::mem::size_of::<OpenFileNameW>() as u32,
-            hwnd_owner: std::ptr::null_mut(),
-            h_instance: std::ptr::null_mut(),
-            lpstr_filter: filter_u16.as_ptr(),
-            lpstr_custom_filter: std::ptr::null_mut(),
-            n_max_cust_filter: 0,
-            n_filter_index: 1,
-            lpstr_file: file_buf.as_mut_ptr(),
-            n_max_file: file_buf.len() as u32,
-            lpstr_file_title: std::ptr::null_mut(),
-            n_max_file_title: 0,
-            lpstr_initial_dir: std::ptr::null(),
-            lpstr_title: title_u16.as_ptr(),
-            flags: 0x0008_0000 | 0x0000_1000 | 0x0000_0800 | 0x0000_0008,
-            n_file_offset: 0,
-            n_file_extension: 0,
-            lpstr_def_ext: std::ptr::null(),
-            l_cust_data: 0,
-            lpfn_hook: std::ptr::null(),
-            lp_template_name: std::ptr::null(),
-            pv_reserved: std::ptr::null_mut(),
-            dw_reserved: 0,
-            flags_ex: 0,
-        };
-        let ok = unsafe { GetOpenFileNameW(&mut ofn) };
-        if ok != 0 {
-            let end = file_buf
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(file_buf.len());
-            let s = String::from_utf16_lossy(&file_buf[..end]);
-            if !s.is_empty() {
-                Some(std::path::PathBuf::from(s))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let prompt = if images_only {
-            "POSIX path of (choose file with prompt \"Chọn hình ảnh để gửi qua Zalo\" of type {\"public.image\"})"
-        } else {
-            "POSIX path of (choose file with prompt \"Chọn tập tin đính kèm để gửi qua Zalo\")"
-        };
-        if let Ok(out) = std::process::Command::new("osascript")
-            .args(["-e", prompt])
-            .output()
-        {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    return Some(std::path::PathBuf::from(s));
-                }
-            }
-        }
-        None
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let mut zcmd = std::process::Command::new("zenity");
-        zcmd.arg("--file-selection");
-        if images_only {
-            zcmd.arg("--file-filter=Images | *.png *.jpg *.jpeg *.webp *.gif *.bmp");
-        }
-        if let Ok(out) = zcmd.output() {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    return Some(std::path::PathBuf::from(s));
-                }
-            }
-        }
-        if let Ok(out) = std::process::Command::new("kdialog")
-            .arg("--getopenfilename")
-            .output()
-        {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    return Some(std::path::PathBuf::from(s));
-                }
-            }
-        }
-        None
-    }
-}
-
 /// Detect `Ctrl+V` or `Shift+Insert` reliably on Windows even when `egui-winit` swallows `Key::V`
 /// because the system clipboard contains an image instead of UTF-8 text.
 pub(super) fn is_clipboard_paste_triggered(ctx: &egui::Context) -> bool {
@@ -544,15 +405,15 @@ pub(super) fn finalize_clipboard_rgba_image(
 
 /// Read an image from the Windows Clipboard supporting:
 /// 1. Registered `"PNG"` / `"image/png"` streams (Snipping Tool, ShareX, Chrome/Edge, Discord)
-/// 2. `CF_HDROP` (`15`) copied image files from Windows Explorer or ShareX
-/// 3. `CF_DIB` (`8`) / `CF_DIBV5` (`17`) 24-bit & 32-bit bitmaps (`BI_RGB` & `BI_BITFIELDS`)
+/// 2. `CF_DIB` (`8`) / `CF_DIBV5` (`17`) 24-bit & 32-bit bitmaps (`BI_RGB` & `BI_BITFIELDS`)
+///
+/// Copied files (`CF_HDROP`) are handled by [`super::attachments::read_clipboard_file_list`].
 pub(super) fn read_clipboard_image_to_png(
 ) -> Option<(std::path::PathBuf, u32, u32, egui::ColorImage)> {
     #[cfg(target_os = "windows")]
     {
         const CF_DIB: u32 = 8;
         const CF_DIBV5: u32 = 17;
-        const CF_HDROP: u32 = 15;
         #[link(name = "user32")]
         extern "system" {
             fn IsClipboardFormatAvailable(format: u32) -> i32;
@@ -567,15 +428,6 @@ pub(super) fn read_clipboard_image_to_png(
             fn GlobalUnlock(h_mem: *mut std::ffi::c_void) -> i32;
             fn GlobalSize(h_mem: *mut std::ffi::c_void) -> usize;
         }
-        #[link(name = "shell32")]
-        extern "system" {
-            fn DragQueryFileW(
-                h_drop: *mut std::ffi::c_void,
-                i_file: u32,
-                lpsz_file: *mut u16,
-                cch: u32,
-            ) -> u32;
-        }
 
         // SAFETY: clipboard handles are inspected and released on this thread; locked data is copied before release.
         unsafe {
@@ -585,9 +437,8 @@ pub(super) fn read_clipboard_image_to_png(
             let has_mime_png = cf_mime_png != 0 && IsClipboardFormatAvailable(cf_mime_png) != 0;
             let has_dib = IsClipboardFormatAvailable(CF_DIB) != 0
                 || IsClipboardFormatAvailable(CF_DIBV5) != 0;
-            let has_hdrop = IsClipboardFormatAvailable(CF_HDROP) != 0;
 
-            if !has_png && !has_mime_png && !has_dib && !has_hdrop {
+            if !has_png && !has_mime_png && !has_dib {
                 return None;
             }
 
@@ -620,36 +471,6 @@ pub(super) fn read_clipboard_image_to_png(
                             }
                         } else if !ptr.is_null() {
                             GlobalUnlock(hmem);
-                        }
-                    }
-                }
-            }
-
-            // 2. Try CF_HDROP (copied image file in Windows Explorer or ShareX)
-            if has_hdrop {
-                let hdrop = GetClipboardData(CF_HDROP);
-                if !hdrop.is_null() {
-                    let mut buf = vec![0u16; 1024];
-                    let chars =
-                        DragQueryFileW(hdrop, 0, buf.as_mut_ptr(), buf.len() as u32) as usize;
-                    if chars > 0 && chars < buf.len() {
-                        let file_path =
-                            std::path::PathBuf::from(String::from_utf16_lossy(&buf[..chars]));
-                        if let Ok(dyn_img) = image::open(&file_path) {
-                            CloseClipboard();
-                            let rgba = dyn_img.to_rgba8();
-                            let (width, height) = rgba.dimensions();
-                            let thumb = if width > 240 || height > 240 {
-                                image::imageops::thumbnail(&rgba, 240, 240)
-                            } else {
-                                rgba
-                            };
-                            let (tw, th) = thumb.dimensions();
-                            let col_img = egui::ColorImage::from_rgba_unmultiplied(
-                                [tw as usize, th as usize],
-                                thumb.as_raw(),
-                            );
-                            return Some((file_path, width, height, col_img));
                         }
                     }
                 }
@@ -1468,6 +1289,7 @@ pub(super) fn render_message_body(
     max_text_width: f32,
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
+    album: &[&ChatMessage],
 ) -> Option<BubbleAction> {
     let mut body_action = None;
     let (text_col, meta_col) = if outgoing {
@@ -1510,6 +1332,18 @@ pub(super) fn render_message_body(
 
     // Dedicated inline Photo Card when the message is an uploaded/received Zalo photo (#72)
     let is_zalo_photo = is_zalo_photo_message(msg);
+    if is_zalo_photo && album.len() >= 2 {
+        return render_photo_album_grid(
+            ui,
+            album,
+            &sender_label,
+            pal,
+            text_col,
+            max_text_width,
+            sticker_textures,
+            loading_stickers,
+        );
+    }
     if is_zalo_photo {
         if let Some(thumb_url) = photo_primary_url(msg) {
             let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
@@ -1972,6 +1806,161 @@ pub(super) fn photo_primary_url(msg: &ChatMessage) -> Option<&str> {
     None
 }
 
+/// For each message in display order: the album run length when it starts a run of two or
+/// more consecutive photos from the same side and sender sharing a `media_group` id, `0` when
+/// it belongs to a run started earlier (not drawn on its own), and `1` otherwise.
+pub(super) fn album_run_lengths(msgs: &[&ChatMessage]) -> Vec<usize> {
+    let album_key = |m: &ChatMessage| -> Option<(String, bool, String)> {
+        let group = m.media_group.as_ref()?;
+        is_zalo_photo_message(m).then(|| (group.id.clone(), m.is_outgoing, m.sender.clone()))
+    };
+    let mut out = vec![1usize; msgs.len()];
+    let mut i = 0;
+    while i < msgs.len() {
+        let Some(key) = album_key(msgs[i]) else {
+            i += 1;
+            continue;
+        };
+        let mut end = i + 1;
+        while end < msgs.len() && album_key(msgs[end]).as_ref() == Some(&key) {
+            end += 1;
+        }
+        if end - i >= 2 {
+            out[i] = end - i;
+            for slot in &mut out[i + 1..end] {
+                *slot = 0;
+            }
+        }
+        i = end;
+    }
+    out
+}
+
+/// Columns for an album grid: pairs and quads read best two-wide, everything else three-wide.
+fn album_columns(count: usize) -> usize {
+    match count {
+        0..=2 | 4 => 2,
+        _ => 3,
+    }
+}
+
+/// UV sub-rectangle that center-crops a `tw`×`th` texture to a square tile ("cover").
+fn cover_uv(tw: f32, th: f32) -> Rect {
+    if tw <= 0.0 || th <= 0.0 {
+        return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    }
+    let aspect = tw / th;
+    if aspect > 1.0 {
+        let span = 1.0 / aspect;
+        let start = (1.0 - span) / 2.0;
+        Rect::from_min_max(Pos2::new(start, 0.0), Pos2::new(start + span, 1.0))
+    } else {
+        let span = aspect;
+        let start = (1.0 - span) / 2.0;
+        Rect::from_min_max(Pos2::new(0.0, start), Pos2::new(1.0, start + span))
+    }
+}
+
+/// Draw an album as a grid of square, center-cropped thumbnails; clicking a tile opens it.
+#[allow(clippy::too_many_arguments)]
+fn render_photo_album_grid(
+    ui: &mut egui::Ui,
+    album: &[&ChatMessage],
+    sender_label: &str,
+    pal: &ThemePalette,
+    text_col: Color32,
+    max_text_width: f32,
+    sticker_textures: &HashMap<String, TextureHandle>,
+    loading_stickers: &mut HashSet<String>,
+) -> Option<BubbleAction> {
+    let mut action = None;
+    let mut members: Vec<&ChatMessage> = album.to_vec();
+    members.sort_by_key(|m| m.media_group.as_ref().map(|g| g.index).unwrap_or(0));
+    let cols = album_columns(members.len());
+    let gap = 3.0_f32;
+    let grid_w = max_text_width.clamp(220.0, 360.0);
+    let tile = ((grid_w - gap * (cols as f32 - 1.0)) / cols as f32).floor();
+
+    ui.spacing_mut().item_spacing = Vec2::splat(gap);
+    for row in members.chunks(cols) {
+        ui.horizontal(|ui| {
+            for m in row {
+                let Some(thumb_url) = photo_primary_url(m) else {
+                    continue;
+                };
+                let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
+                if !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::FetchStickerImage {
+                            key: key.clone(),
+                            url: thumb_url.to_string(),
+                        });
+                    }
+                }
+                let open_target = m
+                    .link_url
+                    .as_deref()
+                    .filter(|u| !u.is_empty() && crate::chat::is_zalo_photo_cdn_url(u))
+                    .unwrap_or(thumb_url)
+                    .to_string();
+                let size = Vec2::splat(tile);
+                let resp = match sticker_textures.get(&key) {
+                    Some(tex) => {
+                        let [tw, th] = tex.size();
+                        ui.add(
+                            egui::Image::new(tex)
+                                .uv(cover_uv(tw as f32, th as f32))
+                                .fit_to_exact_size(size)
+                                .rounding(Rounding::same(6.0))
+                                .sense(Sense::click()),
+                        )
+                    }
+                    None => {
+                        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                        ui.painter().rect_filled(
+                            rect,
+                            Rounding::same(6.0),
+                            text_col.linear_multiply(0.06),
+                        );
+                        draw_icon_image(
+                            ui.painter(),
+                            rect.center(),
+                            20.0,
+                            text_col.linear_multiply(0.4),
+                        );
+                        resp
+                    }
+                };
+                if resp.hovered() {
+                    ui.painter().rect_stroke(
+                        resp.rect,
+                        Rounding::same(6.0),
+                        Stroke::new(1.6_f32, pal.primary),
+                    );
+                }
+                if resp
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text("Bấm để xem ảnh phóng to trong ứng dụng")
+                    .clicked()
+                {
+                    action = Some(BubbleAction::OpenImagePopup {
+                        tex_key: key,
+                        full_url: open_target,
+                        title: "Hình ảnh".to_string(),
+                        sender: sender_label.to_string(),
+                        time: m.time.clone(),
+                    });
+                }
+            }
+        });
+    }
+    if let Some(cap) = members.iter().find_map(|m| extract_photo_user_caption(m)) {
+        ui.add_space(5.0);
+        render_chat_markdown_block(ui, cap, text_col, pal);
+    }
+    action
+}
+
 pub(super) fn is_zalo_photo_message(msg: &ChatMessage) -> bool {
     if is_sticker_message(msg).is_some() || is_zalo_file_or_video_message(msg) {
         return false;
@@ -2057,6 +2046,7 @@ pub(super) fn render_chat_bubble(
     loading_stickers: &mut HashSet<String>,
     emoji_textures: &HashMap<String, TextureHandle>,
     idx: usize,
+    album: &[&ChatMessage],
 ) -> Option<BubbleAction> {
     let avail_w = ui.available_width();
     let max_bubble_width = (avail_w * 0.72).clamp(140.0, 520.0);
@@ -2336,6 +2326,7 @@ pub(super) fn render_chat_bubble(
                                     content_width,
                                     sticker_textures,
                                     loading_stickers,
+                                    album,
                                 );
                             }
                             if let Some(act) = render_reactions(ui, msg, pal, emoji_textures) {
@@ -2485,6 +2476,7 @@ pub(super) fn render_chat_bubble(
                                     content_width,
                                     sticker_textures,
                                     loading_stickers,
+                                    album,
                                 );
                             }
                             if let Some(act) = render_reactions(ui, msg, pal, emoji_textures) {
@@ -3116,6 +3108,7 @@ mod quote_navigation_tests {
                                 &mut HashSet::new(),
                                 &HashMap::new(),
                                 0,
+                                &[],
                             );
                         });
                     },
@@ -3435,5 +3428,62 @@ mod quote_navigation_tests {
             extract_photo_user_caption(&real_caption_msg),
             Some("Xem ảnh này nè")
         );
+    }
+}
+
+#[cfg(test)]
+mod album_grid_tests {
+    use super::*;
+
+    fn album_photo(id: &str, group: Option<(&str, u32)>, outgoing: bool) -> ChatMessage {
+        ChatMessage {
+            id: id.into(),
+            sender: if outgoing { "Tôi".into() } else { "An".into() },
+            text: "[Hình ảnh]".into(),
+            is_outgoing: outgoing,
+            link_src: Some("Hình ảnh Zalo".into()),
+            link_url: Some(format!("https://b-f17-zpcloud.zdn.vn/1/{id}.jpg")),
+            media_group: group.map(|(g, i)| crate::chat::MediaGroupLayout::new(g, i, 3)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn album_runs_group_consecutive_photos_of_one_layout() {
+        let msgs = [
+            album_photo("a", Some(("L1", 0)), true),
+            album_photo("b", Some(("L1", 1)), true),
+            album_photo("c", Some(("L1", 2)), true),
+            album_photo("d", None, true),
+            album_photo("e", Some(("L2", 0)), false),
+            album_photo("f", Some(("L2", 1)), false),
+        ];
+        let refs: Vec<&ChatMessage> = msgs.iter().collect();
+        assert_eq!(album_run_lengths(&refs), vec![3, 0, 0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn album_runs_need_two_members_and_same_side() {
+        let msgs = [
+            album_photo("a", Some(("L1", 0)), true),
+            album_photo("b", Some(("L1", 1)), false),
+            album_photo("c", Some(("L3", 0)), true),
+        ];
+        let refs: Vec<&ChatMessage> = msgs.iter().collect();
+        assert_eq!(album_run_lengths(&refs), vec![1, 1, 1]);
+        assert!(album_run_lengths(&[]).is_empty());
+    }
+
+    #[test]
+    fn album_grid_columns_and_cover_crop() {
+        assert_eq!(album_columns(2), 2);
+        assert_eq!(album_columns(3), 3);
+        assert_eq!(album_columns(4), 2);
+        assert_eq!(album_columns(7), 3);
+        let wide = cover_uv(200.0, 100.0);
+        assert!((wide.min.x - 0.25).abs() < 1e-6 && (wide.max.x - 0.75).abs() < 1e-6);
+        assert_eq!((wide.min.y, wide.max.y), (0.0, 1.0));
+        let tall = cover_uv(100.0, 400.0);
+        assert!((tall.min.y - 0.375).abs() < 1e-6 && (tall.max.y - 0.625).abs() < 1e-6);
     }
 }
