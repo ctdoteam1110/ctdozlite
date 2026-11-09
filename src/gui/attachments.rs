@@ -81,6 +81,26 @@ pub fn plan_album_slots(paths: &[PathBuf]) -> Vec<Option<(u32, u32)>> {
         .collect()
 }
 
+/// Reorder a queue so its album photos are sent back to back, starting where the first one
+/// was queued; everything else keeps its relative order. Album members must be consecutive
+/// in the conversation to render as one grid, so a document or GIF queued between two photos
+/// is sent right after the album instead of splitting it.
+pub fn album_send_order(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    if paths.iter().filter(|p| is_album_photo(p)).count() < 2 {
+        return paths;
+    }
+    let Some(first) = paths.iter().position(|p| is_album_photo(p)) else {
+        return paths;
+    };
+    let (photos, others): (Vec<PathBuf>, Vec<PathBuf>) =
+        paths.into_iter().partition(|p| is_album_photo(p));
+    let mut others = others.into_iter();
+    let mut out: Vec<PathBuf> = others.by_ref().take(first).collect();
+    out.extend(photos);
+    out.extend(others);
+    out
+}
+
 /// Split a Win32 `GetOpenFileNameW` multi-select buffer into absolute paths.
 ///
 /// With `OFN_ALLOWMULTISELECT | OFN_EXPLORER` the buffer is either one full path
@@ -370,7 +390,7 @@ fn pick_native_files(images_only: bool, multi: bool) -> Vec<PathBuf> {
          end repeat\n\
          return out"
     );
-    run_dialog_command("osascript", &["-e", &script])
+    run_dialog_command("osascript", &["-e", &script]).unwrap_or_default()
 }
 
 #[cfg(target_os = "macos")]
@@ -382,6 +402,7 @@ fn pick_native_folder() -> Option<PathBuf> {
             "POSIX path of (choose folder with prompt \"Chọn thư mục để gửi qua Zalo\")",
         ],
     )
+    .unwrap_or_default()
     .into_iter()
     .next()
 }
@@ -395,43 +416,46 @@ fn pick_native_files(images_only: bool, multi: bool) -> Vec<PathBuf> {
     if images_only {
         zenity_args.push("--file-filter=Images | *.png *.jpg *.jpeg *.webp *.gif *.bmp");
     }
-    let picked = run_dialog_command("zenity", &zenity_args);
-    if !picked.is_empty() {
+    // Fall back to kdialog only when zenity is not installed, never after a cancel.
+    if let Some(picked) = run_dialog_command("zenity", &zenity_args) {
         return picked;
     }
-    if multi {
-        run_dialog_command(
-            "kdialog",
-            &["--getopenfilename", "--multiple", "--separate-output"],
-        )
-    } else {
-        run_dialog_command("kdialog", &["--getopenfilename"])
+    let mut kdialog_args = vec!["--getopenfilename"];
+    if multi || images_only {
+        // kdialog takes the start dir before the filter; "." keeps its default location.
+        kdialog_args.push(".");
     }
+    if images_only {
+        kdialog_args.push("*.png *.jpg *.jpeg *.webp *.gif *.bmp|Images");
+    }
+    if multi {
+        kdialog_args.extend(["--multiple", "--separate-output"]);
+    }
+    run_dialog_command("kdialog", &kdialog_args).unwrap_or_default()
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn pick_native_folder() -> Option<PathBuf> {
     run_dialog_command("zenity", &["--file-selection", "--directory"])
+        .or_else(|| run_dialog_command("kdialog", &["--getexistingdirectory"]))?
         .into_iter()
         .next()
-        .or_else(|| {
-            run_dialog_command("kdialog", &["--getexistingdirectory"])
-                .into_iter()
-                .next()
-        })
 }
 
+/// Run a dialog helper and parse the chosen paths. `None` means the program is not
+/// installed (try another helper); `Some(empty)` means the user cancelled.
 #[cfg(not(target_os = "windows"))]
-fn run_dialog_command(prog: &str, args: &[&str]) -> Vec<PathBuf> {
+fn run_dialog_command(prog: &str, args: &[&str]) -> Option<Vec<PathBuf>> {
     match std::process::Command::new(prog).args(args).output() {
+        Ok(out) if out.status.success() => {
+            Some(parse_line_paths(&String::from_utf8_lossy(&out.stdout)))
+        }
         // A non-zero exit is the user cancelling; there is nothing to report.
-        Ok(out) if out.status.success() => parse_line_paths(&String::from_utf8_lossy(&out.stdout)),
-        Ok(_) => Vec::new(),
+        Ok(_) => Some(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                crate::logger::log_error("gui::file_dialog", &format!("{prog}: {e}"));
-            }
-            Vec::new()
+            crate::logger::log_error("gui::file_dialog", &format!("{prog}: {e}"));
+            Some(Vec::new())
         }
     }
 }
@@ -668,6 +692,18 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn album_send_order_keeps_photos_together() {
+        let p = |s: &str| PathBuf::from(s);
+        let queued = vec![p("a.pdf"), p("1.jpg"), p("b.gif"), p("2.png"), p("c.zip")];
+        assert_eq!(
+            album_send_order(queued),
+            vec![p("a.pdf"), p("1.jpg"), p("2.png"), p("b.gif"), p("c.zip")]
+        );
+        let single = vec![p("a.pdf"), p("1.jpg"), p("b.gif")];
+        assert_eq!(album_send_order(single.clone()), single);
+    }
 
     fn u16z(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()

@@ -2058,6 +2058,8 @@ pub async fn send_attachment_in_layout(
         let thumb_url = pick_str(data_node, &["thumbUrl", "normalUrl", "hdUrl"])
             .unwrap_or_else(|| normal_url.clone());
 
+        // Only `photo_original/send` carries album fields; the single-shot fallback does not.
+        let mut joined_album = false;
         let send_resp = if let Some(pid) = photo_id.filter(|_| !normal_url.is_empty()) {
             let send_ep = if is_group {
                 "/api/group/photo_original/send"
@@ -2101,6 +2103,7 @@ pub async fn send_attachment_in_layout(
             send_obj.insert("imei".into(), json!(s.imei));
             if let Some(layout) = layout {
                 layout.apply_to(&mut send_obj);
+                joined_album = true;
             }
             if is_group {
                 send_obj.insert("grid".into(), json!(clean_target));
@@ -2213,7 +2216,7 @@ pub async fn send_attachment_in_layout(
             },
             link_thumb: Some(final_thumb),
             link_src: Some("Hình ảnh Zalo".into()),
-            media_group: layout.cloned(),
+            media_group: layout.filter(|_| joined_album).cloned(),
             ..Default::default()
         };
         return Ok((send_resp, cm));

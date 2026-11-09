@@ -2936,10 +2936,16 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
+                                let paths = super::attachments::album_send_order(paths);
                                 let total = paths.len();
                                 // Two or more still photos go out as one album; GIFs, videos
                                 // and files are sent standalone (same split as Zalo Web).
                                 let album_slots = super::attachments::plan_album_slots(&paths);
+                                // Only photo sends carry a description; for a queue without
+                                // photos the caption goes out as its own text message.
+                                let caption_idx = paths
+                                    .iter()
+                                    .position(|p| super::attachments::is_image_path(p));
                                 let album_id = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_millis())
@@ -2963,7 +2969,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     )));
                                     ctx_clone.request_repaint();
 
-                                    let item_caption = if idx == 0 { caption.as_str() } else { "" };
+                                    let item_caption =
+                                        if Some(idx) == caption_idx { caption.as_str() } else { "" };
                                     let s = session_clone.lock().await.clone();
                                     let layout = album_slots[idx].map(|(slot, of)| {
                                         crate::chat::MediaGroupLayout::new(album_id.clone(), slot, of)
@@ -2992,6 +2999,41 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 thread_id: to_id.clone(),
                                                 text: item_caption.to_string(),
                                                 error: format!("Lỗi gửi '{fname}': {err_s}"),
+                                            });
+                                        }
+                                    }
+                                    ctx_clone.request_repaint();
+                                }
+                                if caption_idx.is_none() && !caption.trim().is_empty() {
+                                    let s = session_clone.lock().await.clone();
+                                    let client_id = crate::chat::next_client_message_id();
+                                    let res = if is_group {
+                                        crate::chat::send_group_message_with_client_id(
+                                            &s, &to_id, &caption, client_id,
+                                        )
+                                        .await
+                                    } else {
+                                        crate::chat::send_message_with_client_id(
+                                            &s, &to_id, &caption, client_id,
+                                        )
+                                        .await
+                                    };
+                                    match res {
+                                        Ok(resp) => {
+                                            let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                                client_message_id: client_id.to_string(),
+                                                thread_id: to_id,
+                                                text: caption,
+                                                msg_id: extract_msg_id(&resp),
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let err_s = e.to_string();
+                                            crate::logger::log_error("gui::send_caption", &err_s);
+                                            let _ = gui_tx_clone.send(GuiEvent::SendFailed {
+                                                thread_id: to_id,
+                                                text: caption,
+                                                error: err_s,
                                             });
                                         }
                                     }

@@ -3475,7 +3475,8 @@ impl ZaloGuiApp {
 
                     // 1d. In-Conversation Message Search Bar (`self.in_chat_search_open`)
                     if self.in_chat_search_open {
-                        if ui.input(|i| i.key_pressed(Key::Escape)) {
+                        // Consume Escape so it does not also clear the attachment queue below.
+                        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
                             self.in_chat_search_open = false;
                             self.in_chat_search_query.clear();
                         }
@@ -4014,8 +4015,9 @@ impl ZaloGuiApp {
                                                     let next_same_sender = next_msg
                                                         .map(|nm| same_message_cluster(msg, nm))
                                                         .unwrap_or(false);
-                                                    let is_latest_outgoing =
-                                                        last_outgoing_idx == Some(idx);
+                                                    // An album row is "latest" when any of its photos is.
+                                                    let is_latest_outgoing = last_outgoing_idx
+                                                        .is_some_and(|l| visible_indices[pos..pos + run_len].contains(&l));
 
                                                     let s_id = if is_group {
                                                         crate::chat::sidebar_sender_id(msg).or_else(|| {

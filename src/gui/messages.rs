@@ -1812,7 +1812,11 @@ pub(super) fn photo_primary_url(msg: &ChatMessage) -> Option<&str> {
 pub(super) fn album_run_lengths(msgs: &[&ChatMessage]) -> Vec<usize> {
     let album_key = |m: &ChatMessage| -> Option<(String, bool, String)> {
         let group = m.media_group.as_ref()?;
-        is_zalo_photo_message(m).then(|| (group.id.clone(), m.is_outgoing, m.sender.clone()))
+        // Recalled photos render as a recall notice on their own, never inside a grid.
+        let text = m.text.trim();
+        let recalled = text == "[Tin nhắn đã thu hồi]" || text.starts_with("[Đã thu hồi]");
+        (!recalled && is_zalo_photo_message(m))
+            .then(|| (group.id.clone(), m.is_outgoing, m.sender.clone()))
     };
     let mut out = vec![1usize; msgs.len()];
     let mut i = 0;
@@ -1834,6 +1838,11 @@ pub(super) fn album_run_lengths(msgs: &[&ChatMessage]) -> Vec<usize> {
         i = end;
     }
     out
+}
+
+/// Width of an album grid: up to 360 pt, never wider than the bubble's text area.
+fn album_grid_width(max_text_width: f32) -> f32 {
+    max_text_width.min(360.0).floor()
 }
 
 /// Columns for an album grid: pairs and quads read best two-wide, everything else three-wide.
@@ -1878,7 +1887,7 @@ fn render_photo_album_grid(
     members.sort_by_key(|m| m.media_group.as_ref().map(|g| g.index).unwrap_or(0));
     let cols = album_columns(members.len());
     let gap = 3.0_f32;
-    let grid_w = max_text_width.clamp(220.0, 360.0);
+    let grid_w = album_grid_width(max_text_width);
     let tile = ((grid_w - gap * (cols as f32 - 1.0)) / cols as f32).floor();
 
     ui.spacing_mut().item_spacing = Vec2::splat(gap);
@@ -2089,6 +2098,8 @@ pub(super) fn render_chat_bubble(
         116.0_f32
     } else if is_call_card {
         max_text_width.min(256.0)
+    } else if is_photo_card && album.len() >= 2 {
+        album_grid_width(max_text_width)
     } else if is_photo_card {
         let thumb_u = photo_primary_url(msg).unwrap_or("");
         let tkey = format!("thumb_{}", crate::crypto::md5_hex(thumb_u));
