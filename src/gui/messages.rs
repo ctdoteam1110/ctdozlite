@@ -3575,6 +3575,22 @@ mod album_grid_tests {
     }
 
     #[test]
+    fn album_runs_skip_recalled_photos() {
+        for marker in ["[Tin nhắn đã thu hồi]", "[Đã thu hồi] [Hình ảnh]"] {
+            let mut recalled = album_photo("a", Some(("L1", 0)), true);
+            recalled.text = marker.into();
+            let msgs = [
+                recalled,
+                album_photo("b", Some(("L1", 1)), true),
+                album_photo("c", Some(("L1", 2)), true),
+            ];
+            let refs: Vec<&ChatMessage> = msgs.iter().collect();
+            // The recalled photo stands alone; the other two still form a grid.
+            assert_eq!(album_run_lengths(&refs), vec![1, 2, 0], "marker {marker}");
+        }
+    }
+
+    #[test]
     fn album_grid_columns_and_cover_crop() {
         assert_eq!(album_columns(2), 2);
         assert_eq!(album_columns(3), 3);

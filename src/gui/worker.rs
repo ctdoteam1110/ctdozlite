@@ -83,8 +83,10 @@ pub enum WorkerCmd {
     PrepareAttachments {
         paths: Vec<std::path::PathBuf>,
     },
-    /// Upload and send queued files one after another, preserving their order.
-    /// `caption` is attached to the first file only.
+    /// Upload and send queued files one after another. Still photos are moved together to
+    /// the first photo's position (see `attachments::album_send_order`) so they form one
+    /// album; everything else keeps its order. `caption` goes on the first photo, or, when
+    /// the queue has no photo, is sent as a text message after the files.
     SendAttachments {
         to_id: String,
         is_group: bool,

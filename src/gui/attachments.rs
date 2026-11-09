@@ -442,22 +442,41 @@ fn pick_native_folder() -> Option<PathBuf> {
         .next()
 }
 
-/// Run a dialog helper and parse the chosen paths. `None` means the program is not
-/// installed (try another helper); `Some(empty)` means the user cancelled.
+/// Run a dialog helper and parse the chosen paths. `None` means the helper is missing or
+/// could not open (try another helper); `Some(empty)` means the user cancelled.
 #[cfg(not(target_os = "windows"))]
 fn run_dialog_command(prog: &str, args: &[&str]) -> Option<Vec<PathBuf>> {
     match std::process::Command::new(prog).args(args).output() {
         Ok(out) if out.status.success() => {
             Some(parse_line_paths(&String::from_utf8_lossy(&out.stdout)))
         }
-        // A non-zero exit is the user cancelling; there is nothing to report.
-        Ok(_) => Some(Vec::new()),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if dialog_failed_to_open(out.status.code(), &stderr) {
+                crate::logger::log_error(
+                    "gui::file_dialog",
+                    &format!("{prog} failed ({:?}): {}", out.status.code(), stderr.trim()),
+                );
+                None
+            } else {
+                Some(Vec::new())
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
             crate::logger::log_error("gui::file_dialog", &format!("{prog}: {e}"));
             Some(Vec::new())
         }
     }
+}
+
+/// Whether a non-zero dialog exit is a failure to open rather than a cancel. zenity and
+/// kdialog exit with 1 on cancel; any other code, a signal, or a display error means the
+/// dialog never appeared.
+#[cfg_attr(windows, allow(dead_code))]
+fn dialog_failed_to_open(code: Option<i32>, stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    code != Some(1) || stderr.contains("cannot open display") || stderr.contains("could not connect to display")
 }
 
 #[cfg(target_os = "windows")]
@@ -692,6 +711,15 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialog_cancel_is_not_a_failure() {
+        assert!(!dialog_failed_to_open(Some(1), ""));
+        assert!(!dialog_failed_to_open(Some(1), "Gtk-WARNING: mapped without a transient parent"));
+        assert!(dialog_failed_to_open(Some(1), "(zenity:42): Gtk-WARNING **: cannot open display: :0"));
+        assert!(dialog_failed_to_open(Some(255), ""));
+        assert!(dialog_failed_to_open(None, ""));
+    }
 
     #[test]
     fn album_send_order_keeps_photos_together() {
