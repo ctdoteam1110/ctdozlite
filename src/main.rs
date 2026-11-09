@@ -363,10 +363,7 @@ async fn main() -> Result<()> {
             Ok(list) => {
                 for ft in list {
                     if let Some(ex) = initial_threads.iter_mut().find(|t| t.id == ft.id) {
-                        if !ft.name.is_empty() {
-                            ex.name = ft.name;
-                            ex.presentation.contact_name = ft.presentation.contact_name;
-                        }
+                        chat::adopt_thread_name(ex, ft.name, ft.presentation.contact_name);
                         ex.is_group = ex.is_group || ft.is_group;
                     } else {
                         initial_threads.push(ft);

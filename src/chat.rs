@@ -996,6 +996,18 @@ pub(crate) fn merge_sent_message(thread: &mut Thread, mut message: ChatMessage) 
     );
 }
 
+/// Apply a thread name from another source: friend-list names (`is_contact_name`) always win,
+/// any other name only fills a placeholder, so it can never undo a contact alias.
+pub fn adopt_thread_name(target: &mut Thread, name: String, is_contact_name: bool) {
+    if name.is_empty() {
+        return;
+    }
+    if is_contact_name || is_generic_thread_name(&target.name) {
+        target.name = name;
+    }
+    target.presentation.contact_name |= is_contact_name;
+}
+
 /// Merge `incoming` thread into `target`. When `incoming_id_is_authoritative` is `true`,
 /// `target.id` is migrated to `incoming.id` so actions (chat/VoIP call) always target the active session's `userId`.
 pub fn merge_thread_into(
@@ -1009,13 +1021,7 @@ pub fn merge_thread_into(
     if incoming_id_is_authoritative && !incoming.id.is_empty() && incoming.id != "0" {
         target.id = incoming.id;
     }
-    let incoming_contact_name =
-        incoming.presentation.contact_name && !is_generic_thread_name(&incoming.name);
-    if incoming_contact_name || (is_generic_thread_name(&target.name) && !incoming.name.is_empty())
-    {
-        target.name = incoming.name;
-    }
-    target.presentation.contact_name |= incoming_contact_name;
+    adopt_thread_name(target, incoming.name, incoming.presentation.contact_name);
     if should_replace_avatar(target.avatar.as_deref(), incoming.avatar.as_deref()) {
         target.avatar = incoming.avatar;
     }
@@ -1366,14 +1372,16 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
 
 fn parse_thread(v: &Value) -> Option<Thread> {
     let id = pick_str(v, &["userId", "uid", "id", "friendId", "globalId"])?;
-    let name = pick_str(v, &["displayName", "zaloName", "display_name", "name"])
-        .or_else(|| {
+    let picked_name =
+        pick_str(v, &["displayName", "zaloName", "display_name", "name"]).or_else(|| {
             v.get("profile_displayName")
                 .or_else(|| v.get("profile").and_then(|p| p.get("displayName")))
                 .and_then(Value::as_str)
                 .map(str::to_string)
-        })
-        .unwrap_or_else(|| id.clone());
+        });
+    // Provenance, not text: an alias may look like a placeholder (e.g. "Nhóm học", "123").
+    let contact_name = picked_name.is_some();
+    let name = picked_name.unwrap_or_else(|| id.clone());
     let avatar = pick_str(v, &["avatar", "avt", "profile_avatar"]);
     let is_group = is_group_flag(v);
     let time = v
@@ -1386,7 +1394,6 @@ fn parse_thread(v: &Value) -> Option<Thread> {
         .map(crate::clock::message_time)
         .unwrap_or_default();
 
-    let contact_name = !is_generic_thread_name(&name) && name != id;
     Some(Thread {
         presentation: SidebarPresentation {
             contact_name,
@@ -8107,6 +8114,31 @@ mod tests {
         let mut named = stale("Nguyễn Thị Lan");
         merge_thread_into(&mut named, stale("Someone Else"), true);
         assert_eq!(named.name, "Nguyễn Thị Lan");
+
+        // An alias that looks like a placeholder is still a contact name.
+        for alias in ["Nhóm học", "123"] {
+            let friend = parse_thread(&serde_json::json!({
+                "userId": "1000000000000000001",
+                "displayName": alias,
+                "zaloName": "Nguyễn Thị Lan"
+            }))
+            .unwrap();
+            assert!(friend.presentation.contact_name, "{alias}");
+            let mut target = stale("Nguyễn Thị Lan");
+            merge_thread_into(&mut target, friend, true);
+            assert_eq!(target.name, alias);
+        }
+
+        // A friend entry without any name falls back to its ID and must not clobber an alias.
+        let unnamed =
+            parse_thread(&serde_json::json!({ "userId": "1000000000000000001" })).unwrap();
+        assert_eq!(unnamed.name, "1000000000000000001");
+        assert!(!unnamed.presentation.contact_name);
+        let mut target = stale("Nguyễn Thị Lan");
+        adopt_thread_name(&mut target, "Chị Lan (lớp 12)".into(), true);
+        adopt_thread_name(&mut target, unnamed.name, unnamed.presentation.contact_name);
+        assert_eq!(target.name, "Chị Lan (lớp 12)");
+        assert!(target.presentation.contact_name);
     }
 
     #[test]

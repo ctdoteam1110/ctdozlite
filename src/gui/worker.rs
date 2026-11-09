@@ -1264,10 +1264,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                     .iter_mut()
                                                                     .find(|t| t.id == ft.id)
                                                                 {
-                                                                    if !ft.name.is_empty() {
-                                                                        ex.name = ft.name;
-                                                                        ex.presentation.contact_name = ft.presentation.contact_name;
-                                                                    }
+                                                                    crate::chat::adopt_thread_name(ex, ft.name, ft.presentation.contact_name);
                                                                     if crate::chat::should_replace_avatar(
                                                                         ex.avatar.as_deref(),
                                                                         ft.avatar.as_deref(),
@@ -1459,10 +1456,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         Ok(friends) => {
                                             for ft in friends {
                                                 if let Some(ex) = list.iter_mut().find(|t| t.id == ft.id) {
-                                                    if !ft.name.is_empty() {
-                                                        ex.name = ft.name;
-                                                        ex.presentation.contact_name = ft.presentation.contact_name;
-                                                    }
+                                                    crate::chat::adopt_thread_name(ex, ft.name, ft.presentation.contact_name);
                                                     if crate::chat::should_replace_avatar(
                                                         ex.avatar.as_deref(),
                                                         ft.avatar.as_deref(),
@@ -3219,10 +3213,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                         if let Some(ex) =
                                                             list.iter_mut().find(|t| t.id == ft.id)
                                                         {
-                                                            if !ft.name.is_empty() {
-                                                                ex.name = ft.name;
-                                                                ex.presentation.contact_name = ft.presentation.contact_name;
-                                                            }
+                                                            crate::chat::adopt_thread_name(ex, ft.name, ft.presentation.contact_name);
                                                             if crate::chat::should_replace_avatar(
                                                                 ex.avatar.as_deref(),
                                                                 ft.avatar.as_deref(),
