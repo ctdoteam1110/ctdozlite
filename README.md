@@ -7,6 +7,16 @@
 > Ứng dụng kiểm tra cập nhật từ `lebad280324/ctdozlite`, tránh tự chuyển về giao diện của upstream. Các tài liệu/bảng nền tảng upstream bên dưới được giữ để tham khảo dự án gốc.
 > **Giới hạn đã biết:** đồng bộ lịch sử từ điện thoại còn thử nghiệm, có thể chỉ tải được một phần. Xem [ghi chú v0.0.9](docs/releases/v0.0.9.md) trước khi sử dụng.
 
+## Giao diện trên macOS
+
+**Cửa sổ trò chuyện:** bố cục bo tròn, thanh công cụ nổi và ảnh nền tùy chọn.
+
+![Giao diện trò chuyện ctdozlite trên macOS](docs/assets/macos-chat.png)
+
+**Cài đặt giao diện:** lựa chọn bộ biểu tượng và thay ảnh nền ứng dụng.
+
+![Cài đặt biểu tượng và ảnh nền ctdozlite trên macOS](docs/assets/macos-appearance.png)
+
 
 **[Tiếng Việt](README.md)** · **[English](docs/i18n/README_EN.md)** · **[한국어](docs/i18n/README_KO.md)** · **[日本語](docs/i18n/README_JA.md)** · **[简体中文](docs/i18n/README_ZH.md)**
 
