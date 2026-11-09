@@ -997,12 +997,16 @@ pub(crate) fn merge_sent_message(thread: &mut Thread, mut message: ChatMessage) 
 }
 
 /// Apply a thread name from another source: friend-list names (`is_contact_name`) always win,
-/// any other name only fills a placeholder, so it can never undo a contact alias.
+/// any other name only fills a placeholder, so it can never undo a contact alias (even one that
+/// looks like a placeholder, e.g. "Nhóm học"). A bare ID never replaces a generated name.
 pub fn adopt_thread_name(target: &mut Thread, name: String, is_contact_name: bool) {
-    if name.is_empty() {
+    if name.trim().is_empty() {
         return;
     }
-    if is_contact_name || is_generic_thread_name(&target.name) {
+    let fills_placeholder = !target.presentation.contact_name
+        && is_generic_thread_name(&target.name)
+        && (target.name.trim().is_empty() || !name.chars().all(|c| c.is_ascii_digit()));
+    if is_contact_name || fills_placeholder {
         target.name = name;
     }
     target.presentation.contact_name |= is_contact_name;
@@ -1372,12 +1376,16 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
 
 fn parse_thread(v: &Value) -> Option<Thread> {
     let id = pick_str(v, &["userId", "uid", "id", "friendId", "globalId"])?;
-    let picked_name =
-        pick_str(v, &["displayName", "zaloName", "display_name", "name"]).or_else(|| {
+    let usable = |n: &String| !n.trim().is_empty();
+    let picked_name = ["displayName", "zaloName", "display_name", "name"]
+        .iter()
+        .find_map(|k| pick_str(v, &[*k]).filter(usable))
+        .or_else(|| {
             v.get("profile_displayName")
                 .or_else(|| v.get("profile").and_then(|p| p.get("displayName")))
                 .and_then(Value::as_str)
                 .map(str::to_string)
+                .filter(usable)
         });
     // Provenance, not text: an alias may look like a placeholder (e.g. "Nhóm học", "123").
     let contact_name = picked_name.is_some();
@@ -4547,7 +4555,9 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
             if let Ok(profiles) = get_mini_profiles(s, chunk).await {
                 for t in threads.iter_mut() {
                     if let Some(p) = profiles.get(&t.id) {
-                        if t.name.starts_with("Người dùng ") || t.name.is_empty() {
+                        if !t.presentation.contact_name
+                            && (t.name.starts_with("Người dùng ") || t.name.is_empty())
+                        {
                             if let Some(name) =
                                 pick_str(p, &["displayName", "zaloName", "name", "display_name"])
                             {
@@ -8139,6 +8149,31 @@ mod tests {
         adopt_thread_name(&mut target, unnamed.name, unnamed.presentation.contact_name);
         assert_eq!(target.name, "Chị Lan (lớp 12)");
         assert!(target.presentation.contact_name);
+
+        // A contact alias that looks like a placeholder survives non-contact names.
+        for alias in ["Nhóm học", "123"] {
+            let mut target = stale("Nguyễn Thị Lan");
+            adopt_thread_name(&mut target, alias.into(), true);
+            merge_thread_into(&mut target, stale("Nguyễn Thị Lan"), true);
+            assert_eq!(target.name, alias);
+        }
+
+        // A bare ID does not replace a generated name; a real non-contact name still does.
+        let mut generated = stale("Người dùng 42");
+        adopt_thread_name(&mut generated, "42".into(), false);
+        assert_eq!(generated.name, "Người dùng 42");
+        adopt_thread_name(&mut generated, "Nhóm Kỹ Thuật".into(), false);
+        assert_eq!(generated.name, "Nhóm Kỹ Thuật");
+
+        // Whitespace-only fields are skipped when picking the contact name.
+        let friend = parse_thread(&serde_json::json!({
+            "userId": "1000000000000000001",
+            "displayName": "  ",
+            "zaloName": "Nguyễn Thị Lan"
+        }))
+        .unwrap();
+        assert_eq!(friend.name, "Nguyễn Thị Lan");
+        assert!(friend.presentation.contact_name);
     }
 
     #[test]
