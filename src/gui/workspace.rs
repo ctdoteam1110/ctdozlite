@@ -969,16 +969,35 @@ impl ZaloGuiApp {
                                 22
                             };
                             let snippet = truncate_chars(&raw_preview, max_snip_chars);
-                            ui.painter().text(
-                                Pos2::new(text_left, row_rect.top() + 33.5),
-                                egui::Align2::LEFT_TOP,
-                                snippet,
+                            // Emoji as Apple Color Emoji images, like the chat: egui's own emoji
+                            // font lacks newer ones (🥱 drew as a box here).
+                            let snip_col = if unread_n > 0 {
+                                pal.text_primary
+                            } else {
+                                pal.text_secondary
+                            };
+                            let mut snip_job = egui::text::LayoutJob::default();
+                            super::emoji_picker::append_text_with_emoji_sized(
+                                &mut snip_job,
+                                ui.ctx(),
+                                &snippet,
                                 FontId::proportional(12.0),
-                                if unread_n > 0 {
-                                    pal.text_primary
-                                } else {
-                                    pal.text_secondary
-                                },
+                                snip_col,
+                                15.0,
+                            );
+                            let snip_galley = ui.fonts(|f| f.layout_job(snip_job));
+                            let snip_pos = Pos2::new(
+                                text_left,
+                                row_rect.top()
+                                    + 33.5
+                                    + (15.0 - snip_galley.size().y).min(0.0) * 0.5,
+                            );
+                            ui.painter().galley(snip_pos, snip_galley.clone(), snip_col);
+                            super::emoji_picker::paint_emoji_overlay(
+                                ui.painter(),
+                                ui.ctx(),
+                                &snip_galley,
+                                snip_pos,
                             );
                             if unread_n > 0 {
                                 let badge_txt = if unread_n > 99 {
@@ -1871,7 +1890,7 @@ impl ZaloGuiApp {
                                         .on_hover_text("Gọi Video")
                                         .clicked()
                                     {
-                                        let ff_ok = crate::media::is_ffmpeg_available();
+                                        let ff_ok = crate::media::video_calls_available();
                                         let (_, cams) = crate::media::list_media_devices(false);
                                         let can_cam = ff_ok && !cams.is_empty();
                                         if !ff_ok {
@@ -2676,12 +2695,29 @@ impl ZaloGuiApp {
                     let mut blockers = vec![self.composer_rect_last, self.header_rect_last];
                     blockers.extend(std::mem::take(&mut self.overlay_rects_last));
                     set_react_blockers(blockers);
-                    egui::ScrollArea::vertical()
+                    let now = ctx.input(|i| i.time);
+                    if self.force_scroll_to_bottom {
+                        // Opening a chat (or the app): hold the newest message in view while
+                        // photos and file previews load and grow the rows above it.
+                        self.pin_chat_bottom_until = now + 2.5;
+                    }
+                    let user_scrolled = ctx.input(|i| {
+                        i.smooth_scroll_delta.y != 0.0 || i.pointer.primary_down()
+                    }) && ctx.pointer_hover_pos().is_some_and(|p| list_rect.contains(p));
+                    if user_scrolled || jump_index.is_some() {
+                        self.pin_chat_bottom_until = 0.0;
+                    }
+                    let pin_bottom = now < self.pin_chat_bottom_until;
+                    if pin_bottom {
+                        ctx.request_repaint();
+                    }
+                    let chat_scroll = egui::ScrollArea::vertical()
                         .id_salt(Id::new(("chat_scroll", &thread_id)))
                         .enable_scrolling(!pointer_over_composer)
                         .max_height(msg_area_height + header_overlap)
                         .auto_shrink([false, false])
-                        .stick_to_bottom(jump_index.is_none())
+                        .stick_to_bottom(jump_index.is_none());
+                    chat_scroll
                         .show(ui, |ui| {
                             ui.add_space(header_overlap);
                             egui::Frame::none()
@@ -2926,8 +2962,16 @@ impl ZaloGuiApp {
                                                 ui.add_space(composer_block_h);
                                             }
                                             let (bottom_rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 1.0), Sense::hover());
-                                            if self.force_scroll_to_bottom {
-                                                ui.scroll_to_rect(bottom_rect, Some(Align::BOTTOM));
+                                            if self.force_scroll_to_bottom || pin_bottom {
+                                                // Instant, not animated: rows above may still grow
+                                                // (photos, previews) and an animation would stop short.
+                                                // Never set the offset past the end up front: egui
+                                                // paints at that offset first, which left the chat blank.
+                                                ui.scroll_to_rect_animation(
+                                                    bottom_rect,
+                                                    Some(Align::BOTTOM),
+                                                    egui::style::ScrollAnimation::none(),
+                                                );
                                                 self.force_scroll_to_bottom = false;
                                             }
                                         }

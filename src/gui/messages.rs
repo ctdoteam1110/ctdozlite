@@ -156,65 +156,46 @@ pub(super) fn extract_call_card_view(msg: &ChatMessage) -> Option<CallCardView> 
         None => raw_reason.is_some() || (!msg.is_outgoing && raw == "Cuộc gọi"),
     };
 
-    let title = if is_video {
-        if is_incoming {
-            if is_missed_or_failed {
-                "Cuộc gọi video nhỡ".to_string()
-            } else {
-                "Cuộc gọi video đến".to_string()
-            }
-        } else {
-            "Cuộc gọi video đi".to_string()
-        }
-    } else if is_incoming {
-        if is_missed_or_failed {
-            "Cuộc gọi thoại nhỡ".to_string()
-        } else {
-            "Cuộc gọi thoại đến".to_string()
-        }
-    } else {
-        "Cuộc gọi thoại đi".to_string()
-    };
+    // Telegram-style wording, short enough for a compact card.
+    let title = match (is_video, is_incoming) {
+        (true, true) => "Cuộc gọi video đến",
+        (true, false) => "Cuộc gọi video đi",
+        (false, true) => "Cuộc gọi đến",
+        (false, false) => "Cuộc gọi đi",
+    }
+    .to_string();
 
     let arrow = if is_incoming { "↙" } else { "↗" };
     let status_badge = match (is_missed_or_failed, secs_opt) {
-        // The title already names the missed/failed state; show the reason instead of repeating it.
         (true, _) => {
-            let reason_txt = raw_reason
+            let short = raw_reason
                 .as_deref()
-                .filter(|r| !r.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    if is_incoming {
-                        "Bạn đã bỏ lỡ cuộc gọi này".to_string()
-                    } else {
-                        "Người nhận không nghe máy".to_string()
-                    }
-                });
-            format!("{arrow} {reason_txt}")
+                .filter(|r| r.chars().count() <= 24)
+                .map(str::to_string);
+            let txt = match short {
+                Some(r) => r,
+                None if is_incoming => "Nhỡ".to_string(),
+                None => "Không trả lời".to_string(),
+            };
+            format!("{arrow} {txt}")
         }
-        (false, Some(s)) if s >= 60 => {
-            format!("{arrow} Thời lượng: {} phút {:02} giây", s / 60, s % 60)
-        }
-        (false, Some(s)) => format!("{arrow} Thời lượng: {s} giây"),
+        (false, Some(s)) if s >= 60 => format!("{arrow} {} phút {:02} giây", s / 60, s % 60),
+        (false, Some(s)) => format!("{arrow} {s} giây"),
         (false, None) => format!("{arrow} Đã kết thúc"),
     };
 
-    // When the call is missed/failed the badge already carries the reason, so only surface a
-    // separate reason line for calls that otherwise look successful.
-    let reason = if is_missed_or_failed {
-        None
-    } else {
-        raw_reason.map(|r| {
+    // A longer reason (dropped connection, declined) goes under the status line.
+    let reason = raw_reason
+        .filter(|r| !is_missed_or_failed || r.chars().count() > 24)
+        .map(|r| {
             if r.contains("gián đoạn") || r.contains("từ chối") {
-                "Người nhận từ chối hoặc kết nối gián đoạn".to_string()
+                "Bị từ chối hoặc mất kết nối".to_string()
             } else if r.contains("đang bận") {
-                "Người nhận đang bận hoặc từ chối".to_string()
+                "Người nhận đang bận".to_string()
             } else {
                 r
             }
-        })
-    };
+        });
 
     Some(CallCardView {
         title,
@@ -238,94 +219,89 @@ pub(super) fn render_call_card_widget(
     card_width: f32,
     outgoing: bool,
 ) -> Option<BubbleAction> {
-    let mut action = None;
     // Ink of the bubble the card sits in (own bubbles are dark graphite with light text).
     let (ink, meta) = if outgoing {
         (pal.bubble_out_text, pal.bubble_out_meta)
     } else {
         (pal.bubble_in_text, pal.bubble_in_meta)
     };
-    // Only a missed / failed call keeps a red accent; everything else follows the palette.
+    // Only a missed / failed call is red; everything else follows the bubble.
     let missed = Color32::from_rgb(239, 68, 68);
-    let icon_col = if card.is_missed_or_failed {
-        missed
-    } else {
-        ink
-    };
     let status_col = if card.is_missed_or_failed {
         missed
     } else {
         meta
     };
 
-    ui.set_width(card_width);
-    ui.vertical(|ui| {
-        ui.set_width(card_width);
-        ui.spacing_mut().item_spacing = Vec2::new(10.0, 2.0);
-        let text_col_w = (card_width - 40.0 - 10.0).max(110.0);
-        ui.horizontal(|ui| {
-            let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
-            ui.painter()
-                .circle_filled(icon_rect.center(), 20.0, ink.gamma_multiply(0.12));
+    // Compact like Telegram: icon, title, one status line. The whole card calls back.
+    let text_w = (card_width - CALL_ICON_W).max(80.0);
+    let resp = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(10.0, 0.0);
+            let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(26.0, 36.0), Sense::hover());
+            let ic = icon_rect.center();
             if card.is_video {
-                draw_icon_video(ui.painter(), icon_rect.center(), 17.0, icon_col);
+                draw_icon_video(ui.painter(), ic, 21.0, ink);
             } else {
-                draw_icon_phone(ui.painter(), icon_rect.center(), 17.0, icon_col);
+                draw_icon_phone(ui.painter(), ic, 21.0, ink);
             }
-            // Title and status centred on the icon.
-            ui.allocate_ui_with_layout(
-                Vec2::new(text_col_w, 40.0),
-                Layout::top_down(Align::Min).with_main_align(Align::Center),
-                |ui| {
-                    ui.set_width(text_col_w);
-                    ui.add(
-                        egui::Label::new(RichText::new(&card.title).size(13.5).color(ink).strong())
-                            .wrap(),
-                    );
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(&card.status_badge)
-                                .size(12.0)
-                                .color(status_col),
-                        )
+            ui.vertical(|ui| {
+                ui.set_max_width(text_w);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.add(
+                    egui::Label::new(RichText::new(&card.title).size(13.5).color(ink).strong())
                         .wrap(),
-                    );
-                    if let Some(reason) = &card.reason {
-                        ui.add(
-                            egui::Label::new(RichText::new(reason).size(11.2).color(meta)).wrap(),
-                        );
-                    }
-                },
-            );
-        });
-        ui.add_space(8.0);
-
-        let label = if card.is_video {
-            format!("{}  Gọi video lại", lucide::VIDEO)
-        } else {
-            format!("{}  Gọi lại", lucide::PHONE)
-        };
-        let (r, resp) = ui.allocate_exact_size(Vec2::new(card_width, 32.0), Sense::click());
-        let hot = resp.hovered();
-        ui.painter().rect_filled(
-            r,
-            Rounding::same(16.0),
-            ink.gamma_multiply(if hot { 0.18 } else { 0.10 }),
-        );
-        ui.painter().text(
-            r.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            FontId::proportional(13.0),
-            ink,
-        );
-        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-            action = Some(BubbleAction::CallAgain {
-                is_video: card.is_video,
+                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&card.status_badge)
+                            .size(12.0)
+                            .color(status_col),
+                    )
+                    .wrap(),
+                );
+                if let Some(reason) = &card.reason {
+                    ui.add(egui::Label::new(RichText::new(reason).size(11.2).color(meta)).wrap());
+                }
             });
-        }
-    });
-    action
+        })
+        .response;
+    let click = ui.interact(resp.rect, resp.id.with("call_again"), Sense::click());
+    let tip = if card.is_video {
+        "Gọi video lại"
+    } else {
+        "Gọi lại"
+    };
+    if click
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(tip)
+        .clicked()
+    {
+        Some(BubbleAction::CallAgain {
+            is_video: card.is_video,
+        })
+    } else {
+        None
+    }
+}
+
+/// Icon column plus gap of a call card.
+const CALL_ICON_W: f32 = 36.0;
+
+/// Width a call card needs for its own text (no wider than `max_w`).
+fn call_card_width(ui: &egui::Ui, card: &CallCardView, max_w: f32) -> f32 {
+    let w = |t: &str, size: f32| {
+        ui.fonts(|f| {
+            f.layout_no_wrap(t.to_owned(), FontId::proportional(size), Color32::WHITE)
+                .size()
+                .x
+        })
+    };
+    let mut text = w(&card.title, 13.5).max(w(&card.status_badge, 12.0));
+    if let Some(r) = &card.reason {
+        text = text.max(w(r, 11.2).min(180.0));
+    }
+    fit_between(CALL_ICON_W + text + 4.0, 140.0, max_w.min(260.0)).ceil()
 }
 
 /// Open an `http://` or `https://` URL in the user's default system browser.
@@ -1604,6 +1580,17 @@ pub(super) fn render_message_body(
         thread_name.to_string()
     };
 
+    if is_oa_message(msg) {
+        return render_oa_card(
+            ui,
+            msg,
+            text_col,
+            meta_col,
+            sticker_textures,
+            loading_stickers,
+        );
+    }
+
     // Dedicated inline Photo Card when the message is an uploaded/received Zalo photo (#72)
     let is_zalo_photo = is_zalo_photo_message(msg);
     if is_zalo_photo {
@@ -1775,6 +1762,70 @@ pub(super) fn render_message_body(
             url: url.to_string(),
             file_name: resolved_file_name.clone(),
         };
+        // Document preview above the name, like Zalo: Quick Look renders the first page.
+        let thumb_key = url
+            .as_deref()
+            .filter(|_| !is_vid && crate::file_preview::previewable(&resolved_file_name))
+            .map(crate::file_preview::thumb_key);
+        if let (Some(k), Some(u)) = (thumb_key.as_ref(), url.as_deref()) {
+            let near = Rect::from_min_size(
+                ui.cursor().min,
+                Vec2::new(ui.available_width().max(1.0), 160.0),
+            );
+            if !sticker_textures.contains_key(k)
+                && ui.is_rect_visible(near)
+                && loading_stickers.insert(k.clone())
+            {
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::FetchFileThumbnail {
+                        key: k.clone(),
+                        url: u.to_string(),
+                        file_name: resolved_file_name.clone(),
+                        local_path: saved.clone(),
+                    });
+                }
+            }
+        }
+        if let Some(tex) = thumb_key.as_ref().and_then(|k| sticker_textures.get(k)) {
+            let w = ui.available_width().max(120.0);
+            let [tw, th] = tex.size();
+            let img_aspect = th.max(1) as f32 / tw.max(1) as f32;
+            let box_h = (w * 0.62).clamp(110.0, 190.0);
+            // Tall pages are cropped to their top; wide slides are shown whole.
+            let (h, uv_bottom) = if w * img_aspect >= box_h {
+                (box_h, box_h / (w * img_aspect))
+            } else {
+                ((w * img_aspect).max(80.0), 1.0)
+            };
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+            let round = Rounding::same(10.0);
+            ui.painter()
+                .rect_filled(r, round, text_col.linear_multiply(0.08));
+            let mut shape = egui::epaint::RectShape::filled(r, round, Color32::WHITE);
+            shape.fill_texture_id = tex.id();
+            shape.uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, uv_bottom));
+            ui.painter().add(egui::Shape::Rect(shape));
+            ui.painter().rect_stroke(
+                r,
+                round,
+                Stroke::new(1.0_f32, text_col.linear_multiply(0.12)),
+            );
+            let resp = resp
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(if saved.is_some() {
+                    "Bấm để mở tệp"
+                } else {
+                    "Bấm để tải và lưu tập tin với tên gốc"
+                });
+            if resp.clicked() {
+                if let Some(path) = saved.clone() {
+                    act = Some(BubbleAction::OpenFile(path));
+                } else if let Some(u) = url.as_deref() {
+                    act = Some(download(u));
+                }
+            }
+            ui.add_space(8.0);
+        }
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let (badge, badge_resp) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
@@ -2059,6 +2110,144 @@ pub(super) fn render_message_body(
     body_action
 }
 
+/// Official Account broadcast (`chat.list.action`), drawn like Zalo's article card.
+pub(super) fn is_oa_message(msg: &ChatMessage) -> bool {
+    msg.link_src.as_deref() == Some(crate::chat::OA_LINK_SRC)
+}
+
+/// Start loading `url` into `sticker_textures` under `thumb_<md5>`; returns the key.
+fn request_remote_image(
+    url: &str,
+    sticker_textures: &HashMap<String, TextureHandle>,
+    loading: &mut HashSet<String>,
+) -> String {
+    let key = format!("thumb_{}", crate::crypto::md5_hex(url));
+    if !sticker_textures.contains_key(&key) && loading.insert(key.clone()) {
+        if let Some(tx) = WORKER_TX.get() {
+            let _ = tx.send(WorkerCmd::FetchStickerImage {
+                key: key.clone(),
+                url: url.to_string(),
+            });
+        }
+    }
+    key
+}
+
+/// Paint `tex` into `rect`, cropped to fill it (no letterboxing).
+fn paint_cover(painter: &egui::Painter, rect: Rect, tex: &TextureHandle, round: Rounding) {
+    let [tw, th] = tex.size();
+    let (tw, th) = (tw.max(1) as f32, th.max(1) as f32);
+    let scale = (rect.width() / tw).max(rect.height() / th);
+    let (vis_w, vis_h) = (rect.width() / (tw * scale), rect.height() / (th * scale));
+    let uv = Rect::from_center_size(Pos2::new(0.5, 0.5), Vec2::new(vis_w, vis_h));
+    let mut shape = egui::epaint::RectShape::filled(rect, round, Color32::WHITE);
+    shape.fill_texture_id = tex.id();
+    shape.uv = uv;
+    painter.add(egui::Shape::Rect(shape));
+}
+
+/// Banner, title, description, then one row per further article (thumbnail + title).
+fn render_oa_card(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    text_col: Color32,
+    meta_col: Color32,
+    sticker_textures: &HashMap<String, TextureHandle>,
+    loading_stickers: &mut HashSet<String>,
+) -> Option<BubbleAction> {
+    let w = ui.available_width().max(160.0);
+    let placeholder = text_col.linear_multiply(0.08);
+    let main_href = msg.link_url.clone().unwrap_or_default();
+    let mut open: Option<String> = None;
+    let link_hint = |resp: egui::Response, href: &str| {
+        if href.is_empty() {
+            resp
+        } else {
+            resp.on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("Bấm để mở bài viết")
+        }
+    };
+
+    if let Some(thumb) = msg.link_thumb.as_deref().filter(|u| !u.is_empty()) {
+        let key = request_remote_image(thumb, sticker_textures, loading_stickers);
+        let tex = sticker_textures.get(&key);
+        let h = tex
+            .map(|t| {
+                let [tw, th] = t.size();
+                w * th.max(1) as f32 / tw.max(1) as f32
+            })
+            .unwrap_or(w * 0.56)
+            .clamp(110.0, 280.0);
+        let (r, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+        let round = Rounding::same(10.0);
+        match tex {
+            Some(t) => paint_cover(ui.painter(), r, t, round),
+            None => {
+                ui.painter().rect_filled(r, round, placeholder);
+            }
+        }
+        if link_hint(resp, &main_href).clicked() {
+            open = Some(main_href.clone());
+        }
+        ui.add_space(8.0);
+    }
+    if let Some(title) = msg.link_title.as_deref().filter(|t| !t.is_empty()) {
+        let resp = ui.add(
+            egui::Label::new(RichText::new(title).size(14.5).strong().color(text_col))
+                .wrap()
+                .sense(Sense::click()),
+        );
+        if link_hint(resp, &main_href).clicked() {
+            open = Some(main_href.clone());
+        }
+    }
+    if let Some(desc) = msg.link_desc.as_deref().filter(|d| !d.is_empty()) {
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(desc)
+                    .size(13.0)
+                    .color(text_col.linear_multiply(0.85)),
+            )
+            .wrap(),
+        );
+    }
+    for item in &msg.oa_items {
+        ui.add_space(6.0);
+        let (sep, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), Sense::hover());
+        ui.painter()
+            .rect_filled(sep, 0.0, meta_col.linear_multiply(0.35));
+        ui.add_space(6.0);
+        let row = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(46.0), Sense::hover());
+            let round = Rounding::same(6.0);
+            match (!item.thumb.is_empty())
+                .then(|| request_remote_image(&item.thumb, sticker_textures, loading_stickers))
+                .and_then(|k| sticker_textures.get(&k))
+            {
+                Some(t) => paint_cover(ui.painter(), r, t, round),
+                None => {
+                    ui.painter().rect_filled(r, round, placeholder);
+                }
+            }
+            ui.add(egui::Label::new(RichText::new(&item.title).size(13.0).color(text_col)).wrap());
+        });
+        let resp = ui.interact(
+            row.response.rect,
+            Id::new(("oa_item", &msg.id, &item.href, &item.title)),
+            Sense::click(),
+        );
+        if link_hint(resp, &item.href).clicked() {
+            open = Some(item.href.clone());
+        }
+    }
+    if let Some(url) = open.filter(|u| !u.is_empty()) {
+        open_external_url(&url);
+    }
+    None
+}
+
 pub(super) fn is_zalo_file_or_video_message(msg: &ChatMessage) -> bool {
     let trimmed = msg.text.trim();
     matches!(
@@ -2085,7 +2274,8 @@ pub(super) fn photo_primary_url(msg: &ChatMessage) -> Option<&str> {
 }
 
 pub(super) fn is_zalo_photo_message(msg: &ChatMessage) -> bool {
-    if is_sticker_message(msg).is_some() || is_zalo_file_or_video_message(msg) {
+    if is_oa_message(msg) || is_sticker_message(msg).is_some() || is_zalo_file_or_video_message(msg)
+    {
         return false;
     }
     // A shared web link (e.g. Google Docs) whose preview thumbnail Zalo re-hosts on its photo
@@ -2205,9 +2395,14 @@ pub(super) fn render_chat_bubble(
     let is_call_card = call_card_opt.is_some();
     let is_photo_card = !has_sticker && is_zalo_photo_message(msg);
     let is_file_card = !has_sticker && is_zalo_file_or_video_message(msg);
-    let has_link_card =
-        !has_sticker && !is_photo_card && !is_file_card && extract_message_link_view(msg).is_some();
-    let has_interactive_card = is_call_card || has_link_card || is_photo_card || is_file_card;
+    let is_oa_card = is_oa_message(msg);
+    let has_link_card = !has_sticker
+        && !is_oa_card
+        && !is_photo_card
+        && !is_file_card
+        && extract_message_link_view(msg).is_some();
+    let has_interactive_card =
+        is_call_card || has_link_card || is_photo_card || is_file_card || is_oa_card;
 
     let compact_text = !has_sticker
         && !has_interactive_card
@@ -2254,8 +2449,8 @@ pub(super) fn render_chat_bubble(
     // photo, and call card hugs its content tightly without horizontal overflow or inner/outer frame mismatch.
     let content_width = if has_sticker {
         116.0_f32
-    } else if is_call_card {
-        max_text_width.min(256.0)
+    } else if let Some(card) = call_card_opt.as_ref() {
+        call_card_width(ui, card, max_text_width)
     } else if is_photo_card {
         let thumb_u = photo_primary_url(msg).unwrap_or("");
         let tkey = format!("thumb_{}", crate::crypto::md5_hex(thumb_u));
@@ -2285,6 +2480,8 @@ pub(super) fn render_chat_bubble(
         } else {
             photo_w
         }
+    } else if is_oa_card {
+        max_text_width.min(340.0).ceil()
     } else if is_file_card {
         // Badge (44) + gap + name, and room for size/status + the two buttons underneath.
         let name = crate::chat::resolve_attachment_file_name(
@@ -2304,7 +2501,17 @@ pub(super) fn render_chat_bubble(
         });
         // A narrow chat (small window, info panel open) makes the upper bound smaller than 250;
         // `f32::clamp` panics on an inverted range and aborted the app inside AppKit's draw.
-        fit_between(name_w.max(190.0) + 54.0 + 8.0, 250.0, max_text_width.min(360.0)).ceil()
+        let has_preview = msg
+            .link_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .is_some_and(|u| sticker_textures.contains_key(&crate::file_preview::thumb_key(u)));
+        let wanted = if has_preview {
+            330.0
+        } else {
+            name_w.max(190.0) + 54.0 + 8.0
+        };
+        fit_between(wanted, 250.0, max_text_width.min(360.0)).ceil()
     } else if has_link_card {
         let has_loaded_thumb = msg
             .link_thumb
@@ -2889,7 +3096,35 @@ pub(super) fn quick_react_overlay(
         let top = ctx.layer_id_at(p);
         top.is_none_or(|l| own_layers.contains(&l)) && !blocked(p) && hover_zone.contains(p)
     });
-    if !near && !picker_open {
+    // Hover intent: the chips wait a moment before appearing (a pointer passing over the
+    // list no longer flashes them) and linger briefly after leaving so they can be reached.
+    const SHOW_DELAY: f64 = 0.2;
+    const LINGER: f64 = 0.25;
+    let since_key = id.with("hover_since");
+    let seen_key = id.with("hover_seen");
+    let since = if near {
+        let t = ctx.data(|d| d.get_temp::<f64>(since_key)).unwrap_or(now);
+        ctx.data_mut(|d| d.insert_temp(since_key, t));
+        Some(t)
+    } else {
+        ctx.data_mut(|d| d.remove::<f64>(since_key));
+        None
+    };
+    let armed = since.is_some_and(|t| now - t >= SHOW_DELAY);
+    if armed {
+        ctx.data_mut(|d| d.insert_temp(seen_key, now));
+    } else if let Some(t) = since {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+            (SHOW_DELAY - (now - t)).max(0.0) + 0.01,
+        ));
+    }
+    let lingering = ctx
+        .data(|d| d.get_temp::<f64>(seen_key))
+        .is_some_and(|t| now - t < LINGER);
+    if lingering && !armed {
+        ctx.request_repaint_after(std::time::Duration::from_millis(60));
+    }
+    if !armed && !lingering && !picker_open {
         return None;
     }
     let mut action = None;
@@ -3023,8 +3258,27 @@ pub(super) fn quick_react_overlay(
     } else if forward_clicked {
         action = Some(BubbleAction::Forward);
     }
-    let mut keep_open = btn_resp.hovered();
-    if btn_resp.hovered() || picker_open {
+    // The reaction strip opens after resting on 👍 for a moment and closes a moment after
+    // the pointer leaves it, instead of snapping open/shut on every pass.
+    const PICKER_DELAY: f64 = 0.35;
+    const PICKER_GRACE: f64 = 0.3;
+    let like_key = id.with("like_since");
+    let like_since = if btn_resp.hovered() {
+        let t = ctx.data(|d| d.get_temp::<f64>(like_key)).unwrap_or(now);
+        ctx.data_mut(|d| d.insert_temp(like_key, t));
+        Some(t)
+    } else {
+        ctx.data_mut(|d| d.remove::<f64>(like_key));
+        None
+    };
+    let like_armed = like_since.is_some_and(|t| now - t >= PICKER_DELAY);
+    if let Some(t) = like_since.filter(|_| !like_armed) {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+            (PICKER_DELAY - (now - t)).max(0.0) + 0.01,
+        ));
+    }
+    let mut keep_open = like_armed;
+    if like_armed || picker_open {
         // Reaction strip pops up above the like button.
         let (pivot, pos) = (
             egui::Align2::CENTER_BOTTOM,
@@ -3106,6 +3360,16 @@ pub(super) fn quick_react_overlay(
         keep_open |= pointer.is_some_and(|p| {
             strip.contains(p) || btn_rect.expand(3.0).contains(p) || corridor.contains(p)
         });
+    }
+    let inside_key = id.with("picker_inside");
+    if keep_open {
+        ctx.data_mut(|d| d.insert_temp(inside_key, now));
+    } else if picker_open {
+        let left_at = ctx.data(|d| d.get_temp::<f64>(inside_key)).unwrap_or(now);
+        if now - left_at < PICKER_GRACE {
+            keep_open = true;
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        }
     }
     if action.is_some() {
         keep_open = false;
@@ -3265,23 +3529,24 @@ pub(super) fn bubble_context_menu(
                                     }
                                 }
                             }
-                            if msg.is_outgoing && msg.text.trim() != "[Tin nhắn đã thu hồi]" {
-                                any = true;
-                                if menu_item(
-                                    ui,
-                                    lucide::UNDO,
-                                    "Thu hồi với mọi người",
-                                    Some(Color32::from_rgb(249, 115, 22)),
-                                ) {
-                                    action = Some(BubbleAction::RecallForEveryone);
-                                }
-                            }
                             if !any {
                                 ui.label(RichText::new("Không có tuỳ chọn khác").size(12.5).weak());
                             }
                         });
                     }
                     ui.separator();
+                    // Zalo keeps "Thu hồi" next to delete in the main menu, for your own messages.
+                    if msg.is_outgoing
+                        && msg.text.trim() != "[Tin nhắn đã thu hồi]"
+                        && menu_item(
+                            ui,
+                            lucide::UNDO,
+                            "Thu hồi",
+                            Some(Color32::from_rgb(249, 115, 22)),
+                        )
+                    {
+                        action = Some(BubbleAction::RecallForEveryone);
+                    }
                     if menu_item(
                         ui,
                         lucide::TRASH,
@@ -3533,6 +3798,31 @@ pub(super) fn reaction_corner_chip(
 #[cfg(test)]
 mod quote_navigation_tests {
     use super::*;
+
+    #[test]
+    fn call_cards_use_short_telegram_style_wording() {
+        let missed = ChatMessage {
+            id: "call_1".into(),
+            text: "Cuộc gọi".into(),
+            is_outgoing: false,
+            ..Default::default()
+        };
+        let card = extract_call_card_view(&missed).expect("call card");
+        assert_eq!(card.title, "Cuộc gọi đến");
+        assert_eq!(card.status_badge, "↙ Nhỡ");
+        assert!(card.is_missed_or_failed);
+
+        let out = ChatMessage {
+            id: "call_2".into(),
+            text: "📹 Cuộc gọi video đi (133s)".into(),
+            is_outgoing: true,
+            ..Default::default()
+        };
+        let card = extract_call_card_view(&out).expect("call card");
+        assert_eq!(card.title, "Cuộc gọi video đi");
+        assert_eq!(card.status_badge, "↗ 2 phút 13 giây");
+        assert!(!card.is_missed_or_failed);
+    }
 
     #[test]
     fn fit_between_never_panics_when_space_is_narrower_than_minimum() {

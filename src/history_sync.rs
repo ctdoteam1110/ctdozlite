@@ -14,7 +14,18 @@ use anyhow::{Context, Result};
 
 use crate::chat::{self, Thread};
 use crate::session::Session;
+
+mod ids;
+mod v2;
 use crate::store::{self, MessageStore};
+pub(crate) use ids::{
+    resolve_phone_sync_ids, PhoneSyncIds, PhoneSyncRequestBatch, PHONE_SCOPES_PER_REQUEST,
+};
+pub use v2::{
+    accept_mobile_sync_event, handle_v2_status, import_sync_v2_batch, is_active_v2_session,
+    v2_snapshot, V2BatchProgress, V2Snapshot,
+};
+pub(crate) use v2::{prepare_sync_v2_keys, wait_for_v2_receipt};
 
 const DB_PATH: &str = "zalo_history.db";
 const PAGE: u32 = 50;
@@ -234,8 +245,255 @@ where
     sync_phone_messages_opts(s, poll_state, threads, true, on_progress).await
 }
 
-/// Synchronize messages with explicit control over whether to send a wake-up/pull prompt
-/// (`send_phone_prompt`) to the user's phone or only drain server/cloud queues.
+async fn persist_phone_report(report: serde_json::Value) {
+    let result = tokio::task::spawn_blocking(move || {
+        crate::data_dir::write_private_atomic(
+            std::path::Path::new("phone_sync_request_status.json"),
+            report.to_string().as_bytes(),
+        )
+    })
+    .await;
+    if !matches!(result, Ok(Ok(()))) {
+        crate::logger::log_error("phone_sync_status", "Could not persist request status");
+    }
+}
+
+async fn record_phone_request_attempt(
+    v2_accepted: bool,
+    legacy_accepted: Option<bool>,
+    v2_error: Option<String>,
+) {
+    let snapshot = v2_snapshot();
+    persist_phone_report(serde_json::json!({
+        "v2_scope_count":snapshot.scope_count,
+        "v2_total_scope_count":snapshot.total_scope_count,
+        "v2_request_group":snapshot.progress.request_number,
+        "v2_request_groups":snapshot.progress.request_total,
+        "v2_skipped_threads":snapshot.progress.skipped_threads,
+        "v2_imported_rows":snapshot.progress.imported,
+        "v2_unavailable_threads":snapshot.progress.unavailable_threads,
+        "v2_batch_state":snapshot.batch_diagnostics,
+        "v2_phone_observed":snapshot.phone_observed,
+        "v2_complete":false,
+        "v2_accepted":v2_accepted,"legacy_accepted":legacy_accepted,"v2_error":v2_error,
+        "websocket_authenticated":crate::socket::has_authenticated_connection(),"time":crate::login::unix_now(),
+    })).await;
+}
+
+fn legacy_fallback_allowed(error: &anyhow::Error) -> bool {
+    !error.is::<chat::PhoneSyncRejection>() && !error.is::<crate::socket::SyncRequestUnconfirmed>()
+}
+
+async fn wait_for_v2_import<F>(on_progress: &mut F) -> Result<Option<V2BatchProgress>>
+where
+    F: FnMut(f32, String),
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let snapshot = v2_snapshot();
+        if let Some(error) = snapshot.failed {
+            anyhow::bail!("{error}");
+        }
+        if snapshot.progress.complete {
+            let note = snapshot.progress.completion_message();
+            set_last_mobile_sync_status(Some(note.clone()));
+            on_progress(1.0, note);
+            return Ok(Some(snapshot.progress));
+        }
+        anyhow::ensure!(snapshot.active, "Phiên đồng bộ điện thoại đã kết thúc");
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "Đồng bộ điện thoại vượt quá thời gian cho phép"
+        );
+        anyhow::ensure!(
+            snapshot
+                .last_activity
+                .is_none_or(|t| t.elapsed() < Duration::from_secs(90)),
+            "Điện thoại chưa phản hồi dữ liệu đồng bộ; hãy mở Zalo trên điện thoại rồi thử lại"
+        );
+        let note = last_mobile_sync_status()
+            .unwrap_or_else(|| "Đang chờ điện thoại xác nhận đồng bộ".into());
+        on_progress(if snapshot.confirmed { 0.65 } else { 0.20 }, note);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn run_phone_v2_transfer<F>(
+    s: &Session,
+    threads: &[Thread],
+    on_progress: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(f32, String),
+{
+    let identities = match resolve_phone_sync_ids(s, threads).await {
+        Ok(ids) => ids,
+        Err(_) => {
+            let error = chat::PhoneSyncRejection::IdentityUnavailable;
+            record_phone_request_attempt(false, None, Some(error.to_string())).await;
+            return Err(error.into());
+        }
+    };
+    let total_scopes = identities.partition_threads.len();
+    let batches = identities.request_batches();
+    let total_requests = batches.len();
+    let mut remote_ids = Vec::new();
+    let mut imported = 0;
+    let mut unavailable = 0;
+    let mut completed_groups = Vec::new();
+    let mut started = false;
+    let mut acknowledged = false;
+    let mut recovered_requests = 0;
+    let result: Result<bool> = async {
+        for (index, identities) in batches.into_iter().enumerate() {
+            if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
+                return Ok(true);
+            }
+            if index > 0 && !v2::wait_for_connection(Duration::from_secs(45)).await {
+                if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) { return Ok(true); }
+                anyhow::bail!("Chưa kết nối lại được máy chủ để gửi đợt tiếp theo");
+            }
+            let note = format!(
+                "Đang gửi yêu cầu đồng bộ đợt {}/{}…",
+                index + 1,
+                total_requests
+            );
+            set_last_mobile_sync_status(Some(note.clone()));
+            on_progress(
+                0.15 + 0.05 * index as f32 / total_requests.max(1) as f32,
+                note,
+            );
+            let batch = PhoneSyncRequestBatch {
+                identities,
+                index,
+                total_requests,
+                total_scopes,
+                imported_before: imported,
+                unavailable_before: unavailable,
+            };
+            let reply = chat::request_phone_sync_v2(s, batch).await;
+            if let Some(id) = v2::current_sync_id() {
+                remote_ids.push(id);
+            }
+            acknowledged = matches!(reply, Ok(chat::PhoneSyncReceipt::ServerAcknowledged));
+            if matches!(reply, Ok(chat::PhoneSyncReceipt::PhoneObserved)) {
+                recovered_requests += 1;
+            }
+            if let Err(error) = reply {
+                record_phone_request_attempt(false, None, Some(error.to_string())).await;
+                return Err(error);
+            }
+            started = true;
+            record_phone_request_attempt(acknowledged, None, None).await;
+            let mut progress = |part: f32, note: String| {
+                let fraction = (index as f32 + part) / total_requests.max(1) as f32;
+                on_progress(0.15 + 0.05 * fraction, note);
+            };
+            let Some(completed) = wait_for_v2_import(&mut progress).await? else {
+                return Ok(true);
+            };
+            imported = completed.imported;
+            unavailable = completed.unavailable_threads;
+            let completed_snapshot = v2_snapshot();
+            completed_groups.push(serde_json::json!({
+                "group":index + 1,
+                "scopes":completed_snapshot.scope_count,
+                "imported_rows":imported,
+                "unavailable_threads":unavailable,
+                "received_batches":completed_snapshot.batch_diagnostics["received"].as_object().map_or(0, |items| items.len()),
+                "completed_batches":completed_snapshot.batch_diagnostics["completed_indices"].as_array().map_or(0, |items| items.len()),
+                "expected_batches":completed_snapshot.batch_diagnostics["expected_batches"],
+            }));
+        }
+        Ok(false)
+    }
+    .await;
+    let snapshot = v2_snapshot();
+    let result = if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
+        Ok(true)
+    } else {
+        result.map_err(|error| {
+            if started || snapshot.progress.imported > 0 {
+                chat::PhoneSyncRejection::Interrupted {
+                    imported: snapshot.progress.imported.max(imported),
+                    reason: error.to_string(),
+                }
+                .into()
+            } else {
+                error
+            }
+        })
+    };
+    if matches!(result, Ok(true)) {
+        set_last_mobile_sync_status(Some(
+            "Đã dừng đồng bộ điện thoại; dữ liệu đã nhập được giữ lại".into(),
+        ));
+    }
+    // Native lifecycle reasons: UserCancel=0, SyncSuccess=1, Error=2. Dispose after all groups.
+    let reason = match &result {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(_) => 2,
+    };
+    let cleanup = v2::finish_v2_transfer(remote_ids, reason).await;
+    let disposal_failures = cleanup.as_ref().ok().copied();
+    let result = if cleanup.is_err() {
+        crate::logger::log_error("phone_sync_cleanup", "Could not clear transfer files");
+        let detail = result
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        Err(chat::PhoneSyncRejection::Interrupted {
+            imported: snapshot.progress.imported.max(imported),
+            reason: format!("Không dọn được tệp đồng bộ tạm. {detail}"),
+        }
+        .into())
+    } else {
+        result
+    };
+    if matches!(result, Ok(false)) {
+        set_last_mobile_sync_status(Some(snapshot.progress.completion_message()));
+    }
+    persist_phone_report(serde_json::json!({
+        "time":crate::login::unix_now(),"websocket_authenticated":crate::socket::has_authenticated_connection(),
+        "v2_accepted":acknowledged,"legacy_accepted":null,
+        "v2_scope_count":snapshot.scope_count,"v2_total_scope_count":total_scopes,
+        "v2_request_group":snapshot.progress.request_number,"v2_request_groups":total_requests,
+        "v2_batch_state":snapshot.batch_diagnostics,
+        "v2_completed_groups":completed_groups,
+        "v2_phone_observed":snapshot.phone_observed,"v2_recovered_requests":recovered_requests,
+        "v2_skipped_threads":snapshot.progress.skipped_threads,"v2_imported_rows":snapshot.progress.imported.max(imported),
+        "v2_unavailable_threads":snapshot.progress.unavailable_threads.max(unavailable),
+        "v2_complete":matches!(result,Ok(false)),"v2_cancelled":PHONE_SYNC_CANCEL.load(Ordering::Relaxed)||matches!(result,Ok(true)),
+        "v2_dispose_failures":disposal_failures,"v2_error":result.as_ref().err().map(ToString::to_string),
+    })).await;
+    result
+}
+
+/// Internal control flow: a background refresh yields to an explicit phone transfer.
+#[derive(Debug)]
+pub(crate) struct BackgroundHistoryPreempted;
+
+impl std::fmt::Display for BackgroundHistoryPreempted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Đã nhường lượt làm mới cho đồng bộ điện thoại")
+    }
+}
+impl std::error::Error for BackgroundHistoryPreempted {}
+
+fn yield_background_history(send_phone_prompt: bool, phone_active: bool) -> Result<()> {
+    if !send_phone_prompt && phone_active {
+        Err(BackgroundHistoryPreempted.into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Synchronize with an explicit phone prompt or refresh only the server-side queues.
 pub async fn sync_phone_messages_opts<F>(
     s: &Session,
     poll_state: &tokio::sync::Mutex<chat::PollState>,
@@ -249,60 +507,110 @@ where
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let pub_key = generate_sync_public_key();
+    yield_background_history(send_phone_prompt, PHONE_SYNC_RUNNING.load(Ordering::SeqCst))?;
+    let pub_key = if send_phone_prompt {
+        generate_sync_public_key()
+    } else {
+        String::new()
+    };
     let before_total: usize = threads.iter().map(|t| t.messages.len()).sum();
+    let mut v2_completion_note = None;
 
     if send_phone_prompt {
         set_last_mobile_sync_status(None);
-
-        // Phase 1: Send mobile wake-up / pull request to phone (`cmd 12000` + WebSocket `cmd 592` & `cmd 590`)
         on_progress(
-            0.10,
-            "📲 Đang gửi yêu cầu đồng bộ tới Zalo trên điện thoại (hãy mở Zalo trên điện thoại và bấm 'Đồng bộ ngay')…".to_string(),
+            0.05,
+            "Đang chuẩn bị các hội thoại để đồng bộ điện thoại…".into(),
         );
-        let _ = chat::request_phone_sync(s, &pub_key).await;
-        let _ = chat::request_phone_sync_v2(s, &pub_key).await;
-
-        // Wait for user to confirm on phone (up to 90 seconds)
-        let deadline = std::time::Instant::now() + Duration::from_secs(90);
-        let mut confirmed = false;
-        while std::time::Instant::now() < deadline {
-            if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
-                let _ = chat::cancel_phone_sync(s, &pub_key).await;
+        let v2_completed = match run_phone_v2_transfer(s, threads, &mut on_progress).await {
+            Ok(true) => {
+                clear_sync_keys();
                 return Ok((0, 0));
             }
-            if let Some(ref st) = last_mobile_sync_status() {
-                if st.contains("đã xác nhận")
-                    || st.contains("đang nén")
-                    || st.contains("giải mã")
-                    || st.contains("Đã nhận gói đồng bộ")
-                    || st.contains("thành công")
-                {
-                    confirmed = true;
-                    on_progress(0.40, st.clone());
-                    break;
-                } else if st.contains("từ chối") {
-                    on_progress(1.0, st.clone());
-                    return Ok((0, 0));
-                } else {
-                    on_progress(0.20, st.clone());
+            Ok(false) => {
+                v2_completion_note = last_mobile_sync_status();
+                clear_sync_keys();
+                // Re-read the imported cache before merging any subsequent cloud snapshots.
+                let refreshed = tokio::task::spawn_blocking(chat::load_threads_cache).await?;
+                if !refreshed.is_empty() {
+                    *threads = refreshed;
                 }
+                true
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-
-        if confirmed {
-            let finish_deadline = std::time::Instant::now() + Duration::from_secs(45);
-            while std::time::Instant::now() < finish_deadline {
+            Err(error) => {
+                if send_phone_prompt && PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
+                    set_last_mobile_sync_status(Some(
+                        "Đã dừng đồng bộ điện thoại; dữ liệu đã nhập được giữ lại".into(),
+                    ));
+                    clear_sync_keys();
+                    return Ok((0, 0));
+                }
+                if !legacy_fallback_allowed(&error) {
+                    clear_sync_keys();
+                    return Err(error);
+                }
+                on_progress(0.12, "Đang thử chế độ đồng bộ tương thích…".into());
+                let legacy = chat::request_phone_sync(s, &pub_key).await;
+                record_phone_request_attempt(false, Some(legacy.is_ok()), Some(error.to_string()))
+                    .await;
+                if let Err(legacy_error) = legacy {
+                    clear_sync_keys();
+                    anyhow::bail!(
+                        "Không gửi được yêu cầu đồng bộ. V2: {error}. Tương thích: {legacy_error}"
+                    );
+                }
+                false
+            }
+        };
+        if !v2_completed {
+            on_progress(0.15,"Máy chủ đã nhận yêu cầu tương thích. Hãy mở Zalo trên điện thoại và xác nhận đồng bộ.".into());
+            // Wait for user to confirm on phone (up to 90 seconds)
+            let deadline = std::time::Instant::now() + Duration::from_secs(90);
+            let mut confirmed = false;
+            while std::time::Instant::now() < deadline {
+                if send_phone_prompt && PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
+                    let _ = chat::cancel_phone_sync(s, &pub_key).await;
+                    return Ok((0, 0));
+                }
                 if let Some(ref st) = last_mobile_sync_status() {
-                    if st.contains("thành công") || st.contains("Không thể") || st.contains("thất bại") {
-                        on_progress(1.0, st.clone());
+                    if st.contains("đã xác nhận")
+                        || st.contains("đang nén")
+                        || st.contains("giải mã")
+                        || st.contains("Đã nhận gói đồng bộ")
+                        || st.contains("thành công")
+                    {
+                        confirmed = true;
+                        on_progress(0.40, st.clone());
                         break;
+                    } else if st.contains("từ chối") {
+                        on_progress(1.0, st.clone());
+                        return Ok((0, 0));
                     } else {
-                        on_progress(0.70, st.clone());
+                        on_progress(0.20, st.clone());
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            if !confirmed {
+                anyhow::bail!("Máy chủ đã nhận yêu cầu nhưng điện thoại chưa xác nhận. Hãy mở Zalo trên điện thoại rồi thử lại.");
+            }
+            if confirmed {
+                let finish_deadline = std::time::Instant::now() + Duration::from_secs(45);
+                while std::time::Instant::now() < finish_deadline {
+                    if let Some(ref st) = last_mobile_sync_status() {
+                        if st.contains("thành công")
+                            || st.contains("Không thể")
+                            || st.contains("thất bại")
+                        {
+                            on_progress(1.0, st.clone());
+                            break;
+                        } else {
+                            on_progress(0.70, st.clone());
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             }
         }
     }
@@ -312,7 +620,8 @@ where
         "📥 Đang nhận hàng đợi tin nhắn 1-1 & nhóm từ điện thoại…".to_string(),
     );
     for batch_idx in 0..5 {
-        if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
+        yield_background_history(send_phone_prompt, PHONE_SYNC_RUNNING.load(Ordering::SeqCst))?;
+        if send_phone_prompt && PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
             let _ = chat::cancel_phone_sync(s, &pub_key).await;
             return Ok((0, 0));
         }
@@ -367,7 +676,8 @@ where
     let chunks: Vec<&[String]> = known_ids.chunks(25).collect();
     let total_chunks = chunks.len().max(1);
     for (idx, chunk) in chunks.into_iter().enumerate() {
-        if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
+        yield_background_history(send_phone_prompt, PHONE_SYNC_RUNNING.load(Ordering::SeqCst))?;
+        if send_phone_prompt && PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
             let _ = chat::cancel_phone_sync(s, &pub_key).await;
             break;
         }
@@ -404,7 +714,8 @@ where
         .collect();
     let total_cm = cm_targets.len().max(1);
     for (pos, tidx) in cm_targets.into_iter().enumerate() {
-        if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
+        yield_background_history(send_phone_prompt, PHONE_SYNC_RUNNING.load(Ordering::SeqCst))?;
+        if send_phone_prompt && PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
             let _ = chat::cancel_phone_sync(s, &pub_key).await;
             break;
         }
@@ -433,7 +744,9 @@ where
         0.96,
         "💾 Đang lưu tin nhắn đã đồng bộ vào cơ sở dữ liệu zalo_history.db…".to_string(),
     );
+    yield_background_history(send_phone_prompt, PHONE_SYNC_RUNNING.load(Ordering::SeqCst))?;
     chat::resolve_thread_names(s, threads).await;
+    yield_background_history(send_phone_prompt, PHONE_SYNC_RUNNING.load(Ordering::SeqCst))?;
     chat::deduplicate_threads(threads, None);
 
     let snapshot = threads.clone();
@@ -450,6 +763,10 @@ where
     let after_total: usize = threads.iter().map(|t| t.messages.len()).sum();
     let added = db_added.max(after_total.saturating_sub(before_total));
     let active_threads = threads.iter().filter(|t| !t.messages.is_empty()).count();
+    // Late status controls during cloud refresh must not erase a completed phone result.
+    if let Some(note) = v2_completion_note {
+        set_last_mobile_sync_status(Some(note));
+    }
     let final_msg = if let Some(phone_note) = last_mobile_sync_status() {
         format!(
             "{phone_note} · Đã đồng bộ Cloud/Nhóm: +{added} tin nhắn ({active_threads} hội thoại)"
@@ -882,12 +1199,13 @@ fn infer_backup_owner_sender_id<'a>(dbs: impl Iterator<Item = &'a std::path::Pat
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+/// Public half of helper-generated transfer keys; private keys stay in the private helper file.
+#[derive(Debug, serde::Deserialize)]
 pub struct SyncV2Keys {
+    /// Base64 identity public key.
     pub ik_pub: String,
-    pub ik_priv: String,
+    /// Base64 ephemeral public key.
     pub ek_pub: String,
-    pub ek_priv: String,
 }
 
 /// Locate a Node.js binary. Apps launched from Finder get a minimal `PATH`
@@ -931,57 +1249,43 @@ fn find_sync_v2_helper() -> Option<std::path::PathBuf> {
 fn run_sync_v2_helper(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
     let node = find_node().context("không tìm thấy Node.js (cần để đồng bộ v2 với điện thoại)")?;
     let script = find_sync_v2_helper().context("không tìm thấy sync_v2_helper.js")?;
-    Ok(std::process::Command::new(node)
+    let mut child = std::process::Command::new(node)
         .arg(script)
         .args(args)
-        .output()?)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    // Helper responses are small JSON records; large decrypted batches are written to disk.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while child.try_wait()?.is_none() {
+        if std::time::Instant::now() >= deadline {
+            // Reap the timed-out helper so retries cannot accumulate Node processes.
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("Bộ xử lý đồng bộ điện thoại phản hồi quá lâu");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(child.wait_with_output()?)
 }
 
 pub fn generate_sync_v2_keys() -> Result<SyncV2Keys> {
-    let out = run_sync_v2_helper(&["gen-keys".as_ref()])?;
+    generate_sync_v2_keys_mode(false)
+}
+
+fn generate_sync_v2_keys_mode(reuse_identity: bool) -> Result<SyncV2Keys> {
+    let command = if reuse_identity {
+        "gen-keys-reuse-identity"
+    } else {
+        "gen-keys"
+    };
+    let out = run_sync_v2_helper(&[command.as_ref()])?;
     if !out.status.success() {
-        anyhow::bail!(
-            "node sync_v2_helper.js gen-keys failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        anyhow::bail!("Không tạo được khóa đồng bộ điện thoại");
     }
     let keys: SyncV2Keys = serde_json::from_slice(&out.stdout)?;
     Ok(keys)
-}
-
-pub async fn import_sync_v2_meta(s: &Session, url: &str) -> Result<()> {
-    let uin = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
-    let sek = s.zpw_sek.clone().unwrap_or_default();
-    let cookie_hdr = format!("zpw_sek={sek}; zpw_uin={uin}");
-
-    let resp = s
-        .http
-        .get(url)
-        .header("Cookie", cookie_hdr)
-        .header("User-Agent", "ZaloPC-win32-26.10.11")
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("failed to download v2 meta: HTTP {}", resp.status());
-    }
-
-    let bytes = resp.bytes().await?;
-    let temp_meta =
-        std::env::temp_dir().join(format!("meta_{}.bin", crate::param_cipher::random_hex(6)));
-    std::fs::write(&temp_meta, &bytes)?;
-
-    let out = run_sync_v2_helper(&["decrypt-meta".as_ref(), temp_meta.as_os_str()])?;
-
-    let _ = std::fs::remove_file(&temp_meta);
-
-    if !out.status.success() {
-        anyhow::bail!(
-            "decrypt-meta failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -1002,21 +1306,43 @@ pub struct ParsedProtoPartition {
 }
 
 fn parse_vli(buf: &[u8], mut offset: usize) -> Option<(u64, usize)> {
-    let mut result: u64 = 0;
-    let mut shift = 0;
-    while offset < buf.len() {
-        let b = buf[offset];
+    let mut result = 0_u64;
+    for shift in (0..70).step_by(7) {
+        let byte = *buf.get(offset)?;
         offset += 1;
-        result |= ((b & 0x7F) as u64) << shift;
-        if (b & 0x80) == 0 {
-            return Some((result, offset));
-        }
-        shift += 7;
-        if shift >= 64 {
+        if shift == 63 && byte > 1 {
             return None;
+        }
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((result, offset));
         }
     }
     None
+}
+
+fn proto_bytes<'a>(buf: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
+    let (length, start) = parse_vli(buf, *offset)?;
+    let end = start.checked_add(usize::try_from(length).ok()?)?;
+    let bytes = buf.get(start..end)?;
+    *offset = end;
+    Some(bytes)
+}
+
+fn skip_proto_field(buf: &[u8], offset: &mut usize, wire: u64) -> Option<()> {
+    match wire {
+        0 => *offset = parse_vli(buf, *offset)?.1,
+        1 | 5 => {
+            let end = offset.checked_add(if wire == 1 { 8 } else { 4 })?;
+            buf.get(*offset..end)?;
+            *offset = end;
+        }
+        2 => {
+            proto_bytes(buf, offset)?;
+        }
+        _ => return None,
+    }
+    Some(())
 }
 
 fn parse_message(buf: &[u8]) -> Option<ParsedProtoMsg> {
@@ -1025,39 +1351,34 @@ fn parse_message(buf: &[u8]) -> Option<ParsedProtoMsg> {
     while offset < buf.len() {
         let (tag, next) = parse_vli(buf, offset)?;
         offset = next;
-        let field_num = tag >> 3;
-        let wire_type = tag & 0x07;
-        match wire_type {
-            0 => {
-                let (val, next) = parse_vli(buf, offset)?;
+        let field = tag >> 3;
+        let wire = tag & 7;
+        if field == 0 {
+            return None;
+        }
+        match (field, wire) {
+            (2..=6, 0) => {
+                let (value, next) = parse_vli(buf, offset)?;
                 offset = next;
-                match field_num {
-                    2 => msg.client_id = val,
-                    3 => msg.msg_status = val as i32,
-                    4 => msg.msg_type = val as i32,
-                    5 => msg.timestamp = val,
+                match field {
+                    2 => msg.client_id = value,
+                    3 => msg.msg_status = value as i32,
+                    4 => msg.msg_type = value as i32,
+                    5 => msg.timestamp = value,
+                    // The owning schema uses int64, not a length-delimited string (re-notes/39).
+                    6 => msg.global_id = (value as i64).to_string(),
                     _ => {}
                 }
             }
-            2 => {
-                let (len, next) = parse_vli(buf, offset)?;
-                offset = next;
-                let len = len as usize;
-                if offset + len > buf.len() {
-                    return None;
-                }
-                let bytes = &buf[offset..offset + len];
-                offset += len;
-                match field_num {
-                    1 => msg.sender_id = String::from_utf8_lossy(bytes).into_owned(),
-                    6 => msg.global_id = String::from_utf8_lossy(bytes).into_owned(),
-                    7 => msg.content = String::from_utf8_lossy(bytes).into_owned(),
-                    _ => {}
+            (1 | 7, 2) => {
+                let value = String::from_utf8(proto_bytes(buf, &mut offset)?.to_vec()).ok()?;
+                if field == 1 {
+                    msg.sender_id = value;
+                } else {
+                    msg.content = value;
                 }
             }
-            1 => offset += 8,
-            5 => offset += 4,
-            _ => return None,
+            _ => skip_proto_field(buf, &mut offset, wire)?,
         }
     }
     Some(msg)
@@ -1069,184 +1390,264 @@ fn parse_partition(buf: &[u8]) -> Option<ParsedProtoPartition> {
     while offset < buf.len() {
         let (tag, next) = parse_vli(buf, offset)?;
         offset = next;
-        let field_num = tag >> 3;
-        let wire_type = tag & 0x07;
-        match (field_num, wire_type) {
-            (1, 2) => {
-                let (len, next) = parse_vli(buf, offset)?;
-                offset = next;
-                let len = len as usize;
-                if offset + len > buf.len() {
-                    return None;
-                }
-                part.id = String::from_utf8_lossy(&buf[offset..offset + len]).into_owned();
-                offset += len;
-            }
-            (2, 2) => {
-                let (len, next) = parse_vli(buf, offset)?;
-                offset = next;
-                let len = len as usize;
-                if offset + len > buf.len() {
-                    return None;
-                }
-                if let Some(m) = parse_message(&buf[offset..offset + len]) {
-                    part.messages.push(m);
-                }
-                offset += len;
-            }
-            (_, 0) => {
-                let (_, next) = parse_vli(buf, offset)?;
-                offset = next;
-            }
-            (_, 2) => {
-                let (len, next) = parse_vli(buf, offset)?;
-                offset = next + len as usize;
-            }
-            _ => return None,
+        if tag >> 3 == 0 {
+            return None;
+        }
+        match (tag >> 3, tag & 7) {
+            (1, 2) => part.id = String::from_utf8(proto_bytes(buf, &mut offset)?.to_vec()).ok()?,
+            (2, 2) => part
+                .messages
+                .push(parse_message(proto_bytes(buf, &mut offset)?)?),
+            (_, wire) => skip_proto_field(buf, &mut offset, wire)?,
         }
     }
     Some(part)
 }
 
+/// Decode the official Message.SyncChunk schema, rejecting malformed nested fields.
 pub fn parse_sync_chunk(buf: &[u8]) -> Option<Vec<ParsedProtoPartition>> {
     let mut parts = Vec::new();
     let mut offset = 0;
     while offset < buf.len() {
         let (tag, next) = parse_vli(buf, offset)?;
         offset = next;
-        let field_num = tag >> 3;
-        let wire_type = tag & 0x07;
-        match (field_num, wire_type) {
-            (2, 2) => {
-                let (len, next) = parse_vli(buf, offset)?;
-                offset = next;
-                let len = len as usize;
-                if offset + len > buf.len() {
-                    return None;
-                }
-                if let Some(p) = parse_partition(&buf[offset..offset + len]) {
-                    parts.push(p);
-                }
-                offset += len;
-            }
-            (_, 0) => {
-                let (_, next) = parse_vli(buf, offset)?;
-                offset = next;
-            }
-            (_, 2) => {
-                let (len, next) = parse_vli(buf, offset)?;
-                offset = next + len as usize;
-            }
-            _ => return None,
+        if tag >> 3 == 0 {
+            return None;
+        }
+        match (tag >> 3, tag & 7) {
+            (2, 2) => parts.push(parse_partition(proto_bytes(buf, &mut offset)?)?),
+            (_, wire) => skip_proto_field(buf, &mut offset, wire)?,
         }
     }
     Some(parts)
 }
 
-pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
-    let uin = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
-    let sek = s.zpw_sek.clone().unwrap_or_default();
-    let cookie_hdr = format!("zpw_sek={sek}; zpw_uin={uin}");
-
-    let resp = s
-        .http
-        .get(url)
-        .header("Cookie", cookie_hdr)
-        .header("User-Agent", "ZaloPC-win32-26.10.11")
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("failed to download v2 messages: HTTP {}", resp.status());
-    }
-
-    let bytes = resp.bytes().await?;
-    let temp_msg =
-        std::env::temp_dir().join(format!("msg_{}.bin", crate::param_cipher::random_hex(6)));
-    std::fs::write(&temp_msg, &bytes)?;
-
-    let out = run_sync_v2_helper(&["decrypt-message".as_ref(), temp_msg.as_os_str()])?;
-
-    let _ = std::fs::remove_file(&temp_msg);
-
-    if !out.status.success() {
-        anyhow::bail!(
-            "decrypt-message failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
+fn decode_v2_plaintext(max_plaintext: usize) -> Result<(Vec<ParsedProtoPartition>, usize)> {
     let decrypted_bytes = std::fs::read("sync_v2_message.bin")?;
-    let decompressed = match zstd::decode_all(std::io::Cursor::new(&decrypted_bytes)) {
-        Ok(d) => d,
-        Err(_) => decrypted_bytes,
+    std::fs::remove_file("sync_v2_message.bin")?;
+    let decompressed = if decrypted_bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        use std::io::Read;
+        let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(&decrypted_bytes))?;
+        let mut bytes = Vec::new();
+        decoder
+            .take(max_plaintext as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() <= max_plaintext,
+            "Dữ liệu đồng bộ sau giải nén quá lớn"
+        );
+        bytes
+    } else {
+        anyhow::ensure!(
+            decrypted_bytes.len() <= max_plaintext,
+            "Dữ liệu đồng bộ quá lớn"
+        );
+        decrypted_bytes
     };
+    let partitions = parse_sync_chunk(&decompressed)
+        .ok_or_else(|| anyhow::anyhow!("Dữ liệu tin nhắn đồng bộ không hợp lệ"))?;
+    Ok((partitions, decompressed.len()))
+}
 
-    let partitions = parse_sync_chunk(&decompressed).unwrap_or_default();
-    let db_path = crate::store::db_path_for_account(&uin);
-    let mut store = crate::store::MessageStore::open(&db_path)?;
-    let my_name = s
-        .login
-        .as_ref()
-        .map(|l| l.display_name.clone())
-        .unwrap_or_else(|| "Tôi".into());
-
-    let mut imported = 0;
+fn phone_batch_messages(
+    uin: &str,
+    my_name: &str,
+    partitions: Vec<ParsedProtoPartition>,
+    identities: &PhoneSyncIds,
+    senders: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<crate::store::StoredMessage>> {
+    let mut messages = Vec::new();
     for part in partitions {
-        let thread_id = part.id.clone();
+        if part.messages.is_empty() {
+            continue;
+        }
+        let thread_id = identities
+            .partition_threads
+            .get(&part.id)
+            .ok_or_else(|| anyhow::anyhow!("Gói đồng bộ không thuộc hội thoại đã yêu cầu"))?;
         for m in part.messages {
-            let is_outgoing = m.sender_id == uin;
-            let sender_name = if is_outgoing {
-                my_name.clone()
-            } else {
-                String::new()
-            };
+            let sender_id = senders.get(&m.sender_id).ok_or_else(|| {
+                anyhow::anyhow!("Gói đồng bộ còn định danh người gửi chưa ánh xạ")
+            })?;
+            let is_outgoing = sender_id == uin;
             let msg_id = if !m.global_id.is_empty() && m.global_id != "0" {
                 m.global_id
             } else {
                 m.client_id.to_string()
             };
-
-            let sm = crate::store::StoredMessage {
+            messages.push(crate::store::StoredMessage {
                 msg_id,
                 thread_id: thread_id.clone(),
-                sender_id: if is_outgoing {
-                    uin.clone()
+                sender_id: sender_id.clone(),
+                sender_name: if is_outgoing {
+                    my_name.to_string()
                 } else {
-                    thread_id.clone()
+                    String::new()
                 },
-                sender_name,
                 text: m.content,
                 msg_type: "webchat".into(),
-                ts: m.timestamp as i64,
+                ts: i64::try_from(m.timestamp)
+                    .map_err(|_| anyhow::anyhow!("Thời gian tin nhắn đồng bộ không hợp lệ"))?,
                 is_outgoing,
                 raw_json: String::new(),
-            };
-
-            if store.upsert_message(&sm).unwrap_or(false) {
-                imported += 1;
-            }
+            });
         }
     }
+    Ok(messages)
+}
+
+fn import_v2_partitions(
+    uin: &str,
+    my_name: &str,
+    partitions: Vec<ParsedProtoPartition>,
+    identities: &PhoneSyncIds,
+    senders: &std::collections::BTreeMap<String, String>,
+) -> Result<usize> {
+    let messages = phone_batch_messages(uin, my_name, partitions, identities, senders)?;
+    let db_path = crate::store::db_path_for_account(uin);
+    let mut store = crate::store::MessageStore::open(&db_path)?;
+    let imported = store.import_phone_batch(&messages)?;
 
     let mut cached_threads = crate::chat::load_threads_cache();
-    let _ = store.hydrate_threads(&mut cached_threads, 50);
+    store.hydrate_threads(&mut cached_threads, 50)?;
     crate::chat::save_threads_cache(&cached_threads);
-
-    if let Some(pub_k) = get_sync_public_key() {
-        let _ = crate::chat::clean_sync(s, &pub_k).await;
-    }
-
-    let _ = std::fs::remove_file("sync_v2_message.bin");
-    let _ = std::fs::remove_file("sync_v2_session.bin");
-    let _ = std::fs::remove_file("sync_v2_keys.json");
 
     Ok(imported)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_refresh_yields_without_preempting_the_explicit_phone_job() {
+        let error = yield_background_history(false, true).unwrap_err();
+        assert!(error.is::<BackgroundHistoryPreempted>());
+        assert!(yield_background_history(true, true).is_ok());
+        assert!(yield_background_history(true, false).is_ok());
+        assert!(yield_background_history(false, false).is_ok());
+    }
     use crate::chat::ChatMessage;
+
+    #[test]
+    fn uncertain_or_started_v2_transfer_never_falls_back_to_another_phone_protocol() {
+        assert!(!legacy_fallback_allowed(
+            &crate::socket::SyncRequestUnconfirmed("fixture timeout".into()).into()
+        ));
+        assert!(!legacy_fallback_allowed(
+            &chat::PhoneSyncRejection::Interrupted {
+                imported: 12,
+                reason: "fixture error".into()
+            }
+            .into()
+        ));
+        assert!(!legacy_fallback_allowed(
+            &chat::PhoneSyncRejection::Server(114).into()
+        ));
+        assert!(legacy_fallback_allowed(&anyhow::anyhow!(
+            "fixture unavailable before send"
+        )));
+    }
+
+    #[test]
+    fn phone_batch_maps_global_partition_and_senders_to_desktop_identities() {
+        let identities = PhoneSyncIds {
+            partition_threads: std::collections::BTreeMap::from([(
+                "group/opaque==".into(),
+                "g333".into(),
+            )]),
+            sender_ids: std::collections::BTreeMap::from([
+                ("owner==".into(), "111".into()),
+                ("peer==".into(), "222".into()),
+            ]),
+            ..Default::default()
+        };
+        let parts = vec![ParsedProtoPartition {
+            id: "group/opaque==".into(),
+            messages: vec![
+                ParsedProtoMsg {
+                    sender_id: "owner==".into(),
+                    global_id: "9007199254740993".into(),
+                    content: "Own message".into(),
+                    timestamp: 100,
+                    ..Default::default()
+                },
+                ParsedProtoMsg {
+                    sender_id: "peer==".into(),
+                    global_id: "9007199254740994".into(),
+                    content: "Incoming message".into(),
+                    timestamp: 101,
+                    ..Default::default()
+                },
+            ],
+        }];
+        let rows = phone_batch_messages("111", "Owner", parts, &identities, &identities.sender_ids)
+            .unwrap();
+        assert_eq!(rows[0].thread_id, "g333");
+        assert_eq!(rows[0].sender_id, "111");
+        assert!(rows[0].is_outgoing);
+        assert_eq!(rows[0].msg_id, "9007199254740993"); // (INV-4)
+        assert_eq!(rows[1].sender_id, "222");
+        assert!(!rows[1].is_outgoing);
+    }
+
+    #[test]
+    fn unknown_phone_partition_or_sender_cannot_be_written_under_a_guessed_identity() {
+        let mut identities = PhoneSyncIds::default();
+        let parts = || {
+            vec![ParsedProtoPartition {
+                id: "oneone/opaque==".into(),
+                messages: vec![ParsedProtoMsg {
+                    sender_id: "unknown==".into(),
+                    global_id: "123".into(),
+                    ..Default::default()
+                }],
+            }]
+        };
+        assert!(
+            phone_batch_messages("111", "Owner", parts(), &identities, &identities.sender_ids)
+                .is_err()
+        );
+        identities
+            .partition_threads
+            .insert("oneone/opaque==".into(), "222".into());
+        assert!(
+            phone_batch_messages("111", "Owner", parts(), &identities, &identities.sender_ids)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn phone_message_global_id_uses_int64_wire_type_and_preserves_large_identity() {
+        // Message schema from PC 26.11.10: sender=1, client=2, timestamp=5, globalId=6, content=7.
+        let message = [
+            10, 3, b'1', b'2', b'3', 16, 8, 40, 100, 48, 129, 128, 128, 128, 128, 128, 128, 16, 58,
+            2, b'h', b'i',
+        ];
+        let mut partition = vec![10, 3, b'4', b'5', b'6', 18, message.len() as u8];
+        partition.extend(message);
+        let mut chunk = vec![8, 1, 18, partition.len() as u8];
+        chunk.extend(partition);
+        let parts = parse_sync_chunk(&chunk).unwrap();
+        assert_eq!(parts[0].id, "456");
+        assert_eq!(parts[0].messages[0].global_id, "9007199254740993"); // (INV-4)
+        assert_eq!(parts[0].messages[0].client_id, 8);
+        assert_eq!(parts[0].messages[0].content, "hi");
+    }
+
+    #[test]
+    fn malformed_phone_protobuf_never_silently_drops_a_nested_message() {
+        for invalid in [
+            vec![18, 127],
+            vec![18, 3, 18, 1, 0],
+            vec![18, 2, 18, 127],
+            vec![18, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1],
+            vec![9, 1],
+            vec![0],
+        ] {
+            assert!(parse_sync_chunk(&invalid).is_none());
+        }
+        assert!(parse_vli(&[255; 10], 0).is_none());
+    }
 
     fn backup_thread_db(dir: &std::path::Path, name: &str, senders: &[i64]) -> std::path::PathBuf {
         let path = dir.join(name);
@@ -1364,7 +1765,9 @@ mod tests {
         // Tampered ciphertext must be rejected, not yield garbage.
         let mut bad = ct.clone();
         bad[0] ^= 0x01;
-        assert!(rsa_pkcs1_v15_decrypt(&key, &bad).map(|p| *p != *pt).unwrap_or(true));
+        assert!(rsa_pkcs1_v15_decrypt(&key, &bad)
+            .map(|p| *p != *pt)
+            .unwrap_or(true));
     }
 
     #[test]
@@ -1372,8 +1775,11 @@ mod tests {
         use aws_lc_rs::rsa::{Pkcs1PublicEncryptingKey, PublicEncryptingKey};
         use base64::Engine;
         let (pkcs8, spki_b64) = generate_rsa_sync_keypair().unwrap();
-        let spki = base64::engine::general_purpose::STANDARD.decode(spki_b64).unwrap();
-        let pub_key = Pkcs1PublicEncryptingKey::new(PublicEncryptingKey::from_der(&spki).unwrap()).unwrap();
+        let spki = base64::engine::general_purpose::STANDARD
+            .decode(spki_b64)
+            .unwrap();
+        let pub_key =
+            Pkcs1PublicEncryptingKey::new(PublicEncryptingKey::from_der(&spki).unwrap()).unwrap();
         let msg = b"0123456789abcdef0123456789abcdef";
         let mut ct = vec![0u8; pub_key.ciphertext_size()];
         let ct = pub_key.encrypt(msg, &mut ct).unwrap().to_vec();
@@ -1389,8 +1795,11 @@ mod tests {
         use aws_lc_rs::rsa::{Pkcs1PublicEncryptingKey, PublicEncryptingKey};
         use base64::Engine;
         let spki_b64 = generate_sync_public_key();
-        let spki = base64::engine::general_purpose::STANDARD.decode(&spki_b64).unwrap();
-        let pub_key = Pkcs1PublicEncryptingKey::new(PublicEncryptingKey::from_der(&spki).unwrap()).unwrap();
+        let spki = base64::engine::general_purpose::STANDARD
+            .decode(&spki_b64)
+            .unwrap();
+        let pub_key =
+            Pkcs1PublicEncryptingKey::new(PublicEncryptingKey::from_der(&spki).unwrap()).unwrap();
         let mut buf = vec![0u8; pub_key.ciphertext_size()];
         let ct = pub_key.encrypt(b"backup-key", &mut buf).unwrap().to_vec();
         let (pt, pk) = decrypt_with_sync_key(&ct).unwrap();
@@ -1471,12 +1880,15 @@ mod tests {
                     sync_id: "abc123".into()
                 },
                 crate::chat::MobileSyncControlEvent::MobileBusyRestoring,
-                crate::chat::MobileSyncControlEvent::SyncV2Batch {
+                crate::chat::MobileSyncControlEvent::SyncV2Batch(crate::chat::MobileSyncV2Batch {
                     url: "https://f.zalo.me/batch1".into(),
                     sync_id: "abc123".into(),
                     batch_type: 0,
                     is_last: false,
-                },
+                    index: 0,
+                    error_code: 0,
+                    scopes: None,
+                }),
             ]
         );
     }

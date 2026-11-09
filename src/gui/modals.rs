@@ -1899,135 +1899,88 @@ impl ZaloGuiApp {
                                                 });
                                         }
                                         SettingsTab::Sync => {
-                                            settings_section_header(ui, pal, "📲 Đồng bộ tin nhắn từ điện thoại (1-1 & Nhóm)");
-                                            ui.add_space(6.0);
-                                            egui::Frame::none()
-                                                .fill(pal.group_card())
-                                                .stroke(Stroke::NONE)
-                                                .rounding(Rounding::same(12.0))
-                                                .inner_margin(Margin::same(14.0))
-                                                .show(ui, |ui| {
-                                                    ui.vertical(|ui| {
-                                                        ui.label(
-                                                            RichText::new(
-                                                                "Gửi yêu cầu đồng bộ trực tiếp tới ứng dụng Zalo trên điện thoại (pull_mobile_msg / transfer-sync-v2) để kéo toàn bộ tin nhắn 1-1 và nhóm gần đây từ điện thoại về máy tính.",
-                                                            )
-                                                            .color(pal.text_primary)
-                                                            .size(13.0),
-                                                        );
-                                                        ui.add_space(4.0);
-                                                        ui.label(
-                                                            RichText::new(
-                                                                "Mẹo: Hãy giữ ứng dụng Zalo trên điện thoại mở và kết nối mạng trong lúc đồng bộ (xác nhận trên điện thoại nếu Zalo hỏi).",
-                                                            )
-                                                            .color(pal.text_secondary)
-                                                            .size(12.2),
-                                                        );
-                                                        ui.add_space(10.0);
-                                                        if crate::history_sync::PHONE_SYNC_RUNNING
-                                                            .load(std::sync::atomic::Ordering::Relaxed)
-                                                        {
-                                                            ui.add(
-                                                                egui::ProgressBar::new(
-                                                                    self.phone_sync_progress.clamp(0.05, 1.0),
-                                                                )
-                                                                .text(&self.phone_sync_status)
+                                            let phone_running = crate::history_sync::PHONE_SYNC_RUNNING
+                                                .load(std::sync::atomic::Ordering::Relaxed);
+                                            sync_card(ui, pal, lucide::MESSAGE_SQUARE, Color32::from_rgb(37, 99, 235),
+                                                "Đồng bộ từ điện thoại",
+                                                "Lấy tin nhắn 1-1 và nhóm đang lưu trên Zalo điện thoại về máy tính. Giữ Zalo trên điện thoại mở và bấm xác nhận khi được hỏi.",
+                                                |ui| {
+                                                    if phone_running {
+                                                        ui.add(
+                                                            egui::ProgressBar::new(self.phone_sync_progress.clamp(0.05, 1.0))
+                                                                .desired_height(8.0)
+                                                                .rounding(Rounding::same(4.0))
                                                                 .animate(true),
-                                                            );
+                                                        );
+                                                        ui.add_space(6.0);
+                                                        ui.label(RichText::new(&self.phone_sync_status).color(pal.text_secondary).size(12.5));
+                                                        ui.add_space(10.0);
+                                                        if sync_pill(ui, pal, lucide::X, "Dừng đồng bộ", false) {
+                                                            crate::history_sync::PHONE_SYNC_CANCEL
+                                                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                                                        }
+                                                    } else {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(RichText::new("Chỉ hội thoại đang mở").color(pal.text_primary).size(13.0));
+                                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                                render_toggle_switch(ui, &mut self.phone_sync_current_only, pal);
+                                                            });
+                                                        });
+                                                        ui.add_space(10.0);
+                                                        if sync_pill(ui, pal, lucide::REFRESH, "Đồng bộ ngay", true) {
+                                                            trigger_phone_sync = true;
+                                                        }
+                                                        if !self.phone_sync_status.is_empty() {
+                                                            ui.add_space(8.0);
+                                                            ui.label(RichText::new(&self.phone_sync_status).color(pal.text_secondary).size(12.2));
+                                                        }
+                                                    }
+                                                });
+                                            ui.add_space(12.0);
+                                            let total_msgs: usize = self.threads.iter().map(|t| t.messages.len()).sum();
+                                            let thread_count = self.threads.len();
+                                            sync_card(ui, pal, lucide::CLOUD, Color32::from_rgb(13, 148, 136),
+                                                "Lịch sử Nhóm & Cloud",
+                                                "Tải tin nhắn cũ của các nhóm và Cloud của tôi từ máy chủ Zalo, tối đa 1.000 tin mỗi hội thoại một lần. Bấm lại để lấy xa hơn.",
+                                                |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                                        sync_stat(ui, pal, &group_thousands(thread_count), "hội thoại");
+                                                        sync_stat(ui, pal, &group_thousands(total_msgs), "tin nhắn đã lưu");
+                                                    });
+                                                    ui.add_space(10.0);
+                                                    if crate::history_sync::RUNNING.load(std::sync::atomic::Ordering::Relaxed) {
+                                                        ui.add(egui::ProgressBar::new(0.5).desired_height(8.0).rounding(Rounding::same(4.0)).animate(true));
+                                                        ui.add_space(6.0);
+                                                        ui.label(RichText::new(&self.status_msg).color(pal.text_secondary).size(12.5));
+                                                        ui.add_space(10.0);
+                                                        if sync_pill(ui, pal, lucide::X, "Dừng", false) {
+                                                            crate::history_sync::CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+                                                        }
+                                                    } else {
+                                                        ui.horizontal(|ui| {
+                                                            if sync_pill(ui, pal, lucide::REFRESH, "Đồng bộ ngay", true) {
+                                                                trigger_sync = true;
+                                                            }
                                                             ui.add_space(6.0);
                                                             if ui
-                                                                .button(RichText::new("Dừng đồng bộ điện thoại").size(13.0))
+                                                                .add(egui::Label::new(RichText::new(format!("Cách hoạt động {}", lucide::EXTERNAL_LINK)).size(12.2).color(pal.primary_hover)).sense(Sense::click()))
+                                                                .on_hover_cursor(CursorIcon::PointingHand)
                                                                 .clicked()
                                                             {
-                                                                crate::history_sync::PHONE_SYNC_CANCEL.store(
-                                                                    true,
-                                                                    std::sync::atomic::Ordering::Relaxed,
-                                                                );
+                                                                open_external_url("https://github.com/ctdoteam1110/ctdozlite/blob/main/docs/TINH_NANG.md");
                                                             }
-                                                        } else {
-                                                            if ui
-                                                                .button(
-                                                                    RichText::new(format!(
-                                                                        "{} Đồng bộ tin nhắn từ điện thoại ngay",
-                                                                        lucide::REFRESH
-                                                                    ))
-                                                                    .size(13.0)
-                                                                    .strong(),
-                                                                )
-                                                                .clicked()
-                                                            {
-                                                                trigger_phone_sync = true;
-                                                            }
-                                                            if !self.phone_sync_status.is_empty() {
-                                                                ui.add_space(6.0);
-                                                                ui.label(
-                                                                    RichText::new(&self.phone_sync_status)
-                                                                        .color(pal.text_secondary)
-                                                                        .size(12.0),
-                                                                );
-                                                            }
-                                                        }
-                                                    });
+                                                        });
+                                                    }
                                                 });
-                                            ui.add_space(16.0);
-                                            settings_section_header(ui, pal, "☁️ Đồng bộ lịch sử Nhóm & Cloud từ máy chủ");
-                                            ui.add_space(6.0);
-                                            egui::Frame::none()
-                                                .fill(pal.group_card())
-                                                .stroke(Stroke::NONE)
-                                                .rounding(Rounding::same(12.0))
-                                                .inner_margin(Margin::same(14.0))
-                                                .show(ui, |ui| {
-                                                    ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Tải lịch sử cũ của các nhóm và Cloud của tôi từ máy chủ Zalo về zalo_history.db, mỗi lần tối đa 1.000 tin/hội thoại; bấm lần nữa để lùi xa hơn.").color(pal.text_primary).size(13.0));
-                                                        ui.add_space(4.0);
-                                                        if ui
-                                                            .add(
-                                                                egui::Label::new(
-                                                                    RichText::new(format!(
-                                                                        "Tìm hiểu chi tiết cơ chế đồng bộ trong docs/TINH_NANG.md {}",
-                                                                        lucide::EXTERNAL_LINK
-                                                                    ))
-                                                                    .size(11.8)
-                                                                    .color(pal.primary_hover),
-                                                                )
-                                                                .sense(Sense::click()),
-                                                            )
-                                                            .on_hover_cursor(CursorIcon::PointingHand)
-                                                            .clicked()
-                                                        {
-                                                            open_external_url("https://github.com/ctdoteam1110/ctdozlite/blob/main/docs/TINH_NANG.md");
-                                                        }
-                                                        ui.add_space(4.0);
-                                                        let total_msgs: usize = self.threads.iter().map(|t| t.messages.len()).sum();
-                                                        ui.label(RichText::new(format!("Hiện có {} hội thoại ({total_msgs} tin nhắn) trong bộ nhớ.", self.threads.len())).color(pal.text_secondary).size(12.2));
-                                                        ui.add_space(10.0);
-                                                        if crate::history_sync::RUNNING.load(std::sync::atomic::Ordering::Relaxed) {
-                                                            ui.label(RichText::new(&self.status_msg).color(pal.primary_hover).size(12.5));
-                                                            if ui.button(RichText::new("Dừng").size(13.0)).clicked() {
-                                                                crate::history_sync::CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
-                                                            }
-                                                        } else if ui.button(RichText::new(format!("{} Đồng bộ Nhóm & Cloud ngay", lucide::REFRESH)).size(13.0).strong()).clicked() {
-                                                            trigger_sync = true;
-                                                        }
-                                                    });
-                                                });
-                                            ui.add_space(16.0);
-                                            settings_section_header(ui, pal, "Di chuyển / Nhập lịch sử tin nhắn có sẵn (Migrate)");
-                                            ui.add_space(6.0);
-                                            egui::Frame::none()
-                                                .fill(pal.group_card())
-                                                .stroke(Stroke::NONE)
-                                                .rounding(Rounding::same(12.0))
-                                                .inner_margin(Margin::same(14.0))
-                                                .show(ui, |ui| {
-                                                    ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Nhập lịch sử tin nhắn từ bản sao lưu SQLite (.db / .sqlite) hoặc JSON (threads_cache.json / bản xuất lịch sử) vào zalo_history.db hiện tại mà không làm mất tin nhắn đang có.").color(pal.text_secondary).size(12.2));
-                                                        ui.add_space(8.0);
-                                                        if ui.button(RichText::new("Chọn file lịch sử (.db / .sqlite / .json) để nhập…").size(12.8).strong()).clicked() {
-                                                            pick_migrate_file = true;
-                                                        }
-                                                    });
+                                            ui.add_space(12.0);
+                                            sync_card(ui, pal, lucide::FOLDER_OPEN, Color32::from_rgb(217, 119, 6),
+                                                "Nhập lịch sử có sẵn",
+                                                "Gộp tin nhắn từ bản sao lưu .db, .sqlite hoặc .json vào máy này. Tin nhắn đang có được giữ nguyên.",
+                                                |ui| {
+                                                    if sync_pill(ui, pal, lucide::FOLDER_OPEN, "Chọn tệp…", false) {
+                                                        pick_migrate_file = true;
+                                                    }
                                                 });
                                         }
                                         SettingsTab::Appearance => {
@@ -2206,6 +2159,29 @@ impl ZaloGuiApp {
                                                                     }
                                                                 },
                                                             );
+                                                        }
+                                                    });
+                                                });
+                                            ui.add_space(16.0);
+
+                                            settings_section_header(ui, pal, "Bộ biểu tượng");
+                                            ui.add_space(6.0);
+                                            egui::Frame::none()
+                                                .fill(pal.group_card())
+                                                .stroke(Stroke::NONE)
+                                                .rounding(Rounding::same(12.0))
+                                                .inner_margin(Margin::same(14.0))
+                                                .show(ui, |ui| {
+                                                    ui.set_width(ui.available_width());
+                                                    let current = super::theme::IconStyle::from_key(&self.settings.icon_style);
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        ui.spacing_mut().item_spacing = Vec2::new(10.0, 10.0);
+                                                        for set in super::theme::IconStyle::ALL {
+                                                            if icon_style_card(ui, pal, set, set == current) {
+                                                                self.settings.icon_style = set.key().into();
+                                                                super::theme::set_icon_style(ui.ctx(), set);
+                                                                self.settings.save();
+                                                            }
                                                         }
                                                     });
                                                 });
@@ -3194,12 +3170,21 @@ impl ZaloGuiApp {
         if trigger_phone_sync {
             self.phone_sync_progress = 0.05;
             self.phone_sync_status = "📲 Đang gửi yêu cầu đồng bộ tin nhắn tới điện thoại…".into();
-            let threads = self.threads.clone();
+            let threads = if self.phone_sync_current_only {
+                self.threads
+                    .get(self.selected_thread_index)
+                    .cloned()
+                    .into_iter()
+                    .collect()
+            } else {
+                self.threads.clone()
+            };
+            if threads.is_empty() {
+                self.show_toast("Hãy chọn hội thoại cần đồng bộ trước");
+                return;
+            }
             if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::SyncPhoneMessages {
-                    threads,
-                    send_phone_prompt: true,
-                });
+                let _ = tx.send(WorkerCmd::SyncPhoneMessages { threads });
             }
             self.show_toast("📲 Đang yêu cầu đồng bộ tin nhắn từ điện thoại…");
         }
@@ -4152,10 +4137,14 @@ impl ZaloGuiApp {
     }
 
     #[allow(clippy::needless_range_loop)] // tile index also keys rects, remotes and egui ids
-    pub(super) fn render_call_overlay(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+    pub(super) fn render_call_overlay(&mut self, ctx: &egui::Context, _app_pal: &ThemePalette) {
         let Some(mut call) = self.active_call.clone() else {
             return;
         };
+        // Calls always use a dark stage (like FaceTime/Zalo): with the light theme the toolbar,
+        // dock and names were dark-on-dark or white panels around a black video area.
+        let call_pal = ThemePalette::dark();
+        let pal = &call_pal;
         // Neutral chips in the app's graphite palette (were fixed slate blue with white icons,
         // which clashed with the light theme).
         let call_chip = if pal.is_dark {
@@ -4295,6 +4284,7 @@ impl ZaloGuiApp {
                         }),
                 )
                 .show(vp_ctx, |ui| {
+                    call_visuals(ui);
                     let max_bar_w = (vp_w - 32.0).max(320.0);
                     let badge_w = 132.0_f32;
                     let ref_w = 28.0_f32;
@@ -4536,12 +4526,13 @@ impl ZaloGuiApp {
                 });
 
             // 2. BOTTOM STATUS PILL + ACTION DOCK PANEL (never clipped at bottom edge)
+            // Status pill + dock + mic level row: the old 138 pt cut the level row in half.
             let bottom_panel_h = if has_err {
-                142.0
+                150.0
             } else if call.is_incoming_ringing {
-                132.0
+                136.0
             } else {
-                138.0
+                164.0
             };
             egui::TopBottomPanel::bottom("call_vp_bottom_panel")
                 .resizable(false)
@@ -4558,6 +4549,7 @@ impl ZaloGuiApp {
                         }),
                 )
                 .show(vp_ctx, |ui| {
+                    call_visuals(ui);
                     let max_bot_w = (vp_w - 40.0).max(280.0);
                     ui.set_max_width(max_bot_w);
                     ui.vertical_centered(|ui| {
@@ -4983,7 +4975,7 @@ impl ZaloGuiApp {
                                         .clicked()
                                     {
                                         if !call.cam_enabled {
-                                            if !crate::media::is_ffmpeg_available() {
+                                            if !crate::media::video_calls_available() {
                                                 self.show_toast(
                                                     "⚠️ Cần cài đặt ffmpeg trong PATH để bật Camera (winget install Gyan.FFmpeg)",
                                                 );
@@ -5099,6 +5091,7 @@ impl ZaloGuiApp {
                         .inner_margin(Margin::symmetric(20.0, 8.0)),
                 )
                 .show(vp_ctx, |ui| {
+                    call_visuals(ui);
                     let stage_avail_w = (vp_w - 40.0).max(280.0);
                     let stage_avail_h = ui.available_height().max(180.0);
                     ui.set_max_width(stage_avail_w);
@@ -6042,25 +6035,44 @@ impl ZaloGuiApp {
             (340.0_f32.min(max_stage_w), 220.0_f32.min(max_stage_h), None)
         };
 
-        // Mouse-wheel zoom (zooms smoothly around cursor without clamping disp_w/disp_h to max_stage)
-        let scroll_y = ctx.input(|i| {
-            if i.raw_scroll_delta.y.abs() > 0.1 {
-                i.raw_scroll_delta.y
-            } else {
-                i.smooth_scroll_delta.y
-            }
-        });
-        if scroll_y.abs() > 0.1 {
-            let old_zoom = viewer.zoom;
-            let factor = if scroll_y > 0.0 { 1.15 } else { 1.0 / 1.15 };
-            let new_zoom = (old_zoom * factor).clamp(0.25, 8.0);
-            if let Some(ptr) = ctx.input(|i| i.pointer.hover_pos()) {
-                if stage_area_rect.contains(ptr) {
-                    let rel = ptr - (stage_area_rect.center() + viewer.pan);
-                    viewer.pan -= rel * (new_zoom / old_zoom - 1.0);
+        // Zoom like Preview: trackpad pinch and Ctrl/⌘-scroll arrive as `zoom_delta`, a mouse
+        // wheel (line units) zooms, and a two-finger trackpad swipe (point units) pans.
+        let (pinch, wheel_lines, swipe) = ctx.input(|i| {
+            let mut lines = 0.0_f32;
+            let mut points = Vec2::ZERO;
+            for ev in &i.events {
+                if let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                } = ev
+                {
+                    if modifiers.ctrl || modifiers.command {
+                        continue; // already folded into zoom_delta by egui
+                    }
+                    match unit {
+                        egui::MouseWheelUnit::Point => points += *delta,
+                        egui::MouseWheelUnit::Line => lines += delta.y,
+                        egui::MouseWheelUnit::Page => lines += delta.y * 3.0,
+                    }
                 }
             }
+            (i.zoom_delta(), lines, points)
+        });
+        let factor = pinch * (wheel_lines * 0.14).exp();
+        if (factor - 1.0).abs() > 0.0005 {
+            let old_zoom = viewer.zoom;
+            let new_zoom = (old_zoom * factor).clamp(0.25, 10.0);
+            if let Some(ptr) = ctx.input(|i| i.pointer.hover_pos()) {
+                // Keep the point under the cursor fixed while scaling.
+                let rel = ptr - (fit_rect.center() + viewer.pan);
+                viewer.pan -= rel * (new_zoom / old_zoom - 1.0);
+            }
             viewer.zoom = new_zoom;
+            ctx.request_repaint();
+        }
+        if swipe != Vec2::ZERO {
+            viewer.pan += swipe;
         }
 
         let disp_w = (base_w * viewer.zoom).max(48.0);
@@ -6294,13 +6306,13 @@ impl ZaloGuiApp {
                         if text_btn(
                             ui,
                             &format!("{:.0}%", viewer.zoom * 100.0),
-                            "Về 100% (hoặc nhấp đúp vào ảnh)",
+                            "Về 100% (hoặc nhấp đúp vào ảnh). Chụm hai ngón trên trackpad hoặc lăn chuột để thu phóng",
                         ) {
                             viewer.zoom = 1.0;
                             viewer.pan = Vec2::ZERO;
                         }
                         if round_btn(ui, lucide::PLUS, "Phóng to", false) {
-                            viewer.zoom = (viewer.zoom + 0.25).min(8.0);
+                            viewer.zoom = (viewer.zoom + 0.25).min(10.0);
                         }
                         if !viewer.full_url.is_empty() {
                             divider(ui);
@@ -6623,8 +6635,10 @@ impl ZaloGuiApp {
             }
             // Search pill + two round buttons, same style as the chat list header.
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let sbox_w = (ui.available_width() - 2.0 * 34.0 - 16.0).max(120.0);
+                // Room between the pill (and its soft shadow) and the two round buttons; a
+                // 120 pt minimum used to push the pill under the buttons in a narrow sidebar.
+                ui.spacing_mut().item_spacing.x = 12.0;
+                let sbox_w = (ui.available_width() - 2.0 * 34.0 - 2.0 * 12.0 - 4.0).max(60.0);
                 let (sbox_rect, _) =
                     ui.allocate_exact_size(Vec2::new(sbox_w, 34.0), Sense::hover());
                 ui.painter().add(
@@ -6764,18 +6778,27 @@ impl ZaloGuiApp {
                 let block_fill = super::workspace::composer_block_fill(pal);
                 let block_shadow = super::workspace::composer_block_shadow(pal);
                 let sort_desc_id = Id::new("contacts_sort_desc");
-                let mut sort_desc = ctx.data(|d| d.get_temp::<bool>(sort_desc_id)).unwrap_or(false);
+                let mut sort_desc = ctx
+                    .data(|d| d.get_temp::<bool>(sort_desc_id))
+                    .unwrap_or(false);
 
                 // Items for the list tabs (friends / groups), searched by name, alias or real name.
                 let want_group = self.contacts_sub_tab == ContactsSubTab::Groups;
                 let mut items: Vec<(String, String, Option<String>, bool, String)> = Vec::new();
-                if matches!(self.contacts_sub_tab, ContactsSubTab::Friends | ContactsSubTab::Groups) {
+                if matches!(
+                    self.contacts_sub_tab,
+                    ContactsSubTab::Friends | ContactsSubTab::Groups
+                ) {
                     items = self
                         .threads
                         .iter()
                         .filter(|t| t.is_group == want_group && !t.name.contains("Cloud của tôi"))
                         .filter(|t| {
-                            let real = self.alias_original_names.get(&t.id).map(String::as_str).unwrap_or("");
+                            let real = self
+                                .alias_original_names
+                                .get(&t.id)
+                                .map(String::as_str)
+                                .unwrap_or("");
                             matches_vn_query(&t.name, &q_low, &q_fold)
                                 || (!real.is_empty() && matches_vn_query(real, &q_low, &q_fold))
                         })
@@ -6792,7 +6815,13 @@ impl ZaloGuiApp {
                                     .map(|r| format!("Tên Zalo: {r}"))
                                     .unwrap_or_default()
                             };
-                            (t.id.clone(), t.name.clone(), t.avatar.clone(), t.is_group, sub)
+                            (
+                                t.id.clone(),
+                                t.name.clone(),
+                                t.avatar.clone(),
+                                t.is_group,
+                                sub,
+                            )
                         })
                         .collect();
                     items.sort_by_key(|a| fold_vn_search(&a.1));
@@ -6814,18 +6843,40 @@ impl ZaloGuiApp {
                         .fill(block_fill)
                         .shadow(block_shadow)
                         .rounding(Rounding::same(22.0))
-                        .inner_margin(Margin { left: 10.0, right: 18.0, top: 6.0, bottom: 6.0 })
+                        .inner_margin(Margin {
+                            left: 10.0,
+                            right: 18.0,
+                            top: 6.0,
+                            bottom: 6.0,
+                        })
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                let (ir, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
-                                ui.painter().circle_filled(ir.center(), 16.0, pal.bg_selected);
-                                draw_lucide_icon(ui.painter(), ir.center(), header_icon, 15.0, pal.text_primary);
+                                let (ir, _) =
+                                    ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
+                                ui.painter()
+                                    .circle_filled(ir.center(), 16.0, pal.bg_selected);
+                                draw_lucide_icon(
+                                    ui.painter(),
+                                    ir.center(),
+                                    header_icon,
+                                    15.0,
+                                    pal.text_primary,
+                                );
                                 ui.add_space(4.0);
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 0.0;
-                                    ui.label(RichText::new(header_title).size(14.0).strong().color(pal.text_primary));
+                                    ui.label(
+                                        RichText::new(header_title)
+                                            .size(14.0)
+                                            .strong()
+                                            .color(pal.text_primary),
+                                    );
                                     if !count_txt.is_empty() {
-                                        ui.label(RichText::new(count_txt).size(11.0).color(pal.text_muted));
+                                        ui.label(
+                                            RichText::new(count_txt)
+                                                .size(11.0)
+                                                .color(pal.text_muted),
+                                        );
                                     }
                                 });
                             });
@@ -6833,167 +6884,327 @@ impl ZaloGuiApp {
                 });
                 ui.add_space(12.0);
 
-                egui::ScrollArea::vertical()
-                    .id_salt(("contacts_main_scroll", self.contacts_sub_tab as u8))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        egui::Frame::none()
-                            .inner_margin(Margin { left: 12.0, right: 12.0, top: 2.0, bottom: 16.0 })
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                match self.contacts_sub_tab {
-                                    ContactsSubTab::Friends | ContactsSubTab::Groups => {
-                                        egui::Frame::none()
-                                            .fill(block_fill)
-                                            .shadow(block_shadow)
-                                            .rounding(Rounding::same(20.0))
-                                            .inner_margin(Margin::symmetric(12.0, 12.0))
-                                            .show(ui, |ui| {
-                                                ui.set_width(ui.available_width());
-                                                // Toolbar: search pill + sort toggle.
-                                                ui.horizontal(|ui| {
-                                                    ui.spacing_mut().item_spacing.x = 8.0;
-                                                    let field = if pal.is_dark { Color32::from_rgb(52, 54, 62) } else { Color32::from_rgb(238, 238, 243) };
-                                                    let fb_w = (ui.available_width() - 120.0).max(140.0);
-                                                    let (fb_rect, _) = ui.allocate_exact_size(Vec2::new(fb_w, 34.0), Sense::hover());
-                                                    ui.painter().rect_filled(fb_rect, Rounding::same(17.0), field);
-                                                    draw_icon_search(
-                                                        ui.painter(),
-                                                        Pos2::new(fb_rect.left() + 16.0, fb_rect.center().y),
-                                                        13.5,
-                                                        pal.text_muted,
-                                                    );
-                                                    let fb_edit = Rect::from_min_max(
-                                                        Pos2::new(fb_rect.left() + 30.0, fb_rect.top() + 5.0),
-                                                        Pos2::new(fb_rect.right() - 10.0, fb_rect.bottom() - 5.0),
-                                                    );
-                                                    ui.put(
-                                                        fb_edit,
-                                                        egui::TextEdit::singleline(&mut self.contacts_search_query)
-                                                            .id(Id::new("contacts_main_filter_input"))
-                                                            .frame(false)
-                                                            .hint_text(
-                                                                RichText::new(if want_group { "Tìm nhóm…" } else { "Tìm theo tên hoặc biệt danh…" })
-                                                                    .color(pal.text_muted.gamma_multiply(0.8)),
-                                                            )
-                                                            .desired_width(fb_edit.width()),
-                                                    );
-                                                    let label = if sort_desc { "Tên Z → A" } else { "Tên A → Z" };
-                                                    let (sr, sresp) = ui.allocate_exact_size(Vec2::new(108.0, 34.0), Sense::click());
-                                                    ui.painter().rect_filled(
-                                                        sr,
-                                                        Rounding::same(17.0),
-                                                        if sresp.hovered() { pal.bg_hover } else { field },
-                                                    );
-                                                    ui.painter().text(sr.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(12.5), pal.text_primary);
-                                                    if sresp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Đổi thứ tự sắp xếp").clicked() {
-                                                        sort_desc = !sort_desc;
-                                                    }
-                                                });
-                                                ui.add_space(8.0);
-                                                if items.is_empty() {
-                                                    ui.add_space(24.0);
-                                                    ui.vertical_centered(|ui| {
-                                                        ui.label(RichText::new("Không có kết quả phù hợp.").size(12.5).color(pal.text_muted));
-                                                    });
-                                                    ui.add_space(24.0);
+                // The card stays put and only its list scrolls, so its bottom corners stay
+                // rounded (a card inside the scroll area was cut square at the viewport edge).
+                ui.scope(|ui| {
+                    egui::Frame::none()
+                        .inner_margin(Margin {
+                            left: 12.0,
+                            right: 12.0,
+                            top: 2.0,
+                            bottom: 16.0,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            match self.contacts_sub_tab {
+                                ContactsSubTab::Friends | ContactsSubTab::Groups => {
+                                    egui::Frame::none()
+                                        .fill(block_fill)
+                                        .shadow(block_shadow)
+                                        .rounding(Rounding::same(20.0))
+                                        .inner_margin(Margin::symmetric(12.0, 12.0))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.set_min_height(ui.available_height());
+                                            // Toolbar: search pill + sort toggle.
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 8.0;
+                                                let field = if pal.is_dark {
+                                                    Color32::from_rgb(52, 54, 62)
+                                                } else {
+                                                    Color32::from_rgb(238, 238, 243)
+                                                };
+                                                let fb_w =
+                                                    (ui.available_width() - 120.0).max(140.0);
+                                                let (fb_rect, _) = ui.allocate_exact_size(
+                                                    Vec2::new(fb_w, 34.0),
+                                                    Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(
+                                                    fb_rect,
+                                                    Rounding::same(17.0),
+                                                    field,
+                                                );
+                                                draw_icon_search(
+                                                    ui.painter(),
+                                                    Pos2::new(
+                                                        fb_rect.left() + 16.0,
+                                                        fb_rect.center().y,
+                                                    ),
+                                                    13.5,
+                                                    pal.text_muted,
+                                                );
+                                                let fb_edit = Rect::from_min_max(
+                                                    Pos2::new(
+                                                        fb_rect.left() + 30.0,
+                                                        fb_rect.top() + 5.0,
+                                                    ),
+                                                    Pos2::new(
+                                                        fb_rect.right() - 10.0,
+                                                        fb_rect.bottom() - 5.0,
+                                                    ),
+                                                );
+                                                ui.put(
+                                                    fb_edit,
+                                                    egui::TextEdit::singleline(
+                                                        &mut self.contacts_search_query,
+                                                    )
+                                                    .id(Id::new("contacts_main_filter_input"))
+                                                    .frame(false)
+                                                    .hint_text(
+                                                        RichText::new(if want_group {
+                                                            "Tìm nhóm…"
+                                                        } else {
+                                                            "Tìm theo tên hoặc biệt danh…"
+                                                        })
+                                                        .color(pal.text_muted.gamma_multiply(0.8)),
+                                                    )
+                                                    .desired_width(fb_edit.width()),
+                                                );
+                                                let label = if sort_desc {
+                                                    "Tên Z → A"
+                                                } else {
+                                                    "Tên A → Z"
+                                                };
+                                                let (sr, sresp) = ui.allocate_exact_size(
+                                                    Vec2::new(108.0, 34.0),
+                                                    Sense::click(),
+                                                );
+                                                ui.painter().rect_filled(
+                                                    sr,
+                                                    Rounding::same(17.0),
+                                                    if sresp.hovered() {
+                                                        pal.bg_hover
+                                                    } else {
+                                                        field
+                                                    },
+                                                );
+                                                ui.painter().text(
+                                                    sr.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    label,
+                                                    FontId::proportional(12.5),
+                                                    pal.text_primary,
+                                                );
+                                                if sresp
+                                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                                    .on_hover_text("Đổi thứ tự sắp xếp")
+                                                    .clicked()
+                                                {
+                                                    sort_desc = !sort_desc;
                                                 }
-                                                let mut current_letter = String::new();
-                                                for (tid, tname, tava, is_grp, sub) in items {
-                                                    let first_ch = tname.trim().chars().next().unwrap_or('#').to_uppercase().to_string();
-                                                    if !want_group && first_ch != current_letter {
-                                                        current_letter = first_ch.clone();
-                                                        ui.add_space(8.0);
-                                                        ui.horizontal(|ui| {
-                                                            ui.add_space(8.0);
-                                                            ui.label(RichText::new(&current_letter).size(12.0).color(pal.text_muted).strong());
+                                            });
+                                            ui.add_space(8.0);
+                                            egui::ScrollArea::vertical()
+                                                .id_salt((
+                                                    "contacts_main_scroll",
+                                                    self.contacts_sub_tab as u8,
+                                                ))
+                                                .auto_shrink([false, false])
+                                                .show(ui, |ui| {
+                                                    if items.is_empty() {
+                                                        ui.add_space(24.0);
+                                                        ui.vertical_centered(|ui| {
+                                                            ui.label(
+                                                                RichText::new(
+                                                                    "Không có kết quả phù hợp.",
+                                                                )
+                                                                .size(12.5)
+                                                                .color(pal.text_muted),
+                                                            );
                                                         });
-                                                        ui.add_space(2.0);
+                                                        ui.add_space(24.0);
                                                     }
-                                                    let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 56.0), Sense::click());
-                                                    let hot = resp.hovered();
-                                                    if hot {
-                                                        ui.painter().rect_filled(r, Rounding::same(14.0), pal.bg_hover);
-                                                    }
-                                                    paint_user_avatar(
-                                                        ui.painter(),
-                                                        Pos2::new(r.left() + 30.0, r.center().y),
-                                                        20.0,
-                                                        &tname,
-                                                        is_grp,
-                                                        tava.as_deref(),
-                                                        &self.sticker_textures,
-                                                        &mut self.loading_stickers,
-                                                    );
-                                                    let has_sub = !sub.is_empty();
-                                                    ui.painter().text(
-                                                        Pos2::new(r.left() + 62.0, r.center().y + if has_sub { -8.0 } else { 0.0 }),
-                                                        egui::Align2::LEFT_CENTER,
-                                                        truncate_chars(&tname, 40),
-                                                        FontId::proportional(13.5),
-                                                        pal.text_primary,
-                                                    );
-                                                    if has_sub {
+                                                    let mut current_letter = String::new();
+                                                    for (tid, tname, tava, is_grp, sub) in items {
+                                                        let first_ch = tname
+                                                            .trim()
+                                                            .chars()
+                                                            .next()
+                                                            .unwrap_or('#')
+                                                            .to_uppercase()
+                                                            .to_string();
+                                                        if !want_group && first_ch != current_letter
+                                                        {
+                                                            current_letter = first_ch.clone();
+                                                            ui.add_space(8.0);
+                                                            ui.horizontal(|ui| {
+                                                                ui.add_space(8.0);
+                                                                ui.label(
+                                                                    RichText::new(&current_letter)
+                                                                        .size(12.0)
+                                                                        .color(pal.text_muted)
+                                                                        .strong(),
+                                                                );
+                                                            });
+                                                            ui.add_space(2.0);
+                                                        }
+                                                        let (r, resp) = ui.allocate_exact_size(
+                                                            Vec2::new(ui.available_width(), 56.0),
+                                                            Sense::click(),
+                                                        );
+                                                        let hot = resp.hovered();
+                                                        if hot {
+                                                            ui.painter().rect_filled(
+                                                                r,
+                                                                Rounding::same(14.0),
+                                                                pal.bg_hover,
+                                                            );
+                                                        }
+                                                        paint_user_avatar(
+                                                            ui.painter(),
+                                                            Pos2::new(
+                                                                r.left() + 30.0,
+                                                                r.center().y,
+                                                            ),
+                                                            20.0,
+                                                            &tname,
+                                                            is_grp,
+                                                            tava.as_deref(),
+                                                            &self.sticker_textures,
+                                                            &mut self.loading_stickers,
+                                                        );
+                                                        let has_sub = !sub.is_empty();
                                                         ui.painter().text(
-                                                            Pos2::new(r.left() + 62.0, r.center().y + 9.0),
+                                                            Pos2::new(
+                                                                r.left() + 62.0,
+                                                                r.center().y
+                                                                    + if has_sub {
+                                                                        -8.0
+                                                                    } else {
+                                                                        0.0
+                                                                    },
+                                                            ),
                                                             egui::Align2::LEFT_CENTER,
-                                                            truncate_chars(&sub, 44),
-                                                            FontId::proportional(11.0),
-                                                            pal.text_muted,
+                                                            truncate_chars(&tname, 40),
+                                                            FontId::proportional(13.5),
+                                                            pal.text_primary,
                                                         );
-                                                    }
-                                                    // "Nhắn tin" pill appears on hover.
-                                                    let t = ui.ctx().animate_bool_with_time(resp.id.with("msg_pill"), hot, 0.12);
-                                                    if t > 0.01 {
-                                                        let pill = Rect::from_center_size(r.right_center() - Vec2::new(52.0, 0.0), Vec2::new(84.0, 28.0));
-                                                        ui.painter().rect_filled(pill, Rounding::same(14.0), pal.text_primary.gamma_multiply(t));
-                                                        ui.painter().text(
-                                                            pill.center(),
-                                                            egui::Align2::CENTER_CENTER,
-                                                            "Nhắn tin",
-                                                            FontId::proportional(12.0),
-                                                            (if pal.is_dark { Color32::BLACK } else { Color32::WHITE }).gamma_multiply(t),
+                                                        if has_sub {
+                                                            ui.painter().text(
+                                                                Pos2::new(
+                                                                    r.left() + 62.0,
+                                                                    r.center().y + 9.0,
+                                                                ),
+                                                                egui::Align2::LEFT_CENTER,
+                                                                truncate_chars(&sub, 44),
+                                                                FontId::proportional(11.0),
+                                                                pal.text_muted,
+                                                            );
+                                                        }
+                                                        // "Nhắn tin" pill appears on hover.
+                                                        let t = ui.ctx().animate_bool_with_time(
+                                                            resp.id.with("msg_pill"),
+                                                            hot,
+                                                            0.12,
                                                         );
-                                                    }
-                                                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                                        open_thread_id = Some((tid, is_grp));
-                                                    }
-                                                }
-                                            });
-                                    }
-                                    ContactsSubTab::FriendRequests | ContactsSubTab::GroupInvites => {
-                                        egui::Frame::none()
-                                            .fill(block_fill)
-                                            .shadow(block_shadow)
-                                            .rounding(Rounding::same(20.0))
-                                            .inner_margin(Margin::symmetric(16.0, 32.0))
-                                            .show(ui, |ui| {
-                                                ui.set_width(ui.available_width());
-                                                ui.vertical_centered(|ui| {
-                                                    let (ir, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
-                                                    ui.painter().circle_filled(ir.center(), 28.0, pal.bg_selected);
-                                                    draw_lucide_icon(ui.painter(), ir.center(), header_icon, 22.0, pal.text_secondary);
-                                                    ui.add_space(10.0);
-                                                    ui.label(RichText::new("Chưa có lời mời mới nào đang chờ xử lý.").size(13.0).color(pal.text_muted));
-                                                    ui.add_space(12.0);
-                                                    let (br, bresp) = ui.allocate_exact_size(Vec2::new(220.0, 34.0), Sense::click());
-                                                    ui.painter().rect_filled(br, Rounding::same(17.0), pal.text_primary.gamma_multiply(if bresp.hovered() { 0.85 } else { 1.0 }));
-                                                    ui.painter().text(
-                                                        br.center(),
-                                                        egui::Align2::CENTER_CENTER,
-                                                        format!("{}  Tìm bạn qua số điện thoại", lucide::SEARCH),
-                                                        FontId::proportional(12.5),
-                                                        if pal.is_dark { Color32::BLACK } else { Color32::WHITE },
-                                                    );
-                                                    if bresp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                                        self.phone_modal_open = true;
+                                                        if t > 0.01 {
+                                                            let pill = Rect::from_center_size(
+                                                                r.right_center()
+                                                                    - Vec2::new(52.0, 0.0),
+                                                                Vec2::new(84.0, 28.0),
+                                                            );
+                                                            ui.painter().rect_filled(
+                                                                pill,
+                                                                Rounding::same(14.0),
+                                                                pal.text_primary.gamma_multiply(t),
+                                                            );
+                                                            ui.painter().text(
+                                                                pill.center(),
+                                                                egui::Align2::CENTER_CENTER,
+                                                                "Nhắn tin",
+                                                                FontId::proportional(12.0),
+                                                                (if pal.is_dark {
+                                                                    Color32::BLACK
+                                                                } else {
+                                                                    Color32::WHITE
+                                                                })
+                                                                .gamma_multiply(t),
+                                                            );
+                                                        }
+                                                        if resp
+                                                            .on_hover_cursor(
+                                                                CursorIcon::PointingHand,
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            open_thread_id = Some((tid, is_grp));
+                                                        }
                                                     }
                                                 });
-                                            });
-                                    }
+                                        });
                                 }
-                            });
-                    });
+                                ContactsSubTab::FriendRequests | ContactsSubTab::GroupInvites => {
+                                    egui::Frame::none()
+                                        .fill(block_fill)
+                                        .shadow(block_shadow)
+                                        .rounding(Rounding::same(20.0))
+                                        .inner_margin(Margin::symmetric(16.0, 32.0))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.vertical_centered(|ui| {
+                                                let (ir, _) = ui.allocate_exact_size(
+                                                    Vec2::splat(56.0),
+                                                    Sense::hover(),
+                                                );
+                                                ui.painter().circle_filled(
+                                                    ir.center(),
+                                                    28.0,
+                                                    pal.bg_selected,
+                                                );
+                                                draw_lucide_icon(
+                                                    ui.painter(),
+                                                    ir.center(),
+                                                    header_icon,
+                                                    22.0,
+                                                    pal.text_secondary,
+                                                );
+                                                ui.add_space(10.0);
+                                                ui.label(
+                                                    RichText::new(
+                                                        "Chưa có lời mời mới nào đang chờ xử lý.",
+                                                    )
+                                                    .size(13.0)
+                                                    .color(pal.text_muted),
+                                                );
+                                                ui.add_space(12.0);
+                                                let (br, bresp) = ui.allocate_exact_size(
+                                                    Vec2::new(220.0, 34.0),
+                                                    Sense::click(),
+                                                );
+                                                ui.painter().rect_filled(
+                                                    br,
+                                                    Rounding::same(17.0),
+                                                    pal.text_primary.gamma_multiply(
+                                                        if bresp.hovered() { 0.85 } else { 1.0 },
+                                                    ),
+                                                );
+                                                ui.painter().text(
+                                                    br.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    format!(
+                                                        "{}  Tìm bạn qua số điện thoại",
+                                                        lucide::SEARCH
+                                                    ),
+                                                    FontId::proportional(12.5),
+                                                    if pal.is_dark {
+                                                        Color32::BLACK
+                                                    } else {
+                                                        Color32::WHITE
+                                                    },
+                                                );
+                                                if bresp
+                                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                                    .clicked()
+                                                {
+                                                    self.phone_modal_open = true;
+                                                }
+                                            });
+                                        });
+                                }
+                            }
+                        });
+                });
                 ctx.data_mut(|d| d.insert_temp(sort_desc_id, sort_desc));
 
                 if let Some((tid, is_grp)) = open_thread_id {
@@ -8389,6 +8600,188 @@ impl ZaloGuiApp {
 
 /// Telegram-style section caption above a settings card: small, grey, upper-case, indented
 /// to line up with the card's content.
+/// One choice in "Bộ biểu tượng": a row of sample icons drawn in that set, and its name.
+fn icon_style_card(
+    ui: &mut egui::Ui,
+    pal: &ThemePalette,
+    set: super::theme::IconStyle,
+    selected: bool,
+) -> bool {
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(150.0, 74.0), Sense::click());
+    let hot = resp.hovered();
+    let stroke = if selected {
+        Stroke::new(2.0_f32, pal.primary)
+    } else {
+        Stroke::new(1.0_f32, if hot { pal.text_secondary } else { pal.border })
+    };
+    ui.painter()
+        .rect(r, Rounding::same(12.0), pal.bg_elevated, stroke);
+    let font = FontId::new(18.0, egui::FontFamily::Name(set.family_name().into()));
+    let samples = [
+        lucide::SEARCH,
+        lucide::PHONE,
+        lucide::VIDEO,
+        lucide::SMILE,
+        lucide::SETTINGS,
+    ];
+    for (i, icon) in samples.iter().enumerate() {
+        let x = r.left() + 22.0 + i as f32 * 26.5;
+        ui.painter().text(
+            Pos2::new(x, r.top() + 26.0),
+            egui::Align2::CENTER_CENTER,
+            icon,
+            font.clone(),
+            pal.text_primary,
+        );
+    }
+    ui.painter().text(
+        Pos2::new(r.center().x, r.bottom() - 18.0),
+        egui::Align2::CENTER_CENTER,
+        set.label(),
+        FontId::proportional(12.5),
+        if selected {
+            pal.primary
+        } else {
+            pal.text_secondary
+        },
+    );
+    resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
+}
+
+/// A settings card for one sync source: tinted icon tile, title, one-line explanation, then
+/// the card's own controls.
+fn sync_card(
+    ui: &mut egui::Ui,
+    pal: &ThemePalette,
+    icon: &str,
+    accent: Color32,
+    title: &str,
+    subtitle: &str,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::none()
+        .fill(pal.group_card())
+        .stroke(Stroke::new(1.0_f32, pal.border.linear_multiply(0.6)))
+        .rounding(Rounding::same(16.0))
+        .inner_margin(Margin::same(18.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                let (tile, _) = ui.allocate_exact_size(Vec2::splat(42.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(tile, Rounding::same(12.0), accent.linear_multiply(0.16));
+                draw_lucide_icon(ui.painter(), tile.center(), icon, 20.0, accent);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.label(
+                        RichText::new(title)
+                            .size(15.0)
+                            .strong()
+                            .color(pal.text_primary),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(subtitle).size(12.8).color(pal.text_secondary),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(10.0);
+                    add_contents(ui);
+                });
+            });
+        });
+}
+
+/// Rounded pill button; `primary` is filled with the accent colour.
+fn sync_pill(
+    ui: &mut egui::Ui,
+    pal: &ThemePalette,
+    icon: &str,
+    label: &str,
+    primary: bool,
+) -> bool {
+    let text = format!("{icon}  {label}");
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, FontId::proportional(13.0), Color32::WHITE);
+    let size = Vec2::new(galley.size().x + 32.0, 34.0);
+    let (r, resp) = ui.allocate_exact_size(size, Sense::click());
+    let hot = resp.hovered();
+    let (fill, fg, stroke) = if primary {
+        let base = pal.primary;
+        (
+            if hot { pal.primary_hover } else { base },
+            Color32::WHITE,
+            Stroke::NONE,
+        )
+    } else {
+        (
+            if hot {
+                pal.bg_hover
+            } else {
+                Color32::TRANSPARENT
+            },
+            pal.text_primary,
+            Stroke::new(1.0_f32, pal.border),
+        )
+    };
+    ui.painter().rect(r, Rounding::same(17.0), fill, stroke);
+    ui.painter().text(
+        r.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{icon}  {label}"),
+        FontId::proportional(13.0),
+        fg,
+    );
+    resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
+}
+
+/// Big number with a caption under it, on a soft tile.
+fn sync_stat(ui: &mut egui::Ui, pal: &ThemePalette, value: &str, caption: &str) {
+    egui::Frame::none()
+        .fill(pal.text_primary.linear_multiply(0.05))
+        .rounding(Rounding::same(10.0))
+        .inner_margin(Margin::symmetric(14.0, 8.0))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(
+                    RichText::new(value)
+                        .size(18.0)
+                        .strong()
+                        .color(pal.text_primary),
+                );
+                ui.label(RichText::new(caption).size(11.5).color(pal.text_muted));
+            });
+        });
+}
+
+/// `5686` → `5.686`, the Vietnamese thousands separator.
+fn group_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push('.');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Dark widget style for the call window's panels (sliders, menus, labels), whatever the app theme.
+fn call_visuals(ui: &mut egui::Ui) {
+    let mut v = egui::Visuals::dark();
+    v.widgets.inactive.bg_fill = Color32::from_rgb(52, 54, 62);
+    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(52, 54, 62);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(66, 68, 78);
+    v.selection.bg_fill = Color32::from_rgb(37, 99, 235);
+    v.window_fill = Color32::from_rgb(30, 32, 38);
+    v.panel_fill = Color32::from_rgb(20, 21, 26);
+    *ui.visuals_mut() = v;
+}
+
 pub(super) fn settings_section_header(ui: &mut egui::Ui, pal: &ThemePalette, title: &str) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -8405,6 +8798,14 @@ pub(super) fn settings_section_header(ui: &mut egui::Ui, pal: &ThemePalette, tit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_use_vietnamese_thousands_separator() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(506), "506");
+        assert_eq!(group_thousands(5686), "5.686");
+        assert_eq!(group_thousands(1_234_567), "1.234.567");
+    }
 
     #[test]
     fn call_gallery_fit_aspects_and_speaker_layout_stay_within_bounds() {

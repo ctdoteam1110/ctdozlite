@@ -26,7 +26,7 @@ use futures_util::{SinkExt, StreamExt};
 use generic_array::typenum::U16;
 use serde_json::{json, Value};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{COOKIE, ORIGIN, USER_AGENT};
@@ -66,6 +66,181 @@ pub const CMD_SYNC_MOBILE_WAKE_UP: u16 = 592;
 
 static WS_OUTBOUND_TX: std::sync::Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>> =
     std::sync::Mutex::new(None);
+
+struct PendingSyncRequest {
+    cmd: u16,
+    frame_bytes: usize,
+    connection: mpsc::UnboundedSender<Vec<u8>>,
+    reply: oneshot::Sender<std::result::Result<Value, String>>,
+}
+
+static SYNC_REQUESTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, PendingSyncRequest>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static NEXT_SYNC_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct SyncRequestCleanup(String);
+
+impl Drop for SyncRequestCleanup {
+    fn drop(&mut self) {
+        // Cancellation and timeouts must remove senders even when no server reply arrives.
+        if let Ok(mut pending) = SYNC_REQUESTS.lock() {
+            pending.remove(&self.0);
+        }
+    }
+}
+
+/// A queued request lost its acknowledgement; delivery must not be assumed to have failed.
+#[derive(Debug)]
+pub(crate) struct SyncRequestUnconfirmed(pub(crate) String);
+
+impl std::fmt::Display for SyncRequestUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for SyncRequestUnconfirmed {}
+
+/// Send a sync API frame and await its correlated server acknowledgement.
+///
+/// # Errors
+/// Rejects unsupported commands, unavailable connections, send failures, disconnects and timeouts.
+/// A nonzero server response is returned intact for the protocol caller to classify.
+pub async fn request_sync_frame(cmd: u16, data: Value, timeout: Duration) -> Result<Value> {
+    if !matches!(
+        cmd,
+        CMD_SYNC_REQUEST | CMD_SYNC_ACK_DELETE | CMD_SYNC_MOBILE_WAKE_UP
+    ) || !data.is_object()
+    {
+        bail!("Yêu cầu đồng bộ WebSocket không hợp lệ");
+    }
+    let connection = WS_OUTBOUND_TX
+        .lock()
+        .map_err(|_| anyhow!("Không đọc được trạng thái kết nối đồng bộ"))?
+        .as_ref()
+        .filter(|tx| !tx.is_closed())
+        .cloned()
+        .ok_or_else(|| anyhow!("Chưa kết nối máy chủ thời gian thực; hãy chờ rồi thử lại"))?;
+    let request_id = format!(
+        "req_sync_{}_{}",
+        now_ms(),
+        NEXT_SYNC_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let (reply, response) = oneshot::channel();
+    let mut data = data;
+    if let Some(object) = data.as_object_mut() {
+        object.insert("reqId".into(), Value::String(request_id.clone()));
+    }
+    let frame = encode_frame(cmd, 0, 1, Some(&data));
+    SYNC_REQUESTS
+        .lock()
+        .map_err(|_| anyhow!("Không đăng ký được yêu cầu đồng bộ"))?
+        .insert(
+            request_id.clone(),
+            PendingSyncRequest {
+                cmd,
+                frame_bytes: frame.len(),
+                connection: connection.clone(),
+                reply,
+            },
+        );
+    let _cleanup = SyncRequestCleanup(request_id.clone());
+    connection
+        .send(frame)
+        .map_err(|_| anyhow!("Kết nối đồng bộ đã đóng trước khi gửi"))?;
+    match tokio::time::timeout(timeout, response).await {
+        Ok(Ok(Ok(value))) => Ok(value),
+        Ok(Ok(Err(message))) => Err(SyncRequestUnconfirmed(message).into()),
+        Ok(Err(_)) => Err(SyncRequestUnconfirmed(
+            "Kết nối đồng bộ đã đóng trước khi nhận xác nhận".into(),
+        )
+        .into()),
+        Err(_) => Err(SyncRequestUnconfirmed(
+            "Chưa nhận được xác nhận đồng bộ từ máy chủ thời gian thực".into(),
+        )
+        .into()),
+    }
+}
+
+fn complete_sync_request(cmd: u16, payload: &Value) -> bool {
+    let parsed;
+    let payload = if let Some(text) = payload.get("data").and_then(Value::as_str) {
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return false;
+        };
+        parsed = value;
+        &parsed
+    } else {
+        payload
+    };
+    let Some(request_id) = payload.pointer("/data/reqId").and_then(Value::as_str) else {
+        return false;
+    };
+    let Ok(mut pending) = SYNC_REQUESTS.lock() else {
+        return false;
+    };
+    if !pending
+        .get(request_id)
+        .is_some_and(|request| request.cmd == cmd)
+    {
+        return false;
+    }
+    if let Some(request) = pending.remove(request_id) {
+        // A cancelled receiver is harmless; its request has already been removed.
+        let _ = request.reply.send(Ok(payload.clone()));
+    }
+    true
+}
+
+// Publish only authenticated connections, and never let an older connection clear its successor.
+struct OutboundRegistration(mpsc::UnboundedSender<Vec<u8>>, Option<u16>);
+
+impl OutboundRegistration {
+    fn activate(&self) {
+        if let Ok(mut current) = WS_OUTBOUND_TX.lock() {
+            *current = Some(self.0.clone());
+        }
+    }
+}
+
+impl Drop for OutboundRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut current) = WS_OUTBOUND_TX.lock() {
+            if current.as_ref().is_some_and(|tx| tx.same_channel(&self.0)) {
+                *current = None;
+            }
+        }
+        if let Ok(mut pending) = SYNC_REQUESTS.lock() {
+            let ids: Vec<_> = pending
+                .iter()
+                .filter(|(_, request)| request.connection.same_channel(&self.0))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in ids {
+                if let Some(request) = pending.remove(&id) {
+                    // Disconnect notification is best-effort when the caller was cancelled.
+                    // A close code and byte count are useful without exposing the wire body/reason.
+                    let code = self.1.map_or_else(
+                        || "không có mã đóng".into(),
+                        |code| format!("mã đóng {code}"),
+                    );
+                    let _ = request.reply.send(Err(format!(
+                        "WebSocket đã ngắt trong lúc đồng bộ ({code}; yêu cầu {} byte)",
+                        request.frame_bytes
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// Whether an authenticated WebSocket can currently accept outgoing frames.
+pub fn has_authenticated_connection() -> bool {
+    WS_OUTBOUND_TX
+        .lock()
+        .ok()
+        .is_some_and(|current| current.as_ref().is_some_and(|tx| !tx.is_closed()))
+}
 
 /// Send a raw encoded frame over the active `zpw_ws` WebSocket if connected.
 pub fn send_ws_frame(cmd: u16, sub_cmd: u8, version: u8, data: Option<&Value>) -> bool {
@@ -208,7 +383,11 @@ fn inflate(buf: &[u8]) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         match make(buf).read_to_end(&mut out) {
             Ok(_) if !out.is_empty() => {
-                trace(format!("inflate ok via {name}: {} -> {} bytes", buf.len(), out.len()));
+                trace(format!(
+                    "inflate ok via {name}: {} -> {} bytes",
+                    buf.len(),
+                    out.len()
+                ));
                 return Ok(out);
             }
             Ok(_) => last_err = Some(anyhow!("{name}: empty output")),
@@ -347,7 +526,10 @@ fn build_url(sess: &Session, endpoint_idx: usize) -> String {
 fn queues_from_auth(auth: &Value) -> Vec<(u16, u8)> {
     let mut out: Vec<(u16, u8)> = Vec::new();
     for key in ["ctrl_qCmds", "qCmds"] {
-        if let Some(arr) = auth.pointer(&format!("/data/{key}")).and_then(|v| v.as_array()) {
+        if let Some(arr) = auth
+            .pointer(&format!("/data/{key}"))
+            .and_then(|v| v.as_array())
+        {
             for q in arr {
                 let cmd = q.get("cmd").and_then(|v| v.as_u64());
                 let sub = q.get("subCmd").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -378,13 +560,7 @@ fn pull_frame(cmd: u16, sub_cmd: u8, req_id: &str) -> Vec<u8> {
     encode_frame(cmd, sub_cmd, 1, Some(&data))
 }
 
-fn pull_next_frame(
-    cmd: u16,
-    sub_cmd: u8,
-    req_id: &str,
-    last_id: Value,
-    pre_ids: Value,
-) -> Vec<u8> {
+fn pull_next_frame(cmd: u16, sub_cmd: u8, req_id: &str, last_id: Value, pre_ids: Value) -> Vec<u8> {
     let data = json!({
         "first": false,
         "reqId": req_id,
@@ -462,9 +638,7 @@ async fn run_once(
     ping.tick().await; // consume the immediate first tick
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    if let Ok(mut g) = WS_OUTBOUND_TX.lock() {
-        *g = Some(out_tx);
-    }
+    let mut outbound = OutboundRegistration(out_tx, None);
     loop {
         tokio::select! {
             _ = ping.tick() => {
@@ -496,7 +670,10 @@ async fn run_once(
                         ws.send(Message::Pong(p)).await?;
                         continue;
                     }
-                    Message::Close(c) => return Ok(format!("close {c:?}")),
+                    Message::Close(c) => {
+                        outbound.1 = c.as_ref().map(|frame| u16::from(frame.code));
+                        return Ok(format!("close {c:?}"));
+                    }
                     _ => continue,
                 };
 
@@ -531,6 +708,7 @@ async fn run_once(
                         return Err(anyhow!("auth rejected: {text}"));
                     }
                     authed = true;
+                    outbound.activate();
                     let _ = tx.send(WsEvent { cmd, sub_cmd, version, payload: auth.clone() });
 
                     for (qcmd, qsub) in queues_from_auth(&auth) {
@@ -553,6 +731,9 @@ async fn run_once(
                         None => envelope.clone(),
                     }
                 };
+                if matches!(cmd, CMD_SYNC_REQUEST | CMD_SYNC_ACK_DELETE | CMD_SYNC_MOBILE_WAKE_UP) {
+                    complete_sync_request(cmd, &payload);
+                }
                 if cmd == CMD_HAS_MSG {
                     if let (Some(qid), Some(ids)) = (
                         payload.pointer("/data/queueId").cloned(),
@@ -650,5 +831,133 @@ mod tests {
     fn gcm_rejects_short_blob() {
         let err = gcm_decrypt(&[0u8; 32], &[0u8; 16]).unwrap_err().to_string();
         assert!(err.contains("too short"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod outbound_registration_tests {
+    use super::*;
+    static TRANSPORT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn only_authenticated_live_connection_accepts_outbound_frames() {
+        let _serial = TRANSPORT_TEST_LOCK.lock().await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let first = OutboundRegistration(sender, None);
+        assert!(!send_mobile_wakeup("test-sync"));
+        first.activate();
+        assert!(send_mobile_wakeup("test-sync"));
+        assert!(receiver.try_recv().is_ok());
+        let (new_sender, mut new_receiver) = mpsc::unbounded_channel();
+        let next = OutboundRegistration(new_sender, None);
+        next.activate();
+        drop(first);
+        assert!(send_mobile_wakeup("test-sync"));
+        assert!(new_receiver.try_recv().is_ok());
+        drop(next);
+        assert!(!send_mobile_wakeup("test-sync"));
+    }
+
+    #[tokio::test]
+    async fn request_waits_for_matching_server_result_and_preserves_rejection() {
+        let _serial = TRANSPORT_TEST_LOCK.lock().await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let connection = OutboundRegistration(sender, None);
+        connection.activate();
+        let payload = json!({"syncId":"test-sync","syncType":0});
+        let request = tokio::spawn(request_sync_frame(
+            CMD_SYNC_REQUEST,
+            json!({"data":payload.clone()}),
+            Duration::from_secs(1),
+        ));
+        let frame = receiver.recv().await.unwrap();
+        let (_, cmd, sub_cmd, body) = decode_frame(&frame).unwrap();
+        assert_eq!((cmd, sub_cmd), (590, 0));
+        assert_eq!(body["data"], payload);
+        let id = body["reqId"].as_str().unwrap();
+        let reply = json!({"error_code":211,"data":{"reqId":id}});
+        assert!(!complete_sync_request(CMD_SYNC_MOBILE_WAKE_UP, &reply));
+        assert!(!complete_sync_request(
+            CMD_SYNC_REQUEST,
+            &json!({"error_code":0,"data":{"reqId":"wrong-request"}})
+        ));
+        assert!(complete_sync_request(CMD_SYNC_REQUEST, &reply));
+        assert_eq!(request.await.unwrap().unwrap()["error_code"], 211);
+        assert!(SYNC_REQUESTS.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeout_and_disconnect_remove_pending_requests() {
+        let _serial = TRANSPORT_TEST_LOCK.lock().await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut connection = OutboundRegistration(sender, None);
+        connection.activate();
+        let request = tokio::spawn(request_sync_frame(
+            CMD_SYNC_REQUEST,
+            json!({"data":{}}),
+            Duration::from_millis(10),
+        ));
+        receiver.recv().await.unwrap();
+        let timeout_error = request.await.unwrap().unwrap_err();
+        assert!(timeout_error.is::<SyncRequestUnconfirmed>());
+        assert!(SYNC_REQUESTS.lock().unwrap().is_empty());
+        let request = tokio::spawn(request_sync_frame(
+            CMD_SYNC_REQUEST,
+            json!({"data":{"private_fixture":"not-for-diagnostics"}}),
+            Duration::from_secs(10),
+        ));
+        let sent_bytes = receiver.recv().await.unwrap().len();
+        connection.1 = Some(3002);
+        drop(connection);
+        let disconnect_error = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(disconnect_error.is::<SyncRequestUnconfirmed>());
+        assert!(disconnect_error.to_string().contains("mã đóng 3002"));
+        assert!(disconnect_error
+            .to_string()
+            .contains(&format!("{sent_bytes} byte")));
+        assert!(!disconnect_error.to_string().contains("not-for-diagnostics"));
+        assert!(SYNC_REQUESTS.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_cleans_up_without_a_server_reply() {
+        let _serial = TRANSPORT_TEST_LOCK.lock().await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let connection = OutboundRegistration(sender, None);
+        connection.activate();
+        let request = tokio::spawn(request_sync_frame(
+            CMD_SYNC_REQUEST,
+            json!({"data":{}}),
+            Duration::from_secs(10),
+        ));
+        receiver.recv().await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(SYNC_REQUESTS.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unencrypted_json_envelope_can_resolve_the_request() {
+        let _serial = TRANSPORT_TEST_LOCK.lock().await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let connection = OutboundRegistration(sender, None);
+        connection.activate();
+        let request = tokio::spawn(request_sync_frame(
+            CMD_SYNC_REQUEST,
+            json!({"data":{}}),
+            Duration::from_secs(1),
+        ));
+        let frame = receiver.recv().await.unwrap();
+        let (_, _, _, body) = decode_frame(&frame).unwrap();
+        let reply = json!({"error_code":0,"data":{"reqId":body["reqId"]}});
+        assert!(complete_sync_request(
+            CMD_SYNC_REQUEST,
+            &json!({"encrypt":0,"data":reply.to_string()})
+        ));
+        assert_eq!(request.await.unwrap().unwrap()["error_code"], 0);
     }
 }

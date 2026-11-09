@@ -108,6 +108,51 @@ pub fn cached_media_devices() -> Option<(Vec<String>, Vec<String>)> {
 }
 
 /// Return cached `(mic_devices, camera_devices)` or enumerate once (with `refresh=true` to rescan).
+/// The bundled `VideoBridge` helper (AVFoundation + VideoToolbox), which replaces ffmpeg for
+/// camera capture and H.264 decoding on macOS. `None` elsewhere or in a build without it.
+pub fn video_bridge() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        static BRIDGE: std::sync::LazyLock<Option<std::path::PathBuf>> =
+            std::sync::LazyLock::new(|| {
+                let exe = std::env::current_exe().ok()?;
+                let packaged = exe.parent()?.parent()?.join("Helpers/VideoBridge");
+                if packaged.is_file() {
+                    return Some(packaged);
+                }
+                let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("native/macos/build/VideoBridge");
+                dev.is_file().then_some(dev)
+            });
+        BRIDGE.clone()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Whether video calls can capture and decode video on this machine.
+pub fn video_calls_available() -> bool {
+    video_bridge().is_some() || is_ffmpeg_available()
+}
+
+/// Video pipe process: `VideoBridge <bridge_args>` when bundled, otherwise ffmpeg with `ffmpeg_args`.
+fn video_command(bridge_args: &[&str], ffmpeg_args: &[&str]) -> std::process::Command {
+    match video_bridge() {
+        Some(bridge) => {
+            let mut cmd = std::process::Command::new(bridge);
+            cmd.args(bridge_args);
+            cmd
+        }
+        None => {
+            let mut cmd = std::process::Command::new("ffmpeg");
+            cmd.args(ffmpeg_args);
+            cmd
+        }
+    }
+}
+
 pub fn list_media_devices(refresh: bool) -> (Vec<String>, Vec<String>) {
     if !refresh {
         if let Ok(g) = CACHED_DEVICES.lock() {
@@ -198,6 +243,19 @@ fn enumerate_ffmpeg_cameras() -> Vec<String> {
     }
     #[cfg(target_os = "macos")]
     {
+        if let Some(bridge) = video_bridge() {
+            if let Ok(out) = std::process::Command::new(bridge).arg("list").output() {
+                let cams: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty() && !is_ignored_virtual_or_ir_device(n))
+                    .map(str::to_string)
+                    .collect();
+                if !cams.is_empty() {
+                    return cams;
+                }
+            }
+        }
         let mut cmd = std::process::Command::new("ffmpeg");
         cmd.args([
             "-hide_banner",
@@ -1015,7 +1073,7 @@ fn spawn_camera_capture_thread(
                 continue;
             }
 
-            if !is_ffmpeg_available() {
+            if !video_calls_available() {
                 if !warned_missing {
                     warned_missing = true;
                     crate::voip_log::line(
@@ -1069,6 +1127,29 @@ fn spawn_camera_capture_thread(
                 current_dev = desired.clone();
                 stream_acc.clear();
 
+                #[cfg(target_os = "macos")]
+                if let Some(bridge) = video_bridge() {
+                    let mut cmd = Command::new(bridge);
+                    cmd.args(["capture", &current_dev, "320", "240", "15", "260000"])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null());
+                    match cmd.spawn() {
+                        Ok(c) => {
+                            crate::voip_log::line(
+                                "VCAM",
+                                format!("started VideoBridge capture: {current_dev}"),
+                            );
+                            let _ = want_keyframe.swap(false, Ordering::Relaxed);
+                            child_opt = Some(c);
+                        }
+                        Err(e) => {
+                            crate::voip_log::line("VCAM", format!("VideoBridge spawn failed: {e}"));
+                            thread::sleep(Duration::from_millis(500));
+                        }
+                    }
+                    continue;
+                }
                 let mut cmd = Command::new("ffmpeg");
                 cmd.args(["-hide_banner", "-loglevel", "error"]);
                 #[cfg(target_os = "windows")]
@@ -1205,7 +1286,11 @@ fn find_aud_delimiter(buf: &[u8], start_from: usize) -> Option<usize> {
         return None;
     }
     (start_from..=buf.len() - 6).find(|&i| {
-        buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1 && (buf[i + 4] & 0x1F) == 9
+        buf[i] == 0
+            && buf[i + 1] == 0
+            && buf[i + 2] == 0
+            && buf[i + 3] == 1
+            && (buf[i + 4] & 0x1F) == 9
     })
 }
 
@@ -1224,38 +1309,40 @@ fn run_local_preview_decoder(
     egui_ctx: eframe::egui::Context,
 ) {
     use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     const PREV_W: usize = 240;
     const PREV_H: usize = 180;
     const PREV_BYTES: usize = PREV_W * PREV_H * 4;
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args([
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-flags",
-        "low_delay",
-        "-probesize",
-        "32",
-        "-analyzeduration",
-        "0",
-        "-f",
-        "h264",
-        "-i",
-        "pipe:0",
-        "-vf",
-        "scale=240:180:force_original_aspect_ratio=decrease,pad=240:180:(ow-iw)/2:(oh-ih)/2",
-        "-pix_fmt",
-        "rgba",
-        "-f",
-        "rawvideo",
-        "pipe:1",
-    ])
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null());
+    let mut cmd = video_command(
+        &["decode", "240", "180"],
+        &[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-flags",
+            "low_delay",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            "-f",
+            "h264",
+            "-i",
+            "pipe:0",
+            "-vf",
+            "scale=240:180:force_original_aspect_ratio=decrease,pad=240:180:(ow-iw)/2:(oh-ih)/2",
+            "-pix_fmt",
+            "rgba",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ],
+    );
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
 
     #[cfg(target_os = "windows")]
     {
@@ -2389,14 +2476,15 @@ fn run_h264_ffmpeg_decoder(
     tex_key: String,
 ) {
     use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     const VID_W: usize = 640;
     const VID_H: usize = 480;
     const FRAME_BYTES: usize = VID_W * VID_H * 4;
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args([
+    let mut cmd = video_command(
+        &["decode", "640", "480"],
+        &[
         "-hide_banner",
         "-loglevel",
         "error",
@@ -2423,10 +2511,10 @@ fn run_h264_ffmpeg_decoder(
         "-f",
         "rawvideo",
         "pipe:1",
-    ])
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+    ]);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     #[cfg(target_os = "windows")]
     {
@@ -2441,7 +2529,14 @@ fn run_h264_ffmpeg_decoder(
             return;
         }
     };
-    crate::voip_log::line("VDEC", "ffmpeg decoder started");
+    crate::voip_log::line(
+        "VDEC",
+        if video_bridge().is_some() {
+            "VideoBridge decoder started"
+        } else {
+            "ffmpeg decoder started"
+        },
+    );
     let Some(mut stdin) = child.stdin.take() else {
         let _ = child.kill();
         return;

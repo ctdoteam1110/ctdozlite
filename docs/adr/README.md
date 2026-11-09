@@ -38,7 +38,8 @@ What we will do, in one paragraph, present tense.
 | [0001](0001-history-sync.md) | History sync | accepted |
 | [0002](0002-self-updater.md) | Self-updater contract | accepted |
 | [0003](0003-changelog-policy.md) | Changelog policy | accepted |
-| [0004](0004-apple-silicon-fork-release.md) | Apple Silicon fork distribution and update channel | proposed |
-| [0005](0005-constant-time-rsa-for-phone-sync.md) | Constant-time RSA for phone-sync key unwrapping | proposed |
+| [0004](0004-apple-silicon-fork-release.md) | Apple Silicon fork distribution and update channel | accepted |
+| [0005](0005-constant-time-rsa-for-phone-sync.md) | Constant-time RSA for phone-sync key unwrapping | accepted |
+| [0006](0006-acknowledged-phone-sync.md) | Acknowledged, session-scoped phone sync | accepted, experimental |
 
 Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).

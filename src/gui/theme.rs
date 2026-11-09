@@ -1195,6 +1195,98 @@ pub(super) fn render_toggle_switch(
 
 static CJK_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The app's icon set. Phosphor fonts are built by `packaging/icons/build-phosphor-fonts.py`
+/// at the same code points as Lucide, so call sites never change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IconStyle {
+    Lucide,
+    Phosphor,
+    PhosphorBold,
+    PhosphorFill,
+}
+
+static ICON_STYLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+impl IconStyle {
+    pub(super) const ALL: [IconStyle; 4] = [
+        IconStyle::Phosphor,
+        IconStyle::PhosphorBold,
+        IconStyle::PhosphorFill,
+        IconStyle::Lucide,
+    ];
+
+    /// Settings value (`AppSettings::icon_style`).
+    pub(super) fn key(self) -> &'static str {
+        match self {
+            IconStyle::Lucide => "lucide",
+            IconStyle::Phosphor => "phosphor",
+            IconStyle::PhosphorBold => "phosphor-bold",
+            IconStyle::PhosphorFill => "phosphor-fill",
+        }
+    }
+
+    pub(super) fn from_key(key: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|s| s.key() == key)
+            .unwrap_or(IconStyle::Phosphor)
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            IconStyle::Lucide => "Nét mảnh",
+            IconStyle::Phosphor => "Bo tròn",
+            IconStyle::PhosphorBold => "Đậm",
+            IconStyle::PhosphorFill => "Đặc",
+        }
+    }
+
+    pub(super) fn family_name(self) -> &'static str {
+        match self {
+            IconStyle::Lucide => "icons_lucide",
+            IconStyle::Phosphor => "icons_phosphor",
+            IconStyle::PhosphorBold => "icons_phosphor_bold",
+            IconStyle::PhosphorFill => "icons_phosphor_fill",
+        }
+    }
+
+    fn font_bytes(self) -> &'static [u8] {
+        match self {
+            IconStyle::Lucide => include_bytes!("../assets/fonts/lucide.ttf"),
+            IconStyle::Phosphor => include_bytes!("../assets/fonts/phosphor-regular.ttf"),
+            IconStyle::PhosphorBold => include_bytes!("../assets/fonts/phosphor-bold.ttf"),
+            IconStyle::PhosphorFill => include_bytes!("../assets/fonts/phosphor-fill.ttf"),
+        }
+    }
+
+    fn current() -> Self {
+        let i = ICON_STYLE.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        [
+            IconStyle::Lucide,
+            IconStyle::Phosphor,
+            IconStyle::PhosphorBold,
+            IconStyle::PhosphorFill,
+        ]
+        .get(i)
+        .copied()
+        .unwrap_or(IconStyle::Phosphor)
+    }
+}
+
+/// Switch the icon set and rebuild the fonts (cheap: the icon fonts are embedded).
+pub(super) fn set_icon_style(ctx: &egui::Context, style: IconStyle) {
+    use std::sync::atomic::Ordering;
+    let idx = match style {
+        IconStyle::Lucide => 0,
+        IconStyle::Phosphor => 1,
+        IconStyle::PhosphorBold => 2,
+        IconStyle::PhosphorFill => 3,
+    };
+    if ICON_STYLE.swap(idx, Ordering::Relaxed) != idx {
+        build_fonts(ctx, CJK_LOADED.load(Ordering::Relaxed));
+    }
+}
+
 pub(crate) fn is_cjk(c: char) -> bool {
     matches!(c as u32,
         0x1100..=0x11FF | 0x3040..=0x30FF | 0x3130..=0x318F | 0x3400..=0x4DBF
@@ -1219,12 +1311,22 @@ pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
 fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // 1. Embed official Lucide Icon Font (vector glyphs for all UI icons)
-    const LUCIDE_BYTES: &[u8] = include_bytes!("../assets/fonts/lucide.ttf");
+    // 1. Icon font. Every set answers to the Lucide code points in `lucide`, so the chosen set
+    //    is loaded as "lucide_font"; each set is also its own family for the settings preview.
+    let style = IconStyle::current();
     fonts.font_data.insert(
         "lucide_font".to_owned(),
-        egui::FontData::from_static(LUCIDE_BYTES),
+        egui::FontData::from_static(style.font_bytes()),
     );
+    for set in IconStyle::ALL {
+        let key = set.family_name().to_owned();
+        fonts
+            .font_data
+            .insert(key.clone(), egui::FontData::from_static(set.font_bytes()));
+        fonts
+            .families
+            .insert(egui::FontFamily::Name(key.clone().into()), vec![key]);
+    }
 
     // Keep Vietnamese coverage available when the preferred system font lacks a glyph.
     const BUNDLED_SANS: &[u8] = include_bytes!("../assets/fonts/BeVietnamPro-Regular.ttf");
@@ -1326,6 +1428,41 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_icon_set_has_every_lucide_code_point() {
+        let consts = [
+            lucide::SEARCH,
+            lucide::PHONE,
+            lucide::VIDEO,
+            lucide::PANEL_RIGHT,
+            lucide::SETTINGS,
+            lucide::SEND,
+            lucide::NEWSPAPER,
+            lucide::USER,
+            lucide::CHEVRON_DOWN,
+            lucide::STICKER,
+        ];
+        let ctx = egui::Context::default();
+        build_fonts(&ctx, false);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        for set in IconStyle::ALL {
+            let font = FontId::new(14.0, egui::FontFamily::Name(set.family_name().into()));
+            for c in consts {
+                let ch = c.chars().next().unwrap();
+                assert!(
+                    ctx.fonts(|f| f.has_glyph(&font, ch)),
+                    "{set:?} lacks {:x}",
+                    ch as u32
+                );
+            }
+        }
+        assert_eq!(
+            IconStyle::from_key("phosphor-fill"),
+            IconStyle::PhosphorFill
+        );
+        assert_eq!(IconStyle::from_key("unknown"), IconStyle::Phosphor);
+    }
 
     #[test]
     fn rounded_sidebar_when_outer_margin_is_present_fits_panel_clip() {

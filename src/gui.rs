@@ -244,6 +244,12 @@ pub enum GuiEvent {
         progress: f32,
         status: String,
     },
+    BackgroundHistoryFinished {
+        added: usize,
+        active_threads: usize,
+        error: Option<String>,
+        yielded: bool,
+    },
     PhoneSyncFinished {
         threads: Vec<Thread>,
         added: usize,
@@ -272,9 +278,23 @@ fn phone_sync_completion_message(
     active_threads: usize,
     cancelled: bool,
     error: Option<&str>,
+    phone_status: Option<&str>,
 ) -> String {
     if let Some(err) = error {
         return format!("⚠️ Đồng bộ thất bại: {err}");
+    }
+    if cancelled {
+        if let Some(note) = phone_status.filter(|note| note.starts_with("Đã dừng")) {
+            return note.to_string();
+        }
+        if let Some(note) = phone_status.filter(|note| note.contains("thành công")) {
+            return format!("Đã dừng yêu cầu. {note}");
+        }
+    }
+    if !cancelled {
+        if let Some(note) = phone_status.filter(|note| note.contains("thành công")) {
+            return format!("{note}. Cloud/Nhóm: {added} tin mới ({active_threads} hội thoại).");
+        }
     }
     let prefix = if cancelled {
         "Đã dừng"
@@ -401,6 +421,8 @@ struct AppSettings {
     use_avatar_as_wallpaper: bool,
     /// Liquid Glass: translucent UI over macOS vibrancy (blurred desktop).
     liquid_glass: bool,
+    /// Icon set: "phosphor" | "phosphor-bold" | "phosphor-fill" | "lucide" (`theme::IconStyle`).
+    icon_style: String,
     /// Whole-window wallpaper copied into the data dir (empty = none).
     app_background: String,
     /// UI zoom. egui sizes fonts by line height (ascent−descent), so the same point size reads
@@ -476,6 +498,7 @@ impl Default for AppSettings {
             theme_mode: "dark".into(),
             use_avatar_as_wallpaper: false,
             liquid_glass: cfg!(target_os = "macos"),
+            icon_style: "phosphor".into(),
             app_background: String::new(),
             ui_scale: if cfg!(target_os = "macos") { 1.18 } else { 1.0 },
             enable_notifications: true,
@@ -760,6 +783,8 @@ pub struct ZaloGuiApp {
     scheduled_items: Vec<crate::scheduler::ScheduledMessage>,
     phone_sync_progress: f32,
     phone_sync_status: String,
+    /// Limit an explicit phone sync to the currently open conversation.
+    phone_sync_current_only: bool,
     last_typing_sent_at: Option<(String, std::time::Instant)>,
     last_synced_icon_unread: Option<usize>,
 
@@ -778,6 +803,9 @@ pub struct ZaloGuiApp {
     selection_fill_saved: Option<Color32>,
     history_reached_start: HashSet<String>,
     force_scroll_to_bottom: bool,
+    /// Until this time (egui seconds) the open chat stays pinned to its newest message while
+    /// images and previews finish loading, unless the user scrolls first.
+    pin_chat_bottom_until: f64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1287,6 +1315,10 @@ impl ZaloGuiApp {
     ) -> Self {
         setup_custom_fonts(&cc.egui_ctx);
         let mut loaded_settings = AppSettings::load();
+        theme::set_icon_style(
+            &cc.egui_ctx,
+            theme::IconStyle::from_key(&loaded_settings.icon_style),
+        );
         if let Ok(mut map) = downloaded_store().write() {
             *map = loaded_settings.downloaded_files.clone();
         }
@@ -1544,6 +1576,7 @@ impl ZaloGuiApp {
                 .unwrap_or_default(),
             phone_sync_progress: 0.0,
             phone_sync_status: String::new(),
+            phone_sync_current_only: false,
             last_typing_sent_at: None,
             last_synced_icon_unread: None,
             event_rx: rx,
@@ -1555,7 +1588,8 @@ impl ZaloGuiApp {
             ime_enter_commit: false,
             selection_fill_saved: None,
             history_reached_start: HashSet::new(),
-            force_scroll_to_bottom: false,
+            force_scroll_to_bottom: true,
+            pin_chat_bottom_until: f64::INFINITY,
         };
         let mut app = app;
         let _ = app.reload_custom_sticker_packs();
@@ -2707,6 +2741,24 @@ impl ZaloGuiApp {
                     self.phone_sync_status = status.clone();
                     self.status_msg = status;
                 }
+                GuiEvent::BackgroundHistoryFinished {
+                    added,
+                    active_threads,
+                    error,
+                    yielded,
+                } => {
+                    // A startup refresh must never replace the phone transfer's status or result.
+                    if !yielded
+                        && !crate::history_sync::PHONE_SYNC_RUNNING
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        self.status_msg = if let Some(error) = error {
+                            format!("Không thể làm mới lịch sử máy chủ: {error}")
+                        } else {
+                            format!("Đã làm mới Cloud/Nhóm: {added} tin cập nhật ({active_threads} hội thoại)")
+                        };
+                    }
+                }
                 GuiEvent::PhoneSyncFinished {
                     threads,
                     added,
@@ -2738,6 +2790,7 @@ impl ZaloGuiApp {
                         active_threads,
                         cancelled,
                         error.as_deref(),
+                        crate::history_sync::last_mobile_sync_status().as_deref(),
                     );
                     self.phone_sync_status = msg.clone();
                     self.status_msg = msg.clone();
@@ -4322,15 +4375,37 @@ mod tests {
 
     #[test]
     fn phone_sync_completion_does_not_claim_phone_messages_were_imported() {
-        let none = phone_sync_completion_message(0, 0, false, None);
+        let none = phone_sync_completion_message(0, 0, false, None, None);
         assert!(none.contains("Lịch sử điện thoại chưa được tải vào ứng dụng"));
         assert!(none.contains("0 tin mới từ Cloud/Nhóm"));
 
-        let cloud = phone_sync_completion_message(12, 3, false, None);
+        let cloud = phone_sync_completion_message(12, 3, false, None, None);
         assert!(cloud.contains("12 tin mới từ Cloud/Nhóm (3 hội thoại)"));
         assert!(cloud.contains("Lịch sử điện thoại chưa được tải vào ứng dụng"));
 
-        let failed = phone_sync_completion_message(0, 0, false, Some("network"));
+        let failed = phone_sync_completion_message(0, 0, false, Some("network"), None);
         assert!(failed.contains("Đồng bộ thất bại: network"));
+    }
+
+    #[test]
+    fn completed_phone_import_reports_phone_and_cloud_counts_separately() {
+        let result = phone_sync_completion_message(
+            2,
+            1,
+            false,
+            None,
+            Some("Đã giải mã & đồng bộ thành công 7 tin nhắn từ điện thoại"),
+        );
+        assert!(result.contains("7 tin nhắn từ điện thoại"));
+        assert!(result.contains("Cloud/Nhóm: 2 tin mới"));
+        assert!(!result.contains("chưa được tải"));
+    }
+
+    #[test]
+    fn cancelled_phone_import_does_not_claim_committed_history_was_never_loaded() {
+        let note = "Đã dừng đồng bộ điện thoại; dữ liệu đã nhập được giữ lại";
+        let result = phone_sync_completion_message(0, 0, true, None, Some(note));
+        assert_eq!(result, note);
+        assert!(!result.contains("chưa được tải"));
     }
 }

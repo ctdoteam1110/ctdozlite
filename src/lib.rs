@@ -6,6 +6,8 @@ pub mod clock;
 pub mod crypto;
 pub mod endpoints;
 pub mod feed;
+/// Quick Look thumbnails for file attachments.
+pub mod file_preview;
 pub mod gui;
 pub mod history_sync;
 pub mod logger;

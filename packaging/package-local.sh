@@ -44,7 +44,7 @@ if [[ "$OS_NAME" == "Darwin" ]]; then
 
   # Phone sync v2 helper (run with the user's Node.js; loads libzproto from their Zalo PC install).
   cp sync_v2_helper.js zproto_lib.js "$STAGE_DIR/ctdozlite.app/Contents/Resources/"
-  cp LICENSE-MIT LICENSE-APACHE src/assets/fonts/BeVietnamPro-OFL.txt "$STAGE_DIR/ctdozlite.app/Contents/Resources/ThirdPartyLicenses/"
+  cp LICENSE-MIT LICENSE-APACHE src/assets/fonts/BeVietnamPro-OFL.txt src/assets/fonts/Phosphor-LICENSE.txt "$STAGE_DIR/ctdozlite.app/Contents/Resources/ThirdPartyLicenses/"
   # AWS-LC (constant-time RSA, ADR-0005) is linked into the binary: ship its notices verbatim,
   # taken from the exact locked crate sources.
   python3 - "$STAGE_DIR/ctdozlite.app/Contents/Resources/ThirdPartyLicenses" <<'PY'
@@ -81,11 +81,21 @@ PY
   mkdir -p "$STAGE_DIR/ctdozlite.app/Contents/Helpers/DailyNotifier.app/Contents/Resources"
   cp "$STAGE_DIR/ctdozlite.app/Contents/Resources/AppIcon.icns" "$STAGE_DIR/ctdozlite.app/Contents/Helpers/DailyNotifier.app/Contents/Resources/AppIcon.icns"
   plutil -replace CFBundleIconFile -string AppIcon "$STAGE_DIR/ctdozlite.app/Contents/Helpers/DailyNotifier.app/Contents/Info.plist"
+  # Notification Center caches a sender's icon per bundle version; a new build number makes it
+  # pick up the current app icon instead of the one from the first install.
+  plutil -replace CFBundleVersion -string "$(date +%Y%m%d%H%M%S)" "$STAGE_DIR/ctdozlite.app/Contents/Helpers/DailyNotifier.app/Contents/Info.plist"
   rm -rf "$ICONSET_DIR"
 
   xattr -cr "$STAGE_DIR/ctdozlite.app" || true
   codesign --force --sign - "$STAGE_DIR/ctdozlite.app/Contents/Helpers/DailyNotifier.app"
   codesign --force --deep --sign - "$STAGE_DIR/ctdozlite.app"
+  # Local installs only: an ad-hoc signature's identity is its cdhash, so every rebuild looks
+  # like a new app to macOS privacy controls and camera/microphone access is asked again.
+  # Signing with a stable local identity keeps the grant. Public builds leave this unset.
+  if [[ -n "${CTDOZLITE_CODESIGN_IDENTITY:-}" ]]; then
+    codesign --force --sign "$CTDOZLITE_CODESIGN_IDENTITY" "$STAGE_DIR/ctdozlite.app/Contents/Helpers/DailyNotifier.app"
+    codesign --force --deep --sign "$CTDOZLITE_CODESIGN_IDENTITY" "$STAGE_DIR/ctdozlite.app"
+  fi
   codesign --verify --deep --strict "$STAGE_DIR/ctdozlite.app"
   ln -s /Applications "$STAGE_DIR/Applications"
 

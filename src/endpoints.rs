@@ -54,3 +54,35 @@ pub fn service(key: &str) -> Option<&'static str> {
         .find(|(k, _)| *k == key)
         .map(|(_, v)| *v)
 }
+/// Whether a host belongs to the authenticated Zalo API service family.
+pub fn is_zalo_api_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    ["zalo.me", "zaloapp.com"]
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+}
+
+/// Whether a host is an approved Zalo API or signed-download CDN host.
+pub fn is_zalo_download_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    is_zalo_api_host(&host) || host == "zdn.vn" || host.ends_with(".zdn.vn")
+}
+
+#[cfg(test)]
+mod download_host_tests {
+    use super::*;
+    #[test]
+    fn host_checks_require_exact_domain_boundary() {
+        assert!(is_zalo_api_host("file.zalo.me"));
+        assert!(is_zalo_download_host("PHOTO.ZDN.VN"));
+        assert!(!is_zalo_api_host("photo.zdn.vn"));
+        for host in [
+            "evilzalo.me",
+            "zalo.me.evil.test",
+            "evilzdn.vn",
+            "zdn.vn.evil.test",
+        ] {
+            assert!(!is_zalo_download_host(host)); // (INV-2)
+        }
+    }
+}

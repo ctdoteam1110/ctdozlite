@@ -11,6 +11,7 @@ case "$HELPER" in
     DailyMediaViewer) FRAMEWORKS=(-framework AppKit -framework AVKit -framework AVFoundation -framework ImageIO -framework UniformTypeIdentifiers); DEST=Resources ;;
     DailyNotifier) FRAMEWORKS=(-framework AppKit -framework UserNotifications); DEST=Helpers/DailyNotifier.app/Contents/MacOS ;;
     HistoryCodec) FRAMEWORKS=(-framework JavaScriptCore -framework Security -lz); DEST=Helpers ;;
+    VideoBridge) FRAMEWORKS=(-framework AVFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework Accelerate); DEST=Helpers ;;
     *) printf 'Unknown helper: %s\n' "$HELPER" >&2; exit 2 ;;
 esac
 mkdir -p "$OUT"

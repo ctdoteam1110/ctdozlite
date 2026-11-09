@@ -94,3 +94,4 @@ Thumbs.db
 .serena/
 output/
 phone_sync_types.json
+phone_sync_request_status.json

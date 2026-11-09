@@ -28,6 +28,8 @@ Ubiquitous language for `ctdozlite`. Use these terms verbatim in issues, ADRs, t
 
 | Term | Definition | Avoid |
 | :--- | :--- | :--- |
+| **Global ID** | Opaque server-issued `globalId` used across clients for phone sync; translate it back to account-local user IDs before storage. | Substituting a Thread ID or parsing it as a decimal number. |
+| **Phone partition** | SyncFull scope `oneone/<globalId>` or `group/<globalId>`, mapped back to its original Thread. | A bare desktop conversation ID. |
 | **Thread** | A conversation: 1:1 user thread or group thread. Identified by `thread_id`. | "chat", "conversation" (when the ID matters) |
 | **Message** | One chat entry with `msg_id`, `thread_id`, sender, timestamp, type and raw JSON. | "text" |
 | **Local message ID** | Client-generated ID used to reconcile optimistic UI rows with server echoes. | "temp id" |

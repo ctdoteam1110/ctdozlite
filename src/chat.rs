@@ -2,7 +2,7 @@
 //!
 //! Notes: `re-notes/02_chat_data.md`.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::session::{obj, Session};
@@ -69,6 +69,155 @@ pub struct ChatMessage {
     pub history_source: Option<Value>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub resolved_mention_uids: std::collections::BTreeMap<String, String>,
+    /// Further articles of an Official Account broadcast (`chat.list.action`); the first
+    /// article lives in the `link_*` fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub oa_items: Vec<OaItem>,
+}
+
+/// One article of an Official Account broadcast (`chat.list.action`, Zalo's `MSG_OA`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OaItem {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub desc: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub href: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thumb: String,
+}
+
+/// Label stored in `link_src` for Official Account broadcasts.
+pub const OA_LINK_SRC: &str = "Zalo OA";
+
+/// Articles of a `chat.list.action` payload, as Zalo PC's `getDetailedOAMessage` reads them:
+/// a list of `{title, description, href, thumb}`. The list may arrive as the content itself, as a
+/// JSON string, or nested (up to three levels) inside the content object, e.g. in `params`.
+/// A bare object with its own title/thumbnail is a single article.
+pub fn extract_oa_items(v: &Value) -> Vec<OaItem> {
+    fn decoded(v: &Value) -> Option<Value> {
+        let t = v.as_str()?.trim();
+        if t.starts_with('[') || t.starts_with('{') {
+            serde_json::from_str::<Value>(t).ok()
+        } else {
+            None
+        }
+    }
+    fn text(o: &Value, keys: &[&str]) -> String {
+        keys.iter()
+            .find_map(|k| o.get(*k).and_then(Value::as_str))
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
+    }
+    fn web(o: &Value, keys: &[&str]) -> String {
+        let u = text(o, keys);
+        if u.starts_with("https://") || u.starts_with("http://") {
+            u
+        } else {
+            String::new()
+        }
+    }
+    fn item(o: &Value) -> Option<OaItem> {
+        if !o.is_object() {
+            return None;
+        }
+        let it = OaItem {
+            title: text(o, &["title"]),
+            desc: text(o, &["description", "desc"]),
+            href: web(o, &["href", "url", "link"]),
+            thumb: web(o, &["thumb", "thumbUrl", "image", "imageUrl"]),
+        };
+        (!it.title.is_empty() || !it.thumb.is_empty()).then_some(it)
+    }
+    fn list(v: &Value, depth: usize) -> Option<Vec<OaItem>> {
+        let owned;
+        let v = match decoded(v) {
+            Some(d) => {
+                owned = d;
+                &owned
+            }
+            None => v,
+        };
+        match v {
+            Value::Array(a) => {
+                let items: Vec<OaItem> = a.iter().filter_map(item).collect();
+                (!items.is_empty()).then_some(items)
+            }
+            Value::Object(o) if depth < 3 => o.values().find_map(|x| list(x, depth + 1)),
+            _ => None,
+        }
+    }
+    let owned;
+    let root = match decoded(v) {
+        Some(d) => {
+            owned = d;
+            &owned
+        }
+        None => v,
+    };
+    match (list(root, 0), item(root)) {
+        (Some(mut items), Some(own)) if !items.contains(&own) => {
+            items.insert(0, own);
+            items
+        }
+        (Some(items), _) => items,
+        (None, Some(own)) => vec![own],
+        (None, None) => Vec::new(),
+    }
+}
+
+/// Appends the key structure (values redacted) of an OA payload to `oa_shapes.log` in the data
+/// directory, so a format this parser does not understand yet can be fixed from evidence.
+/// At most five per run, and the file stays under 64 KB.
+fn note_oa_shape(it: &Value) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) >= 5 {
+        return;
+    }
+    fn shape(v: &Value, depth: usize) -> String {
+        if depth > 4 {
+            return "…".into();
+        }
+        match v {
+            Value::Object(m) => format!(
+                "{{{}}}",
+                m.iter()
+                    .map(|(k, x)| format!("{k}: {}", shape(x, depth + 1)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Value::Array(a) => format!(
+                "[{}x{}]",
+                a.len(),
+                a.first().map(|x| shape(x, depth + 1)).unwrap_or_default()
+            ),
+            Value::String(s) => match serde_json::from_str::<Value>(s.trim()) {
+                Ok(p) if p.is_object() || p.is_array() => format!("json{}", shape(&p, depth + 1)),
+                _ => format!("str{}", s.len()),
+            },
+            Value::Number(_) => "num".into(),
+            Value::Bool(_) => "bool".into(),
+            Value::Null => "null".into(),
+        }
+    }
+    let line = format!("{} {}\n", crate::login::unix_now(), shape(it, 0));
+    let path = std::path::Path::new("oa_shapes.log");
+    if std::fs::metadata(path)
+        .map(|m| m.len() < 64 * 1024)
+        .unwrap_or(true)
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
 }
 
 impl ChatMessage {
@@ -3752,6 +3901,19 @@ pub async fn delete_message_for_me(
 }
 
 /// Recall / undo an outgoing message for everyone (`undoMessage` @ `compact-app-pc.js:14376599`, cmd `11281` / `11192`).
+/// `cliMsgIdUndo` for a recall: the message's own client id, as Zalo PC's `MultiRecall.recall`
+/// sends it (`re-notes/46_recall_cli_msg_id.md`). Older cached messages lack it; their timestamp
+/// is the best remaining guess, which is what this client sent before.
+fn recall_target_cli_id(msg: &ChatMessage, now_ms: u64) -> String {
+    if !msg.client_message_id.is_empty() {
+        msg.client_message_id.clone()
+    } else if msg.ts > 0 {
+        msg.ts.to_string()
+    } else {
+        now_ms.to_string()
+    }
+}
+
 pub async fn recall_message(
     s: &Session,
     to_id: &str,
@@ -3765,11 +3927,7 @@ pub async fn recall_message(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let cli_id = if msg.ts > 0 {
-        msg.ts.to_string()
-    } else {
-        now.to_string()
-    };
+    let cli_id = recall_target_cli_id(msg, now);
 
     if is_group {
         let clean_grid = to_id
@@ -4785,11 +4943,7 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
                     })
                     .map(|(_, url)| url.as_str())
                     .unwrap_or("");
-                slots.push(format!(
-                    "{}|{}",
-                    p.replace([';', '|'], " "),
-                    matched_url
-                ));
+                slots.push(format!("{}|{}", p.replace([';', '|'], " "), matched_url));
             }
             let new_multi = format!("multi:{};{}", parts.len(), slots.join(";"));
             if should_replace_avatar(t.avatar.as_deref(), Some(&new_multi)) {
@@ -5509,7 +5663,7 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     {
         sticker_meta = extract_sticker_info(it);
     }
-    let (link_url, mut link_title, link_desc, mut link_thumb, mut link_src) = raw_content_val
+    let (link_url, link_title, link_desc, link_thumb, link_src) = raw_content_val
         .map(extract_link_info)
         .unwrap_or((None, None, None, None, None));
 
@@ -5517,18 +5671,91 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         .and_then(extract_content_text)
         .unwrap_or_default();
 
+    // Official Account broadcast: banner article plus a list of further articles.
+    // Types this parser renders on its own; anything else may be an OA list under another code.
+    let known_type = matches!(
+        msg_type.as_str(),
+        "webchat"
+            | "chat.text"
+            | "chat.photo"
+            | "photo"
+            | "2"
+            | "chat.sticker"
+            | "sticker"
+            | "5"
+            | "chat.voice"
+            | "voice"
+            | "3"
+            | "chat.video"
+            | "chat.video.msg"
+            | "video"
+            | "4"
+            | "chat.file"
+            | "file"
+            | "19"
+            | "share.file"
+            | "chat.location"
+            | "chat.location.new"
+            | "location"
+            | "24"
+            | "chat.contact"
+            | "contact"
+            | "chat.undo"
+            | "undo"
+            | "31"
+            | "chat.recommended"
+            | "chat.gif"
+            | "chat.doodle"
+            | "chat.delete.everyone"
+    );
+    let mut oa_items = if msg_type == "chat.list.action" {
+        note_oa_shape(it);
+        raw_content_val.map(extract_oa_items).unwrap_or_default()
+    } else if !known_type && raw_content_val.is_some_and(|v| !v.is_null()) {
+        note_oa_shape(it);
+        // Only a real list (two or more articles) is taken as an OA card here.
+        raw_content_val
+            .map(extract_oa_items)
+            .filter(|items| items.len() >= 2)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let is_oa_msg = !oa_items.is_empty();
+    let (link_url, mut link_title, link_desc, mut link_thumb, mut link_src) = if is_oa_msg {
+        let first = oa_items.remove(0);
+        content = if first.title.is_empty() {
+            "[Tin từ Official Account]".to_string()
+        } else {
+            first.title.clone()
+        };
+        let some = |s: String| (!s.is_empty()).then_some(s);
+        (
+            some(first.href),
+            some(first.title),
+            some(first.desc),
+            some(first.thumb),
+            Some(OA_LINK_SRC.to_string()),
+        )
+    } else {
+        (link_url, link_title, link_desc, link_thumb, link_src)
+    };
+
     // A shared web page (Google Docs/Sheets, articles, …) keeps its preview thumbnail on
     // Zalo's photo CDN; only the thumbnail is an image, the message is a link.
     let is_web_link = link_url.as_deref().is_some_and(is_shared_web_link);
-    let is_photo_msg = matches!(msg_type.as_str(), "chat.photo" | "photo" | "2")
-        || (!is_web_link
+    let is_photo_msg = !is_oa_msg && matches!(msg_type.as_str(), "chat.photo" | "photo" | "2")
+        || (!is_oa_msg
+            && !is_web_link
             && (link_src.as_deref() == Some("Hình ảnh Zalo")
                 || link_url.as_deref().is_some_and(is_zalo_photo_cdn_url)
                 || link_thumb.as_deref().is_some_and(is_zalo_photo_cdn_url)));
-    let is_file_msg = matches!(
-        msg_type.as_str(),
-        "chat.file" | "file" | "19" | "share.file"
-    ) || link_src.as_deref() == Some("Tập tin Zalo")
+    let is_file_msg = !is_oa_msg
+        && matches!(
+            msg_type.as_str(),
+            "chat.file" | "file" | "19" | "share.file"
+        )
+        || link_src.as_deref() == Some("Tập tin Zalo")
         || link_url
             .as_deref()
             .is_some_and(|u| u.to_ascii_lowercase().contains("/renewmedia"));
@@ -5755,6 +5982,7 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         link_desc,
         link_thumb,
         link_src,
+        oa_items,
 
         ..Default::default()
     })
@@ -6004,7 +6232,13 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                         existing.reply_to_sender = parsed.reply_to_sender;
                         existing.reply_to_text = parsed.reply_to_text;
                     }
-                    if existing.link_url.is_none() && parsed.link_url.is_some() {
+                    // An OA broadcast cached by an older build as "[Hình ảnh]" is upgraded in place.
+                    let becomes_oa = parsed.link_src.as_deref() == Some(OA_LINK_SRC)
+                        && existing.link_src != parsed.link_src;
+                    if (existing.link_url.is_none() || becomes_oa)
+                        && (parsed.link_url.is_some() || becomes_oa)
+                    {
+                        existing.oa_items = parsed.oa_items.clone();
                         existing.link_url = parsed.link_url;
                         existing.link_title = parsed.link_title;
                         existing.link_desc = parsed.link_desc;
@@ -6122,7 +6356,13 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
                 {
                     existing.id = m.id.clone();
                 }
-                if existing.link_url.is_none() && m.link_url.is_some() {
+                // An OA broadcast cached by an older build as "[Hình ảnh]" is upgraded in place.
+                let becomes_oa =
+                    m.link_src.as_deref() == Some(OA_LINK_SRC) && existing.link_src != m.link_src;
+                if (existing.link_url.is_none() || becomes_oa)
+                    && (m.link_url.is_some() || becomes_oa)
+                {
+                    existing.oa_items = m.oa_items.clone();
                     existing.link_url = m.link_url;
                     existing.link_title = m.link_title;
                     existing.link_desc = m.link_desc;
@@ -6901,13 +7141,76 @@ pub fn extract_mute_controls(data_node: &Value, now_unix: i64) -> Vec<MuteContro
 
 /// Request mobile message sync (`pullMobileMsg` @ `app.asar`, cmd `12000`, `file` endpoint, #68, #73).
 /// Sends a wake-up/sync signal with a 2048-bit RSA SPKI DER public key to the user's phone Zalo client.
+///
+/// # Errors
+/// Returns a bounded transport error or a nonzero server response code, without signed URLs.
 pub async fn request_phone_sync(s: &Session, public_key: &str) -> Result<Value> {
     let temp_key = crate::history_sync::latest_mobile_temp_key();
     request_phone_sync_with_temp_key(s, public_key, &temp_key).await
 }
 
+#[derive(serde::Deserialize)]
+struct PhoneSyncResponse {
+    error_code: i64,
+}
+
+/// A definitive rejection or invalid payload, rather than an offline transport.
+#[derive(Debug)]
+pub(crate) enum PhoneSyncRejection {
+    /// The server replied with a nonzero business code.
+    Server(i64),
+    /// The acknowledgement did not contain a correctly typed result code.
+    Malformed,
+    /// No valid conversation partition was available; do not retry through another protocol.
+    InvalidScope,
+    /// Identity lookup must succeed before any phone request is permitted.
+    IdentityUnavailable,
+    /// A v2 transfer already began; never start another protocol after a later failure.
+    Interrupted { imported: usize, reason: String },
+}
+
+impl std::fmt::Display for PhoneSyncRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Server(code) => write!(f, "Máy chủ từ chối đồng bộ điện thoại (mã {code})"),
+            Self::Malformed => write!(f, "Phản hồi đồng bộ điện thoại không hợp lệ"),
+            Self::InvalidScope => write!(f, "Không có hội thoại hợp lệ để đồng bộ"),
+            Self::IdentityUnavailable => write!(
+                f,
+                "Không lấy được định danh đồng bộ. Chưa gửi yêu cầu tới điện thoại."
+            ),
+            Self::Interrupted { imported, reason } => write!(
+                f,
+                "Đã nhập {imported} tin từ điện thoại; đồng bộ chưa hoàn tất: {reason}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PhoneSyncRejection {}
+
+// Never include the response body or signed URL in a user-facing error.
+fn accepted_phone_sync_response(response: Value) -> Result<Value> {
+    let envelope: PhoneSyncResponse =
+        serde_json::from_value(response.clone()).map_err(|_| PhoneSyncRejection::Malformed)?;
+    if envelope.error_code != 0 {
+        return Err(PhoneSyncRejection::Server(envelope.error_code).into());
+    }
+    Ok(response)
+}
+
+fn phone_sync_transport_error(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<crate::session::SessionError>() {
+        Some(error) => PhoneSyncRejection::Server(error.code).into(),
+        None => anyhow::anyhow!("Không kết nối được máy chủ đồng bộ điện thoại"),
+    }
+}
+
 /// Request mobile message sync (`pullMobileMsg`, cmd `12000`) with an explicit `temp_key`
 /// (received from `transfer_after_login` control event or empty for manual request).
+///
+/// # Errors
+/// Returns an error for missing authentication, request timeout or server rejection.
 pub async fn request_phone_sync_with_temp_key(
     s: &Session,
     public_key: &str,
@@ -6930,43 +7233,54 @@ pub async fn request_phone_sync_with_temp_key(
         "/api/message/pull_mobile_msg?{}&params={params}",
         s.common_params()
     );
-    if let Ok(resp) = s.get_endpoint("file", &path).await {
-        let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-        if dec.get("error_code").and_then(Value::as_i64) == Some(0) {
-            return Ok(dec);
-        }
-    }
-    let post_url = format!(
-        "{}/api/message/pull_mobile_msg?{}",
-        s.domains.file,
-        s.common_params()
-    );
-    let resp = s.post_form(&post_url, format!("params={params}")).await?;
-    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        s.get_endpoint("file", &path),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Máy chủ đồng bộ điện thoại phản hồi quá lâu"))?
+    .map_err(phone_sync_transport_error)?;
+    accepted_phone_sync_response(s.maybe_decrypt(response, s.session_key_bytes()).await)
 }
 
-/// Request transfer-sync v2 from phone (`requestSyncMessage` @ `app.asar`, cmd `12888`, `file` endpoint, #68, #73).
-/// Mirrors `requestSyncMessage(reqId, data)` in `main-startup.js:14372356` & `shared-worker.js:282247`
-/// plus WebSocket `cmd 592` (`REQUEST_MOBILE_WAKE_UP`) and `cmd 590` (`SYNC_MESSAGE.REQUEST`).
-pub async fn request_phone_sync_v2(s: &Session, _public_key: &str) -> Result<Value> {
+/// Request transfer-sync v2 using the PC client's acknowledged WebSocket RPC (`cmd 590`).
+///
+/// # Errors
+/// Returns an error when genuine sync keys cannot be generated, the request times out,
+/// or the server rejects the request. No signed URL or key material is included.
+pub(crate) async fn request_phone_sync_v2(
+    s: &Session,
+    batch: crate::history_sync::PhoneSyncRequestBatch,
+) -> Result<PhoneSyncReceipt> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    // Only real zproto key pairs may reach the phone. The hashed placeholder from
-    // `generate_sync_v2_ed25519_public_key` is not a valid Curve25519 key, has no private half
-    // to decrypt the reply with, and makes the phone's Zalo app crash when the user confirms.
-    // Without real keys we skip v2 entirely; the v1 `pull_mobile_msg` request still goes out.
-    let keys = crate::history_sync::generate_sync_v2_keys()
-        .context("không tạo được khoá đồng bộ v2 (thiếu node/libzproto); bỏ qua yêu cầu v2")?;
-    let (ik_pub, ek_pub) = (keys.ik_pub, keys.ek_pub);
+    // A hashed placeholder has no matching private half. Only genuine zproto pairs may be sent.
     let sync_id = crate::param_cipher::random_hex(32);
-    let temp_key = crate::history_sync::latest_mobile_temp_key();
-    // 1. Wake up mobile master device over WebSocket (`cmd 592`)
-    let _ = crate::socket::send_mobile_wakeup(&sync_id);
-
+    let owner = s.login.as_ref().map(|v| v.uin.clone()).unwrap_or_default();
+    anyhow::ensure!(
+        !crate::history_sync::PHONE_SYNC_CANCEL.load(std::sync::atomic::Ordering::Relaxed),
+        "Đã dừng đồng bộ điện thoại"
+    );
+    let queries = batch.identities.queries();
+    if queries.is_empty() || queries.len() > crate::history_sync::PHONE_SCOPES_PER_REQUEST {
+        return Err(PhoneSyncRejection::InvalidScope.into());
+    }
+    let request_index = batch.index;
+    let keys = crate::history_sync::prepare_sync_v2_keys(sync_id.clone(), owner, batch)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("Không tạo được khoá đồng bộ v2; cần Node.js và Zalo PC trên máy")
+        })?;
+    let (ik_pub, ek_pub) = (keys.ik_pub, keys.ek_pub);
+    let temp_key = if request_index == 0 {
+        crate::history_sync::latest_mobile_temp_key()
+    } else {
+        String::new()
+    };
     // 2. Build SyncFull v2 request payload matching `shared-worker.js:282247` & `314736`
     let sync_data = json!({
-        "syncId": sync_id,
+        "syncId": sync_id.clone(),
         "syncType": 0, // No.d.SyncFull = 0
         "ek": ek_pub,
         "ik": ik_pub,
@@ -6976,27 +7290,57 @@ pub async fn request_phone_sync_v2(s: &Session, _public_key: &str) -> Result<Val
         "req": {
             "type": "message",
             "priority": 1,
-            "queries": [
-                {
-                    "partition": "",
-                    "from": 0,
-                    "to": 9_007_199_254_740_991_i64,
-                    "limit": 2000
-                }
-            ],
+            "queries": queries,
             "batchSize": 2000
         },
         "ver": 1,
-        "ussidx": 0
+        "ussidx": request_index
     });
-    let sent_ws = crate::socket::send_sync_message_ws_request(&sync_data);
-    Ok(json!({
-        "error_code": 0,
-        "data": {
-            "syncId": sync_id,
-            "ws_sent": sent_ws,
+    // The HTTP equivalent currently returns 404; the official client awaits cmd 590 by reqId.
+    anyhow::ensure!(
+        !crate::history_sync::PHONE_SYNC_CANCEL.load(std::sync::atomic::Ordering::Relaxed),
+        "Đã dừng đồng bộ điện thoại"
+    );
+    let response = crate::socket::request_sync_frame(
+        crate::socket::CMD_SYNC_REQUEST,
+        json!({"data": sync_data}),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    confirm_phone_sync_delivery(response, || {
+        crate::history_sync::wait_for_v2_receipt(&sync_id, std::time::Duration::from_secs(45))
+    })
+    .await
+}
+
+/// Keep RPC acknowledgement distinct from later matching phone evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhoneSyncReceipt {
+    ServerAcknowledged,
+    PhoneObserved,
+}
+
+async fn confirm_phone_sync_delivery<F, Fut>(
+    response: Result<Value>,
+    observe_phone: F,
+) -> Result<PhoneSyncReceipt>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    match response {
+        Ok(response) => {
+            accepted_phone_sync_response(response).map(|_| PhoneSyncReceipt::ServerAcknowledged)
         }
-    }))
+        Err(error) if error.is::<crate::socket::SyncRequestUnconfirmed>() => {
+            if observe_phone().await {
+                Ok(PhoneSyncReceipt::PhoneObserved)
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Cancel an active mobile message sync request (`cancelTransferMessage` @ `app.asar:14372356`, cmd `12700`, #68).
@@ -7044,6 +7388,8 @@ pub enum MobileSyncControlEvent {
     TransferAfterLogin { temp_key: String },
     /// `act == "transfer_status"` (`status == 3`) — phone displayed confirmation prompt and is waiting for user tap!
     WaitingConfirmOnPhone { sync_id: String },
+    /// A v2 status whose sync ID must match the active request.
+    V2Status { sync_id: String, status: u8 },
     /// `act == "user_confirm"` (`user_action == 1 | 3`) or `transfer_status` (`status == 4 | 5`) — user tapped "Đồng bộ" on their phone!
     UserConfirmed,
     /// `act == "user_confirm"` (`user_action == 0`) or `transfer_status` (`status == 6 | 7`) — user declined sync on their phone.
@@ -7058,12 +7404,26 @@ pub enum MobileSyncControlEvent {
         checksum: String,
     },
     /// `act == "upload_batch"` (`act_type == "transfer_sync2"`) — Sync v2 chunk (used by iOS).
-    SyncV2Batch {
-        url: String,
-        sync_id: String,
-        batch_type: u8,
-        is_last: bool,
-    },
+    SyncV2Batch(MobileSyncV2Batch),
+}
+
+/// One server-announced phone transfer batch, before download or decryption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MobileSyncV2Batch {
+    /// Signed download location; never log this value.
+    pub url: String,
+    /// Correlation with the current sync attempt.
+    pub sync_id: String,
+    /// Message=1 or MetadataEmbedded=2.
+    pub batch_type: u8,
+    /// Zero-based transfer batch index.
+    pub index: u64,
+    /// The phone declared this the final index.
+    pub is_last: bool,
+    /// The phone's batch-production result.
+    pub error_code: i64,
+    /// Validated wire scope names, retained privately to match a scoped phone failure.
+    pub scopes: Option<Vec<String>>,
 }
 
 /// Extract `transfer_msg` / `syncmsgmb` / `transfer_sync2` events from a control payload.
@@ -7137,13 +7497,14 @@ pub fn extract_mobile_sync_controls(data_node: &Value) -> Vec<MobileSyncControlE
                     .to_string();
                 match st {
                     3 => out.push(MobileSyncControlEvent::WaitingConfirmOnPhone { sync_id: sid }),
-                    4 | 5 => out.push(MobileSyncControlEvent::UserConfirmed),
-                    6 | 7 => out.push(MobileSyncControlEvent::UserRejected),
-                    8 => out.push(MobileSyncControlEvent::MobileBusyRestoring),
+                    1 | 2 | 4..=10 => out.push(MobileSyncControlEvent::V2Status {
+                        sync_id: sid,
+                        status: st as u8,
+                    }),
                     _ => {}
                 }
             }
-            "upload_batch" => {
+            "upload_batch" | "transfer_error" => {
                 let url = parsed_data
                     .get("msgUrl")
                     .or_else(|| parsed_data.get("url"))
@@ -7157,23 +7518,60 @@ pub fn extract_mobile_sync_controls(data_node: &Value) -> Vec<MobileSyncControlE
                     .to_string();
                 let batch_type = parsed_data
                     .get("batchType")
-                    .and_then(|v| v.as_i64())
+                    .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
                     .unwrap_or(0) as u8;
                 let is_last = parsed_data
                     .get("isLast")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-                    == 1;
-                if !url.is_empty() {
-                    out.push(MobileSyncControlEvent::SyncV2Batch {
-                        url,
-                        sync_id: sid,
-                        batch_type,
-                        is_last,
-                    });
+                    .and_then(|v| v.as_bool().or_else(|| v.as_i64().map(|n| n == 1)))
+                    .unwrap_or(false);
+                let index = parsed_data
+                    .get("idx")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+                    .unwrap_or(0);
+                // SyncEventsHandler routes transfer_error.errorCode through the same session.
+                let error_field = if act == "transfer_error" {
+                    parsed_data
+                        .get("errorCode")
+                        .or_else(|| parsed_data.get("err"))
                 } else {
-                    out.push(MobileSyncControlEvent::MobileBusyRestoring);
-                }
+                    parsed_data
+                        .get("err")
+                        .or_else(|| parsed_data.get("errorCode"))
+                };
+                let error_code = error_field
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+                    .unwrap_or(if act == "transfer_error" { -1 } else { 0 });
+                // A malformed error control must never become a successful empty download.
+                let error_code = if act == "transfer_error" && error_code == 0 {
+                    -1
+                } else {
+                    error_code
+                };
+                let scopes = parsed_data
+                    .get("scopes")
+                    .and_then(Value::as_array)
+                    .filter(|scopes| scopes.len() <= crate::history_sync::PHONE_SCOPES_PER_REQUEST)
+                    .and_then(|scopes| {
+                        scopes
+                            .iter()
+                            .map(|scope| {
+                                scope
+                                    .get("partition")?
+                                    .as_str()
+                                    .filter(|partition| partition.len() <= 4104)
+                                    .map(str::to_string)
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    });
+                out.push(MobileSyncControlEvent::SyncV2Batch(MobileSyncV2Batch {
+                    url,
+                    sync_id: sid,
+                    batch_type,
+                    index,
+                    is_last,
+                    error_code,
+                    scopes,
+                }));
             }
             "syncmsg_info" => {
                 let url = parsed_data
@@ -8662,5 +9060,223 @@ mod posting_policy_tests {
         );
         let cached: SidebarPresentation = serde_json::from_str("{}").unwrap();
         assert!(cached.posting.allows("member"));
+    }
+}
+
+#[cfg(test)]
+mod phone_sync_request_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lost_rpc_ack_uses_phone_evidence_without_repeating_the_request() {
+        let error = || {
+            anyhow::Error::new(crate::socket::SyncRequestUnconfirmed(
+                "fixture disconnect".into(),
+            ))
+        };
+        let recovered = confirm_phone_sync_delivery(Err(error()), || async { true })
+            .await
+            .unwrap();
+        assert_eq!(recovered, PhoneSyncReceipt::PhoneObserved);
+        let unresolved = confirm_phone_sync_delivery(Err(error()), || async { false })
+            .await
+            .unwrap_err();
+        assert!(unresolved.is::<crate::socket::SyncRequestUnconfirmed>());
+    }
+
+    #[tokio::test]
+    async fn definitive_results_and_unsent_failures_do_not_wait_for_phone_evidence() {
+        let no_wait = || async { panic!("only an uncertain queued request may wait for evidence") };
+        let receipt = confirm_phone_sync_delivery(Ok(json!({"error_code":0})), no_wait)
+            .await
+            .unwrap();
+        assert_eq!(receipt, PhoneSyncReceipt::ServerAcknowledged);
+        for response in [
+            Ok(json!({"error_code":211})),
+            Ok(json!({})),
+            Err(anyhow::anyhow!("not queued")),
+        ] {
+            assert!(confirm_phone_sync_delivery(response, no_wait)
+                .await
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn scoped_phone_failure_preserves_exact_partitions_and_rejects_malformed_scope_lists() {
+        let mut data = json!({"syncId":"fake-sync", "errorCode":502, "batchType":1,
+            "scopes":[{"partition":"group/opaque-fixture"}]});
+        let parse = |data: Value| {
+            let mut events = extract_mobile_sync_controls(
+                &json!({"act_type":"transfer_sync2", "act":"transfer_error", "data":data}),
+            );
+            let MobileSyncControlEvent::SyncV2Batch(batch) = events.remove(0) else {
+                panic!("missing failure");
+            };
+            batch
+        };
+        assert_eq!(
+            parse(data.clone()).scopes,
+            Some(vec!["group/opaque-fixture".into()])
+        );
+        data["scopes"] = json!([{"partition":"group/opaque-fixture"}, {"unexpected":true}]);
+        assert!(parse(data.clone()).scopes.is_none());
+        data["scopes"] = json!(vec![json!({"partition":"group/opaque-fixture"}); 31]);
+        assert!(parse(data).scopes.is_none());
+    }
+
+    #[test]
+    fn standalone_phone_transfer_errors_are_not_silently_discarded() {
+        for (data, expected) in [
+            (json!({"syncId":"fake-sync", "errorCode":"114"}), 114),
+            (json!({"syncId":"fake-sync", "err":211}), 211),
+            (json!({"syncId":"fake-sync", "errorCode":0}), -1),
+            (json!({"syncId":"fake-sync"}), -1),
+        ] {
+            let controls =
+                json!({"act_type":"transfer_sync2", "act":"transfer_error", "data":data});
+            let events = extract_mobile_sync_controls(&controls);
+            assert_eq!(events.len(), 1);
+            let MobileSyncControlEvent::SyncV2Batch(batch) = &events[0] else {
+                panic!("missing standalone transfer failure");
+            };
+            assert_eq!(batch.sync_id, "fake-sync");
+            assert_eq!(batch.error_code, expected);
+            assert!(batch.url.is_empty());
+        }
+    }
+
+    #[test]
+    fn batch_controls_preserve_metadata_index_last_flag_and_phone_error() {
+        let controls = json!({"controls":[{"act_type":"transfer_sync2", "act":"upload_batch",
+            "data":{"syncId":"fake-sync", "msgUrl":"https://example.invalid/fake", "idx":"7",
+                "batchType":"2", "isLast":1, "err":"0"}},
+            {"act_type":"transfer_sync2", "act":"upload_batch",
+            "data":{"syncId":"fake-sync", "idx":8, "batchType":1, "isLast":true, "err":114}}]});
+        let events = extract_mobile_sync_controls(&controls);
+        assert_eq!(events.len(), 2);
+        let MobileSyncControlEvent::SyncV2Batch(first) = &events[0] else {
+            panic!("missing batch");
+        };
+        assert_eq!(
+            (
+                first.batch_type,
+                first.index,
+                first.is_last,
+                first.error_code
+            ),
+            (2, 7, true, 0)
+        );
+        let MobileSyncControlEvent::SyncV2Batch(failed) = &events[1] else {
+            panic!("missing error batch");
+        };
+        assert_eq!(failed.error_code, 114);
+        assert!(failed.url.is_empty());
+    }
+
+    #[test]
+    fn rejected_or_malformed_sync_response_is_not_reported_as_success() {
+        for response in [
+            json!({"error_code":211}),
+            json!({"error_code":114}),
+            json!({}),
+            json!({"error_code":"0"}),
+        ] {
+            assert!(accepted_phone_sync_response(response).is_err());
+        }
+        assert!(accepted_phone_sync_response(json!({"error_code":0,"data":{}})).is_ok());
+    }
+
+    #[test]
+    fn sync_errors_expose_only_code_and_never_response_or_signed_url() {
+        let response = json!({"error_code":114,"error_message":"private-secret","data":{"key":"private-secret"}});
+        let error = accepted_phone_sync_response(response)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("114"));
+        assert!(!error.contains("private-secret"));
+        let mut failure = crate::session::SessionError::new(600, "private-secret");
+        failure.url = "https://example.invalid/?params=private-secret".into();
+        let error = phone_sync_transport_error(failure.into()).to_string();
+        assert!(error.contains("600"));
+        assert!(!error.contains("private-secret"));
+    }
+}
+
+#[cfg(test)]
+mod oa_message_tests {
+    use super::*;
+
+    #[test]
+    fn oa_list_nested_in_a_params_json_string_is_found() {
+        let params = json!({"items": [
+            {"title": "A", "thumb": "https://x.invalid/a.jpg", "href": "https://x.invalid/a"},
+            {"title": "B"}
+        ]})
+        .to_string();
+        let content = json!({"title": "", "href": "", "thumb": "", "action": "", "params": params});
+        let items = extract_oa_items(&content);
+        let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, ["A", "B"]);
+    }
+
+    #[test]
+    fn single_article_object_becomes_one_item() {
+        let items = extract_oa_items(&json!({"title": "Tin", "thumb": "https://x.invalid/t.jpg"}));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Tin");
+    }
+
+    #[test]
+    fn official_account_list_becomes_banner_plus_articles_not_a_photo() {
+        let raw = json!({
+            "msgType": "chat.list.action",
+            "msgId": "9001",
+            "uidFrom": "4242",
+            "ts": "1794100000000",
+            "content": [
+                {"title": "KHỎE BỀN LÂU", "description": "Giảm đến 30%",
+                 "href": "https://example.invalid/a", "thumb": "https://photo-zmp3.zmdcdn.me/a.jpg"},
+                {"title": "Bài 2", "href": "https://example.invalid/b", "thumb": "https://example.invalid/b.jpg"},
+                {"title": "Gọi 1800", "href": "javascript:alert(1)", "thumb": ""}
+            ]
+        });
+        let msg = parse_chat_message(&raw).expect("parsed");
+        assert_eq!(msg.link_src.as_deref(), Some(OA_LINK_SRC));
+        assert_eq!(msg.text, "KHỎE BỀN LÂU");
+        assert_eq!(msg.link_desc.as_deref(), Some("Giảm đến 30%"));
+        assert_eq!(msg.link_url.as_deref(), Some("https://example.invalid/a"));
+        assert_eq!(msg.oa_items.len(), 2);
+        // Non-web links are dropped rather than opened.
+        assert!(msg.oa_items[1].href.is_empty());
+    }
+
+    #[test]
+    fn oa_items_accept_a_json_string_payload() {
+        let items = extract_oa_items(&json!(
+            "[{\"title\":\"A\",\"thumb\":\"https://x.invalid/a.png\"}]"
+        ));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "A");
+        assert!(extract_oa_items(&json!({"other": 1})).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod recall_tests {
+    use super::*;
+
+    #[test]
+    fn recall_targets_the_client_message_id_like_zalo_pc() {
+        let mut msg = ChatMessage {
+            ts: 1_794_100_000_123,
+            client_message_id: "1794099999999".into(),
+            ..Default::default()
+        };
+        assert_eq!(recall_target_cli_id(&msg, 5), "1794099999999");
+        msg.client_message_id.clear();
+        assert_eq!(recall_target_cli_id(&msg, 5), "1794100000123");
+        msg.ts = 0;
+        assert_eq!(recall_target_cli_id(&msg, 5), "5");
     }
 }

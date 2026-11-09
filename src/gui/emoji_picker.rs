@@ -199,6 +199,18 @@ pub(super) fn append_text_with_emoji(
     font: FontId,
     color: Color32,
 ) {
+    append_text_with_emoji_sized(job, ctx, text, font, color, 26.0);
+}
+
+/// [`append_text_with_emoji`] with emoji slots `slot` points wide (small text, e.g. previews).
+pub(super) fn append_text_with_emoji_sized(
+    job: &mut egui::text::LayoutJob,
+    ctx: &egui::Context,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    slot: f32,
+) {
     let fmt = |c: Color32| egui::TextFormat {
         font_id: font.clone(),
         color: c,
@@ -223,9 +235,9 @@ pub(super) fn append_text_with_emoji(
             job.append(&text[last..ba], 0.0, fmt(color));
         }
         // Make the slot one em-ish square whatever glyph (or box) the font has.
-        let target = 26.0;
+        let target = slot;
         let n = cluster.chars().count().max(1) as f32;
-        let emoji_font = FontId::proportional(26.0);
+        let emoji_font = FontId::proportional(slot);
         let natural: f32 =
             ctx.fonts(|f| cluster.chars().map(|c| f.glyph_width(&emoji_font, c)).sum());
         let mut f = fmt(Color32::TRANSPARENT);

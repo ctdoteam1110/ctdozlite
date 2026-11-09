@@ -134,6 +134,40 @@ impl MessageStore {
         Ok(rows > 0)
     }
 
+    /// Insert one phone-sync batch atomically without overwriting authoritative existing rows.
+    ///
+    /// # Errors
+    /// Rolls back the entire batch on validation, SQL or commit failure.
+    pub fn import_phone_batch(&mut self, messages: &[StoredMessage]) -> Result<usize> {
+        let transaction = self.conn.transaction()?;
+        let mut inserted = 0;
+        {
+            let mut statement = transaction.prepare_cached(
+                "INSERT OR IGNORE INTO messages (msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for message in messages {
+                anyhow::ensure!(
+                    !message.msg_id.is_empty() && message.msg_id != "0",
+                    "Phone message has no stable identity"
+                );
+                inserted += statement.execute(params![
+                    message.msg_id,
+                    message.thread_id,
+                    message.sender_id,
+                    message.sender_name,
+                    message.text,
+                    message.msg_type,
+                    message.ts,
+                    message.is_outgoing as i64,
+                    message.raw_json,
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
     /// Correct sender attribution of an already stored message (`INSERT OR IGNORE` in
     /// `upsert_message` never rewrites it). Used when a phone backup re-import knows the
     /// direction better than an earlier import did. Returns whether a row changed.
@@ -1950,5 +1984,48 @@ mod tests {
             decode_zalo_cipher_payload(&enc, key),
             "Này bố kiểm tra mail xem ạ"
         );
+    }
+}
+
+#[cfg(test)]
+mod phone_batch_tests {
+    use super::*;
+
+    fn message(id: &str) -> StoredMessage {
+        StoredMessage {
+            msg_id: id.into(),
+            thread_id: "fake-thread".into(),
+            sender_id: "fake-user".into(),
+            sender_name: "Fixture".into(),
+            text: "Fixture message".into(),
+            msg_type: "webchat".into(),
+            ts: 1,
+            is_outgoing: false,
+            raw_json: String::new(),
+        }
+    }
+
+    #[test]
+    fn batch_import_is_idempotent_and_preserves_existing_rows() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let rows = [message("one"), message("two")];
+        assert_eq!(store.import_phone_batch(&rows).unwrap(), 2);
+        let mut changed = message("one");
+        changed.text = "Must not replace existing server content".into();
+        assert_eq!(store.import_phone_batch(&[changed]).unwrap(), 0); // (INV-4)
+        assert_eq!(
+            store.messages_for("fake-thread", 10).unwrap()[0].text,
+            "Fixture message"
+        );
+    }
+
+    #[test]
+    fn failed_batch_rolls_back_earlier_insertions() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        store.conn.execute_batch("CREATE TRIGGER reject_bad BEFORE INSERT ON messages WHEN NEW.msg_id = 'bad' BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END;").unwrap();
+        assert!(store
+            .import_phone_batch(&[message("one"), message("bad")])
+            .is_err());
+        assert!(store.messages_for("fake-thread", 10).unwrap().is_empty());
     }
 }

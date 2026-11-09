@@ -62,19 +62,35 @@ async function initWasm() {
     }
 }
 
-async function generateV2Keys() {
+async function generateV2Keys(reuseIdentity = false) {
     await initWasm();
-    const ik = zproto.e();
+    let identity;
+    if (reuseIdentity) {
+        // Subsequent native SyncFull requests keep IK and generate a fresh EK.
+        const previous = JSON.parse(fs.readFileSync('sync_v2_keys.json', 'utf8'));
+        if (typeof previous.ik_pub !== 'string' || previous.ik_pub.length !== 44 ||
+            typeof previous.ik_priv !== 'string' || !/^[0-9a-f]{64}$/i.test(previous.ik_priv) ||
+            Buffer.from(previous.ik_pub, 'base64').length !== 33 ||
+            Buffer.from(previous.ik_pub, 'base64')[0] !== 5) {
+            throw new Error('Invalid retained sync identity');
+        }
+        identity = {ik_pub: previous.ik_pub, ik_priv: previous.ik_priv};
+    } else {
+        const ik = zproto.e();
+        identity = {
+            ik_pub: Buffer.from(ik.publicKey).toString('base64'),
+            ik_priv: Buffer.from(ik.privateKey).toString('hex')
+        };
+        ik.free();
+    }
     const ek = zproto.e();
     const res = {
-        ik_pub: Buffer.from(ik.publicKey).toString('base64'),
-        ik_priv: Buffer.from(ik.privateKey).toString('hex'),
+        ...identity,
         ek_pub: Buffer.from(ek.publicKey).toString('base64'),
         ek_priv: Buffer.from(ek.privateKey).toString('hex')
     };
-    ik.free();
     ek.free();
-    fs.writeFileSync('sync_v2_keys.json', JSON.stringify(res, null, 2));
+    fs.writeFileSync('sync_v2_keys.json', JSON.stringify(res, null, 2), {mode: 0o600});
     return res;
 }
 
@@ -86,13 +102,7 @@ async function decryptMeta(metaFilePath) {
     const keys = JSON.parse(fs.readFileSync('sync_v2_keys.json', 'utf8'));
     let metaBytes = fs.readFileSync(metaFilePath);
     
-    // Strip 4-byte uint32 LE length header if present
-    if (metaBytes.length >= 4) {
-        const len = metaBytes.readUInt32LE(0);
-        if (len === metaBytes.length - 4) {
-            metaBytes = metaBytes.slice(4);
-        }
-    }
+    // The Rust coordinator validates and removes each transfer record's length prefix.
     
     const ik_pub = Buffer.from(keys.ik_pub, 'base64');
     const ik_priv = Buffer.from(keys.ik_priv, 'hex');
@@ -103,9 +113,10 @@ async function decryptMeta(metaFilePath) {
     const plaintext = Buffer.from(res.plaintext);
     res.free();
 
-    fs.writeFileSync('sync_v2_session.bin', sessionRecord);
+    fs.writeFileSync('sync_v2_session.bin', sessionRecord, {mode: 0o600});
+    // MetadataEmbedded carries the first plaintext batch as well as the session record.
+    fs.writeFileSync('sync_v2_message.bin', plaintext, {mode: 0o600});
     return {
-        sessionRecordHex: sessionRecord.toString('hex'),
         plainLen: plaintext.length
     };
 }
@@ -118,28 +129,20 @@ async function decryptMessage(msgFilePath) {
     const sessionRecord = fs.readFileSync('sync_v2_session.bin');
     let msgBytes = fs.readFileSync(msgFilePath);
 
-    // Strip 4-byte uint32 LE length header if present
-    if (msgBytes.length >= 4) {
-        const len = msgBytes.readUInt32LE(0);
-        if (len === msgBytes.length - 4) {
-            msgBytes = msgBytes.slice(4);
-        }
-    }
-
     const res = zproto.i(msgBytes, sessionRecord);
     const plaintext = Buffer.from(res.plaintext);
     res.free();
 
-    fs.writeFileSync('sync_v2_message.bin', plaintext);
+    fs.writeFileSync('sync_v2_message.bin', plaintext, {mode: 0o600});
     return {
         plainLen: plaintext.length
     };
 }
 
 const cmd = process.argv[2];
-if (cmd === 'gen-keys') {
-    generateV2Keys().then(keys => {
-        console.log(JSON.stringify(keys));
+if (cmd === 'gen-keys' || cmd === 'gen-keys-reuse-identity') {
+    generateV2Keys(cmd === 'gen-keys-reuse-identity').then(keys => {
+        console.log(JSON.stringify({ik_pub: keys.ik_pub, ek_pub: keys.ek_pub}));
         process.exit(0);
     }).catch(e => {
         console.error(e);
