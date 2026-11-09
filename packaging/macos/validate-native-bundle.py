@@ -14,6 +14,7 @@ HELPERS = {
     "DailyMediaViewer": "Resources/DailyMediaViewer",
     "DailyNotifier": "Helpers/DailyNotifier.app/Contents/MacOS/DailyNotifier",
     "HistoryCodec": "Helpers/HistoryCodec",
+    "VideoBridge": "Helpers/VideoBridge",
 }
 
 
@@ -28,7 +29,7 @@ def validate(app, arches):
         assert binary.is_file() and binary.stat().st_mode & 0o111, f"Missing executable: {binary}"
     assert not (contents / "Resources/HistoryCodecAssets").exists(), "Public bundle contains external codec assets"
     assert (contents / "Resources/ThirdPartyLicenses/zstd-LICENSE").is_file(), "Missing zstd license"
-    for notice in ("AWS-LC-LICENSE", "aws-lc-rs-LICENSE"):
+    for notice in ("AWS-LC-LICENSE", "aws-lc-rs-LICENSE", "Phosphor-LICENSE.txt"):
         assert (contents / "Resources/ThirdPartyLicenses" / notice).is_file(), f"Missing {notice}"
     for binary in contents.rglob("*"):
         if not binary.is_file() or "Mach-O" not in output("file", "-b", str(binary)):
@@ -61,6 +62,8 @@ def validate(app, arches):
         response = json.loads(history.stdout)
         assert history.returncode == 0 and response["ok"] is False and response["code"] == "history_codec_assets_missing", "Relocated history missing-assets contract"
         assert "--local-use" in response["error"] and "assetsDir" in response["error"]
+        video = subprocess.run([str(relocated / "Contents/Helpers/VideoBridge")], capture_output=True, timeout=10, cwd=temporary)
+        assert video.returncode == 2 and not video.stdout, "Relocated video helper argument contract"
     print("PASS: all executable architectures, system-only dependencies, relocated headless contracts")
 
 

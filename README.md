@@ -5,6 +5,7 @@
 >
 > **Tải bản macOS:** [GitHub Releases của fork](https://github.com/lebad280324/ctdozlite/releases/latest) · **Cài đặt và cập nhật:** [Hướng dẫn Apple Silicon](docs/MACOS_APPLE_SILICON.md).
 > Ứng dụng kiểm tra cập nhật từ `lebad280324/ctdozlite`, tránh tự chuyển về giao diện của upstream. Các tài liệu/bảng nền tảng upstream bên dưới được giữ để tham khảo dự án gốc.
+> **Giới hạn đã biết:** đồng bộ lịch sử từ điện thoại còn thử nghiệm, có thể chỉ tải được một phần. Xem [ghi chú v0.0.9](docs/releases/v0.0.9.md) trước khi sử dụng.
 
 
 **[Tiếng Việt](README.md)** · **[English](docs/i18n/README_EN.md)** · **[한국어](docs/i18n/README_KO.md)** · **[日本語](docs/i18n/README_JA.md)** · **[简体中文](docs/i18n/README_ZH.md)**
@@ -46,7 +47,7 @@ Bản Zalo PC chính thức đóng gói trên Electron thường chiếm 350–6
 | **Số tiến trình chạy nền** | 7 tiến trình | **1 tiến trình duy nhất** |
 | **Kích thước file thực thi** | ~136 MB | **~17,2 MB** (bản phát hành strip symbols) |
 | **Thời gian khởi chạy cửa sổ** | 2.5 – 4.0s | **~0,18 – 0,19 giây** (< 200ms) |
-| **Phụ thuộc runtime** | Chromium, Node.js | Native binary thuần (`ffmpeg` tùy chọn nếu gọi video) |
+| **Phụ thuộc runtime** | Chromium, Node.js | Giao diện Rust native; `ffmpeg` tùy chọn cho video. Đồng bộ điện thoại cần Node.js và Zalo PC đã cài ([chi tiết](docs/MACOS_APPLE_SILICON.md#đồng-bộ-lịch-sử-từ-điện-thoại)). |
 
 > *Dữ liệu đo thực tế trên Windows 11 (Intel Core i7-12700H, PowerShell `Get-Process WorkingSet64`, đo trung vị sau 15 giây chạy ổn định ở trạng thái chờ).*
 

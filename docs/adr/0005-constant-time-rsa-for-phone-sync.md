@@ -1,8 +1,8 @@
 # ADR-0005: Constant-time RSA for phone-sync key unwrapping
 
-- **Status:** proposed
+- **Status:** accepted for 0.0.9 distribution (2026-11-09)
 - **Date:** 2026-11-07
-- **Deciders:** maintainer (pending human review before release 0.0.9)
+- **Deciders:** maintainer (authorized distribution of the current 0.0.9 build)
 
 ## Context
 

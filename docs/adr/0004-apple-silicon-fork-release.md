@@ -1,6 +1,6 @@
 # ADR 0004: Apple Silicon fork distribution and update channel
 
-- **Status:** proposed (pending release audit)
+- **Status:** accepted for 0.0.9 distribution (2026-11-09)
 - **Date:** 2026-11-06
 
 ## Context
@@ -19,6 +19,7 @@ The macOS installer uses private download and sibling staging directories, waits
 - Protocol features retain their existing evidence under re-notes/36* through 38*; no protocol encoding is changed by the release work.
 - Rust regression suite, disposable macOS transaction tests and relocated native bundle contracts must pass.
 - cargo audit and explicit human release audit are required before publication by project standards. Outstanding advisories are recorded in the local release review report; no blanket audit exception is approved by this ADR.
+- The maintainer authorized public distribution of the current build with phone-history synchronization explicitly documented as experimental and incomplete. Local checks passed 341 Rust tests (2 ignored), Clippy, Rust 1.95, native bundle/update contracts and the helper fixtures; the current RustSec scan found zero vulnerabilities. Tagged artifacts must still pass GitHub Actions before publication.
 
 ## Consequences
 

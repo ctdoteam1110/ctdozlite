@@ -5,15 +5,23 @@ Xem thêm quy ước tại [ADR 0003 — Chính sách Changelog & Release Notes]
 
 ## [Unreleased]
 
-## [0.0.9] - 2026-11-06
+## [0.0.9] - 2026-11-09
 
 ### Added
 - Bản cộng đồng miễn phí riêng cho macOS Apple Silicon với giao diện Liquid Glass và các cải tiến hiện có trong bản phát triển.
 - GitHub Actions tạo DMG arm64, checksum và manifest từ nguồn trong fork; giữ ghi công và giấy phép gốc.
+- Xem trước tệp bằng Quick Look, phóng to ảnh, thẻ nội dung OA và lựa chọn bộ biểu tượng Phosphor.
+- VideoBridge dùng AVFoundation/VideoToolbox cho H.264 trên macOS.
 
 ### Fixed
 - Cập nhật đi theo Releases của fork, không chọn DMG sai kiến trúc; thay thế app có giao dịch và hoàn tác.
 - Nâng bản vá Tokio khắc phục lỗi Interval.
+- Thu hồi dùng đúng mã tin phía máy khách; cải tiến cửa sổ gọi và giữ vị trí tin mới khi mở hội thoại.
+- Tách làm mới Cloud/Nhóm tự động khỏi tiến trình đồng bộ điện thoại; bổ sung xử lý phản hồi, định danh, chia đợt và phục hồi phiên.
+
+### Known limitations
+- Đồng bộ lịch sử từ điện thoại còn thử nghiệm, có thể dừng giữa chừng và chưa bảo đảm tải toàn bộ. Bản này được phát hành với giới hạn đó; dữ liệu đã nhập được giữ lại.
+- Đồng bộ điện thoại cần Node.js và Zalo PC chính thức đã cài trên máy để nạp thư viện đồng bộ.
 
 - Sửa lỗi ứng dụng thoát đột ngột (`abort` trong AppKit) khi khung chat hẹp hơn thẻ tệp/liên kết: `f32::clamp` với cận trên nhỏ hơn cận dưới gây panic; thay bằng `fit_between` không panic.
 

@@ -46,6 +46,8 @@ jobs:
           fi
       - name: Run Rust regression tests
         run: cargo test --release --locked --target aarch64-apple-darwin
+      - name: Verify phone-sync helper contract without account access
+        run: python3 tests/phone_sync_helper.py
       - name: Audit release dependencies
         run: |
           cargo install cargo-audit --locked --version 0.22.2

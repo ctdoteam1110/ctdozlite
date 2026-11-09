@@ -5,7 +5,7 @@ edition = "2021"
 # Lowest toolchain the code builds with (AtomicU64::try_update needs 1.95); checked in CI.
 rust-version = "1.95"
 authors = ["TIPC1110 <tienichpc1110@gmail.com>"]
-description = "Lightweight, high-performance native Zalo PC client written in Rust (zero Node.js, zero Electron)"
+description = "Native Zalo PC client in Rust; optional phone history helper uses local Node.js"
 homepage = "https://ctdozlite.ctdo.net/"
 repository = "https://github.com/lebad280324/ctdozlite"
 license = "MIT OR Apache-2.0"

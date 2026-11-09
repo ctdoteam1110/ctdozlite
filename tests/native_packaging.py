@@ -21,6 +21,7 @@ class NativePackagingTests(unittest.TestCase):
         script = (ROOT / "native/macos/build-native-helpers.sh").read_text()
         self.assertNotIn("prepare-history-assets", script)
         self.assertIn("HistoryCodec", script)
+        self.assertIn("VideoBridge", script)
         workflow = (ROOT / ".github/workflows/ci-release.yml").read_text()
         self.assertIn("bash packaging/package-local.sh", workflow)
         packaging = (ROOT / "packaging/package-local.sh").read_text()
@@ -59,9 +60,15 @@ class NativePackagingTests(unittest.TestCase):
                 licenses = app / "Contents/Resources/ThirdPartyLicenses"
                 licenses.mkdir()
                 shutil.copy2(BUILD / "zstd-1.5.7/arm64/source/LICENSE", licenses / "zstd-LICENSE")
-                for notice in ("AWS-LC-LICENSE", "aws-lc-rs-LICENSE"):
+                for notice in ("AWS-LC-LICENSE", "aws-lc-rs-LICENSE", "Phosphor-LICENSE.txt"):
                     (licenses / notice).write_text("fixture notice\n")
                 validator.validate(app, arches)
+                video = app / "Contents/Helpers/VideoBridge"
+                saved_video = video.with_suffix(".saved")
+                video.rename(saved_video)
+                with self.assertRaisesRegex(AssertionError, "Missing executable"):
+                    validator.validate(app, arches)
+                saved_video.rename(video)
                 with self.assertRaisesRegex(AssertionError, "Architecture mismatch"):
                     validator.validate(app, {"invalid-architecture"})
                 assets = app / "Contents/Resources/HistoryCodecAssets"

@@ -19,6 +19,16 @@ Bộ cập nhật chỉ chọn gói tương thích, xác thực SHA-256 trước
 
 Nếu kho chưa có release công khai, API latest trả 404. Nếu mất mạng hoặc bị giới hạn API, thử lại hoặc mở trang Releases trong trình duyệt.
 
+## Đồng bộ lịch sử từ điện thoại
+
+Tính năng này cần **Node.js và Zalo PC chính thức đã cài trên Mac**. Bộ trợ giúp nạp thư viện đồng bộ từ bản Zalo PC trên máy; giao diện ứng dụng vẫn chạy bằng Rust native.
+
+Mở **Cài đặt → Đồng bộ tin nhắn → Đồng bộ tin nhắn từ điện thoại ngay**, xác nhận trên điện thoại và giữ Zalo mở trong lúc tải. Tùy chọn **Chỉ đồng bộ hội thoại đang mở** dùng để tải riêng một hội thoại. Tiến trình toàn bộ chạy qua nhiều đợt; chờ kết quả cuối trước khi bấm lại.
+
+Kết quả cho biết số tin mới được nhập từ điện thoại. Tin đã có trên Mac được giữ nguyên và tránh nhập trùng. Các phạm vi lịch sử điện thoại báo không tìm thấy (mã 502) được thống kê riêng. Kết quả chỉ có Cloud/Nhóm chưa xác nhận đồng bộ lịch sử điện thoại hoàn tất.
+
+Nếu kết nối gián đoạn, ứng dụng chờ phản hồi đúng phiên đã gửi để tiếp tục. Khi không xác nhận được, ứng dụng báo đồng bộ chưa hoàn tất và giữ dữ liệu đã nhập. Có thể bấm **Dừng đồng bộ điện thoại** để kết thúc phiên.
+
 ## Tạo bản tiếp theo
 
 - Tăng version trong Cargo.toml/Cargo.lock, thêm `docs/releases/v<version>.md` và cập nhật CHANGELOG.md.
