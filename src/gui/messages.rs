@@ -3475,6 +3475,7 @@ mod quote_navigation_tests {
 mod album_grid_tests {
     use super::*;
 
+    /// Photo message fixture, optionally in album `group` at the given index.
     fn album_photo(id: &str, group: Option<(&str, u32)>, outgoing: bool) -> ChatMessage {
         ChatMessage {
             id: id.into(),

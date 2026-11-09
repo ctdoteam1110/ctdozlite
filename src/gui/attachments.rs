@@ -157,6 +157,7 @@ pub fn parse_uri_list(payload: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Decode `%XX` escapes in a URI path; `None` on a malformed escape or non-UTF-8 result.
 #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
 fn percent_decode(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
@@ -206,6 +207,7 @@ pub fn list_folder_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Whether Explorer hides this entry (hidden or system attribute).
 #[cfg(windows)]
 fn is_os_hidden(meta: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -214,6 +216,7 @@ fn is_os_hidden(meta: &std::fs::Metadata) -> bool {
     meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
 }
 
+/// Unix has no hidden attribute; dot-files are filtered by name instead.
 #[cfg(not(windows))]
 fn is_os_hidden(_meta: &std::fs::Metadata) -> bool {
     false
@@ -356,16 +359,19 @@ pub fn read_clipboard_file_list() -> Vec<PathBuf> {
     }
 }
 
+/// Win32 open-file dialog; `multi` enables multi-select. Empty on cancel.
 #[cfg(target_os = "windows")]
 fn pick_native_files(images_only: bool, multi: bool) -> Vec<PathBuf> {
     win::open_file_dialog(images_only, multi)
 }
 
+/// Win32 folder browser; `None` on cancel.
 #[cfg(target_os = "windows")]
 fn pick_native_folder() -> Option<PathBuf> {
     win::browse_for_folder()
 }
 
+/// AppleScript `choose file`, optionally multi-select and image-only. Empty on cancel.
 #[cfg(target_os = "macos")]
 fn pick_native_files(images_only: bool, multi: bool) -> Vec<PathBuf> {
     let (prompt, of_type) = if images_only {
@@ -393,6 +399,7 @@ fn pick_native_files(images_only: bool, multi: bool) -> Vec<PathBuf> {
     run_dialog_command("osascript", &["-e", &script]).unwrap_or_default()
 }
 
+/// AppleScript `choose folder`; `None` on cancel.
 #[cfg(target_os = "macos")]
 fn pick_native_folder() -> Option<PathBuf> {
     run_dialog_command(
@@ -407,6 +414,8 @@ fn pick_native_folder() -> Option<PathBuf> {
     .next()
 }
 
+/// zenity file dialog, falling back to kdialog when zenity is missing or cannot open.
+/// Empty on cancel.
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn pick_native_files(images_only: bool, multi: bool) -> Vec<PathBuf> {
     let mut zenity_args = vec!["--file-selection"];
@@ -416,7 +425,7 @@ fn pick_native_files(images_only: bool, multi: bool) -> Vec<PathBuf> {
     if images_only {
         zenity_args.push("--file-filter=Images | *.png *.jpg *.jpeg *.webp *.gif *.bmp");
     }
-    // Fall back to kdialog only when zenity is not installed, never after a cancel.
+    // Fall back to kdialog only when zenity is missing or cannot open, never after a cancel.
     if let Some(picked) = run_dialog_command("zenity", &zenity_args) {
         return picked;
     }
@@ -434,6 +443,7 @@ fn pick_native_files(images_only: bool, multi: bool) -> Vec<PathBuf> {
     run_dialog_command("kdialog", &kdialog_args).unwrap_or_default()
 }
 
+/// zenity directory dialog, falling back to kdialog; `None` on cancel.
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn pick_native_folder() -> Option<PathBuf> {
     run_dialog_command("zenity", &["--file-selection", "--directory"])
@@ -551,10 +561,12 @@ mod win {
         fn GetClipboardData(u_format: u32) -> *mut c_void;
     }
 
+    /// NUL-terminated UTF-16 for Win32 wide-string parameters.
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    /// Show `GetOpenFileNameW` and return the chosen paths; logs dialog errors, empty on cancel.
     pub(super) fn open_file_dialog(images_only: bool, multi: bool) -> Vec<PathBuf> {
         let filter_raw = if images_only {
             "Image Files (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp)\0*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp\0All Files (*.*)\0*.*\0"
@@ -620,6 +632,7 @@ mod win {
         super::parse_multiselect_buffer(&file_buf)
     }
 
+    /// Show `SHBrowseForFolderW` with COM initialised for this thread; `None` on cancel.
     pub(super) fn browse_for_folder() -> Option<PathBuf> {
         const COINIT_APARTMENTTHREADED: u32 = 0x2;
         const BIF_RETURNONLYFSDIRS: u32 = 0x0001;
@@ -665,6 +678,7 @@ mod win {
         }
     }
 
+    /// Every path in the clipboard's `CF_HDROP` list, in order; empty when absent or locked.
     pub(super) fn clipboard_hdrop_paths() -> Vec<PathBuf> {
         const CF_HDROP: u32 = 15;
         const QUERY_COUNT: u32 = 0xFFFF_FFFF;
@@ -733,6 +747,7 @@ mod tests {
         assert_eq!(album_send_order(single.clone()), single);
     }
 
+    /// UTF-16 code units without a terminator, for building dialog buffers.
     fn u16z(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
     }
