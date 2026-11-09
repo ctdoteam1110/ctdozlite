@@ -418,6 +418,18 @@ fn pick_native_folder() -> Option<PathBuf> {
 /// Empty on cancel.
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn pick_native_files(images_only: bool, multi: bool) -> Vec<PathBuf> {
+    pick_files_with_helpers(run_dialog_command, images_only, multi)
+}
+
+/// zenity → kdialog file-picker dispatch over an injectable helper runner. `run` returns
+/// `None` when a helper could not open (try the next one) and `Some(paths)` otherwise,
+/// where an empty list is a cancel and must not fall through to kdialog.
+#[cfg_attr(any(target_os = "windows", target_os = "macos"), allow(dead_code))]
+fn pick_files_with_helpers(
+    mut run: impl FnMut(&str, &[&str]) -> Option<Vec<PathBuf>>,
+    images_only: bool,
+    multi: bool,
+) -> Vec<PathBuf> {
     let mut zenity_args = vec!["--file-selection"];
     if multi {
         zenity_args.extend(["--multiple", "--separator=\n"]);
@@ -426,7 +438,7 @@ fn pick_native_files(images_only: bool, multi: bool) -> Vec<PathBuf> {
         zenity_args.push("--file-filter=Images | *.png *.jpg *.jpeg *.webp *.gif *.bmp");
     }
     // Fall back to kdialog only when zenity is missing or cannot open, never after a cancel.
-    if let Some(picked) = run_dialog_command("zenity", &zenity_args) {
+    if let Some(picked) = run("zenity", &zenity_args) {
         return picked;
     }
     let mut kdialog_args = vec!["--getopenfilename"];
@@ -440,7 +452,7 @@ fn pick_native_files(images_only: bool, multi: bool) -> Vec<PathBuf> {
     if multi {
         kdialog_args.extend(["--multiple", "--separate-output"]);
     }
-    run_dialog_command("kdialog", &kdialog_args).unwrap_or_default()
+    run("kdialog", &kdialog_args).unwrap_or_default()
 }
 
 /// zenity directory dialog, falling back to kdialog; `None` on cancel.
@@ -750,6 +762,52 @@ mod tests {
     /// UTF-16 code units without a terminator, for building dialog buffers.
     fn u16z(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
+    }
+
+    /// Runs `pick_files_with_helpers` with scripted helper results, recording which ran.
+    fn pick_with_fakes(
+        zenity: Option<Vec<PathBuf>>,
+        kdialog: Option<Vec<PathBuf>>,
+    ) -> (Vec<PathBuf>, Vec<String>) {
+        let mut calls: Vec<String> = Vec::new();
+        let picked = pick_files_with_helpers(
+            |prog, _args| {
+                calls.push(prog.to_string());
+                match prog {
+                    "zenity" => zenity.clone(),
+                    "kdialog" => kdialog.clone(),
+                    other => panic!("unexpected helper {other}"),
+                }
+            },
+            false,
+            true,
+        );
+        (picked, calls)
+    }
+
+    #[test]
+    fn picker_cancel_in_zenity_does_not_open_kdialog() {
+        let (picked, calls) = pick_with_fakes(Some(Vec::new()), Some(vec![PathBuf::from("/k.png")]));
+        assert!(picked.is_empty());
+        assert_eq!(calls, vec!["zenity"]);
+    }
+
+    #[test]
+    fn picker_returns_zenity_selection_without_kdialog() {
+        let chosen = vec![PathBuf::from("/a.png"), PathBuf::from("/b.pdf")];
+        let (picked, calls) = pick_with_fakes(Some(chosen.clone()), None);
+        assert_eq!(picked, chosen);
+        assert_eq!(calls, vec!["zenity"]);
+    }
+
+    #[test]
+    fn picker_falls_back_to_kdialog_when_zenity_cannot_open() {
+        let (picked, calls) = pick_with_fakes(None, Some(vec![PathBuf::from("/k.png")]));
+        assert_eq!(picked, vec![PathBuf::from("/k.png")]);
+        assert_eq!(calls, vec!["zenity", "kdialog"]);
+        let (none, calls) = pick_with_fakes(None, None);
+        assert!(none.is_empty());
+        assert_eq!(calls, vec!["zenity", "kdialog"]);
     }
 
     #[test]
