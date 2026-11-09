@@ -498,7 +498,13 @@ fn run_dialog_command(prog: &str, args: &[&str]) -> Option<Vec<PathBuf>> {
 #[cfg_attr(windows, allow(dead_code))]
 fn dialog_failed_to_open(code: Option<i32>, stderr: &str) -> bool {
     let stderr = stderr.to_ascii_lowercase();
-    code != Some(1) || stderr.contains("cannot open display") || stderr.contains("could not connect to display")
+    const DISPLAY_ERRORS: [&str; 3] = [
+        "cannot open display",
+        "could not connect to display",
+        // GTK's gtk_init failure text, printed by zenity before exiting with status 1.
+        "failed to open display",
+    ];
+    code != Some(1) || DISPLAY_ERRORS.iter().any(|e| stderr.contains(e))
 }
 
 #[cfg(target_os = "windows")]
@@ -743,6 +749,8 @@ mod tests {
         assert!(!dialog_failed_to_open(Some(1), ""));
         assert!(!dialog_failed_to_open(Some(1), "Gtk-WARNING: mapped without a transient parent"));
         assert!(dialog_failed_to_open(Some(1), "(zenity:42): Gtk-WARNING **: cannot open display: :0"));
+        assert!(dialog_failed_to_open(Some(1), "(zenity:42): Gtk-WARNING **: Failed to open display"));
+        assert!(dialog_failed_to_open(Some(1), "kdialog: could not connect to display"));
         assert!(dialog_failed_to_open(Some(255), ""));
         assert!(dialog_failed_to_open(None, ""));
     }
