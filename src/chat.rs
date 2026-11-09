@@ -454,6 +454,9 @@ pub struct SidebarPresentation {
     pub pinned: bool,
     pub muted: bool,
     pub hidden: bool,
+    /// `name` comes from the friend list (`getfriends` `displayName`), which already applies the
+    /// alias the user set for this contact, so it wins over message-, cache- or DB-derived names.
+    pub contact_name: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1006,9 +1009,13 @@ pub fn merge_thread_into(
     if incoming_id_is_authoritative && !incoming.id.is_empty() && incoming.id != "0" {
         target.id = incoming.id;
     }
-    if is_generic_thread_name(&target.name) && !incoming.name.is_empty() {
+    let incoming_contact_name =
+        incoming.presentation.contact_name && !is_generic_thread_name(&incoming.name);
+    if incoming_contact_name || (is_generic_thread_name(&target.name) && !incoming.name.is_empty())
+    {
         target.name = incoming.name;
     }
+    target.presentation.contact_name |= incoming_contact_name;
     if should_replace_avatar(target.avatar.as_deref(), incoming.avatar.as_deref()) {
         target.avatar = incoming.avatar;
     }
@@ -1379,8 +1386,12 @@ fn parse_thread(v: &Value) -> Option<Thread> {
         .map(crate::clock::message_time)
         .unwrap_or_default();
 
+    let contact_name = !is_generic_thread_name(&name) && name != id;
     Some(Thread {
-        presentation: Default::default(),
+        presentation: SidebarPresentation {
+            contact_name,
+            ..Default::default()
+        },
         unread: Default::default(),
         id,
         name,
@@ -4307,7 +4318,7 @@ fn format_multi_group_avatar(
             .to_string();
         let mut m_ava = String::new();
         if let Some(p) = profiles.get(uid) {
-            if let Some(n) = pick_str(p, &["zaloName", "displayName", "name", "display_name"]) {
+            if let Some(n) = pick_str(p, &["displayName", "zaloName", "name", "display_name"]) {
                 if !n.is_empty() {
                     m_name = n;
                 }
@@ -4531,7 +4542,7 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
                     if let Some(p) = profiles.get(&t.id) {
                         if t.name.starts_with("Người dùng ") || t.name.is_empty() {
                             if let Some(name) =
-                                pick_str(p, &["zaloName", "displayName", "name", "display_name"])
+                                pick_str(p, &["displayName", "zaloName", "name", "display_name"])
                             {
                                 if !name.is_empty() {
                                     t.name = name;
@@ -8061,6 +8072,41 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].thread_id, "u789");
         assert_eq!(seen[0].seen_ts, 1700000000);
+    }
+
+    #[test]
+    fn friend_list_alias_wins_over_stale_names() {
+        // `getfriends` returns the user's alias in `displayName` and the owner's name in `zaloName`.
+        let friend = parse_thread(&serde_json::json!({
+            "userId": "1000000000000000001",
+            "displayName": "Chị Lan (lớp 12)",
+            "zaloName": "Nguyễn Thị Lan"
+        }))
+        .unwrap();
+        assert_eq!(friend.name, "Chị Lan (lớp 12)");
+        assert!(friend.presentation.contact_name);
+
+        let stale = |name: &str| Thread {
+            id: "1000000000000000001".into(),
+            name: name.into(),
+            ..Default::default()
+        };
+        let mut target = stale("Nguyễn Thị Lan");
+        merge_thread_into(&mut target, friend.clone(), true);
+        assert_eq!(target.name, "Chị Lan (lớp 12)");
+        assert!(target.presentation.contact_name);
+
+        // A later message- or cache-derived name must not undo the alias.
+        merge_thread_into(&mut target, stale("Nguyễn Thị Lan"), true);
+        assert_eq!(target.name, "Chị Lan (lớp 12)");
+
+        // Non-contact names still only fill placeholders.
+        let mut placeholder = stale("Người dùng 1000000000000000001");
+        merge_thread_into(&mut placeholder, stale("Nguyễn Thị Lan"), true);
+        assert_eq!(placeholder.name, "Nguyễn Thị Lan");
+        let mut named = stale("Nguyễn Thị Lan");
+        merge_thread_into(&mut named, stale("Someone Else"), true);
+        assert_eq!(named.name, "Nguyễn Thị Lan");
     }
 
     #[test]

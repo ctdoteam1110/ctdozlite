@@ -212,7 +212,7 @@ impl MessageStore {
                      WHEN excluded.name IS NOT NULL AND excluded.name != ''
                           AND excluded.name NOT LIKE 'Người dùng %'
                           AND excluded.name NOT LIKE 'Nhóm %'
-                          AND (threads.name IS NULL OR threads.name = '' OR threads.name LIKE 'Người dùng %' OR threads.name LIKE 'Nhóm %')
+                          AND excluded.name GLOB '*[^0-9]*'
                      THEN excluded.name
                      ELSE COALESCE(NULLIF(threads.name, ''), excluded.name)
                  END,
@@ -353,7 +353,10 @@ impl MessageStore {
                 continue;
             }
             if let Some(existing) = threads.iter_mut().find(|t| t.id == st.thread_id) {
-                if !st.name.is_empty() && !crate::chat::is_generic_thread_name(&st.name) {
+                if !st.name.is_empty()
+                    && !crate::chat::is_generic_thread_name(&st.name)
+                    && !existing.presentation.contact_name
+                {
                     existing.name = st.name;
                 }
                 existing.is_group = existing.is_group || st.is_group;
@@ -1046,7 +1049,7 @@ fn query_names_from_index_db(
             let uid: String = r.get(0)?;
             let dname: String = r.get(1).unwrap_or_default();
             let zname: String = r.get(2).unwrap_or_default();
-            let name = if !zname.is_empty() { zname } else { dname };
+            let name = if !dname.is_empty() { dname } else { zname };
             Ok((uid, name))
         })?;
         for r in rows.flatten() {
@@ -1060,7 +1063,7 @@ fn query_names_from_index_db(
             let uid: String = r.get(0)?;
             let dname: String = r.get(1).unwrap_or_default();
             let zname: String = r.get(2).unwrap_or_default();
-            let name = if !zname.is_empty() { zname } else { dname };
+            let name = if !dname.is_empty() { dname } else { zname };
             Ok((uid, name))
         })?;
         for r in rows.flatten() {
@@ -1805,6 +1808,48 @@ mod tests {
         store.upsert_thread(&st(300)).unwrap();
         store.upsert_thread(&st(100)).unwrap();
         assert_eq!(store.all_threads().unwrap()[0].last_ts, 300);
+    }
+
+    #[test]
+    fn stored_thread_name_tracks_renames_but_never_overrides_friend_list_names() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let upsert = |store: &mut MessageStore, name: &str| {
+            store
+                .upsert_thread(&StoredThread {
+                    thread_id: "1000000000000000001".into(),
+                    name: name.into(),
+                    is_group: false,
+                    last_ts: 0,
+                    last_read_msg_id: String::new(),
+                })
+                .unwrap();
+        };
+        let stored = |store: &MessageStore| store.all_threads().unwrap()[0].name.clone();
+
+        upsert(&mut store, "Nguyễn Thị Lan");
+        upsert(&mut store, "Chị Lan (lớp 12)");
+        assert_eq!(stored(&store), "Chị Lan (lớp 12)");
+        for placeholder in ["", "Người dùng 1000000000000000001", "1000000000000000001"] {
+            upsert(&mut store, placeholder);
+            assert_eq!(stored(&store), "Chị Lan (lớp 12)", "{placeholder:?}");
+        }
+
+        upsert(&mut store, "Nguyễn Thị Lan");
+        let mut threads = vec![crate::chat::Thread {
+            id: "1000000000000000001".into(),
+            name: "Chị Lan (lớp 12)".into(),
+            presentation: crate::chat::SidebarPresentation {
+                contact_name: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        store.hydrate_threads(&mut threads, 10).unwrap();
+        assert_eq!(threads[0].name, "Chị Lan (lớp 12)");
+
+        threads[0].presentation.contact_name = false;
+        store.hydrate_threads(&mut threads, 10).unwrap();
+        assert_eq!(threads[0].name, "Nguyễn Thị Lan");
     }
 
     #[test]

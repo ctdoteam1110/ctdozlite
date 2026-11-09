@@ -5,6 +5,9 @@ Xem thêm quy ước tại [ADR 0003 — Chính sách Changelog & Release Notes]
 
 ## [Unreleased]
 
+### Fixed (Sửa lỗi)
+- **Danh sách bạn bè không hiển thị tên gợi nhớ (alias) đã đặt trên điện thoại (`src/chat.rs`, `src/store.rs`):** Tên lấy từ danh bạ (`getfriends` `displayName`, đã áp dụng tên gợi nhớ) nay được ưu tiên hơn tên cũ trong SQLite, cache hoặc `dName` của tin nhắn; `upsert_thread` cập nhật tên khi có tên thật mới thay vì giữ mãi tên lưu đầu tiên, và các chỗ đọc hồ sơ ưu tiên `displayName` trước `zaloName`.
+
 ## [0.1.0] - 2026-11-09
 
 ### Added (Tính năng mới & Cập nhật)
