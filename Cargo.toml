@@ -41,7 +41,7 @@ lzma-rs = "0.3.0"
 zstd = "0.14.3"
 wasmtime = { version = "50.0.1", default-features = false, features = ["runtime", "cranelift", "std", "anyhow"] }
 getrandom = { version = "0.3", features = ["std"] }
-nokhwa = { version = "=0.10.11", default-features = false, features = ["input-native", "decoding"] }
+nokhwa = { version = "=0.10.11", default-features = false, features = ["input-native"] }
 openh264 = { version = "=0.9.9", default-features = false, features = ["source"] }
 
 [lib]
