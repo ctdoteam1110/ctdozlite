@@ -1099,6 +1099,12 @@ impl<'a> TuiApp<'a> {
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         if self.local_reset_pending {
+            if (mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c'))
+                || code == KeyCode::Char('q')
+            {
+                self.should_quit = true;
+                self.status = "Sẽ thoát sau khi hoàn tất thao tác dữ liệu đã xác nhận…".into();
+            }
             return;
         }
         if mods.contains(KeyModifiers::CONTROL) {
@@ -1476,6 +1482,8 @@ impl<'a> TuiApp<'a> {
                 BgEvent::LocalResetDone(result) => {
                     self.local_reset_pending = false;
                     self.poll_inflight = false;
+                    // Aborted sticker requests cannot send their completion events.
+                    self.sticker.loading = false;
                     match result {
                         Ok(status) => {
                             for thread in &mut self.threads {
@@ -1661,7 +1669,8 @@ async fn run_loop(
     }
     let mut last_poll = std::time::Instant::now();
 
-    while !app.should_quit {
+    // A quit request must drain a confirmed reset rather than aborting its blocking work.
+    while !app.should_quit || app.local_reset_pending {
         app.check_background_events();
         terminal.draw(|f| ui_draw(f, app))?;
 
@@ -2938,6 +2947,22 @@ mod tests {
 
     /// The "clear local data" confirmation must reach the terminal with its Vietnamese
     /// text intact — it is the only guard in front of an irreversible delete (#21).
+    #[test]
+    fn quit_during_reset_is_remembered_without_abandoning_the_reset() {
+        let mut session = Session::new(false, false, false).unwrap();
+        let mut app = TuiApp::new(&mut session, Vec::new());
+        app.local_reset_pending = true;
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit);
+        assert!(app.local_reset_pending);
+        app.bg_tx
+            .send(BgEvent::LocalResetDone(Ok("Test".into())))
+            .unwrap();
+        app.check_background_events();
+        assert!(app.should_quit);
+        assert!(!app.local_reset_pending);
+    }
+
     #[test]
     fn wipe_confirmation_renders_its_vietnamese_text() {
         let mut session = crate::session::Session::new(false, false, false).unwrap();

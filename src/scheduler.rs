@@ -393,8 +393,22 @@ pub fn update_scheduled_message(
 pub fn cancel_scheduled_message(db_path: &str, id: i64) -> Result<bool> {
     let conn = open_scheduler_db(db_path)?;
     let changed = conn.execute(
-        "DELETE FROM scheduled_messages WHERE id = ?1 AND status != 'sent'",
+        "DELETE FROM scheduled_messages WHERE id = ?1 AND status IN ('pending', 'failed')",
         params![id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Makes an unclaimed schedule due without creating a second delivery path.
+///
+/// # Errors
+/// Returns an error if the account's schedule database cannot be opened or updated.
+pub fn send_scheduled_now(db_path: &str, id: i64, now_ts: i64) -> Result<bool> {
+    let conn = open_scheduler_db(db_path)?;
+    let changed = conn.execute(
+        "UPDATE scheduled_messages SET deliver_at = ?1, status = 'pending', error_msg = ''
+         WHERE id = ?2 AND status IN ('pending', 'failed')",
+        params![now_ts, id],
     )?;
     Ok(changed > 0)
 }
@@ -455,6 +469,33 @@ pub fn mark_scheduled_failed(db_path: &str, id: i64, err: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_now_and_cancel_cannot_duplicate_a_claimed_schedule() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-send-now-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("history.db");
+        let db = path.to_str().unwrap();
+        let now = 1_762_000_000;
+        let item = schedule_message(db, "thread-1", "Test", false, "Test", now + 60, now).unwrap();
+        assert!(send_scheduled_now(db, item.id, now).unwrap());
+        let due = claim_due_scheduled_messages(db, now).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, item.id);
+        assert!(!send_scheduled_now(db, item.id, now).unwrap());
+        assert!(!cancel_scheduled_message(db, item.id).unwrap());
+        assert!(claim_due_scheduled_messages(db, now + 60)
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn presets_and_custom_input_parsing_produce_future_timestamps() {

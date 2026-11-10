@@ -200,6 +200,9 @@ pub enum GuiEvent {
         reason: String,
     },
     StatusUpdate(String),
+    HistoryImportFinished(Result<String, String>),
+    ScheduleSendNowFinished(Result<bool, String>),
+    ScheduleCancelFinished(Result<bool, String>),
     RefreshFinished {
         threads: usize,
         messages: usize,
@@ -207,6 +210,10 @@ pub enum GuiEvent {
         manual: bool,
     },
     ScheduledListUpdated,
+    ScheduledItemsLoaded {
+        result: Result<Vec<crate::scheduler::ScheduledMessage>, String>,
+        notify_sent: bool,
+    },
     SyncFinished {
         added: usize,
         errors: Vec<String>,
@@ -622,7 +629,7 @@ impl GuiTx {
     }
 
     /// Invalidate all tasks and queued events belonging to the previous account.
-    fn advance_account(&self) -> Self {
+    pub(crate) fn advance_account(&self) -> Self {
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.reset_video_generation(None);
         self.scoped()
@@ -1255,11 +1262,27 @@ impl ZaloGuiApp {
     }
 
     pub(super) fn refresh_scheduled_items(&mut self) {
-        self.scheduled_items = crate::scheduler::list_pending_scheduled(
-            &crate::store::db_path_for_account(&self.user_uin),
-            None,
-        )
-        .unwrap_or_default();
+        self.request_scheduled_items(false);
+    }
+
+    fn request_scheduled_items(&mut self, notify_sent: bool) {
+        if crate::account_manager::validate_uin(&self.user_uin).is_err() {
+            self.scheduled_items.clear();
+            return;
+        }
+        if let Some(tx) = WORKER_TX.get() {
+            if tx
+                .send(WorkerCmd::LoadScheduledMessages {
+                    uin: self.user_uin.clone(),
+                    notify_sent,
+                })
+                .is_err()
+            {
+                self.status_msg = "Không thể tải lịch hẹn: tác vụ nền đã dừng.".into();
+            }
+        } else {
+            self.status_msg = "Không thể tải lịch hẹn: tác vụ nền chưa sẵn sàng.".into();
+        }
     }
 
     /// Hand the worker's poll timer the thread ids/names it maps incoming messages onto.
@@ -1319,6 +1342,9 @@ impl ZaloGuiApp {
                     self.is_logged_in = true;
                     self.user_name = name;
                     self.user_uin = uin;
+                    if let Some(tx) = WORKER_TX.get() {
+                        tx.set_visible_account(&self.user_uin);
+                    }
                     if avatar.is_some() {
                         self.user_avatar = avatar;
                     }
@@ -1604,10 +1630,14 @@ impl ZaloGuiApp {
                     self.status_msg = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên)".into();
                 }
                 GuiEvent::LoggedOut => {
+                    self.reaction_inbox = Default::default();
                     self.saved_accounts.invalidate();
                     self.is_logged_in = false;
                     self.user_name.clear();
                     self.user_uin.clear();
+                    if let Some(tx) = WORKER_TX.get() {
+                        tx.set_visible_account("");
+                    }
                     self.threads.clear();
                     self.active_call = None;
                     self.scheduled_items.clear();
@@ -1625,6 +1655,9 @@ impl ZaloGuiApp {
                     self.saved_accounts.invalidate();
                     self.is_logged_in = true;
                     self.user_uin = uin;
+                    if let Some(tx) = WORKER_TX.get() {
+                        tx.set_visible_account(&self.user_uin);
+                    }
                     self.user_name = name.clone();
                     self.user_avatar = avatar;
                     self.threads = threads;
@@ -2207,6 +2240,29 @@ impl ZaloGuiApp {
                 GuiEvent::StatusUpdate(msg) => {
                     self.status_msg = msg;
                 }
+                GuiEvent::HistoryImportFinished(result) => {
+                    let message = match result {
+                        Ok(message) => message,
+                        Err(error) => format!("Lỗi nhập lịch sử: {error}"),
+                    };
+                    self.status_msg = message.clone();
+                    self.show_toast(message);
+                }
+                GuiEvent::ScheduleSendNowFinished(result) => match result {
+                    Ok(true) => self.show_toast("Đang gửi ngay tin nhắn hẹn giờ…"),
+                    Ok(false) => self.show_toast("Lịch hẹn không còn chờ gửi."),
+                    Err(error) => self.show_toast(format!("Không thể gửi lịch hẹn: {error}")),
+                },
+                GuiEvent::ScheduleCancelFinished(result) => {
+                    self.refresh_scheduled_items();
+                    let message = match result {
+                        Ok(true) => "Đã hủy tin nhắn hẹn giờ.".to_string(),
+                        Ok(false) => "Lịch hẹn không còn chờ gửi.".to_string(),
+                        Err(error) => format!("Không thể hủy lịch hẹn: {error}"),
+                    };
+                    self.status_msg = message.clone();
+                    self.show_toast(message);
+                }
                 GuiEvent::HistoryReachedStart(tid) => {
                     self.history_reached_start.insert(tid);
                     self.show_toast("Đã hiển thị toàn bộ lịch sử tin nhắn của cuộc trò chuyện này");
@@ -2232,9 +2288,19 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::ScheduledListUpdated => {
+                    self.request_scheduled_items(true);
+                }
+                GuiEvent::ScheduledItemsLoaded { result, notify_sent } => {
                     let prev_cnt = self.scheduled_items.len();
-                    self.refresh_scheduled_items();
-                    if self.scheduled_items.len() < prev_cnt {
+                    let items = match result {
+                        Ok(items) => items,
+                        Err(error) => {
+                            self.status_msg = format!("Không thể tải lịch hẹn: {error}");
+                            continue;
+                        }
+                    };
+                    self.scheduled_items = items;
+                    if notify_sent && self.scheduled_items.len() < prev_cnt {
                         if self.settings.enable_notifications
                             && self.settings.play_notification_sound
                         {

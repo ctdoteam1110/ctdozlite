@@ -4499,12 +4499,19 @@ impl ZaloGuiApp {
             }
         }
         if let Some(id) = action_cancel {
-            let _ = crate::scheduler::cancel_scheduled_message(
-                &crate::store::db_path_for_account(&self.user_uin),
-                id,
-            );
-            self.refresh_scheduled_items();
-            self.show_toast("Đã hủy tin nhắn hẹn giờ");
+            if let Some(tx) = WORKER_TX.get() {
+                if tx
+                    .send(WorkerCmd::CancelScheduledMessage {
+                        uin: self.user_uin.clone(),
+                        id,
+                    })
+                    .is_err()
+                {
+                    self.show_toast("Không thể hủy lịch hẹn: tác vụ nền đã dừng.");
+                }
+            } else {
+                self.show_toast("Không thể hủy lịch hẹn: tác vụ nền chưa sẵn sàng.");
+            }
         }
         if let Some(item) = action_edit {
             self.input_message = item.text;
@@ -4512,19 +4519,19 @@ impl ZaloGuiApp {
             self.schedule_custom_input = crate::scheduler::format_schedule_time(item.deliver_at);
         }
         if let Some(item) = action_send_now {
-            let _ = crate::scheduler::cancel_scheduled_message(
-                &crate::store::db_path_for_account(&self.user_uin),
-                item.id,
-            );
-            self.refresh_scheduled_items();
             if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::SendMessage {
-                    to_id: item.thread_id,
-                    text: item.text,
-                    is_group: item.is_group,
-                });
+                if tx
+                    .send(WorkerCmd::SendScheduledMessageNow {
+                        uin: self.user_uin.clone(),
+                        id: item.id,
+                    })
+                    .is_err()
+                {
+                    self.show_toast("Không thể gửi lịch hẹn: tác vụ nền đã dừng.");
+                }
+            } else {
+                self.show_toast("Không thể gửi lịch hẹn: tác vụ nền chưa sẵn sàng.");
             }
-            self.show_toast("Đang gửi ngay tin nhắn hẹn giờ…");
         }
         if !open {
             self.schedule_modal_open = false;
