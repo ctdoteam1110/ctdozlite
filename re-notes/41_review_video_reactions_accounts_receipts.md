@@ -48,7 +48,11 @@ Verification logs are local artifacts under `target/review-four-fixes-*` and
 hardware and real-peer acceptance checks in [note 40](40_native_video_integration.md).
 No commit, push or publication is authorized by these corrections.
 
-## Final verification
+## Historical v0.0.9 verification, before the upstream v0.1.0 rebase
+
+These results apply to the older v0.0.9 lockfile, before upstream added
+Wasmtime 50.0.1. They do not describe the compiler requirement or test count of
+the current rebased branch; see the follow-up section below and ADR-0006.
 
 - Rust 1.89 locked full suite: **338 passed, 0 failed, 1 ignored**.
 - Locked Windows x64 release build completed. Changed source files pass rustfmt
@@ -62,3 +66,46 @@ No commit, push or publication is authorized by these corrections.
   remain unresolved; no clean release-readiness claim is made.
 - Local test binary: `dist/test-build/ctdozlite-native-video-win64.exe`.
   SHA-256: `6fc03b63e4f840a63d65aef61344df511429d7c03974e61fa112f371e55ace0f`.
+
+## Follow-up review on upstream v0.1.0 (2026-11-10)
+
+The current manifest requires Rust **1.97**, matching the locked Wasmtime
+50.0.1 manifest's `rust-version`. Current verification uses **Rust 1.99**:
+`cargo +stable test --locked` reports **373 passed, zero failed, one ignored**.
+The earlier Rust 1.89 results above remain historical results for v0.0.9 only.
+
+- Account-transition hangup carries the departing session snapshot and scoped
+  GUI sender before logout or account-generation advance. The signal payloads
+  and endpoints are unchanged. An isolated command-queue regression verifies
+  that clearing the active session cannot clear the queued hangup credentials;
+  GUI generation tests cover rejection of departing-account events.
+- GUI commands carry the identity visible when enqueued, rather than inheriting
+  the account active when dispatched. Cross-account commands are rejected;
+  remote mutations and user call commands retain their accepted session
+  snapshot. Login callbacks are generation-checked, and internal sync follow-ups
+  retain the account that produced them. Queue and delayed-task regressions
+  cover the account-switch window without contacting Zalo.
+- Restarting QR/password authentication invalidates the previous account's
+  completions, including after runtime session expiration. Explicit logout
+  retains the departing owner so saved credentials are removed. The call engine
+  never saves its private profile-resolution snapshot to `session.json`.
+- Session snapshots use a nonblocking lock attempt in the dispatcher. Locked
+  login work defers ordinary commands in FIFO order; authorization, updates and
+  account transitions bypass that backlog. Tests hold the login mutex while
+  checking app-wide dispatch and cancellation priority.
+- Completed dials recheck their account generation, cancellation generation
+  and empty active-call slot under the call-state lock. Rejected dials release
+  media and relay keepalives before sending the existing `405` / `12437` cancel
+  payloads with the original session. Tests cover departure during dialing,
+  cancellation without an account change, occupied call state and payloads.
+- Late-loaded reaction snapshots reconcile queued identities against their
+  persisted ledger before adding new events. The synthetic five-replay plus
+  one-new-event regression preserves a snapshot of ten as eleven. Snapshots
+  without identities retain the previous conservative counting policy.
+- Schedule reads and send-now/cancel updates run on blocking workers and return
+  scoped result events. Cancellation never uses the automatic-delivery toast.
+- TUI quit requests during a confirmed reset are remembered and drain that
+  reset before exiting; aborted sticker fetches release their loading flag.
+
+The earlier release-binary results above remain historical. Physical devices,
+peer calls and cross-platform release verification remain pending.
