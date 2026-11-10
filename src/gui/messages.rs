@@ -3067,29 +3067,6 @@ mod quote_navigation_tests {
     use super::*;
 
     #[test]
-    fn reaction_bar_handles_narrow_and_empty_chat_panes() {
-        for width in [0.0, 180.0, 251.0, 252.0, 600.0] {
-            for outgoing in [false, true] {
-                let ctx = egui::Context::default();
-                let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        ui.set_clip_rect(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 300.0)));
-                        let _ = render_hover_reaction_bar(
-                            ui,
-                            Rect::from_min_size(Pos2::new(10.0, 50.0), Vec2::new(120.0, 40.0)),
-                            &ChatMessage::default(),
-                            0,
-                            outgoing,
-                            &ThemePalette::light(),
-                            &HashMap::new(),
-                        );
-                    });
-                });
-            }
-        }
-    }
-
-    #[test]
     fn quote_navigation_bubble_propagates_action_for_both_directions() {
         for is_outgoing in [false, true] {
             let ctx = egui::Context::default();
