@@ -47,10 +47,10 @@ Electron이나 Chromium 없이 Rust(`eframe`/`egui` + `ratatui`)로 제작되어
 ## 🛠️ 소스 코드 빌드 방법
 
 ### 사전 요구사항
-- **Rust 툴체인:** Stable Rust (1.80+ 권장, `rustup`으로 설치).
+- **Rust 툴체인:** Rust 1.97 이상 (네이티브 동기화의 Wasmtime 요구 사항, `rustup`으로 설치).
 - **시스템 종속성:**
-  - **Linux:** `libasound2-dev`, `libfontconfig1-dev`, `libx11-dev`, `libxcursor-dev`, `libxi-dev`, `libgl1-mesa-dev`, `ffmpeg`.
-  - **Windows / macOS:** 표준 C 툴체인 및 `ffmpeg` (영상/음성 통화용).
+  - **Linux:** `libasound2-dev`, `libfontconfig1-dev`, `libx11-dev`, `libxcursor-dev`, `libxi-dev`, `libgl1-mesa-dev`, `clang`, `libclang-dev`, `cmake`, `pkg-config`.
+  - **Windows / macOS:** 표준 C/C++ 툴체인 및 CMake. 카메라는 네이티브 API, 영상은 내장 OpenH264를 사용합니다.
 
 ```bash
 # 리포지토리 클론

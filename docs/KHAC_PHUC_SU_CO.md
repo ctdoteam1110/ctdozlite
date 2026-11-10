@@ -28,8 +28,8 @@ Bảng tra cứu các mã lỗi trả về từ máy chủ Zalo và các vấn �
 - **Cách khắc phục:** Hàm `setup_custom_fonts` trong `src/gui/theme.rs` tự động tìm và nạp các font hệ thống hỗ trợ tiếng Việt (`Segoe UI`, `Arial`, `Tahoma`, `NotoSans`, `DejaVuSans`, `Ubuntu`). Nếu chạy trên bản Linux tối giản chưa có font, hãy cài gói `fonts-noto-core` hoặc `fonts-dejavu-core`.
 
 ### 2.3. Không giải mã được hình ảnh cuộc gọi video
-- **Nguyên nhân:** Tính năng gọi video H.264 sử dụng `ffmpeg` để thu hình từ thiết bị camera và giải mã luồng video nhận về.
-- **Cách khắc phục:** Kiểm tra `ffmpeg -version` trong terminal và đảm bảo `ffmpeg` đã nằm trong `PATH` của hệ thống.
+- **Nguyên nhân:** Camera chưa được cấp quyền, thiết bị đang bận hoặc luồng H.264 chưa nhận được SPS/PPS và khung hình khoá.
+- **Cách khắc phục:** Cấp quyền camera trong cài đặt hệ điều hành, đóng ứng dụng đang giữ camera rồi quét lại thiết bị. Ứng dụng dùng camera native và OpenH264 tích hợp, không cần cài FFmpeg. Nếu hình nhận về bị treo, kiểm tra voip.log để xác định mất gói hoặc định dạng không được hỗ trợ.
 
 ---
 

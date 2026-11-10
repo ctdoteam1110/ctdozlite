@@ -94,7 +94,7 @@ Cột **Issue** trỏ tới nơi đang theo dõi. Nếu issue đã đóng, tính
 | Tính năng | Trạng thái | Ghi chú | Issue |
 |---|---|---|---|
 | Gọi thoại 1-1 | 🟡 | Đã có luồng gọi; chất lượng phụ thuộc mạng | |
-| Gọi video | 🟡 | Cần `ffmpeg` trong `PATH` để thu và giải mã hình | |
+| Gọi video | 🟡 | Camera native + OpenH264 tích hợp; không cần FFmpeg. Cần kiểm thử tương thích cuộc gọi thực tế | |
 | Gọi nhóm | 🟡 | | |
 
 ---

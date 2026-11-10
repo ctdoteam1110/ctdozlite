@@ -47,10 +47,10 @@ Prebuilt installers and portable binaries are available on [GitHub Releases](htt
 ## 🛠️ Building from Source
 
 ### Prerequisites
-- **Rust Toolchain:** Stable Rust (1.80+ recommended) via `rustup`.
+- **Rust Toolchain:** Rust 1.97+ via `rustup` (required by the native Wasmtime sync dependency).
 - **System Dependencies:**
-  - **Linux:** `libasound2-dev`, `libfontconfig1-dev`, `libx11-dev`, `libxcursor-dev`, `libxi-dev`, `libgl1-mesa-dev`, `ffmpeg`.
-  - **Windows / macOS:** Standard C toolchain and `ffmpeg` (for media/video calls).
+  - **Linux:** `libasound2-dev`, `libfontconfig1-dev`, `libx11-dev`, `libxcursor-dev`, `libxi-dev`, `libgl1-mesa-dev`, `clang`, `libclang-dev`, `cmake`, `pkg-config`.
+  - **Windows / macOS:** Standard C/C++ toolchain and CMake. Video uses native cameras and bundled OpenH264; no FFmpeg installation is required.
 
 ```bash
 # Clone the repository

@@ -77,8 +77,8 @@ window.CTD_ISSUES = [
       "Nhat Nguyen"
     ],
     "symptom": "Vào cuộc gọi video nhưng không thấy hình từ camera của mình.",
-    "evidence": "src/media.rs có spawn_camera_capture_thread và enumerate_ffmpeg_cameras, phụ thuộc ffmpeg trong PATH. Trên Windows nếu ffmpeg không có trong PATH thì danh sách camera rỗng và luồng capture không khởi động, không có cảnh báo rõ ràng.",
-    "fix": "Kiểm tra ffmpeg trước khi vào cuộc gọi và báo lỗi rõ ràng trong UI thay vì im lặng; hoặc đóng gói ffmpeg kèm bản cài.",
+    "evidence": "Bản v0.0.9 dùng công cụ video bên ngoài. Nhánh native-video thay bằng camera hệ điều hành và OpenH264 tích hợp; còn cần kiểm thử camera và cuộc gọi thực tế.",
+    "fix": "Dùng bản thử native-video, cấp quyền camera và chọn đúng thiết bị; ghi lại kết quả kiểm thử phần cứng trước khi phát hành.",
     "files": [
       "src/media.rs",
       "src/call.rs"
