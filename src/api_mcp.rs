@@ -356,7 +356,9 @@ async fn execute_tool_call(
 ) -> (bool, Value) {
     // The GUI server survives account switches; bind both history and requests to
     // one session snapshot instead of continuing to use its legacy startup path.
-    if db_path == "zalo_history.db" && name != "zalo_status" && session.lock().await.login.is_none()
+    if matches!(db_path, "zalo_history.db" | ":memory:")
+        && name != "zalo_status"
+        && session.lock().await.login.is_none()
     {
         return (true, json!({"error": "Chưa đăng nhập phiên Zalo"}));
     }
@@ -924,6 +926,31 @@ mod tests {
             execute_tool_call(&session, "zalo_list_threads", &json!({}), "zalo_history.db").await;
         assert!(is_error);
         assert_eq!(response["error"], "Chưa đăng nhập phiên Zalo");
+    }
+
+    #[tokio::test]
+    async fn logged_out_rest_and_mcp_cannot_schedule_into_a_discarded_database() {
+        let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
+        let args = json!({"to_id":"thread-1", "text":"Test", "when":"+30m"});
+        let (status, response) = handle_rest_request(
+            &session,
+            "POST",
+            "/api/v1/messages/schedule",
+            &args.to_string(),
+            "zalo_history.db",
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(response.get("error").is_some());
+        let response = handle_mcp_request(
+            &session,
+            &json!({"jsonrpc":"2.0", "id":1,
+            "method":"tools/call", "params":{"name":"zalo_schedule_message", "arguments":args}}),
+            "zalo_history.db",
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["result"]["isError"], true);
     }
 
     #[test]
