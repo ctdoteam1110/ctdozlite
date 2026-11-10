@@ -8,6 +8,7 @@
 //! - GUI parity: search/filter/unread, scrollback, quote, reactions, delete,
 //!   attachments, sticker store, group history and the dev log inspector.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
@@ -163,6 +164,7 @@ enum BgEvent {
     UpdateAvailable(crate::gui::UpdateCheckResult),
     SendFailed(String),
     ActionFailed(String),
+    LocalResetDone(std::result::Result<String, String>),
 }
 
 pub struct TuiApp<'a> {
@@ -196,11 +198,16 @@ pub struct TuiApp<'a> {
     poll_inflight: bool,
     bg_rx: Receiver<BgEvent>,
     bg_tx: Sender<BgEvent>,
+    background_tasks: RefCell<Vec<tokio::task::JoinHandle<()>>>,
+    local_reset_pending: bool,
 }
 
 impl<'a> TuiApp<'a> {
     pub fn new(session: &'a mut Session, mut threads: Vec<Thread>) -> Self {
-        let store = crate::store::MessageStore::open("zalo_history.db").ok();
+        let store = session
+            .login
+            .as_ref()
+            .and_then(|login| crate::store::MessageStore::open_account(&login.uin).ok());
         if let Some(ref st) = store {
             let _ = st.hydrate_threads(&mut threads, 200);
         }
@@ -238,10 +245,33 @@ impl<'a> TuiApp<'a> {
             poll_inflight: false,
             bg_rx: rx,
             bg_tx: tx,
+            background_tasks: RefCell::new(Vec::new()),
+            local_reset_pending: false,
         };
         app.rebuild_filter();
         app.ensure_msg_selection();
         app
+    }
+
+    fn account_uin(&self) -> Option<String> {
+        self.session.login.as_ref().map(|login| login.uin.clone())
+    }
+
+    fn save_account_cache(&self) {
+        if !self.local_reset_pending {
+            if let Some(uin) = self.account_uin() {
+                chat::save_threads_cache_for_account(&uin, &self.threads);
+            }
+        }
+    }
+
+    fn spawn_background(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        if self.local_reset_pending {
+            return;
+        }
+        let mut tasks = self.background_tasks.borrow_mut();
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(tokio::spawn(future));
     }
 
     fn session_clone(&self) -> Session {
@@ -476,9 +506,15 @@ impl<'a> TuiApp<'a> {
     }
 
     fn persist_snapshot(&mut self, threads: &[Thread]) {
+        if self.local_reset_pending {
+            return;
+        }
+        let Some(uin) = self.account_uin() else {
+            return;
+        };
         if let Some(ref mut st) = self.store {
             let _ = crate::store::persist_threads(st, threads);
-        } else if let Ok(mut st) = crate::store::MessageStore::open("zalo_history.db") {
+        } else if let Ok(mut st) = crate::store::MessageStore::open_account(&uin) {
             let _ = crate::store::persist_threads(&mut st, threads);
             self.store = Some(st);
         }
@@ -501,19 +537,24 @@ impl<'a> TuiApp<'a> {
     }
 
     fn persist_async(&self) {
+        if self.local_reset_pending {
+            return;
+        }
+        let Some(uin) = self.account_uin() else {
+            return;
+        };
         let snapshot = self.threads.clone();
-        tokio::spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(mut st) = crate::store::MessageStore::open("zalo_history.db") {
-                    let _ = crate::store::persist_threads(&mut st, &snapshot);
-                }
-            })
-            .await;
+        // Keep the blocking task's handle so a wipe can wait for an already-running write.
+        let task = tokio::task::spawn_blocking(move || {
+            if let Ok(mut st) = crate::store::MessageStore::open_account(&uin) {
+                let _ = crate::store::persist_threads(&mut st, &snapshot);
+            }
         });
+        self.background_tasks.borrow_mut().push(task);
     }
 
     fn spawn_poll(&mut self) {
-        if self.poll_inflight || self.session.login.is_none() {
+        if self.local_reset_pending || self.poll_inflight || self.session.login.is_none() {
             return;
         }
         self.poll_inflight = true;
@@ -521,7 +562,7 @@ impl<'a> TuiApp<'a> {
         let mut state = self.poll_state.clone();
         let mut threads = self.threads.clone();
         let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             match chat::poll_new_messages(&session, &mut state, &mut threads).await {
                 Ok(()) => {
                     let _ = tx.send(BgEvent::PollDone { threads, state });
@@ -538,7 +579,7 @@ impl<'a> TuiApp<'a> {
         self.status = "Đang làm mới...".into();
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             let result = async {
                 let mut list = chat::get_friends(&session).await?;
                 let ids: Vec<String> = list.iter().map(|t| t.id.clone()).collect();
@@ -587,7 +628,7 @@ impl<'a> TuiApp<'a> {
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
         let gid = group_id.clone();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             match chat::get_group_history(&session, &gid, 50).await {
                 Ok(resp) => {
                     let _ = tx.send(BgEvent::HistoryLoaded {
@@ -612,7 +653,7 @@ impl<'a> TuiApp<'a> {
         self.sticker.loading = true;
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             match chat::fetch_sticker_store_packs(&session).await {
                 Ok(packs) => {
                     let _ = tx.send(BgEvent::StickerPacks(packs));
@@ -652,7 +693,7 @@ impl<'a> TuiApp<'a> {
             self.sticker.loaded_name = name.clone();
             let session = self.session_clone();
             let tx = self.bg_tx.clone();
-            tokio::spawn(async move {
+            self.spawn_background(async move {
                 match chat::fetch_sticker_pack_items(&session, cate_id, &name).await {
                     Ok(items) => {
                         let _ = tx.send(BgEvent::StickerItems(items));
@@ -720,11 +761,11 @@ impl<'a> TuiApp<'a> {
         self.selected_msg = None;
         self.follow_tail = true;
         self.persist_current_snapshot();
-        chat::save_threads_cache(&self.threads);
+        self.save_account_cache();
 
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             match chat::send_sticker(
                 &session,
                 &to_id,
@@ -763,7 +804,7 @@ impl<'a> TuiApp<'a> {
 
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             match chat::send_attachment(&session, &to_id, is_group, &path, &caption).await {
                 Ok((_resp, msg)) => {
                     let _ = tx.send(BgEvent::AttachmentSent {
@@ -828,12 +869,12 @@ impl<'a> TuiApp<'a> {
         self.selected_msg = None;
         self.follow_tail = true;
         self.persist_current_snapshot();
-        chat::save_threads_cache(&self.threads);
+        self.save_account_cache();
         self.bump_thread(&to_id);
 
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             let result = match (&reply, is_group) {
                 (Some(q), true) => chat::send_quote_message(&session, &to_id, &text, q, true)
                     .await
@@ -900,7 +941,7 @@ impl<'a> TuiApp<'a> {
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
         let msg_id = msg.id.clone();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             match chat::send_reaction(&session, &to_id, is_group, &msg, emoji).await {
                 Ok(_) => {
                     let _ = tx.send(BgEvent::ReactionDone {
@@ -977,26 +1018,55 @@ impl<'a> TuiApp<'a> {
 
     fn run_confirm(&mut self, action: ConfirmAction) {
         match action.kind {
-            ConfirmKind::Logout => {
-                let _ = std::fs::remove_file("session.json");
-                let _ = std::fs::remove_file("threads_cache.json");
-                self.session.logout();
-                self.threads.clear();
-                self.filtered.clear();
-                self.list_state.select(None);
-                self.unread.clear();
-                self.selected_thread = 0;
-                self.selected_msg = None;
-                self.status = "Đã đăng xuất. Bấm 'q' để thoát.".into();
-            }
-            ConfirmKind::WipeLocalData => {
-                // History only: the session and the thread list stay usable (#21).
-                let _ = std::fs::remove_file("zalo_history.db");
-                let _ = std::fs::remove_file("threads_cache.json");
-                for t in self.threads.iter_mut() {
-                    t.messages.clear();
+            ConfirmKind::Logout | ConfirmKind::WipeLocalData => {
+                if self.local_reset_pending {
+                    return;
                 }
-                self.status = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên).".into();
+                let Some(uin) = self.account_uin() else {
+                    return;
+                };
+                let logout = action.kind == ConfirmKind::Logout;
+                self.local_reset_pending = true;
+                self.store = None;
+                let tasks = self
+                    .background_tasks
+                    .get_mut()
+                    .drain(..)
+                    .collect::<Vec<_>>();
+                for task in &tasks {
+                    task.abort();
+                }
+                if logout {
+                    self.session.logout();
+                    self.threads.clear();
+                    self.filtered.clear();
+                    self.list_state.select(None);
+                    self.unread.clear();
+                    self.selected_thread = 0;
+                    self.selected_msg = None;
+                }
+                self.status = "Đang xoá dữ liệu cục bộ…".into();
+                let tx = self.bg_tx.clone();
+                tokio::spawn(async move {
+                    // Await cancelled tasks before deleting so an old snapshot cannot restore history.
+                    for task in tasks {
+                        let _ = task.await;
+                    }
+                    let result = tokio::task::spawn_blocking(move || -> Result<String> {
+                        if logout {
+                            crate::account_manager::logout_account(&uin)?;
+                            remove_owned_thread_caches(std::path::Path::new("."), &uin)?;
+                            Ok("Đã đăng xuất. Bấm 'q' để thoát.".into())
+                        } else {
+                            wipe_account_history_in(std::path::Path::new("."), &uin)?;
+                            Ok("Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên).".into())
+                        }
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                    let _ = tx.send(BgEvent::LocalResetDone(result));
+                });
             }
             ConfirmKind::DeleteMessage => {
                 let thread_id = action.thread_id;
@@ -1010,7 +1080,7 @@ impl<'a> TuiApp<'a> {
                 let is_group = t.is_group;
                 let session = self.session_clone();
                 let tx = self.bg_tx.clone();
-                tokio::spawn(async move {
+                self.spawn_background(async move {
                     match chat::delete_message_for_me(&session, &thread_id, is_group, &msg).await {
                         Ok(_) => {
                             let _ = tx.send(BgEvent::DeleteDone { thread_id, msg_id });
@@ -1028,6 +1098,9 @@ impl<'a> TuiApp<'a> {
     }
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        if self.local_reset_pending {
+            return;
+        }
         if mods.contains(KeyModifiers::CONTROL) {
             match code {
                 KeyCode::Char('c') => {
@@ -1382,19 +1455,46 @@ impl<'a> TuiApp<'a> {
             }
         }
         self.rebuild_filter();
-        chat::save_threads_cache(&self.threads);
+        self.save_account_cache();
         self.persist_async();
     }
 
     fn check_background_events(&mut self) {
         while let Ok(event) = self.bg_rx.try_recv() {
+            if self.local_reset_pending && !matches!(&event, BgEvent::LocalResetDone(_)) {
+                continue;
+            }
+            if self.session.login.is_none()
+                && !matches!(
+                    &event,
+                    BgEvent::LocalResetDone(_) | BgEvent::UpdateAvailable(_)
+                )
+            {
+                continue;
+            }
             match event {
+                BgEvent::LocalResetDone(result) => {
+                    self.local_reset_pending = false;
+                    self.poll_inflight = false;
+                    match result {
+                        Ok(status) => {
+                            for thread in &mut self.threads {
+                                thread.messages.clear();
+                                thread.preview.clear();
+                            }
+                            self.status = status;
+                        }
+                        Err(error) => {
+                            self.status = format!("Không thể xoá dữ liệu cục bộ: {error}")
+                        }
+                    }
+                }
                 BgEvent::PollDone { threads, state } => {
                     self.poll_inflight = false;
                     let changed = self.apply_polled(threads, state);
                     self.status = format!("Cập nhật {}", crate::ui::clock());
                     if changed {
-                        chat::save_threads_cache(&self.threads);
+                        self.save_account_cache();
                         self.persist_async();
                     }
                 }
@@ -1415,7 +1515,7 @@ impl<'a> TuiApp<'a> {
                     }
                     if count > 0 {
                         self.persist_thread_by_id(&thread_id);
-                        chat::save_threads_cache(&self.threads);
+                        self.save_account_cache();
                         self.selected_msg = None;
                         self.follow_tail = true;
                         self.status = format!("Đã tải lịch sử nhóm ({count} tin)");
@@ -1447,7 +1547,7 @@ impl<'a> TuiApp<'a> {
                     if appended {
                         self.bump_thread(&thread_id);
                         self.persist_thread_by_id(&thread_id);
-                        chat::save_threads_cache(&self.threads);
+                        self.save_account_cache();
                         self.follow_tail = true;
                         self.status = "Đã gửi tệp đính kèm".into();
                     }
@@ -1480,7 +1580,7 @@ impl<'a> TuiApp<'a> {
                     }
                     self.selected_msg = None;
                     self.persist_thread_by_id(&thread_id);
-                    chat::save_threads_cache(&self.threads);
+                    self.save_account_cache();
                     self.status = "Đã xoá tin nhắn".into();
                 }
                 BgEvent::StickerPacks(packs) => {
@@ -2678,8 +2778,63 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+fn remove_owned_thread_caches(root: &std::path::Path, uin: &str) -> Result<()> {
+    crate::account_manager::validate_uin(uin)?;
+    for path in [
+        root.join("accounts").join(format!("{uin}_threads.json")),
+        root.join("threads_cache.json"),
+    ] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn wipe_account_history_in(root: &std::path::Path, uin: &str) -> Result<()> {
+    let store = crate::store::MessageStore::open_account_in(root, uin)?;
+    store
+        .conn
+        .execute_batch("BEGIN IMMEDIATE; DELETE FROM messages; DELETE FROM threads; COMMIT;")?;
+    remove_owned_thread_caches(root, uin)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wipe_preserves_migration_marker_and_removes_only_owned_caches() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-tui-wipe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("accounts")).unwrap();
+        let legacy =
+            crate::store::MessageStore::open(root.join("zalo_history.db").to_str().unwrap())
+                .unwrap();
+        legacy.conn.execute("INSERT INTO messages(msg_id, thread_id, ts, is_outgoing) VALUES ('old', 'thread-a', 1, 0)", []).unwrap();
+        drop(legacy);
+        for cache in [
+            "threads_cache.json",
+            "accounts/user-a_threads.json",
+            "accounts/user-b_threads.json",
+        ] {
+            std::fs::write(root.join(cache), b"[]").unwrap();
+        }
+        super::wipe_account_history_in(&root, "user-a").unwrap();
+        let store = crate::store::MessageStore::open_account_in(&root, "user-a").unwrap();
+        assert!(store.messages_for("thread-a", 10).unwrap().is_empty());
+        assert!(!root.join("accounts/user-a_threads.json").exists());
+        assert!(!root.join("threads_cache.json").exists());
+        assert!(root.join("accounts/user-b_threads.json").exists());
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use super::*;
 
     #[test]
@@ -2772,6 +2927,8 @@ mod tests {
             poll_inflight: false,
             bg_rx: rx,
             bg_tx: tx,
+            background_tasks: RefCell::new(Vec::new()),
+            local_reset_pending: false,
         };
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2823,6 +2980,8 @@ mod tests {
             poll_inflight: false,
             bg_rx: rx,
             bg_tx: tx,
+            background_tasks: RefCell::new(Vec::new()),
+            local_reset_pending: false,
         };
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();

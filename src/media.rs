@@ -22,7 +22,29 @@ const FRAME_SAMPLES: usize = 320; // 20 ms @ 16 kHz
 static SELECTED_MIC_DEVICE: Mutex<String> = Mutex::new(String::new());
 static SELECTED_CAMERA_DEVICE: Mutex<String> = Mutex::new(String::new());
 static CACHED_DEVICES: Mutex<Option<(Vec<String>, Vec<String>)>> = Mutex::new(None);
-static SHARED_CAM_H264: Mutex<(u64, Vec<u8>, Vec<u8>)> = Mutex::new((0, Vec::new(), Vec::new()));
+static NATIVE_CAMERAS: Mutex<Vec<crate::video::camera::CameraDevice>> = Mutex::new(Vec::new());
+static DEVICE_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+static DEVICE_ENUMERATION: Mutex<()> = Mutex::new(());
+
+struct VideoWorkers {
+    stop: Arc<AtomicBool>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl VideoWorkers {
+    fn push(&mut self, handle: JoinHandle<()>) {
+        self.handles.push(handle);
+    }
+}
+
+impl Drop for VideoWorkers {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
 static MIC_GAIN_PERCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
 static MIC_LEVEL_PERMILLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static REMOTE_AUDIO_ACTIVE: std::sync::atomic::AtomicBool =
@@ -83,171 +105,86 @@ pub fn selected_camera_device() -> String {
         .unwrap_or_default()
 }
 
-/// Check whether `ffmpeg` is installed and reachable in `PATH` (cached after first probe).
-pub fn is_ffmpeg_available() -> bool {
-    static FFMPEG_OK: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let mut cmd = std::process::Command::new("ffmpeg");
-        cmd.arg("-version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
-        cmd.status().map(|s| s.success()).unwrap_or(false)
-    });
-    *FFMPEG_OK
-}
-/// Return cached `(mic_devices, camera_devices)` or enumerate once (with `refresh=true` to rescan).
+/// Return device snapshots without doing driver I/O on the rendering thread.
+/// Refresh requests are executed by the GUI worker or a headless background task.
 pub fn list_media_devices(refresh: bool) -> (Vec<String>, Vec<String>) {
-    if !refresh {
-        if let Ok(g) = CACHED_DEVICES.lock() {
-            if let Some(ref cached) = *g {
-                return cached.clone();
+    let cached = CACHED_DEVICES.lock().ok().and_then(|cache| cache.clone());
+    if (refresh || cached.is_none())
+        && !DEVICE_REFRESH_PENDING.swap(true, Ordering::AcqRel)
+        && !crate::gui::request_media_device_refresh()
+    {
+        thread::spawn(|| {
+            if let Err(error) = refresh_media_devices() {
+                crate::voip_log::line(
+                    "DEVICES",
+                    format!("native device discovery failed: {error}"),
+                );
             }
-        }
+        });
     }
-    let mut mics = Vec::new();
-    let host = cpal::default_host();
-    if let Ok(devs) = host.input_devices() {
-        for d in devs {
-            if let Ok(name) = d.name() {
-                let trimmed = name.trim().to_string();
-                if !trimmed.is_empty()
-                    && !is_ignored_virtual_or_ir_device(&trimmed)
-                    && !mics.contains(&trimmed)
+    cached.unwrap_or_default()
+}
+
+/// Enumerate devices on a blocking worker and atomically publish the resulting snapshots.
+///
+/// # Errors
+/// Returns a native camera discovery failure; microphone snapshots remain available.
+pub fn refresh_media_devices() -> Result<()> {
+    let Ok(_enumeration) = DEVICE_ENUMERATION.try_lock() else {
+        return Ok(());
+    };
+    DEVICE_REFRESH_PENDING.store(true, Ordering::Release);
+    let mut microphones = Vec::new();
+    if let Ok(devices) = cpal::default_host().input_devices() {
+        for device in devices {
+            if let Ok(name) = device.name() {
+                let name = name.trim().to_string();
+                if !name.is_empty()
+                    && !is_ignored_virtual_or_ir_device(&name)
+                    && !microphones.contains(&name)
                 {
-                    mics.push(trimmed);
+                    microphones.push(name);
                 }
             }
         }
     }
-    let cams = enumerate_ffmpeg_cameras();
-    let pair = (mics, cams);
-    if let Ok(mut g) = CACHED_DEVICES.lock() {
-        *g = Some(pair.clone());
+    let result = crate::video::camera::list_devices();
+    let devices = result
+        .as_ref()
+        .map(|devices| {
+            devices
+                .iter()
+                .filter(|device| !is_ignored_virtual_or_ir_device(&device.label))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let labels = devices
+        .iter()
+        .map(|device| format!("{} [{}]", device.label, device.id))
+        .collect();
+    if let Ok(mut cameras) = NATIVE_CAMERAS.lock() {
+        *cameras = devices;
     }
-    pair
+    if let Ok(mut cache) = CACHED_DEVICES.lock() {
+        *cache = Some((microphones, labels));
+    }
+    DEVICE_REFRESH_PENDING.store(false, Ordering::Release);
+    result.map(|_| ())
 }
 
-fn enumerate_ffmpeg_cameras() -> Vec<String> {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        let mut cmd = std::process::Command::new("ffmpeg");
-        cmd.args([
-            "-hide_banner",
-            "-list_devices",
-            "true",
-            "-f",
-            "dshow",
-            "-i",
-            "dummy",
-        ])
-        .creation_flags(0x08000000);
-        if let Ok(out) = cmd.output() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let mut cams = Vec::new();
-            for line in stderr.lines() {
-                if line.contains("Alternative name") {
-                    continue;
-                }
-                if line.contains("(video)") && line.contains('"') {
-                    let parts: Vec<&str> = line.split('"').collect();
-                    if parts.len() >= 2 {
-                        let name = parts[1].trim().to_string();
-                        if !name.is_empty()
-                            && !is_ignored_virtual_or_ir_device(&name)
-                            && !cams.contains(&name)
-                        {
-                            cams.push(name);
-                        }
-                    }
-                }
-            }
-            if cams.is_empty() {
-                for line in stderr.lines() {
-                    if line.contains("Alternative name") {
-                        continue;
-                    }
-                    if line.contains("(none)") && line.contains('"') {
-                        let parts: Vec<&str> = line.split('"').collect();
-                        if parts.len() >= 2 {
-                            let name = parts[1].trim().to_string();
-                            if !name.is_empty()
-                                && !is_ignored_virtual_or_ir_device(&name)
-                                && !cams.contains(&name)
-                            {
-                                cams.push(name);
-                            }
-                        }
-                    }
-                }
-            }
-            return cams;
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let mut cmd = std::process::Command::new("ffmpeg");
-        cmd.args([
-            "-hide_banner",
-            "-f",
-            "avfoundation",
-            "-list_devices",
-            "true",
-            "-i",
-            "",
-        ]);
-        if let Ok(out) = cmd.output() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let mut cams = Vec::new();
-            let mut in_video_section = false;
-            for line in stderr.lines() {
-                if line.contains("AVFoundation video devices:") {
-                    in_video_section = true;
-                    continue;
-                }
-                if line.contains("AVFoundation audio devices:") {
-                    break;
-                }
-                if in_video_section {
-                    if let Some((_, right)) = line.rsplit_once(']') {
-                        let name = right.trim().to_string();
-                        if !name.is_empty() && !cams.contains(&name) {
-                            cams.push(name);
-                        }
-                    }
-                }
-            }
-            if !cams.is_empty() {
-                return cams;
-            }
-        }
-        return vec!["0".to_string()];
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let mut cams = Vec::new();
-        for idx in 0..8 {
-            let dev = format!("/dev/video{idx}");
-            if std::path::Path::new(&dev).exists() {
-                cams.push(dev);
-            }
-        }
-        return cams;
-    }
-    #[allow(unreachable_code)]
-    Vec::new()
+/// Native device identities from the last worker discovery; no driver calls.
+pub(crate) fn cached_camera_devices() -> Vec<crate::video::camera::CameraDevice> {
+    NATIVE_CAMERAS
+        .lock()
+        .map(|devices| devices.clone())
+        .unwrap_or_default()
 }
-
 pub struct MediaHandle {
     stop: Arc<AtomicBool>,
     mic_muted: Arc<AtomicBool>,
-    cam_enabled: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    _video_session: Arc<crate::video::session::VideoSession>,
 }
 impl MediaHandle {
     pub fn start(rtp_addr: String, local_port: u16) -> Result<Self> {
@@ -282,15 +219,57 @@ impl MediaHandle {
         gui_tx: Option<crate::gui::GuiTx>,
         egui_ctx: Option<eframe::egui::Context>,
     ) -> Result<Self> {
+        Self::start_with_sockets_and_camera_state(
+            rtp_addr,
+            rtcp_addr,
+            from_uid_u32,
+            partner_uid_u32,
+            is_caller,
+            relay_token,
+            udp_rtp_sock,
+            udp_rtcp_sock,
+            local_port,
+            is_video,
+            is_video,
+            gui_tx,
+            egui_ctx,
+        )
+    }
+
+    /// Start media with camera permission established before any worker is spawned.
+    ///
+    /// # Errors
+    /// Returns an error if a local transport socket cannot be opened.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_sockets_and_camera_state(
+        rtp_addr: String,
+        rtcp_addr: String,
+        from_uid_u32: u32,
+        partner_uid_u32: u32,
+        is_caller: bool,
+        relay_token: u32,
+        udp_rtp_sock: Option<Arc<tokio::net::UdpSocket>>,
+        udp_rtcp_sock: Option<Arc<tokio::net::UdpSocket>>,
+        local_port: u16,
+        is_video: bool,
+        initial_camera_enabled: bool,
+        gui_tx: Option<crate::gui::GuiTx>,
+        egui_ctx: Option<eframe::egui::Context>,
+    ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let mic_muted = Arc::new(AtomicBool::new(false));
-        let cam_enabled = Arc::new(AtomicBool::new(is_video));
         let mut threads = Vec::new();
         let slot_idx = if udp_rtp_sock.is_some() {
             local_port
         } else {
             0
         };
+        let video_session = crate::video::session::VideoSession::acquire(
+            gui_tx.clone(),
+            slot_idx == 0,
+            initial_camera_enabled,
+        );
+        let cam_enabled = video_session.camera_enabled();
         let fallback_sock = if udp_rtp_sock.is_none() {
             let s = UdpSocket::bind(format!("0.0.0.0:{local_port}"))?;
             let _ = s.set_read_timeout(Some(Duration::from_millis(10)));
@@ -302,6 +281,7 @@ impl MediaHandle {
         let stop_t = stop.clone();
         let mute_t = mic_muted.clone();
         let cam_t = cam_enabled.clone();
+        let video_t = video_session.clone();
         let t = thread::spawn(move || {
             run_media_loop(
                 stop_t,
@@ -320,6 +300,7 @@ impl MediaHandle {
                 is_video,
                 gui_tx,
                 egui_ctx,
+                video_t,
             );
         });
         threads.push(t);
@@ -327,8 +308,8 @@ impl MediaHandle {
         Ok(Self {
             stop,
             mic_muted,
-            cam_enabled,
             threads,
+            _video_session: video_session,
         })
     }
 
@@ -337,7 +318,7 @@ impl MediaHandle {
     }
 
     pub fn set_cam_enabled(&self, enabled: bool) {
-        self.cam_enabled.store(enabled, Ordering::Relaxed);
+        self._video_session.set_camera_enabled(enabled);
     }
 }
 
@@ -487,6 +468,7 @@ const ZALO_FRAG_INDICATOR: u8 = 0x1C;
 /// Max RTP payload per packet (2-byte fragment header included). Peer packets reached 1212; 1200 is the
 /// threshold that reproduces its split sizes. Whether the relay/peer accepts it from us is unverified.
 const RTP_MAX_PAYLOAD: usize = 1200;
+#[cfg(test)]
 const ZALO_FRAG_BUF_MAX: usize = 1 << 20;
 const VIDEO_IDR_INTERVAL_FRAMES: u32 = 15;
 
@@ -642,10 +624,12 @@ fn annexb_au(nals: &[&[u8]]) -> Vec<u8> {
     v
 }
 
+#[cfg(test)]
 fn is_annexb(p: &[u8]) -> bool {
     p.starts_with(&[0, 0, 0, 1]) || p.starts_with(&[0, 0, 1])
 }
 
+#[cfg(test)]
 fn is_zalo_frag(p: &[u8]) -> bool {
     p.len() >= 2 && (p[0] & 0x1F) == 28 && (p[1] & 0x1F) == 0
 }
@@ -672,6 +656,7 @@ fn au_has_idr(au: &[u8]) -> bool {
 }
 
 /// True if the access unit can start decoding: it carries an IDR slice (5) or an SPS (7).
+#[cfg(test)]
 fn au_is_sync_point(au: &[u8]) -> bool {
     au_has_nal_type(au, &[5, 7])
 }
@@ -716,6 +701,7 @@ fn packetize_zalo_au(au: &[u8], max_payload: usize) -> Vec<(u8, Vec<u8>)> {
 
 /// Feed one video RTP payload to the decoder channel. Dispatch is by content (unambiguous: RFC 6184
 /// never starts with byte `0x00` and never uses FU type 0): Annex-B access unit, Zalo fragment, else RFC 6184.
+#[cfg(test)]
 fn depacketize_h264(
     payload: &[u8],
     frag_buf: &mut Vec<u8>,
@@ -969,230 +955,7 @@ fn build_zrtp_incall_negotiate_packet(call_id: u32, relay_token: u32, nego_seq: 
     pkt
 }
 
-/// Spawn a background webcam capture thread via `ffmpeg -f dshow` (on Windows) that encodes live 320x240 15fps
-/// Constrained Baseline H.264 access units for RTP transmission AND decodes a local PIP preview for the call window.
-fn spawn_camera_capture_thread(
-    stop: Arc<AtomicBool>,
-    cam_enabled: Arc<AtomicBool>,
-    want_keyframe: Arc<AtomicBool>,
-    cam_au_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
-    gui_tx: Option<crate::gui::GuiTx>,
-    egui_ctx: Option<eframe::egui::Context>,
-) {
-    thread::spawn(move || {
-        use std::io::Read;
-        use std::process::{Command, Stdio};
-
-        let mut current_dev = String::new();
-        let mut child_opt: Option<std::process::Child> = None;
-        let mut failed_devs: Vec<String> = Vec::new();
-        let mut read_buf = [0u8; 8192];
-        let mut stream_acc: Vec<u8> = Vec::with_capacity(65536);
-        let mut warned_missing = false;
-
-        // Optional local preview decoder (`ffmpeg` H.264 -> 240x180 RGBA)
-        let (prev_tx, prev_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(15);
-        if let (Some(gtx), Some(ctx)) = (gui_tx.clone(), egui_ctx.clone()) {
-            let stop_p = stop.clone();
-            thread::spawn(move || {
-                run_local_preview_decoder(stop_p, prev_rx, gtx, ctx);
-            });
-        }
-
-        while !stop.load(Ordering::Relaxed) {
-            if !cam_enabled.load(Ordering::Relaxed) {
-                if let Some(mut c) = child_opt.take() {
-                    let _ = c.kill();
-                }
-                thread::sleep(Duration::from_millis(80));
-                continue;
-            }
-
-            if !is_ffmpeg_available() {
-                if !warned_missing {
-                    warned_missing = true;
-                    crate::voip_log::line(
-                        "VCAM",
-                        "ffmpeg not found in PATH; camera capture unavailable",
-                    );
-                    if let Some(ref gtx) = gui_tx {
-                        let _ = gtx.send(crate::gui::GuiEvent::StatusUpdate(
-                            "⚠️ Không tìm thấy ffmpeg trong PATH để bật Camera (cài bằng: winget install Gyan.FFmpeg)".into(),
-                        ));
-                    }
-                    if let Some(ref ctx) = egui_ctx {
-                        ctx.request_repaint();
-                    }
-                }
-                thread::sleep(Duration::from_millis(500));
-                continue;
-            }
-
-            let desired = {
-                let sel = selected_camera_device();
-                if !sel.is_empty() && !failed_devs.contains(&sel) {
-                    sel
-                } else {
-                    let (_, cams) = list_media_devices(false);
-                    cams.into_iter()
-                        .find(|c| !failed_devs.contains(c))
-                        .unwrap_or_default()
-                }
-            };
-            if desired.is_empty() {
-                if !warned_missing {
-                    warned_missing = true;
-                    if let Some(ref gtx) = gui_tx {
-                        let _ = gtx.send(crate::gui::GuiEvent::StatusUpdate(
-                            "⚠️ Không tìm thấy thiết bị Camera khả dụng trên máy".into(),
-                        ));
-                    }
-                    if let Some(ref ctx) = egui_ctx {
-                        ctx.request_repaint();
-                    }
-                }
-                thread::sleep(Duration::from_millis(250));
-                continue;
-            }
-
-            if child_opt.is_none() || current_dev != desired {
-                if let Some(mut c) = child_opt.take() {
-                    let _ = c.kill();
-                }
-                current_dev = desired.clone();
-                stream_acc.clear();
-
-                let mut cmd = Command::new("ffmpeg");
-                cmd.args(["-hide_banner", "-loglevel", "error"]);
-                #[cfg(target_os = "windows")]
-                cmd.args([
-                    "-f",
-                    "dshow",
-                    "-rtbufsize",
-                    "32M",
-                    "-i",
-                    &format!("video={current_dev}"),
-                ]);
-                #[cfg(target_os = "macos")]
-                cmd.args([
-                    "-f",
-                    "avfoundation",
-                    "-framerate",
-                    "30",
-                    "-i",
-                    &format!("{current_dev}:none"),
-                ]);
-                #[cfg(target_os = "linux")]
-                cmd.args(["-f", "v4l2", "-i", &current_dev]);
-                cmd.args([
-                    "-vf",
-                    "fps=15,scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "ultrafast",
-                    "-tune",
-                    "zerolatency",
-                    "-profile:v",
-                    "baseline",
-                    "-level",
-                    "3.0",
-                    "-b:v",
-                    "260k",
-                    "-maxrate",
-                    "320k",
-                    "-bufsize",
-                    "640k",
-                    "-x264-params",
-                    "keyint=10:min-keyint=1:bframes=0:ref=1:cabac=0:sliced-threads=0:scenecut=0:aud=1:repeat-headers=1",
-                    "-f",
-                    "h264",
-                    "pipe:1",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null());
-                #[cfg(target_os = "windows")]
-                {
-                    use std::os::windows::process::CommandExt;
-                    cmd.creation_flags(0x08000000);
-                }
-
-                match cmd.spawn() {
-                    Ok(c) => {
-                        crate::voip_log::line(
-                            "VCAM",
-                            format!("started webcam capture: {current_dev}"),
-                        );
-                        let _ = want_keyframe.swap(false, Ordering::Relaxed);
-                        child_opt = Some(c);
-                    }
-                    Err(e) => {
-                        crate::voip_log::line(
-                            "VCAM",
-                            format!("webcam spawn failed ({current_dev}): {e}"),
-                        );
-                        thread::sleep(Duration::from_millis(500));
-                        continue;
-                    }
-                }
-            }
-
-            let Some(child) = &mut child_opt else {
-                continue;
-            };
-            let Some(stdout) = &mut child.stdout else {
-                child_opt = None;
-                continue;
-            };
-            match stdout.read(&mut read_buf) {
-                Ok(0) | Err(_) => {
-                    let _ = child.kill();
-                    child_opt = None;
-                    if stream_acc.is_empty()
-                        && !current_dev.is_empty()
-                        && !failed_devs.contains(&current_dev)
-                    {
-                        crate::voip_log::line(
-                            "VCAM",
-                            format!(
-                                "webcam device produced 0 bytes, marking failed: {current_dev}"
-                            ),
-                        );
-                        failed_devs.push(current_dev.clone());
-                    }
-                    thread::sleep(Duration::from_millis(250));
-                }
-                Ok(n) => {
-                    stream_acc.extend_from_slice(&read_buf[..n]);
-                    while let Some(pos) = find_aud_delimiter(&stream_acc, 6) {
-                        let chunk = stream_acc[..pos].to_vec();
-                        stream_acc.drain(..pos);
-                        let clean = strip_leading_aud(&chunk);
-                        if !clean.is_empty() {
-                            if let Ok(mut sh) = SHARED_CAM_H264.lock() {
-                                sh.0 = sh.0.wrapping_add(1);
-                                if au_has_idr(&clean) {
-                                    sh.2 = clean.clone();
-                                }
-                                sh.1 = clean.clone();
-                            }
-                            let _ = prev_tx.try_send(clean.clone());
-                            let _ = cam_au_tx.try_send(clean);
-                        }
-                    }
-                    if stream_acc.len() > 262_144 {
-                        stream_acc.clear();
-                    }
-                }
-            }
-        }
-        if let Some(mut c) = child_opt.take() {
-            let _ = c.kill();
-        }
-    });
-}
-
+#[cfg(test)]
 fn find_aud_delimiter(buf: &[u8], start_from: usize) -> Option<usize> {
     if buf.len() < start_from + 6 {
         return None;
@@ -1210,6 +973,7 @@ fn find_aud_delimiter(buf: &[u8], start_from: usize) -> Option<usize> {
     None
 }
 
+#[cfg(test)]
 fn strip_leading_aud(au: &[u8]) -> Vec<u8> {
     if au.len() >= 6 && au[0..4] == [0, 0, 0, 1] && (au[4] & 0x1F) == 9 {
         normalize_annexb_au_4byte(&au[6..])
@@ -1222,6 +986,7 @@ fn strip_leading_aud(au: &[u8]) -> Vec<u8> {
 /// 1) Both 3-byte (`00 00 01`) and 4-byte (`00 00 00 01`) start codes are parsed.
 /// 2) AUD (`nal_type == 9`) and SEI (`nal_type == 6`) NAL units are stripped.
 /// 3) Every remaining NAL unit (`SPS=7`, `PPS=8`, `IDR=5`, `Slice=1`) is prefixed with a 4-byte `00 00 00 01` start code.
+#[cfg(test)]
 fn normalize_annexb_au_4byte(au: &[u8]) -> Vec<u8> {
     let mut nal_ranges: Vec<(usize, usize)> = Vec::new();
     let mut i = 0usize;
@@ -1396,98 +1161,6 @@ impl SrtpContext {
     }
 }
 
-fn run_local_preview_decoder(
-    stop: Arc<AtomicBool>,
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    gui_tx: crate::gui::GuiTx,
-    egui_ctx: eframe::egui::Context,
-) {
-    use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
-
-    const PREV_W: usize = 240;
-    const PREV_H: usize = 180;
-    const PREV_BYTES: usize = PREV_W * PREV_H * 4;
-
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args([
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-flags",
-        "low_delay",
-        "-probesize",
-        "32",
-        "-analyzeduration",
-        "0",
-        "-f",
-        "h264",
-        "-i",
-        "pipe:0",
-        "-vf",
-        "scale=240:180:force_original_aspect_ratio=decrease,pad=240:180:(ow-iw)/2:(oh-ih)/2",
-        "-fps_mode",
-        "passthrough",
-        "-pix_fmt",
-        "rgba",
-        "-f",
-        "rawvideo",
-        "pipe:1",
-    ])
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null());
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
-
-    let Ok(mut child) = cmd.spawn() else {
-        return;
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
-        return;
-    };
-    let Some(mut stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        return;
-    };
-    let stop_w = stop.clone();
-    thread::spawn(move || {
-        while !stop_w.load(Ordering::Relaxed) {
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(au) => {
-                    if stdin.write_all(H264_AUD).is_err() || stdin.write_all(&au).is_err() {
-                        break;
-                    }
-                    let _ = stdin.flush();
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-    });
-
-    let mut frame = vec![0u8; PREV_BYTES];
-    while !stop.load(Ordering::Relaxed) {
-        if stdout.read_exact(&mut frame).is_ok() {
-            let (cw, ch, cropped) = trim_black_borders(&frame, PREV_W, PREV_H);
-            let img = eframe::egui::ColorImage::from_rgba_unmultiplied([cw, ch], &cropped);
-            let _ = gui_tx.send(crate::gui::GuiEvent::StickerImageReady {
-                key: "call_local_video".to_string(),
-                image: img,
-            });
-            egui_ctx.request_repaint();
-        } else {
-            break;
-        }
-    }
-    let _ = child.kill();
-}
-
 /// Result counters of every UDP send. They used to be dropped silently (`let _ = try_send_to`) while the
 /// RTP sequence number still advanced. The peer's RTCP reported ~78% loss of our audio and video, in
 /// bursts that hit both streams at once; whether any of that is a failed local send is **unknown** until
@@ -1569,6 +1242,14 @@ fn extract_rtp_opus_payload(rtp: &[u8]) -> Option<&[u8]> {
     }
 }
 
+type IncomingVideoStream = (
+    u32,
+    String,
+    crate::video::ingress::VideoIngress,
+    Arc<crate::video::decode_queue::DecodeQueue>,
+    Option<std::time::Instant>,
+);
+
 #[allow(clippy::too_many_arguments)]
 fn run_media_loop(
     stop: Arc<AtomicBool>,
@@ -1587,10 +1268,16 @@ fn run_media_loop(
     is_video: bool,
     gui_tx: Option<crate::gui::GuiTx>,
     egui_ctx: Option<eframe::egui::Context>,
+    video_session: Arc<crate::video::session::VideoSession>,
 ) {
-    let (h264_tx, h264_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(120);
-    let (cam_au_tx, cam_au_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
-    let video_synced = Arc::new(AtomicBool::new(false));
+    let h264_queue = Arc::new(crate::video::decode_queue::DecodeQueue::default());
+    let video_synced = h264_queue.synced.clone();
+    let camera = video_session.subscribe(&cam_enabled);
+    let video_generation = video_session.generation;
+    let mut video_workers = VideoWorkers {
+        stop: stop.clone(),
+        handles: Vec::new(),
+    };
     let want_keyframe = Arc::new(AtomicBool::new(false));
     let mut decoder_active = false;
     let tex_key = if slot_idx == 0 {
@@ -1600,25 +1287,16 @@ fn run_media_loop(
     };
     if let (Some(tx), Some(ctx)) = (gui_tx.clone(), egui_ctx.clone()) {
         let stop_v = stop.clone();
-        let synced_v = video_synced.clone();
+        let queue = h264_queue.clone();
         decoder_active = true;
-        thread::spawn(move || {
-            run_h264_ffmpeg_decoder(stop_v, h264_rx, tx, ctx, synced_v, tex_key);
-        });
+        video_workers.push(thread::spawn(move || {
+            let _ = ctx;
+            run_native_video_decoder(stop_v, queue, tx, video_generation, tex_key);
+        }));
     }
     let gui_tx_extra = gui_tx.clone();
     let egui_ctx_extra = egui_ctx.clone();
-    if slot_idx == 0 {
-        spawn_camera_capture_thread(
-            stop.clone(),
-            cam_enabled.clone(),
-            want_keyframe.clone(),
-            cam_au_tx,
-            gui_tx,
-            egui_ctx,
-        );
-    }
-    let mut fu_a_buf: Vec<u8> = Vec::with_capacity(65536);
+    let mut ingress = crate::video::ingress::VideoIngress::default();
     let host = cpal::default_host();
     let preferred_mic = selected_mic_device();
     let input_dev = host
@@ -1821,17 +1499,10 @@ fn run_media_loop(
     let mut recent_vid_seqs: std::collections::VecDeque<(u32, u16)> =
         std::collections::VecDeque::with_capacity(64);
     let mut nego_seq: u32 = 1;
-    let mut last_cam_idr: Option<Vec<u8>> = None;
-    let mut last_shared_cam_seq: u64 = 0;
     let mut primary_video_ssrc: u32 = 0;
+    let mut camera_was_enabled = false;
     let mut last_primary_vid_rx: Option<std::time::Instant> = None;
-    let mut extra_vid_streams: Vec<(
-        u32,
-        String,
-        Vec<u8>,
-        std::sync::mpsc::SyncSender<Vec<u8>>,
-        Option<std::time::Instant>,
-    )> = Vec::new();
+    let mut extra_vid_streams: Vec<IncomingVideoStream> = Vec::new();
     let mut room_partners: Vec<u32> = Vec::new();
     let mut tx_layer_byte: u8 = 0x00;
     if partner_uid_u32 != 0 && partner_uid_u32 != from_uid_u32 {
@@ -1918,53 +1589,21 @@ fn run_media_loop(
             && last_video_tx.elapsed() >= Duration::from_millis(66)
         {
             last_video_tx = std::time::Instant::now();
-            let force_kf = vid_frame_no == 0
+            let camera_on = cam_enabled.load(Ordering::Acquire);
+            let camera_transition = camera_on != camera_was_enabled;
+            camera_was_enabled = camera_on;
+            let force_kf = camera_transition
+                || vid_frame_no == 0
                 || vid_gop_pos >= H264_PSLICES.len()
                 || vid_frame_no % VIDEO_IDR_INTERVAL_FRAMES == 0
                 || want_keyframe.swap(false, Ordering::Relaxed);
 
-            // Drain latest live webcam access unit if available (or read shared webcam stream for extra legs)
-            let mut latest_cam_au: Option<Vec<u8>> = None;
-            while let Ok(au) = cam_au_rx.try_recv() {
-                if au_has_idr(&au) {
-                    last_cam_idr = Some(au.clone());
-                }
-                latest_cam_au = Some(au);
+            if force_kf {
+                camera.request_keyframe();
             }
-            if latest_cam_au.is_none() && slot_idx > 0 {
-                if let Ok(sh) = SHARED_CAM_H264.lock() {
-                    if !sh.2.is_empty() {
-                        last_cam_idr = Some(sh.2.clone());
-                    }
-                    if sh.0 != last_shared_cam_seq && !sh.1.is_empty() {
-                        last_shared_cam_seq = sh.0;
-                        latest_cam_au = Some(sh.1.clone());
-                    }
-                }
-            }
-            let au_opt: Option<Vec<u8>> = if cam_enabled.load(Ordering::Relaxed) {
-                if let Some(au) = latest_cam_au {
-                    Some(au)
-                } else if last_cam_idr.is_some() {
-                    // Live webcam already started: never inject synthetic P-slices or stale IDR
-                    // into the active libx264 reference chain when a 66ms tick happens between webcam frames.
-                    None
-                } else {
-                    let idr_nal = if (vid_idr_parity & 1) == 0 {
-                        H264_IDR
-                    } else {
-                        H264_IDR_ALT
-                    };
-                    let p_nal = H264_PSLICES[vid_gop_pos.min(H264_PSLICES.len() - 1)];
-                    if force_kf {
-                        vid_idr_parity = vid_idr_parity.wrapping_add(1);
-                        vid_gop_pos = 0;
-                        Some(annexb_au(&[H264_SPS, H264_PPS, idr_nal]))
-                    } else {
-                        vid_gop_pos += 1;
-                        Some(annexb_au(&[p_nal]))
-                    }
-                }
+            let au_opt = if cam_enabled.load(Ordering::Acquire) {
+                // Never skip encoded P frames or inject synthetic pictures into a live chain.
+                camera.try_recv()
             } else {
                 let idr_nal = if (vid_idr_parity & 1) == 0 {
                     H264_IDR
@@ -1981,7 +1620,6 @@ fn run_media_loop(
                     Some(annexb_au(&[p_nal]))
                 }
             };
-
             if let Some(au_bytes) = au_opt {
                 let is_group_sfu = rtp_addr.ends_with(":3000") || rtcp_addr.ends_with(":3500");
                 let payloads = packetize_zalo_au(&au_bytes, RTP_MAX_PAYLOAD);
@@ -2098,6 +1736,7 @@ fn run_media_loop(
                     }
                 }
                 let rtcp_sender = udp_rtp_sock.as_ref().unwrap_or(rtcp_s);
+
                 for (rtcp_type, rtcp_pkt) in pkts {
                     if relay_token != 0 {
                         let mut wire = Vec::with_capacity(5 + rtcp_pkt.len());
@@ -2355,7 +1994,7 @@ fn run_media_loop(
                         }
                         last_primary_vid_rx = Some(std::time::Instant::now());
                         if let Some(payload) = dec_vid_payload.as_deref() {
-                            depacketize_h264(payload, &mut fu_a_buf, &h264_tx);
+                            receive_video_packet(&mut ingress, &h264_queue, inner_rtp, payload);
                         }
                     } else if slot_idx == 0 {
                         let stream_pos = extra_vid_streams
@@ -2370,19 +2009,25 @@ fn run_media_loop(
                                 let stream_num = extra_vid_streams.len() + 1;
                                 let tex_key = format!("call_remote_video_{stream_num}");
                                 let tex_key_cl = tex_key.clone();
-                                let (tx_n, rx_n) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+                                let queue =
+                                    Arc::new(crate::video::decode_queue::DecodeQueue::default());
                                 let stop_vn = stop.clone();
-                                let synced_vn = Arc::new(AtomicBool::new(false));
-                                thread::spawn(move || {
-                                    run_h264_ffmpeg_decoder(
-                                        stop_vn, rx_n, tx, ctx, synced_vn, tex_key_cl,
+                                let decoder_queue = queue.clone();
+                                video_workers.push(thread::spawn(move || {
+                                    let _ = ctx;
+                                    run_native_video_decoder(
+                                        stop_vn,
+                                        decoder_queue,
+                                        tx,
+                                        video_generation,
+                                        tex_key_cl,
                                     );
-                                });
+                                }));
                                 extra_vid_streams.push((
                                     pkt_ssrc,
                                     tex_key,
-                                    Vec::with_capacity(65536),
-                                    tx_n,
+                                    crate::video::ingress::VideoIngress::default(),
+                                    queue,
                                     None,
                                 ));
                                 Some(extra_vid_streams.len() - 1)
@@ -2397,7 +2042,7 @@ fn run_media_loop(
                                 let (_, _, ref mut fbuf, ref tx_n, ref mut last_rx) =
                                     extra_vid_streams[i];
                                 *last_rx = Some(std::time::Instant::now());
-                                depacketize_h264(payload, fbuf, tx_n);
+                                receive_video_packet(fbuf, tx_n, inner_rtp, payload);
                             }
                         }
                     }
@@ -2414,7 +2059,7 @@ fn run_media_loop(
                     } else {
                         format!("call_remote_video_{slot_idx}")
                     };
-                    let _ = tx.send(crate::gui::GuiEvent::StickerImageFailed { key: pri_key });
+                    tx.clear_video_frame(video_generation, &pri_key);
                 }
             }
         }
@@ -2423,64 +2068,76 @@ fn run_media_loop(
                 if t.elapsed() >= Duration::from_millis(1800) {
                     *last_rx = None;
                     if let Some(ref tx) = gui_tx_extra {
-                        let _ = tx.send(crate::gui::GuiEvent::StickerImageFailed {
-                            key: tex_key.clone(),
-                        });
+                        tx.clear_video_frame(video_generation, tex_key);
                     }
                 }
             }
         }
         wl.tick();
         // --- PLI towards the peer: its video is undecodable until a keyframe (SPS/IDR) reaches the decoder ---
-        // Live log (call at 18:28 UTC): the peer sent only P frames, no SPS/IDR ever arrived, ffmpeg printed
-        // "non-existing PPS 0 referenced" for all of them and decoded 0 frames; we never sent a PLI back.
-        if (is_video || cam_enabled.load(Ordering::Relaxed))
+        // Ask for new reference frames while the native decoder is waiting for SPS/PPS and IDR.
+        if (is_video || rx_video.started || cam_enabled.load(Ordering::Relaxed))
             && decoder_active
             && (rx_video.started || rx_audio.started)
             && peer_ssrc != 0
-            && (!video_synced.load(Ordering::Relaxed) || pli_gap)
+            && (!video_synced.load(Ordering::Relaxed)
+                || pli_gap
+                || extra_vid_streams.iter().any(|(_, _, _, queue, last_rx)| {
+                    last_rx.is_some() && !queue.synced.load(Ordering::Acquire)
+                }))
             && last_pli.elapsed() >= Duration::from_millis(500)
         {
             last_pli = std::time::Instant::now();
             pli_gap = false;
             if let (Some(ref rtcp_s), Some(target)) = (&udp_rtcp_sock, rtcp_sock_addr) {
                 let rtcp_sender = udp_rtp_sock.as_ref().unwrap_or(rtcp_s);
-                // Compound packet: empty RR first (RFC 3550 6.1), then the PLI.
-                let mut pkt = vec![0x80u8, 201, 0, 1];
-                pkt.extend_from_slice(&ssrc.to_be_bytes());
-                pkt.extend_from_slice(&build_pli(ssrc, peer_ssrc));
-                if relay_token != 0 {
-                    let rtcp_type: u8 = 0x0F; // `ZRTPPacket::initZRTPPacketVideo` (`isRtcp=true`)
-                    let mut wire = Vec::with_capacity(5 + pkt.len());
-                    wire.push(rtcp_type);
-                    wire.extend_from_slice(&relay_token.to_le_bytes());
-                    wire.extend_from_slice(&pkt);
-                    send_dgram(rtcp_sender, &wire, target, &mut txs);
-                    if let Some(rtarget) = rtp_sock_addr {
-                        if rtarget != target {
-                            send_dgram(rtcp_sender, &wire, rtarget, &mut txs);
-                        }
+                let mut targets = vec![peer_ssrc];
+                for (ssrc, _, _, queue, last_rx) in &extra_vid_streams {
+                    if last_rx.is_some()
+                        && !queue.synced.load(Ordering::Acquire)
+                        && !targets.contains(ssrc)
+                    {
+                        targets.push(*ssrc);
                     }
-                    wl.rtcp(
-                        ">",
-                        crate::voip_log::Via::RtcpSock,
-                        rtcp_type,
-                        wire.len(),
-                        &rtcp_addr,
-                        &pkt,
-                    );
-                } else {
-                    send_dgram(rtcp_sender, &pkt, target, &mut txs);
-                    wl.rtcp(
-                        ">",
-                        crate::voip_log::Via::RtcpSock,
-                        pkt[0],
-                        pkt.len(),
-                        &rtcp_addr,
-                        &pkt,
-                    );
                 }
-                pli_sent += 1;
+                for requested_ssrc in targets {
+                    // Compound packet: empty RR first (RFC 3550 6.1), then the PLI.
+                    let mut pkt = vec![0x80u8, 201, 0, 1];
+                    pkt.extend_from_slice(&ssrc.to_be_bytes());
+                    pkt.extend_from_slice(&build_pli(ssrc, requested_ssrc));
+                    if relay_token != 0 {
+                        let rtcp_type: u8 = 0x0F; // `ZRTPPacket::initZRTPPacketVideo` (`isRtcp=true`)
+                        let mut wire = Vec::with_capacity(5 + pkt.len());
+                        wire.push(rtcp_type);
+                        wire.extend_from_slice(&relay_token.to_le_bytes());
+                        wire.extend_from_slice(&pkt);
+                        send_dgram(rtcp_sender, &wire, target, &mut txs);
+                        if let Some(rtarget) = rtp_sock_addr {
+                            if rtarget != target {
+                                send_dgram(rtcp_sender, &wire, rtarget, &mut txs);
+                            }
+                        }
+                        wl.rtcp(
+                            ">",
+                            crate::voip_log::Via::RtcpSock,
+                            rtcp_type,
+                            wire.len(),
+                            &rtcp_addr,
+                            &pkt,
+                        );
+                    } else {
+                        send_dgram(rtcp_sender, &pkt, target, &mut txs);
+                        wl.rtcp(
+                            ">",
+                            crate::voip_log::Via::RtcpSock,
+                            pkt[0],
+                            pkt.len(),
+                            &rtcp_addr,
+                            &pkt,
+                        );
+                    }
+                    pli_sent += 1;
+                }
             }
         }
         // --- send-side health: result counters of every UDP send + longest stall of this loop ---
@@ -2516,6 +2173,7 @@ fn run_media_loop(
 }
 
 /// Reassemble RFC 6184 H.264 RTP payloads (Single NAL 1..23, STAP-A 24, FU-A 28) into Annex-B (`00 00 00 01`) byte stream.
+#[cfg(test)]
 fn depacketize_rfc6184_h264(
     payload: &[u8],
     fu_a_buf: &mut Vec<u8>,
@@ -2574,12 +2232,13 @@ fn depacketize_rfc6184_h264(
     }
 }
 
-/// Access Unit Delimiter NAL (`primary_pic_type=7`), written before every access unit sent to ffmpeg.
+/// Access Unit Delimiter fixture used by the legacy stream-boundary regression tests.
+#[cfg(test)]
 const H264_AUD: &[u8] = &[0, 0, 0, 1, 0x09, 0xf0];
 
-/// Spawn a headless `ffmpeg` pipe to decode incoming H.264 Annex-B NAL units into `480×360` RGBA frames.
-/// Trim black letterbox/pillarbox borders added by `ffmpeg pad` so the returned RGBA buffer
+/// Legacy border-trimming fixture; native video preserves decoded image content.
 /// has the exact aspect ratio of the active video content with zero black bars.
+#[cfg(test)]
 fn trim_black_borders(rgba: &[u8], w: usize, h: usize) -> (usize, usize, Vec<u8>) {
     if rgba.len() < w * h * 4 || w < 16 || h < 16 {
         return (w, h, rgba.to_vec());
@@ -2642,223 +2301,83 @@ fn trim_black_borders(rgba: &[u8], w: usize, h: usize) -> (usize, usize, Vec<u8>
     (cw, ch, out)
 }
 
-fn run_h264_ffmpeg_decoder(
+fn run_native_video_decoder(
     stop: Arc<AtomicBool>,
-    h264_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    gui_tx: crate::gui::GuiTx,
-    egui_ctx: eframe::egui::Context,
-    synced: Arc<AtomicBool>,
-    tex_key: String,
+    queue: Arc<crate::video::decode_queue::DecodeQueue>,
+    gui: crate::gui::GuiTx,
+    generation: u64,
+    texture: String,
 ) {
-    use std::io::{Read, Write};
-    use std::process::{Child, Command, Stdio};
-    use std::sync::atomic::AtomicU64;
-
-    const VID_W: usize = 640;
-    const VID_H: usize = 480;
-    const FRAME_BYTES: usize = VID_W * VID_H * 4;
-
-    fn spawn_ffmpeg_h264_child() -> Option<Child> {
-        let mut cmd = Command::new("ffmpeg");
-        cmd.args([
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-flags",
-            "low_delay",
-            "-probesize",
-            "32",
-            "-analyzeduration",
-            "0",
-            "-f",
-            "h264",
-            "-i",
-            "pipe:0",
-            "-vf",
-            "scale=640:480:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:480:(ow-iw)/2:(oh-ih)/2:black",
-            "-fps_mode",
-            "passthrough",
-            "-pix_fmt",
-            "rgba",
-            "-f",
-            "rawvideo",
-            "pipe:1",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let mut decoder = match crate::video::codec::VideoDecoder::new() {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            crate::voip_log::line(
+                "VDEC",
+                format!("native decoder initialization failed: {error}"),
+            );
+            let _ = gui.send(crate::gui::GuiEvent::StatusUpdate(format!(
+                "Không thể giải mã video: {error}"
+            )));
+            return;
         }
-
-        match cmd.spawn() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                crate::voip_log::line("VDEC", format!("ffmpeg spawn failed: {e}"));
-                None
+    };
+    while !stop.load(Ordering::Acquire) {
+        let (reset, frame) = queue.pop(Duration::from_millis(100));
+        if reset {
+            if let Err(error) = decoder.reset() {
+                crate::voip_log::line("VDEC", format!("native decoder reset failed: {error}"));
+                return;
+            }
+        }
+        let Some(frame) = frame else {
+            continue;
+        };
+        match decoder.decode(&frame) {
+            Ok(Some(frame)) => {
+                if !queue.finish_frame() {
+                    continue;
+                }
+                let image = eframe::egui::ColorImage::from_rgba_unmultiplied(
+                    [frame.width, frame.height],
+                    &frame.rgba,
+                );
+                gui.send_video_frame(generation, &texture, image);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                queue.synced.store(false, Ordering::Release);
+                crate::voip_log::line(
+                    "VDEC",
+                    format!("native decode rejected access unit: {error}"),
+                );
             }
         }
     }
-
-    let decoded_counter = Arc::new(AtomicU64::new(0));
-    while !stop.load(Ordering::Relaxed) {
-        synced.store(false, Ordering::Relaxed);
-        let Some(mut child) = spawn_ffmpeg_h264_child() else {
-            return;
-        };
-        crate::voip_log::line("VDEC", "ffmpeg decoder started");
-        let Some(mut stdin) = child.stdin.take() else {
-            let _ = child.kill();
-            return;
-        };
-        let Some(mut stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            return;
-        };
-        if let Some(mut stderr) = child.stderr.take() {
-            thread::spawn(move || {
-                let mut buf = [0u8; 512];
-                let mut lines = 0u32;
-                while let Ok(n) = stderr.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    lines += 1;
-                    if lines <= 20 {
-                        crate::voip_log::line(
-                            "VDEC",
-                            format!("ffmpeg: {}", String::from_utf8_lossy(&buf[..n]).trim()),
-                        );
-                    }
-                }
-            });
-        }
-
-        let stop_reader = stop.clone();
-        let gui_tx_r = gui_tx.clone();
-        let egui_ctx_r = egui_ctx.clone();
-        let tex_key_r = tex_key.clone();
-        let dec_cnt_r = decoded_counter.clone();
-        let reader_handle = thread::spawn(move || {
-            let mut raw_frame = vec![0u8; FRAME_BYTES];
-            while !stop_reader.load(Ordering::Relaxed) {
-                if stdout.read_exact(&mut raw_frame).is_ok() {
-                    let total_dec = dec_cnt_r.fetch_add(1, Ordering::Relaxed) + 1;
-                    if total_dec == 1 || total_dec % 100 == 0 {
-                        crate::voip_log::line("VDEC", format!("decoded frame #{total_dec}"));
-                    }
-                    let (cw, ch, cropped) = trim_black_borders(&raw_frame, VID_W, VID_H);
-                    let color_img =
-                        eframe::egui::ColorImage::from_rgba_unmultiplied([cw, ch], &cropped);
-                    let _ = gui_tx_r.send(crate::gui::GuiEvent::StickerImageReady {
-                        key: tex_key_r.clone(),
-                        image: color_img,
-                    });
-                    egui_ctx_r.request_repaint();
-                } else {
-                    break;
-                }
-            }
-        });
-
-        let mut fed = 0u64;
-        let mut dropped = 0u64;
-        let mut last_seen_dec = decoded_counter.load(Ordering::Relaxed);
-        let mut fed_without_decode = 0u64;
-        let mut restart_decoder = false;
-
-        while !stop.load(Ordering::Relaxed) {
-            match h264_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(nal) => {
-                    if !synced.load(Ordering::Relaxed) {
-                        if au_is_sync_point(&nal) {
-                            synced.store(true, Ordering::Relaxed);
-                            last_seen_dec = decoded_counter.load(Ordering::Relaxed);
-                            fed_without_decode = 0;
-                            crate::voip_log::line(
-                                "VDEC",
-                                format!(
-                                    "first SPS/IDR access unit after {dropped} undecodable ones ({} bytes)",
-                                    nal.len()
-                                ),
-                            );
-                        } else {
-                            dropped += 1;
-                            if dropped == 1 || dropped % 100 == 0 {
-                                crate::voip_log::line(
-                                    "VDEC",
-                                    format!(
-                                        "waiting for SPS/IDR, dropped {dropped} P access units"
-                                    ),
-                                );
-                            }
-                            continue;
-                        }
-                    }
-
-                    let cur_dec = decoded_counter.load(Ordering::Relaxed);
-                    if cur_dec > last_seen_dec {
-                        last_seen_dec = cur_dec;
-                        fed_without_decode = 0;
-                    } else {
-                        fed_without_decode += 1;
-                        if fed_without_decode >= 22 {
-                            crate::voip_log::line(
-                                "VDEC",
-                                format!("decoder stalled ({fed_without_decode} AUs with 0 output frames), requesting PLI & restarting ffmpeg"),
-                            );
-                            synced.store(false, Ordering::Relaxed);
-                            restart_decoder = true;
-                            break;
-                        }
-                    }
-
-                    let norm_nal = normalize_annexb_au_4byte(&nal);
-                    // Write the normalized access unit followed by an AUD delimiter so ffmpeg's
-                    // H.264 parser knows the access unit is complete and emits the frame immediately.
-                    if stdin.write_all(&norm_nal).is_err() || stdin.write_all(H264_AUD).is_err() {
-                        crate::voip_log::line(
-                            "VDEC",
-                            format!("ffmpeg stdin closed after {fed} access units"),
-                        );
-                        restart_decoder = true;
-                        break;
-                    }
-                    let _ = stdin.flush();
-                    fed += 1;
-                    if fed == 1 || fed % 100 == 0 {
-                        crate::voip_log::line("VDEC", format!("fed {fed} access units to ffmpeg"));
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    restart_decoder = false;
-                    break;
-                }
-            }
-        }
-
-        drop(stdin);
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = reader_handle.join();
-        if !restart_decoder || stop.load(Ordering::Relaxed) {
-            break;
-        }
-    }
-    crate::voip_log::line(
-        "VDEC",
-        format!(
-            "decoder stop, {} frames decoded",
-            decoded_counter.load(Ordering::Relaxed)
-        ),
-    );
 }
 
-/// Play a pleasant, zero-latency Zalo-style two-tone notification chime (`E5` -> `B5`) via a warm background thread.
+fn receive_video_packet(
+    ingress: &mut crate::video::ingress::VideoIngress,
+    queue: &crate::video::decode_queue::DecodeQueue,
+    rtp: &[u8],
+    payload: &[u8],
+) {
+    if rtp.len() < 12 {
+        queue.reset();
+        return;
+    }
+    let sequence = u16::from_be_bytes([rtp[2], rtp[3]]);
+    let timestamp = u32::from_be_bytes([rtp[4], rtp[5], rtp[6], rtp[7]]);
+    match ingress.push(sequence, timestamp, rtp[1] & 0x80 != 0, payload) {
+        Ok(Some(au)) => {
+            queue.push(au);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            queue.reset();
+            crate::voip_log::line("VDEC", format!("video access unit lost: {error}"));
+        }
+    }
+}
 pub fn play_notification_chime() {
     static CHIME_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>> =
         std::sync::OnceLock::new();
@@ -2924,6 +2443,54 @@ pub fn play_notification_chime() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_codec_roundtrips_zalo_fragments_and_recovers_after_loss() {
+        use crate::video::{
+            codec::{VideoDecoder, VideoEncoder},
+            decode_queue::DecodeQueue,
+            ingress::VideoIngress,
+        };
+        let mut encoder = VideoEncoder::new().unwrap();
+        let mut decoder = VideoDecoder::new().unwrap();
+        let mut ingress = VideoIngress::default();
+        let queue = DecodeQueue::default();
+        let pixels: Vec<u8> = (0..320 * 240 * 3).map(|i| (i % 251) as u8).collect();
+        let mut sequence = u16::MAX - 2;
+        for frame in 0..3 {
+            let au = encoder.encode_rgb(&pixels, 320, 240, frame != 1).unwrap();
+            let packets = packetize_zalo_au(&au, 80);
+            assert!(packets.len() > 2);
+            for (index, (_, payload)) in packets.iter().enumerate() {
+                sequence = sequence.wrapping_add(1);
+                if frame == 1 && index == 1 {
+                    continue;
+                }
+                let mut rtp = vec![0x80, 97, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+                if index + 1 == packets.len() {
+                    rtp[1] |= 0x80;
+                }
+                rtp[2..4].copy_from_slice(&sequence.to_be_bytes());
+                rtp[4..8].copy_from_slice(&(frame * 6000_u32).to_be_bytes());
+                receive_video_packet(&mut ingress, &queue, &rtp, payload);
+            }
+            let (reset, assembled) = queue.pop(Duration::ZERO);
+            if reset {
+                decoder.reset().unwrap();
+            }
+            if frame == 1 {
+                assert!(reset);
+                assert!(assembled.is_none());
+                assert!(!queue.synced.load(Ordering::Acquire));
+            } else {
+                let assembled = assembled.unwrap();
+                assert_eq!(assembled, au);
+                let image = decoder.decode(&assembled).unwrap().unwrap();
+                assert_eq!((image.width, image.height), (320, 240));
+                assert!(queue.finish_frame());
+            }
+        }
+    }
 
     #[test]
     fn test_unwrap_zalo_relay_rtp_all_formats() {

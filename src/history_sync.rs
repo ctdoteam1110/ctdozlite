@@ -1,11 +1,11 @@
 //! Paged history sync for groups, "Cloud của tôi", and mobile message sync (`Đồng bộ tin nhắn từ điện thoại`, #19, #23, #68).
 //!
 //! - Group & Cloud history walks `/api/cm/getoldv2` backwards 50 messages at a time from the oldest
-//!   message already in `zalo_history.db`, so a second run resumes where the first stopped.
+//!   message in the captured account's store, so a second run resumes where the first stopped.
 //! - Phone message sync (`sync_phone_messages`, #68) triggers Zalo's mobile pull endpoints
-//!   (`/api/message/pull_mobile_msg` cmd `12000` & `/api/transfer-sync-v2/request-sync` cmd `12888`),
+//!   (`/api/message/pull_mobile_msg` cmd `12000`),
 //!   drains `lp_chat` multi-batch queues (`getChatFromPolling`), batch-queries `/api/preloadconvers/get-last-msgs`
-//!   across all 1-1 and group threads in 25-thread chunks, and syncs recent cloud/group history into `zalo_history.db`.
+//!   across all 1-1 and group threads in 25-thread chunks, and persists to the captured account's store.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -16,7 +16,6 @@ use crate::chat::{self, Thread};
 use crate::session::Session;
 use crate::store::{self, MessageStore};
 
-const DB_PATH: &str = "zalo_history.db";
 const PAGE: u32 = 50;
 /// Pages per thread per run (1 000 messages); run again to go further back.
 const MAX_PAGES: usize = 20;
@@ -38,10 +37,20 @@ pub static PHONE_SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
 /// Returns how many messages were new to the database.
 pub async fn sync_thread(s: &Session, t: &mut Thread) -> Result<usize> {
     let id = t.id.clone();
-    let mut cursor =
-        tokio::task::spawn_blocking(move || MessageStore::open(DB_PATH).ok()?.oldest_msg_id(&id))
-            .await?
-            .unwrap_or_default();
+    let uin = s
+        .login
+        .as_ref()
+        .map(|login| login.uin.clone())
+        .filter(|uin| !uin.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Chưa đăng nhập"))?;
+    let cursor_uin = uin.clone();
+    let mut cursor = tokio::task::spawn_blocking(move || {
+        MessageStore::open_account(&cursor_uin)
+            .ok()?
+            .oldest_msg_id(&id)
+    })
+    .await?
+    .unwrap_or_default();
     let mut added = 0;
     for _ in 0..MAX_PAGES {
         if CANCEL.load(Ordering::Relaxed) {
@@ -54,9 +63,10 @@ pub async fn sync_thread(s: &Session, t: &mut Thread) -> Result<usize> {
             break; // nothing older on the server
         }
         let snapshot = t.clone();
+        let page_uin = uin.clone();
         added += tokio::task::spawn_blocking(move || {
             store::persist_threads(
-                &mut MessageStore::open(DB_PATH)?,
+                &mut MessageStore::open_account(&page_uin)?,
                 std::slice::from_ref(&snapshot),
             )
         })
@@ -123,7 +133,10 @@ pub fn get_sync_keys() -> Option<(rsa::RsaPrivateKey, String)> {
 
 /// Retrieve the active RSA 2048 public key.
 pub fn get_sync_public_key() -> Option<String> {
-    CURRENT_SYNC_KEYS.lock().ok().and_then(|g| g.as_ref().map(|(_, pub_k)| pub_k.clone()))
+    CURRENT_SYNC_KEYS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(_, pub_k)| pub_k.clone()))
 }
 /// Clear the active sync keys once sync is finalized.
 pub fn clear_sync_keys() {
@@ -136,9 +149,9 @@ pub fn clear_sync_keys() {
 /// (`294 bytes` -> `392 chars` Base64 starting with `MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...`),
 /// matching `sync-message-key-generator` (`main-startup.js:598226`) for `pullMobileMsg` (`cmd 12000`).
 pub fn generate_sync_public_key() -> String {
+    use base64::Engine;
     use rsa::pkcs8::EncodePublicKey;
     use rsa::{RsaPrivateKey, RsaPublicKey};
-    use base64::Engine;
 
     let mut rng = rsa::rand_core::OsRng;
     if let Ok(priv_key) = RsaPrivateKey::new(&mut rng, 2048) {
@@ -156,13 +169,13 @@ pub fn generate_sync_public_key() -> String {
 /// Synchronize 1-1 and group messages from the user's phone and Zalo cloud (`Đồng bộ tin nhắn từ điện thoại`, #68).
 ///
 /// Workflow:
-/// 1. Sends mobile pull signal (`request_phone_sync` `cmd 12000` + `request_phone_sync_v2` `cmd 12888`)
+/// 1. Sends the supported RSA mobile pull signal (`request_phone_sync` `cmd 12000`)
 ///    so the phone Zalo app is notified to push recent 1-1 & group messages.
 /// 2. Drains `lp_chat` (`get_chat_from_polling`) across multiple batches to collect queued 1-1 & group messages.
 /// 3. Queries `/api/preloadconvers/get-last-msgs` (`get_last_msgs`) in 25-thread batches across all
 ///    1-1 and group conversations and merges messages into `threads`.
 /// 4. Fetches recent & older pages via `/api/cm/getrecentv2` and `/api/cm/getoldv2` for Cloud & groups.
-/// 5. Persists all merged messages to `zalo_history.db` and `threads_cache.json`.
+/// 5. Persists all merged messages and the cache snapshot for the captured account.
 ///
 /// Returns `(added_messages, synced_threads_count)`.
 pub async fn sync_phone_messages<F>(
@@ -198,7 +211,7 @@ where
     if send_phone_prompt {
         set_last_mobile_sync_status(None);
 
-        // Phase 1: Send mobile wake-up / pull request to phone (`cmd 12000` + WebSocket `cmd 592` & `cmd 590`)
+        // Keep the supported RSA pull independent of unavailable transfer-sync v2.
         on_progress(
             0.10,
             "📲 Đang gửi yêu cầu đồng bộ tới Zalo trên điện thoại (hãy mở Zalo trên điện thoại và bấm 'Đồng bộ ngay')…".to_string(),
@@ -207,7 +220,6 @@ where
         if let Ok(ref val) = r1 {
             chat::merge_previews(threads, val);
         }
-        let _ = chat::request_phone_sync_v2(s, &pub_key).await;
 
         // Wait for user to confirm on phone (up to 90 seconds)
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
@@ -393,22 +405,20 @@ where
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
-    // Phase 5: Resolve contact/group display names, deduplicate, and persist to SQLite (`zalo_history.db`)
+    // Phase 5: Resolve contact/group names and persist to the captured account's store.
     on_progress(
         0.96,
-        "💾 Đang lưu tin nhắn đã đồng bộ vào cơ sở dữ liệu zalo_history.db…".to_string(),
+        "💾 Đang lưu tin nhắn đã đồng bộ vào kho dữ liệu tài khoản…".to_string(),
     );
     chat::resolve_thread_names(s, threads).await;
     chat::deduplicate_threads(threads, None);
 
     let snapshot = threads.clone();
     let uin_str = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
-    let db_path = store::db_path_for_account(&uin_str);
-    let db_path_clone = db_path.clone();
     let db_added = tokio::task::spawn_blocking(move || -> Result<usize> {
-        let mut st = MessageStore::open(&db_path_clone)?;
+        let mut st = MessageStore::open_account(&uin_str)?;
         let n = store::persist_threads(&mut st, &snapshot)?;
-        chat::save_threads_cache(&snapshot);
+        chat::save_threads_cache_for_account(&uin_str, &snapshot);
         Ok(n)
     })
     .await??;
@@ -416,7 +426,9 @@ where
     let added = db_added.max(after_total.saturating_sub(before_total));
     let active_threads = threads.iter().filter(|t| !t.messages.is_empty()).count();
     let final_msg = if let Some(phone_note) = last_mobile_sync_status() {
-        format!("{phone_note} · Đã đồng bộ Cloud/Nhóm: +{added} tin nhắn ({active_threads} hội thoại)")
+        format!(
+            "{phone_note} · Đã đồng bộ Cloud/Nhóm: +{added} tin nhắn ({active_threads} hội thoại)"
+        )
     } else {
         format!("✅ Đã gửi yêu cầu tới điện thoại & đồng bộ Cloud/Nhóm: +{added} tin nhắn ({active_threads} hội thoại). Hãy mở Zalo trên điện thoại để xác nhận nếu muốn kéo tin nhắn 1-1 cũ.")
     };
@@ -424,13 +436,51 @@ where
     Ok((added, active_threads))
 }
 
-/// Download, decrypt, decompress and ingest a mobile backup container (.db.crypt)
-/// into `zalo_history.db` and hydrate `threads_cache.json`.
+// The existing znoise response maps numeric backup user IDs to web IDs. A decimal web
+// UIN alone is not evidence of the Android SenderId namespace (re-notes/39_phone_sync_safety.md).
+fn android_self_sender_id(
+    uin: &str,
+    id_map: &std::collections::HashMap<String, String>,
+) -> Result<i64> {
+    let mut sender_id = None;
+    for (name, web_id) in id_map {
+        if uin.is_empty() || web_id != uin || name.starts_with("group_") {
+            continue;
+        }
+        let Some(id) = name
+            .strip_suffix(".db")
+            .and_then(|stem| stem.parse::<i64>().ok())
+            .filter(|id| *id > 0)
+        else {
+            continue;
+        };
+        if sender_id.is_some_and(|previous| previous != id) {
+            crate::logger::log_error(
+                "history_sync::android_identity",
+                "Backup maps multiple Android sender IDs to the captured account",
+            );
+            anyhow::bail!(
+                "Không thể nhập bản sao Android: ánh xạ định danh chủ tài khoản không rõ ràng."
+            );
+        }
+        sender_id = Some(id);
+    }
+    sender_id.ok_or_else(|| {
+        crate::logger::log_error("history_sync::android_identity", "Backup has no trusted Android sender identity for the captured account");
+        anyhow::anyhow!("Không thể nhập bản sao Android: chưa xác định được định danh người gửi của tài khoản từ ánh xạ bản sao. Vui lòng dùng đồng bộ Cloud/Nhóm.")
+    })
+}
+
+/// Download, decrypt and ingest a mobile backup for the captured account.
+///
+/// # Errors
+/// Rejects backups without an unambiguous numeric-to-web mapping for the account owner.
 pub async fn import_mobile_backup_container(
     s: &Session,
     url: &str,
     encrypted_key: &str,
 ) -> Result<usize> {
+    use crate::store::StoredMessage;
     use aes::cipher::{BlockDecryptMut, KeyIvInit};
     use base64::Engine;
     use rsa::Pkcs1v15Encrypt;
@@ -438,8 +488,14 @@ pub async fn import_mobile_backup_container(
     use serde_json::json;
     use std::collections::HashMap;
     use std::io::Cursor;
-    use crate::store::StoredMessage;
 
+    let uin = s
+        .login
+        .as_ref()
+        .map(|login| login.uin.clone())
+        .filter(|uin| !uin.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Chưa đăng nhập"))?;
+    crate::account_manager::validate_uin(&uin)?;
     if url.is_empty() {
         anyhow::bail!("empty backup url");
     }
@@ -454,7 +510,6 @@ pub async fn import_mobile_backup_container(
         anyhow::bail!("encrypted_key is empty");
     };
 
-    let uin = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
     let sek = s.zpw_sek.clone().unwrap_or_default();
     let cookie_hdr = format!("zpw_sek={sek}; zpw_uin={uin}");
 
@@ -563,8 +618,14 @@ pub async fn import_mobile_backup_container(
         "gids": gids
     });
     let enc_params = s.encoded_params(&noise_body)?;
-    let znoise_url = format!("https://zwid.api.zalo.me/api/znoise?{}", s.common_params());
-    let resp = s.post_form(&znoise_url, format!("params={enc_params}")).await?;
+    let znoise_url = format!(
+        "{}/api/znoise?{}",
+        crate::endpoints::ZNOISE,
+        s.common_params()
+    );
+    let resp = s
+        .post_form(&znoise_url, format!("params={enc_params}"))
+        .await?;
     let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
 
     let mut id_map: HashMap<String, String> = HashMap::new();
@@ -585,129 +646,135 @@ pub async fn import_mobile_backup_container(
         }
     }
 
-    let mut store = crate::store::MessageStore::open("zalo_history.db")?;
-    let temp_dir = std::env::temp_dir().join(format!("ctdozlite_sync_{}", crate::param_cipher::random_hex(8)));
-    let _ = std::fs::create_dir_all(&temp_dir);
+    let my_uin = android_self_sender_id(&uin, &id_map)?;
+    let my_uid = uin.clone();
+    let my_name = s
+        .login
+        .as_ref()
+        .map(|l| l.display_name.clone())
+        .unwrap_or_else(|| "Tôi".into());
+    let total_imported = tokio::task::spawn_blocking(move || -> Result<usize> {
+        let mut store = crate::store::MessageStore::open_account(&uin)?;
+        let temp_dir = std::env::temp_dir().join(format!("ctdozlite_sync_{}", crate::param_cipher::random_hex(8)));
+        let _ = std::fs::create_dir_all(&temp_dir);
 
-    let my_uin = 435550501_i64;
-    let my_uid = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
-    let my_name = s.login.as_ref().map(|l| l.display_name.clone()).unwrap_or_else(|| "Tôi".into());
+        let mut curr_offset = 0;
+        let mut total_imported = 0;
 
-    let mut curr_offset = 0;
-    let mut total_imported = 0;
+        for (name, size) in toc {
+            if curr_offset + size > payload.len() {
+                break;
+            }
+            let db_bytes = &payload[curr_offset..curr_offset + size];
+            curr_offset += size;
 
-    for (name, size) in toc {
-        if curr_offset + size > payload.len() {
-            break;
-        }
-        let db_bytes = &payload[curr_offset..curr_offset + size];
-        curr_offset += size;
-
-        let Some(thread_id) = id_map.get(&name) else {
-            continue;
-        };
-
-        let temp_db_path = temp_dir.join(&name);
-        if std::fs::write(&temp_db_path, db_bytes).is_err() {
-            continue;
-        }
-
-        let Ok(conn) = Connection::open(&temp_db_path) else {
-            continue;
-        };
-
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT SenderId, CliMsgId, GlbMsgId, MsgStatus, MsgType, TimeStamp, MsgContent, BinNet 
-             FROM ChatContent ORDER BY TimeStamp ASC",
-        ) else {
-            continue;
-        };
-
-        let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<Vec<u8>>>(7)?,
-            ))
-        }) else {
-            continue;
-        };
-
-        for r in rows.flatten() {
-            let (sender_id_num, cli_msg_id, glb_msg_id, _status, msg_type_num, ts, content_opt, bin_net_opt) = r;
-            let is_outgoing = sender_id_num == my_uin;
-            let sender_id = if is_outgoing { my_uid.clone() } else { thread_id.clone() };
-            let sender_name = if is_outgoing { my_name.clone() } else { String::new() };
-
-            let msg_id = if glb_msg_id > 0 {
-                glb_msg_id.to_string()
-            } else {
-                cli_msg_id.to_string()
+            let Some(thread_id) = id_map.get(&name) else {
+                continue;
             };
 
-            let mut text = content_opt.unwrap_or_default().trim().to_string();
-            let mut msg_type = "webchat".to_string();
+            let temp_db_path = temp_dir.join(&name);
+            if std::fs::write(&temp_db_path, db_bytes).is_err() {
+                continue;
+            }
 
-            if text.is_empty() {
-                if let Some(bn) = &bin_net_opt {
-                    let s_latin = String::from_utf8_lossy(bn);
-                    if let Some(pos) = s_latin.find("maps.app.goo.gl") {
-                        msg_type = "chat.link".to_string();
-                        let sub = &s_latin[pos..];
-                        let end_url = sub.find(['"', '}', '\\', ' ']).unwrap_or(sub.len());
-                        let url = format!("https://{}", &sub[..end_url]);
-                        text = format!("Tôi đang trên đường tới. Bạn có thể xem tiến độ đi đường và thời gian đến của tôi trên Maps: {url}");
-                    } else if msg_type_num == 10 {
-                        msg_type = "chat.sticker".to_string();
+            let Ok(conn) = Connection::open(&temp_db_path) else {
+                continue;
+            };
+
+            let Ok(mut stmt) = conn.prepare(
+                "SELECT SenderId, CliMsgId, GlbMsgId, MsgStatus, MsgType, TimeStamp, MsgContent, BinNet
+                 FROM ChatContent ORDER BY TimeStamp ASC",
+            ) else {
+                continue;
+            };
+
+            let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
+                ))
+            }) else {
+                continue;
+            };
+
+            for r in rows.flatten() {
+                let (sender_id_num, cli_msg_id, glb_msg_id, _status, msg_type_num, ts, content_opt, bin_net_opt) = r;
+                let is_outgoing = sender_id_num == my_uin;
+                let sender_id = if is_outgoing { my_uid.clone() } else { thread_id.clone() };
+                let sender_name = if is_outgoing { my_name.clone() } else { String::new() };
+
+                let msg_id = if glb_msg_id > 0 {
+                    glb_msg_id.to_string()
+                } else {
+                    cli_msg_id.to_string()
+                };
+
+                let mut text = content_opt.unwrap_or_default().trim().to_string();
+                let mut msg_type = "webchat".to_string();
+
+                if text.is_empty() {
+                    if let Some(bn) = &bin_net_opt {
+                        let s_latin = String::from_utf8_lossy(bn);
+                        if let Some(pos) = s_latin.find("maps.app.goo.gl") {
+                            msg_type = "chat.link".to_string();
+                            let sub = &s_latin[pos..];
+                            let end_url = sub.find(['"', '}', '\\', ' ']).unwrap_or(sub.len());
+                            let url = format!("https://{}", &sub[..end_url]);
+                            text = format!("Tôi đang trên đường tới. Bạn có thể xem tiến độ đi đường và thời gian đến của tôi trên Maps: {url}");
+                        } else if msg_type_num == 10 {
+                            msg_type = "chat.sticker".to_string();
+                            text = "[Nhãn dán]".to_string();
+                        } else if msg_type_num == 3 {
+                            msg_type = "chat.photo".to_string();
+                            text = "[Hình ảnh]".to_string();
+                        } else if msg_type_num == 12 {
+                            msg_type = "chat.link".to_string();
+                            text = "[Liên kết]".to_string();
+                        }
+                    }
+                }
+
+                if text.is_empty() {
+                    if msg_type_num == 10 {
                         text = "[Nhãn dán]".to_string();
                     } else if msg_type_num == 3 {
-                        msg_type = "chat.photo".to_string();
                         text = "[Hình ảnh]".to_string();
                     } else if msg_type_num == 12 {
-                        msg_type = "chat.link".to_string();
                         text = "[Liên kết]".to_string();
                     }
                 }
-            }
 
-            if text.is_empty() {
-                if msg_type_num == 10 {
-                    text = "[Nhãn dán]".to_string();
-                } else if msg_type_num == 3 {
-                    text = "[Hình ảnh]".to_string();
-                } else if msg_type_num == 12 {
-                    text = "[Liên kết]".to_string();
+                let sm = StoredMessage {
+                    msg_id,
+                    thread_id: thread_id.clone(),
+                    sender_id,
+                    sender_name,
+                    text,
+                    msg_type,
+                    ts,
+                    is_outgoing,
+                    raw_json: String::new(),
+                };
+
+                if store.upsert_message(&sm).unwrap_or(false) {
+                    total_imported += 1;
                 }
             }
-
-            let sm = StoredMessage {
-                msg_id,
-                thread_id: thread_id.clone(),
-                sender_id,
-                sender_name,
-                text,
-                msg_type,
-                ts,
-                is_outgoing,
-                raw_json: String::new(),
-            };
-
-            if store.upsert_message(&sm).unwrap_or(false) {
-                total_imported += 1;
-            }
         }
-    }
 
-    let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_dir_all(&temp_dir);
 
-    let mut cached_threads = crate::chat::load_threads_cache();
-    let _ = store.hydrate_threads(&mut cached_threads, 50);
-    crate::chat::save_threads_cache(&cached_threads);
+        let mut cached_threads = crate::chat::load_threads_cache_for_account(&uin);
+        let _ = store.hydrate_threads(&mut cached_threads, 50);
+        crate::chat::save_threads_cache_for_account(&uin, &cached_threads);
+        Ok(total_imported)
+    }).await??;
 
     // Notify Zalo server and phone that snapshot is downloaded, dismissing mobile spinner
     let _ = crate::chat::clean_sync(s, &pub_key_b64).await;
@@ -879,7 +946,9 @@ fn parse_vli(buf: &[u8], mut offset: usize) -> Option<(u64, usize)> {
             return Some((result, offset));
         }
         shift += 7;
-        if shift >= 64 { return None; }
+        if shift >= 64 {
+            return None;
+        }
     }
     None
 }
@@ -908,7 +977,9 @@ fn parse_message(buf: &[u8]) -> Option<ParsedProtoMsg> {
                 let (len, next) = parse_vli(buf, offset)?;
                 offset = next;
                 let len = len as usize;
-                if offset + len > buf.len() { return None; }
+                if offset + len > buf.len() {
+                    return None;
+                }
                 let bytes = &buf[offset..offset + len];
                 offset += len;
                 match field_num {
@@ -939,7 +1010,9 @@ fn parse_partition(buf: &[u8]) -> Option<ParsedProtoPartition> {
                 let (len, next) = parse_vli(buf, offset)?;
                 offset = next;
                 let len = len as usize;
-                if offset + len > buf.len() { return None; }
+                if offset + len > buf.len() {
+                    return None;
+                }
                 part.id = String::from_utf8_lossy(&buf[offset..offset + len]).into_owned();
                 offset += len;
             }
@@ -947,7 +1020,9 @@ fn parse_partition(buf: &[u8]) -> Option<ParsedProtoPartition> {
                 let (len, next) = parse_vli(buf, offset)?;
                 offset = next;
                 let len = len as usize;
-                if offset + len > buf.len() { return None; }
+                if offset + len > buf.len() {
+                    return None;
+                }
                 if let Some(m) = parse_message(&buf[offset..offset + len]) {
                     part.messages.push(m);
                 }
@@ -1006,7 +1081,9 @@ pub fn parse_sync_chunk(buf: &[u8]) -> Option<Vec<ParsedProtoPartition>> {
                 let (len, next) = parse_vli(buf, offset)?;
                 offset = next;
                 let len = len as usize;
-                if offset + len > buf.len() { return None; }
+                if offset + len > buf.len() {
+                    return None;
+                }
                 if let Some(p) = parse_partition(&buf[offset..offset + len]) {
                     parts.push(p);
                 }
@@ -1059,8 +1136,7 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
     let decompressed = decompress_sync_payload(&decrypted_bytes);
 
     let partitions = parse_sync_chunk(&decompressed).unwrap_or_default();
-    let db_path = crate::store::db_path_for_account(&uin);
-    let mut store = crate::store::MessageStore::open(&db_path)?;
+    let mut store = crate::store::MessageStore::open_account(&uin)?;
     let my_name = s.login.as_ref().map(|l| l.display_name.clone()).unwrap_or_else(|| "Tôi".into());
 
     let mut imported = 0;
@@ -1093,9 +1169,9 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
         }
     }
 
-    let mut cached_threads = crate::chat::load_threads_cache();
+    let mut cached_threads = crate::chat::load_threads_cache_for_account(&uin);
     let _ = store.hydrate_threads(&mut cached_threads, 50);
-    crate::chat::save_threads_cache(&cached_threads);
+    crate::chat::save_threads_cache_for_account(&uin, &cached_threads);
 
     if let Some(pub_k) = get_sync_public_key() {
         let _ = crate::chat::clean_sync(s, &pub_k).await;
@@ -1106,10 +1182,42 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
 
     Ok(imported)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chat::ChatMessage;
+
+    #[test]
+    fn android_sender_identity_uses_each_accounts_backup_mapping() {
+        let mappings = std::collections::HashMap::from([
+            ("101.db".into(), "web-account-a".into()),
+            ("202.db".into(), "web-account-b".into()),
+            ("group_303.db".into(), "web-account-b".into()),
+        ]);
+        assert_eq!(
+            android_self_sender_id("web-account-a", &mappings).unwrap(),
+            101
+        );
+        assert_eq!(
+            android_self_sender_id("web-account-b", &mappings).unwrap(),
+            202
+        );
+    }
+
+    #[test]
+    fn android_sender_identity_rejects_missing_mapping_even_for_decimal_web_uin() {
+        assert!(android_self_sender_id("1234567890123456789", &Default::default()).is_err());
+    }
+
+    #[test]
+    fn android_sender_identity_rejects_ambiguous_backup_mapping() {
+        let mappings = std::collections::HashMap::from([
+            ("101.db".into(), "web-account-a".into()),
+            ("202.db".into(), "web-account-a".into()),
+        ]);
+        assert!(android_self_sender_id("web-account-a", &mappings).is_err());
+    }
 
     fn thread_with(ids: &[&str]) -> Thread {
         Thread {
@@ -1140,6 +1248,15 @@ mod tests {
             next_cursor(&thread_with(&["out_1", "7", "9"]), "9").as_deref(),
             Some("7")
         );
+    }
+
+    #[tokio::test]
+    async fn request_phone_sync_v2_rejects_logged_out_sessions_before_key_generation() {
+        let session = Session::new(false, false, false).unwrap();
+        let error = chat::request_phone_sync_v2(&session, "unused")
+            .await
+            .expect_err("logged-out Sync v2 must not generate keys or queue a wakeup");
+        assert!(error.to_string().contains("chưa đăng nhập"));
     }
 
     #[test]

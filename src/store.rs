@@ -41,12 +41,97 @@ pub fn db_path_for_account(uin: &str) -> String {
     if uin.is_empty() {
         "zalo_history.db".to_string()
     } else {
-        let _ = std::fs::create_dir_all("accounts");
         format!("accounts/{uin}_history.db")
     }
 }
 
 impl MessageStore {
+    /// Open the active account's canonical history, claiming legacy history for it once.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid UIN or a failed database operation.
+    pub fn open_account(uin: &str) -> Result<Self> {
+        Self::open_account_in(std::path::Path::new("."), uin)
+    }
+
+    /// Open account history below an explicit application root without changing the process directory.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid UIN or a failed migration. Legacy history is never
+    /// imported into an account other than the first account that claims it.
+    pub fn open_account_in(root: &std::path::Path, uin: &str) -> Result<Self> {
+        crate::account_manager::validate_uin(uin)?;
+        std::fs::create_dir_all(root.join("accounts"))?;
+        let path = root.join(db_path_for_account(uin));
+        let mut store = Self::open(
+            path.to_str()
+                .ok_or_else(|| anyhow::anyhow!("Đường dẫn dữ liệu không hợp lệ"))?,
+        )?;
+        let imported: bool = store.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_store_metadata WHERE key = 'legacy_imported')",
+            [],
+            |row| row.get(0),
+        )?;
+        if imported {
+            return Ok(store);
+        }
+        let legacy_path = root.join("zalo_history.db");
+        if !legacy_path.is_file() {
+            return Ok(store);
+        }
+        let legacy = Self::open(
+            legacy_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Đường dẫn dữ liệu không hợp lệ"))?,
+        )?;
+        // Claim ownership before copying. A failed copy can retry, but another account
+        // must never inherit this account's legacy rows.
+        legacy.conn.execute(
+            "INSERT OR IGNORE INTO account_store_metadata(key, value) VALUES ('legacy_owner', ?1)",
+            [uin],
+        )?;
+        let owner: String = legacy.conn.query_row(
+            "SELECT value FROM account_store_metadata WHERE key = 'legacy_owner'",
+            [],
+            |row| row.get(0),
+        )?;
+        if owner != uin {
+            return Ok(store);
+        }
+        let has_scheduled_messages: bool = legacy.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_messages')", [], |row| row.get(0))?;
+        if has_scheduled_messages {
+            crate::scheduler::init_scheduler_schema(&store.conn)?;
+        }
+        store.conn.execute(
+            "ATTACH DATABASE ?1 AS legacy_history",
+            [legacy_path.to_string_lossy().as_ref()],
+        )?;
+        let tx = store.conn.transaction()?;
+        let imported: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_store_metadata WHERE key = 'legacy_imported')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !imported {
+            // Read through SQLite so committed WAL rows are included. Canonical rows
+            // win on ID collisions; migration must not overwrite newer account data.
+            tx.execute_batch("INSERT OR IGNORE INTO messages(msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json)
+                SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json FROM legacy_history.messages;
+                INSERT OR IGNORE INTO threads(thread_id, name, is_group, last_ts, last_read_msg_id)
+                SELECT thread_id, name, is_group, last_ts, last_read_msg_id FROM legacy_history.threads;
+                INSERT INTO account_store_metadata(key, value) VALUES ('legacy_imported', '1');")?;
+            if has_scheduled_messages {
+                // Scheduler IDs are local autoincrement values, so both databases can
+                // contain unrelated ID 1. Allocate fresh IDs instead of dropping either row.
+                tx.execute_batch("INSERT INTO scheduled_messages(thread_id, thread_name, is_group, text, deliver_at, created_at, status, error_msg)
+                    SELECT thread_id, thread_name, is_group, text, deliver_at, created_at, status, error_msg FROM legacy_history.scheduled_messages;")?;
+            }
+        }
+        tx.commit()?;
+        store.conn.execute_batch("DETACH DATABASE legacy_history")?;
+        Ok(store)
+    }
+
     /// Messages per thread loaded at startup / on refresh. The list only needs the newest one
     /// for ordering and preview; opening a thread reads deeper (`LoadGroupHistory`).
     pub const PRELOAD_MSGS: usize = 20;
@@ -59,6 +144,11 @@ impl MessageStore {
             Connection::open(path)?
         };
 
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > 2 {
+            anyhow::bail!("Dữ liệu được tạo bởi phiên bản mới hơn; vui lòng nâng cấp ứng dụng");
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
                 msg_id TEXT PRIMARY KEY,
@@ -104,6 +194,12 @@ impl MessageStore {
                  COMMIT;",
             )?;
         }
+        if version < 2 {
+            conn.execute_batch("BEGIN;
+                CREATE TABLE IF NOT EXISTS account_store_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                PRAGMA user_version = 2;
+                COMMIT;")?;
+        }
 
         Ok(Self { conn })
     }
@@ -126,10 +222,19 @@ impl MessageStore {
             ],
         )?;
         if rows == 0 && !msg.raw_json.is_empty() {
-            let _ = self.conn.execute(
-                "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3",
-                params![msg.raw_json, msg.msg_type, msg.msg_id, msg.text],
+            let previous: Option<String> = self.conn.query_row(
+                "SELECT raw_json FROM messages WHERE msg_id = ?1",
+                [&msg.msg_id],
+                |row| row.get(0),
+            )?;
+            let raw_json = preserve_reaction_replay_metadata(
+                previous.as_deref().unwrap_or_default(),
+                &msg.raw_json,
             );
+            self.conn.execute(
+                "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3",
+                params![raw_json, msg.msg_type, msg.msg_id, msg.text],
+            )?;
         }
         Ok(rows > 0)
     }
@@ -447,6 +552,7 @@ impl MessageStore {
                 let mut reply_to_text = None;
                 let mut reactions = Vec::new();
                 let mut reaction_summaries = Vec::new();
+                let mut reaction_versions = std::collections::BTreeMap::new();
                 let mut is_pinned = false;
                 let mut is_starred = false;
                 let mut link_url = None;
@@ -490,6 +596,10 @@ impl MessageStore {
                             {
                                 reaction_summaries = parsed_sums;
                             }
+                        }
+                        if let Some(versions) = val.get("reaction_versions") {
+                            reaction_versions =
+                                serde_json::from_value(versions.clone()).unwrap_or_default();
                         }
                         if reaction_summaries.is_empty() && !reactions.is_empty() {
                             reaction_summaries = reactions
@@ -550,6 +660,7 @@ impl MessageStore {
                     reply_to_text,
                     reactions,
                     reaction_summaries,
+                    reaction_versions,
                     is_pinned,
                     is_starred,
                     link_url,
@@ -601,6 +712,15 @@ impl MessageStore {
                         );
                         existing.reaction_summaries = cm.reaction_summaries;
                     }
+                    for (sender, version) in cm.reaction_versions {
+                        let current = existing
+                            .reaction_versions
+                            .entry(sender)
+                            .or_insert_with(|| version.clone());
+                        for event in version.events.iter().chain(&version.covered_events) {
+                            current.cover(event);
+                        }
+                    }
                     existing.is_pinned = existing.is_pinned || cm.is_pinned;
                     existing.is_starred = existing.is_starred || cm.is_starred;
                 } else {
@@ -623,6 +743,38 @@ impl MessageStore {
         crate::chat::deduplicate_threads(threads, None);
         Ok(loaded_count)
     }
+}
+
+// Counts may be refreshed from history without event IDs. Retain replay identities across
+// metadata upserts; an older or incomplete writer cannot erase the local deduplication ledger.
+fn preserve_reaction_replay_metadata(previous: &str, incoming: &str) -> String {
+    type Versions = std::collections::BTreeMap<String, crate::reactions::ReactionVersion>;
+    let old: Versions = serde_json::from_str::<serde_json::Value>(previous)
+        .ok()
+        .and_then(|value| value.get("reaction_versions").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    if old.is_empty() {
+        return incoming.to_string();
+    }
+    let Ok(serde_json::Value::Object(mut metadata)) = serde_json::from_str(incoming) else {
+        return incoming.to_string();
+    };
+    let mut versions: Versions = metadata
+        .get("reaction_versions")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    for (sender, old_version) in old {
+        let current = versions
+            .entry(sender)
+            .or_insert_with(|| old_version.clone());
+        for event in old_version.events.iter().chain(&old_version.covered_events) {
+            current.cover(event);
+        }
+    }
+    metadata.insert("reaction_versions".into(), serde_json::json!(versions));
+    serde_json::Value::Object(metadata).to_string()
 }
 
 impl From<&ChatMessage> for StoredMessage {
@@ -654,6 +806,12 @@ impl From<&ChatMessage> for StoredMessage {
             meta.insert(
                 "reaction_summaries".into(),
                 serde_json::json!(m.reaction_summaries),
+            );
+        }
+        if !m.reaction_versions.is_empty() {
+            meta.insert(
+                "reaction_versions".into(),
+                serde_json::json!(m.reaction_versions),
             );
         }
         if m.is_pinned {
@@ -902,31 +1060,12 @@ pub fn import_history_from_path(src: &std::path::Path, dst_db_path: &str) -> Res
                 }
             }
         } else if bytes.len() >= 4096 {
-            if let Some(decrypted_bytes) = try_decrypt_zalo_pc_database(&bytes) {
-                let tmp_dir = std::env::temp_dir();
-                let tmp_name = format!(
-                    "ctdozlite_import_{}_{}.db",
-                    std::process::id(),
-                    report.sources_read.len()
-                );
-                let tmp_path = tmp_dir.join(tmp_name);
-                if std::fs::write(&tmp_path, &decrypted_bytes).is_ok() {
-                    if let Ok(src_conn) = Connection::open(&tmp_path) {
-                        let _ = import_official_zalo_pc_db(
-                            &src_conn,
-                            &mut dst,
-                            &file_path,
-                            &mut report,
-                        );
-                    }
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
-            }
+            anyhow::bail!("Chưa hỗ trợ nhập cơ sở dữ liệu Zalo PC được mã hóa khi chưa xác minh được khóa của tài khoản");
         }
     }
 
     if src.is_dir() {
-        let _ = scan_and_import_zalo_data_dir(src, &mut dst, &mut report);
+        scan_and_import_zalo_data_dir(src, &mut dst, &mut report)?;
     }
 
     Ok(report)
@@ -938,12 +1077,6 @@ fn scan_and_import_zalo_data_dir(
     dst: &mut MessageStore,
     report: &mut ImportReport,
 ) -> Result<()> {
-    // 1. Recover the 32-char XOR key from Local Storage LevelDB if present
-    let mut cipher_key = recover_zalo_localstorage_key(root);
-    if cipher_key.is_empty() {
-        cipher_key = "de039414865b856ea650d3305b1f387f".to_string();
-    }
-
     // 2. Discover user folders under Database/_production
     let mut message_dirs = Vec::new();
     let mut index_files = Vec::new();
@@ -968,6 +1101,11 @@ fn scan_and_import_zalo_data_dir(
             }
         }
     }
+
+    if message_dirs.is_empty() && index_files.is_empty() {
+        return Ok(());
+    }
+    let cipher_key = recover_zalo_localstorage_key(root)?;
 
     // 3. Build contact/group name dictionary from Index.db
     let mut id_to_name: std::collections::HashMap<String, (String, bool)> =
@@ -1201,91 +1339,24 @@ fn import_message_table(
     Ok(())
 }
 
-/// Recover the 32-character XOR key from LevelDB in `Partitions/zalo/Local Storage/leveldb`.
-pub fn recover_zalo_localstorage_key(base_dir: &std::path::Path) -> String {
-    let cand_dirs = vec![base_dir
-        .join("Partitions")
-        .join("zalo")
-        .join("Local Storage")
-        .join("leveldb")];
-
-    let mut key = vec![None; 32];
-    let u_pat = "z_ecrp_"
-        .encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect::<Vec<u8>>();
-
-    for ldb_dir in cand_dirs {
-        let Ok(entries) = std::fs::read_dir(ldb_dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
-            if ext != "ldb" && ext != "log" {
-                continue;
-            }
-            let Ok(b) = std::fs::read(&p) else {
-                continue;
-            };
-            let mut pos = 0;
-            while let Some(rel) = b[pos..]
-                .windows(u_pat.len())
-                .position(|w| w == u_pat.as_slice())
-            {
-                let idx = pos + rel + u_pat.len();
-                pos = idx;
-                let mut chars = Vec::new();
-                for i in (0..64).step_by(2) {
-                    if idx + i + 1 < b.len() {
-                        chars.push((b[idx + i] as u16 | ((b[idx + i + 1] as u16) << 8)) as u32);
-                    }
-                }
-                if chars.len() >= 32 {
-                    let prefix = b"{\"version\":";
-                    let cand: Vec<u32> = chars
-                        .iter()
-                        .take(prefix.len())
-                        .zip(prefix.iter())
-                        .map(|(c, p)| c ^ (*p as u32))
-                        .collect();
-                    if cand.iter().all(|x| (*x as u8 as char).is_ascii_hexdigit()) {
-                        for (i, v) in cand.iter().enumerate() {
-                            key[i] = Some(*v as u8 as char);
-                        }
-                        let suffix = b",\"list_recent\":[{\"";
-                        if chars.len() >= 14 + suffix.len() {
-                            let cand2: Vec<u32> = chars[14..14 + suffix.len()]
-                                .iter()
-                                .zip(suffix.iter())
-                                .map(|(c, p)| c ^ (*p as u32))
-                                .collect();
-                            if cand2.iter().all(|x| (*x as u8 as char).is_ascii_hexdigit()) {
-                                for (i, v) in cand2.iter().enumerate() {
-                                    key[14 + i] = Some(*v as u8 as char);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut full_key = String::new();
-    for k in key {
-        match k {
-            Some(c) => full_key.push(c),
-            None => return "de039414865b856ea650d3305b1f387f".to_string(),
-        }
-    }
-    full_key
+/// Recover an account's XOR key only when all key material can be verified.
+///
+/// # Errors
+/// Returns an unsupported error: the observed prefix and suffix leave three key
+/// positions unknown, so the existing evidence cannot establish a complete key.
+pub fn recover_zalo_localstorage_key(_base_dir: &std::path::Path) -> Result<String> {
+    anyhow::bail!(
+        "Chưa hỗ trợ khôi phục đầy đủ khóa dữ liệu Zalo PC; không thể nhập dữ liệu mã hóa an toàn"
+    )
 }
 
-/// Decrypt single official Zalo PC database bytes using PBKDF2-HMAC-SHA512 + AES-256-CBC (SQLCipher v4 profile).
-pub fn try_decrypt_zalo_pc_database(bytes: &[u8]) -> Option<Vec<u8>> {
-    let key = "de039414865b856ea650d3305b1f387f";
-    decrypt_sqlcipher_bytes(bytes, key.as_bytes())
+/// Decrypt an official database with an explicitly supplied account passphrase.
+/// Returns `None` if the data cannot be decrypted using the supplied key.
+pub fn try_decrypt_zalo_pc_database(bytes: &[u8], passphrase: &[u8]) -> Option<Vec<u8>> {
+    if passphrase.is_empty() {
+        return None;
+    }
+    decrypt_sqlcipher_bytes(bytes, passphrase)
 }
 
 /// Decrypt SQLCipher v4 database pages with 80-byte reserve, 4096 page size, SHA-512 256k iterations.
@@ -1628,31 +1699,99 @@ fn extract_zalo_message_text_and_meta(
     (xored.to_string(), meta)
 }
 
-fn import_official_zalo_pc_db(
-    src_conn: &Connection,
-    dst: &mut MessageStore,
-    file_path: &std::path::Path,
-    report: &mut ImportReport,
-) -> Result<()> {
-    let stem = file_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("import_pc");
-    let cipher_key = "de039414865b856ea650d3305b1f387f";
-    import_message_table(
-        src_conn,
-        dst,
-        stem,
-        stem,
-        stem.starts_with('g'),
-        cipher_key,
-        report,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_recovery_does_not_invent_a_key_when_local_storage_is_absent() {
+        let absent = std::env::temp_dir().join(format!("ctdozlite-no-key-{}", std::process::id()));
+        assert!(recover_zalo_localstorage_key(&absent).is_err());
+    }
+
+    #[test]
+    fn account_open_merges_legacy_wal_once_for_its_owner() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-owner-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("accounts")).unwrap();
+        let mut legacy =
+            MessageStore::open(root.join("zalo_history.db").to_str().unwrap()).unwrap();
+        legacy
+            .conn
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        let message = |id: &str| StoredMessage {
+            msg_id: id.into(),
+            thread_id: "thread-1".into(),
+            sender_id: "user-1".into(),
+            sender_name: "Example".into(),
+            text: id.into(),
+            msg_type: "chat.text".into(),
+            ts: 1,
+            is_outgoing: false,
+            raw_json: String::new(),
+        };
+        legacy.upsert_message(&message("msg-legacy")).unwrap();
+        legacy.upsert_thread(&StoredThread {
+            thread_id: "thread-1".into(),
+            name: "Example".into(),
+            is_group: false,
+            last_ts: 1,
+            last_read_msg_id: "msg-legacy".into(),
+        }).unwrap();
+        crate::scheduler::init_scheduler_schema(&legacy.conn).unwrap();
+        legacy.conn.execute("INSERT INTO scheduled_messages(thread_id, text, deliver_at, created_at) VALUES ('thread-1', 'legacy schedule', 2, 1)", []).unwrap();
+        {
+            let mut existing =
+                MessageStore::open(root.join("accounts/user-a_history.db").to_str().unwrap())
+                    .unwrap();
+            existing.upsert_message(&message("msg-canonical")).unwrap();
+            crate::scheduler::init_scheduler_schema(&existing.conn).unwrap();
+            existing.conn.execute("INSERT INTO scheduled_messages(thread_id, text, deliver_at, created_at) VALUES ('thread-1', 'canonical schedule', 2, 1)", []).unwrap();
+        }
+        {
+            let account = MessageStore::open_account_in(&root, "user-a").unwrap();
+            assert_eq!(account.messages_for("thread-1", 20).unwrap().len(), 2);
+            assert_eq!(account.all_threads().unwrap()[0].last_read_msg_id, "msg-legacy");
+            let count: i64 = account
+                .conn
+                .query_row("SELECT COUNT(*) FROM scheduled_messages", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 2);
+        }
+        {
+            let account = MessageStore::open_account_in(&root, "user-a").unwrap();
+            assert_eq!(account.messages_for("thread-1", 20).unwrap().len(), 2); // (INV-4)
+            let count: i64 = account
+                .conn
+                .query_row("SELECT COUNT(*) FROM scheduled_messages", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 2);
+        }
+        let other = MessageStore::open_account_in(&root, "user-b").unwrap();
+        assert!(other.messages_for("thread-1", 20).unwrap().is_empty());
+        drop(other);
+        drop(legacy);
+        std::fs::write(
+            root.join("zalo_history.db"),
+            b"unusable retired legacy file",
+        )
+        .unwrap();
+        let migrated = MessageStore::open_account_in(&root, "user-a").unwrap();
+        assert_eq!(migrated.messages_for("thread-1", 20).unwrap().len(), 2);
+        drop(migrated);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn local_time_when_hydrating_seconds_and_milliseconds() {
@@ -1972,13 +2111,13 @@ mod tests {
 
     #[test]
     fn jxl_to_jpg_url_and_decode_zalo_cipher_payload_work() {
-        let jxl = "https://photo-stal-17.zdn.vn/no/jxl/ba5262149ded4eb317fc/2aOboR74hO3nF0sTxZSJAzpYZhLbEB780ODEOKsS.jxl?jxlstatus=1";
+        let jxl = "https://example.invalid/no/jxl/fixture.jxl?jxlstatus=1";
         assert_eq!(
             jxl_to_jpg_url(jxl),
-            "https://photo-stal-17.zdn.vn/no/jpg/ba5262149ded4eb317fc/2aOboR74hO3nF0sTxZSJAzpYZhLbEB780ODEOKsS.jpg"
+            "https://example.invalid/no/jpg/fixture.jpg"
         );
-        let key = "de039414865b856ea650d3305b1f387f";
-        let plain = "\"Này bố kiểm tra mail xem ạ\"";
+        let key = "0123456789abcdef0123456789abcdef";
+        let plain = "\"Synthetic fixture\"";
         let key_chars: Vec<char> = key.chars().collect();
         let enc: String = plain
             .chars()
@@ -1987,9 +2126,6 @@ mod tests {
                 char::from_u32((c as u32) ^ (key_chars[i % key_chars.len()] as u32)).unwrap()
             })
             .collect();
-        assert_eq!(
-            decode_zalo_cipher_payload(&enc, key),
-            "Này bố kiểm tra mail xem ạ"
-        );
+        assert_eq!(decode_zalo_cipher_payload(&enc, key), "Synthetic fixture");
     }
 }

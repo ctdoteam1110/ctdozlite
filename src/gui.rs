@@ -21,6 +21,7 @@ use crate::logger::{self, FindingLevel, LogEntry, ScanFinding};
 use crate::qr::QrLogin;
 use crate::session::Session;
 
+mod accounts;
 mod messages;
 mod modals;
 mod reactions_dialog;
@@ -36,11 +37,25 @@ pub use theme::{emoji_to_tex_key, load_app_icon, lucide, REACTION_LIST};
 pub use worker::WorkerCmd;
 use worker::*;
 
+/// Queue native device discovery when the GUI worker is available.
+/// Returns false when no worker is running or its command receiver has closed.
+pub(crate) fn request_media_device_refresh() -> bool {
+    WORKER_TX
+        .get()
+        .is_some_and(|tx| tx.send(WorkerCmd::RefreshMediaDevices).is_ok())
+}
+
 fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
     crate::chat::merge_sent_message(thread, message);
 }
 
 pub enum GuiEvent {
+    /// Account-bound completion; queued results are checked again when consumed.
+    AccountScoped {
+        epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        generation: u64,
+        event: Box<GuiEvent>,
+    },
     /// Terminal response for a Settings authorization action.
     NotificationAuthorization {
         request_id: u64,
@@ -84,6 +99,17 @@ pub enum GuiEvent {
     StickerImageReady {
         key: String,
         image: egui::ColorImage,
+    },
+    /// One wake-up for all pending native video frames.
+    VideoFramesReady(std::sync::Arc<VideoFrameMailbox>),
+    /// Terminal result of asynchronous microphone and camera discovery.
+    MediaDevicesRefreshed {
+        error: Option<String>,
+    },
+    /// Terminal account discovery/deletion result containing profile metadata only.
+    SavedAccountsLoaded {
+        request_id: u64,
+        result: Result<Vec<crate::account_manager::AccountProfile>, String>,
     },
     StickerImageFailed {
         key: String,
@@ -529,19 +555,222 @@ const CHAT_RENDER_STEP: usize = 150;
 pub struct GuiTx {
     tx: Sender<GuiEvent>,
     ctx: egui::Context,
+    epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    generation: Option<u64>,
+    video_frames: std::sync::Arc<VideoFrameMailbox>,
+}
+
+/// Bounded latest-frame storage shared by the media producers and UI.
+#[derive(Default)]
+pub struct VideoFrameMailbox {
+    // A short lock couples frame replacement and its single notification latch.
+    state: std::sync::Mutex<VideoFrameState>,
+}
+
+#[derive(Default)]
+struct VideoFrameState {
+    generation: u64,
+    active: bool,
+    notification_pending: bool,
+    clear_textures: bool,
+    frames: HashMap<String, egui::ColorImage>,
+    removed: HashSet<String>,
+}
+
+fn is_call_video_key(key: &str) -> bool {
+    matches!(
+        key,
+        "call_local_video"
+            | "call_remote_video"
+            | "call_remote_video_1"
+            | "call_remote_video_2"
+            | "call_remote_video_3"
+            | "call_remote_video_4"
+            | "call_remote_video_5"
+    )
+}
+
+impl VideoFrameMailbox {
+    fn take(&self) -> (bool, HashMap<String, egui::ColorImage>, HashSet<String>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.notification_pending = false;
+        let clear = std::mem::take(&mut state.clear_textures);
+        (
+            clear,
+            std::mem::take(&mut state.frames),
+            std::mem::take(&mut state.removed),
+        )
+    }
 }
 
 impl GuiTx {
     pub fn new(tx: Sender<GuiEvent>, ctx: egui::Context) -> Self {
-        Self { tx, ctx }
+        Self {
+            tx,
+            ctx,
+            epoch: Default::default(),
+            generation: None,
+            video_frames: Default::default(),
+        }
+    }
+
+    /// Bind a task's completions to the account active when it starts.
+    pub(crate) fn scoped(&self) -> Self {
+        let mut scoped = self.clone();
+        scoped.generation = Some(self.epoch.load(std::sync::atomic::Ordering::SeqCst));
+        scoped
+    }
+
+    /// Invalidate all tasks and queued events belonging to the previous account.
+    fn advance_account(&self) -> Self {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.reset_video_generation(None);
+        self.scoped()
+    }
+
+    /// Whether this sender still belongs to the active account.
+    pub(crate) fn is_current(&self) -> bool {
+        self.generation.is_none_or(|generation| {
+            generation == self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+        })
+    }
+
+    /// Start a call's frame lifetime; all its local and remote producers share this token.
+    /// Returns zero when the sender belongs to a previous account.
+    pub fn begin_video_generation(&self) -> u64 {
+        let mut state = self
+            .video_frames
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.is_current() {
+            return 0;
+        }
+        state.generation = state.generation.wrapping_add(1).max(1);
+        state.active = true;
+        state.frames.clear();
+        state.removed.clear();
+        state.clear_textures = true;
+        let generation = state.generation;
+        self.notify_video_frames(&mut state);
+        generation
+    }
+
+    /// Replace a stream's latest frame without buffering one event per frame.
+    /// Returns false for an obsolete account/call, unknown stream, or failed wake-up.
+    pub fn send_video_frame(&self, generation: u64, key: &str, image: egui::ColorImage) -> bool {
+        if !is_call_video_key(key) {
+            return false;
+        }
+        let mut state = self
+            .video_frames
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.is_current() || !state.active || generation != state.generation {
+            return false;
+        }
+        state.removed.remove(key);
+        state.frames.insert(key.to_owned(), image);
+        self.notify_video_frames(&mut state)
+    }
+
+    /// Remove a stream texture through the same bounded, generation-checked mailbox.
+    /// Returns false when the stream or generation is obsolete or a wake-up fails.
+    pub fn clear_video_frame(&self, generation: u64, key: &str) -> bool {
+        if !is_call_video_key(key) {
+            return false;
+        }
+        let mut state = self
+            .video_frames
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.is_current() || !state.active || generation != state.generation {
+            return false;
+        }
+        state.frames.remove(key);
+        state.removed.insert(key.to_owned());
+        self.notify_video_frames(&mut state)
+    }
+
+    /// Stop this call's frame lifetime; an older call cannot invalidate a newer one.
+    pub fn end_video_generation(&self, generation: u64) {
+        if self.is_current() {
+            self.reset_video_generation(Some(generation));
+        }
+    }
+
+    fn reset_video_generation(&self, generation: Option<u64>) {
+        let mut state = self
+            .video_frames
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if generation.is_some() && !self.is_current() {
+            return;
+        }
+        if generation.is_some_and(|generation| generation != state.generation) {
+            return;
+        }
+        if !state.active && state.frames.is_empty() && !state.clear_textures {
+            return;
+        }
+        state.active = false;
+        state.frames.clear();
+        state.removed.clear();
+        state.clear_textures = true;
+        self.notify_video_frames(&mut state);
+    }
+
+    fn notify_video_frames(&self, state: &mut VideoFrameState) -> bool {
+        if state.notification_pending {
+            return true;
+        }
+        // This account-independent wake only drains the current mailbox. Old producers
+        // are rejected before insertion, so an account switch cannot strand its latch.
+        if self
+            .tx
+            .send(GuiEvent::VideoFramesReady(self.video_frames.clone()))
+            .is_err()
+        {
+            state.frames.clear();
+            state.removed.clear();
+            return false;
+        }
+        state.notification_pending = true;
+        self.ctx.request_repaint();
+        true
     }
 
     /// Same contract as `Sender::send` (callers already `let _ =` it), plus the wake-up.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, ev: GuiEvent) -> Result<(), std::sync::mpsc::SendError<GuiEvent>> {
+        let ev = if let Some(generation) = self.generation {
+            GuiEvent::AccountScoped {
+                epoch: self.epoch.clone(),
+                generation,
+                event: Box::new(ev),
+            }
+        } else {
+            ev
+        };
         let res = self.tx.send(ev);
         self.ctx.request_repaint();
         res
+    }
+}
+
+impl GuiEvent {
+    pub(crate) fn for_current_account(self) -> Option<Self> {
+        match self {
+            Self::AccountScoped {
+                epoch,
+                generation,
+                event,
+            } => (epoch.load(std::sync::atomic::Ordering::SeqCst) == generation).then(|| *event),
+            event => Some(event),
+        }
     }
 }
 
@@ -602,6 +831,7 @@ pub struct ZaloGuiApp {
     pub(crate) typing_map: HashMap<String, (String, std::time::Instant)>,
     pub(crate) last_typing_ping_at: std::time::Instant,
     active_call: Option<ActiveCallOverlay>,
+    media_devices_ready: bool,
     image_viewer: Option<ImageViewerModal>,
 
     info_drawer_open: bool,
@@ -661,6 +891,7 @@ pub struct ZaloGuiApp {
     allow_quit: bool,
     settings_modal_open: bool,
     settings_tab: SettingsTab,
+    saved_accounts: accounts::SavedAccountsState,
     notification_authorization: crate::native_notifications::AuthorizationState,
     settings: AppSettings,
     settings_blur_tex: Option<TextureHandle>,
@@ -852,6 +1083,7 @@ impl ZaloGuiApp {
             typing_map: HashMap::new(),
             last_typing_ping_at: std::time::Instant::now(),
             active_call: None,
+            media_devices_ready: false,
             image_viewer: None,
             status_msg: "Trực tuyến · Sẵn sàng".into(),
             info_drawer_open: loaded_settings.info_drawer_open,
@@ -914,6 +1146,7 @@ impl ZaloGuiApp {
             allow_quit: false,
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
+            saved_accounts: Default::default(),
             notification_authorization: Default::default(),
             settings: loaded_settings,
             settings_blur_tex: None,
@@ -955,8 +1188,7 @@ impl ZaloGuiApp {
             schedule_modal_open: false,
             schedule_custom_input: String::new(),
             schedule_editing_id: None,
-            scheduled_items: crate::scheduler::list_pending_scheduled("zalo_history.db", None)
-                .unwrap_or_default(),
+            scheduled_items: Vec::new(),
             phone_sync_progress: 0.0,
             phone_sync_status: String::new(),
             last_typing_sent_at: None,
@@ -984,10 +1216,7 @@ impl ZaloGuiApp {
         app.publish_known_threads();
         spawn_session_worker(
             session,
-            GuiTx {
-                tx,
-                ctx: cc.egui_ctx.clone(),
-            },
+            GuiTx::new(tx, cc.egui_ctx.clone()),
             cc.egui_ctx.clone(),
         );
         ensure_cjk_font(&cc.egui_ctx, thread_texts(&app.threads));
@@ -1026,8 +1255,11 @@ impl ZaloGuiApp {
     }
 
     pub(super) fn refresh_scheduled_items(&mut self) {
-        self.scheduled_items =
-            crate::scheduler::list_pending_scheduled("zalo_history.db", None).unwrap_or_default();
+        self.scheduled_items = crate::scheduler::list_pending_scheduled(
+            &crate::store::db_path_for_account(&self.user_uin),
+            None,
+        )
+        .unwrap_or_default();
     }
 
     /// Hand the worker's poll timer the thread ids/names it maps incoming messages onto.
@@ -1052,13 +1284,20 @@ impl ZaloGuiApp {
         self.publish_known_threads();
         let snapshot = self.threads.clone();
         if let Some(wtx) = WORKER_TX.get() {
-            let _ = wtx.send(WorkerCmd::PersistThreads(snapshot));
+            let _ = wtx.send(WorkerCmd::PersistThreads {
+                uin: self.user_uin.clone(),
+                threads: snapshot,
+            });
         }
     }
 
     fn check_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.event_rx.try_recv() {
+            let Some(event) = event.for_current_account() else {
+                continue;
+            };
             match event {
+                GuiEvent::AccountScoped { .. } => continue,
                 GuiEvent::NotificationAuthorization { request_id, result } => {
                     self.notification_authorization.finish(request_id, result);
                 }
@@ -1076,6 +1315,7 @@ impl ZaloGuiApp {
                     // On session refresh under the same account, keep thread list & unread counts.
                     // Clearing + re-fetching counts all existing history as brand-new unread (#119).
                     let is_refresh = self.is_logged_in;
+                    self.saved_accounts.invalidate();
                     self.is_logged_in = true;
                     self.user_name = name;
                     self.user_uin = uin;
@@ -1364,10 +1604,13 @@ impl ZaloGuiApp {
                     self.status_msg = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên)".into();
                 }
                 GuiEvent::LoggedOut => {
+                    self.saved_accounts.invalidate();
                     self.is_logged_in = false;
                     self.user_name.clear();
                     self.user_uin.clear();
                     self.threads.clear();
+                    self.active_call = None;
+                    self.scheduled_items.clear();
                     self.selected_thread_index = 0;
                     self.qr_texture = None;
                     self.qr_status = "Đang xin mã QR mới…".into();
@@ -1379,11 +1622,20 @@ impl ZaloGuiApp {
                     avatar,
                     threads,
                 } => {
+                    self.saved_accounts.invalidate();
                     self.is_logged_in = true;
                     self.user_uin = uin;
                     self.user_name = name.clone();
                     self.user_avatar = avatar;
                     self.threads = threads;
+                    self.active_call = None;
+                    self.refresh_scheduled_items();
+                    self.unread_counts.clear();
+                    self.reaction_inbox = Default::default();
+                    self.incoming_popup = None;
+                    self.phone_sync_progress = 0.0;
+                    self.phone_sync_status.clear();
+                    self.input_message.clear();
                     self.selected_thread_index = 0;
                     self.status_msg = format!("Đã chuyển sang tài khoản {name}");
                     self.show_toast(format!("Đã chuyển sang tài khoản {name}"));
@@ -1511,6 +1763,10 @@ impl ZaloGuiApp {
                 GuiEvent::ReactionEventsReceived(events) => {
                     let total = events.len();
                     let pending_before = self.reaction_inbox.pending_len();
+                    for thread in &self.threads {
+                        self.reaction_inbox
+                            .observe_loaded(&thread.messages, &events);
+                    }
                     self.reaction_inbox.record(&events);
                     let mut changed = false;
                     for t in self.threads.iter_mut() {
@@ -1654,6 +1910,34 @@ impl ZaloGuiApp {
                     self.loading_stickers.remove(&key);
                     let tex = ctx.load_texture(&key, image, TextureOptions::LINEAR);
                     self.sticker_textures.insert(key, tex);
+                }
+                GuiEvent::VideoFramesReady(mailbox) => {
+                    let (clear, frames, removed) = mailbox.take();
+                    if clear {
+                        self.sticker_textures
+                            .retain(|key, _| !is_call_video_key(key));
+                    }
+                    for key in removed {
+                        self.sticker_textures.remove(&key);
+                    }
+                    for (key, image) in frames {
+                        if let Some(texture) = self.sticker_textures.get_mut(&key) {
+                            texture.set(image, TextureOptions::LINEAR);
+                        } else {
+                            let texture = ctx.load_texture(&key, image, TextureOptions::LINEAR);
+                            self.sticker_textures.insert(key, texture);
+                        }
+                    }
+                }
+                GuiEvent::MediaDevicesRefreshed { error } => {
+                    self.media_devices_ready = true;
+                    if let Some(error) = error {
+                        self.show_toast(format!("Không thể quét thiết bị âm thanh/video: {error}"));
+                    }
+                    ctx.request_repaint();
+                }
+                GuiEvent::SavedAccountsLoaded { request_id, result } => {
+                    self.saved_accounts.finish(request_id, result);
                 }
                 GuiEvent::StickerImageFailed { key } => {
                     if key.starts_with("call_remote_video") {
@@ -3149,6 +3433,201 @@ impl ZaloGuiApp {
 #[cfg(test)]
 mod tests {
     use super::{is_newer_semver, phone_sync_completion_message};
+
+    fn video_frame(color: eframe::egui::Color32) -> eframe::egui::ColorImage {
+        eframe::egui::ColorImage::new([1, 1], color)
+    }
+
+    #[test]
+    fn video_mailbox_keeps_only_latest_frame_per_bounded_stream_when_ui_stalls() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = super::GuiTx::new(tx, eframe::egui::Context::default());
+        let generation = sender.begin_video_generation();
+        let keys = [
+            "call_local_video",
+            "call_remote_video",
+            "call_remote_video_1",
+            "call_remote_video_2",
+            "call_remote_video_3",
+            "call_remote_video_4",
+            "call_remote_video_5",
+        ];
+        for value in 0..=255 {
+            for key in keys {
+                assert!(sender.send_video_frame(
+                    generation,
+                    key,
+                    video_frame(eframe::egui::Color32::from_gray(value))
+                ));
+            }
+        }
+        assert!(!sender.send_video_frame(
+            generation,
+            "call_remote_video_6",
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        let super::GuiEvent::VideoFramesReady(mailbox) = rx.try_recv().unwrap() else {
+            panic!("expected video wake");
+        };
+        assert!(rx.try_recv().is_err());
+        let (clear, frames, _) = mailbox.take();
+        assert!(clear);
+        assert_eq!(frames.len(), 7);
+        assert!(frames
+            .values()
+            .all(|image| image.pixels == [eframe::egui::Color32::WHITE]));
+        assert!(sender.send_video_frame(
+            generation,
+            keys[0],
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(super::GuiEvent::VideoFramesReady(_))
+        ));
+    }
+
+    #[test]
+    fn video_mailbox_rejects_old_call_frames_and_late_stop_when_new_call_starts() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = super::GuiTx::new(tx, eframe::egui::Context::default());
+        let old = sender.begin_video_generation();
+        assert!(sender.send_video_frame(
+            old,
+            "call_local_video",
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        let current = sender.begin_video_generation();
+        sender.end_video_generation(old);
+        assert!(!sender.send_video_frame(
+            old,
+            "call_local_video",
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        assert!(sender.send_video_frame(
+            current,
+            "call_local_video",
+            video_frame(eframe::egui::Color32::WHITE)
+        ));
+        let super::GuiEvent::VideoFramesReady(mailbox) = rx.try_recv().unwrap() else {
+            panic!("expected video wake");
+        };
+        assert_eq!(
+            mailbox.take().1["call_local_video"].pixels,
+            [eframe::egui::Color32::WHITE]
+        );
+        sender.end_video_generation(current);
+        assert!(!sender.send_video_frame(
+            current,
+            "call_local_video",
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        let super::GuiEvent::VideoFramesReady(mailbox) = rx.try_recv().unwrap() else {
+            panic!("expected clear wake");
+        };
+        let (clear, frames, _) = mailbox.take();
+        assert!(clear);
+        assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn video_mailbox_rejects_previous_account_and_reuses_pending_wake_after_switch() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = super::GuiTx::new(tx, eframe::egui::Context::default());
+        let old_sender = root.scoped();
+        let old_generation = old_sender.begin_video_generation();
+        assert!(old_sender.send_video_frame(
+            old_generation,
+            "call_remote_video",
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        let current_sender = root.advance_account();
+        assert_eq!(old_sender.begin_video_generation(), 0);
+        let current_generation = current_sender.begin_video_generation();
+        old_sender.end_video_generation(current_generation);
+        assert!(!old_sender.send_video_frame(
+            current_generation,
+            "call_remote_video",
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        assert!(current_sender.send_video_frame(
+            current_generation,
+            "call_remote_video",
+            video_frame(eframe::egui::Color32::WHITE)
+        ));
+        let super::GuiEvent::VideoFramesReady(mailbox) = rx.try_recv().unwrap() else {
+            panic!("expected video wake");
+        };
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            mailbox.take().1["call_remote_video"].pixels,
+            [eframe::egui::Color32::WHITE]
+        );
+    }
+
+    #[test]
+    fn video_mailbox_coalesces_peer_removal_and_rejects_old_call_removal() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = super::GuiTx::new(tx, eframe::egui::Context::default());
+        let old = sender.begin_video_generation();
+        let current = sender.begin_video_generation();
+        assert!(!sender.clear_video_frame(old, "call_remote_video"));
+        assert!(sender.send_video_frame(
+            current,
+            "call_remote_video",
+            video_frame(eframe::egui::Color32::WHITE)
+        ));
+        for _ in 0..1000 {
+            assert!(sender.clear_video_frame(current, "call_remote_video"));
+        }
+        let super::GuiEvent::VideoFramesReady(mailbox) = rx.try_recv().unwrap() else {
+            panic!("expected video wake");
+        };
+        assert!(rx.try_recv().is_err());
+        let (_, frames, removed) = mailbox.take();
+        assert!(frames.is_empty());
+        assert_eq!(
+            removed,
+            std::collections::HashSet::from(["call_remote_video".to_owned()])
+        );
+        assert!(sender.clear_video_frame(current, "call_remote_video"));
+        assert!(sender.send_video_frame(
+            current,
+            "call_remote_video",
+            video_frame(eframe::egui::Color32::WHITE)
+        ));
+        let super::GuiEvent::VideoFramesReady(mailbox) = rx.try_recv().unwrap() else {
+            panic!("expected video wake");
+        };
+        let (_, frames, removed) = mailbox.take();
+        assert_eq!(frames.len(), 1);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn account_generation_rejects_queued_and_late_completions() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = super::GuiTx::new(tx, eframe::egui::Context::default());
+        let old = root.scoped();
+        assert!(old
+            .send(super::GuiEvent::ThreadsUpdated(Vec::new()))
+            .is_ok());
+        let current = root.advance_account();
+        assert!(!old.is_current());
+        assert!(current.is_current());
+        assert!(old
+            .send(super::GuiEvent::StatusUpdate("old account".into()))
+            .is_ok());
+        assert!(rx.recv().unwrap().for_current_account().is_none());
+        assert!(rx.recv().unwrap().for_current_account().is_none());
+        assert!(current
+            .send(super::GuiEvent::ThreadsUpdated(Vec::new()))
+            .is_ok());
+        assert!(matches!(
+            rx.recv().unwrap().for_current_account(),
+            Some(super::GuiEvent::ThreadsUpdated(_))
+        ));
+    }
 
     #[test]
     fn sent_message_reconciles_when_server_push_arrives_first() {

@@ -1892,11 +1892,6 @@ impl ZaloGuiApp {
                             self.schedule_modal_open = true;
                         }
                         ThreadCtxAction::DeleteConv(idx, tid, tname, is_group, last_msg_id) => {
-                            if let Ok(mut store) =
-                                crate::store::MessageStore::open("zalo_history.db")
-                            {
-                                let _ = store.delete_thread(&tid);
-                            }
                             if idx < self.threads.len() && self.threads[idx].id == tid {
                                 self.threads.remove(idx);
                                 if self.selected_thread_index >= self.threads.len() {
@@ -2963,14 +2958,9 @@ impl ZaloGuiApp {
                                         })
                                         .clicked()
                                     {
-                                        let ff_ok = crate::media::is_ffmpeg_available();
                                         let (_, cams) = crate::media::list_media_devices(false);
-                                        let can_cam = ff_ok && !cams.is_empty();
-                                        if !ff_ok {
-                                            self.show_toast(
-                                                "⚠️ Không tìm thấy ffmpeg trong PATH để bật Camera (cài bằng: winget install Gyan.FFmpeg)",
-                                            );
-                                        } else if cams.is_empty() {
+                                        let can_cam = !self.media_devices_ready || !cams.is_empty();
+                                        if !can_cam {
                                             self.show_toast(
                                                 "⚠️ Không phát hiện thiết bị Camera trên máy — đang gọi không hình",
                                             );
@@ -4575,10 +4565,12 @@ impl ZaloGuiApp {
                                 });
                             });
                         if let Some(cid) = cancel_sched_id {
-                            let _ =
-                                crate::scheduler::cancel_scheduled_message("zalo_history.db", cid);
-                            self.refresh_scheduled_items();
-                            self.show_toast("Đã hủy tin nhắn hẹn giờ");
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(WorkerCmd::CancelScheduledMessage {
+                                    uin: self.user_uin.clone(),
+                                    id: cid,
+                                });
+                            }
                         }
                         if open_sched_mgr {
                             self.schedule_modal_open = true;
