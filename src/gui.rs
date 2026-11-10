@@ -77,6 +77,12 @@ pub enum GuiEvent {
         avatar: Option<String>,
     },
     LoginFailed(String),
+    /// Authentication was restarted; cached history stays locally viewable.
+    AuthenticationRestarted,
+    /// A failed switch kept the previous identity, but cancelled its old work.
+    AccountSwitchFailed(String),
+    /// A failed wipe cancelled old work without removing the current identity.
+    LocalDataWipeFailed(String),
     ThreadsUpdated(Vec<Thread>),
     MessageSent {
         client_message_id: String,
@@ -185,7 +191,7 @@ pub enum GuiEvent {
     SessionExpired(String),
     /// The server could not be reached: the session is intact, show it and retry (#21).
     SessionUnreachable(String),
-    /// `zalo_history.db` + `threads_cache.json` were removed on request (#21).
+    /// Account history was cleared while retaining credentials and migration metadata.
     LocalDataWiped,
     CallStateChanged(String),
     IncomingCall {
@@ -564,6 +570,8 @@ pub struct GuiTx {
     ctx: egui::Context,
     epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     generation: Option<u64>,
+    work_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    work_generation: Option<u64>,
     video_frames: std::sync::Arc<VideoFrameMailbox>,
 }
 
@@ -617,6 +625,8 @@ impl GuiTx {
             ctx,
             epoch: Default::default(),
             generation: None,
+            work_epoch: Default::default(),
+            work_generation: None,
             video_frames: Default::default(),
         }
     }
@@ -625,7 +635,22 @@ impl GuiTx {
     pub(crate) fn scoped(&self) -> Self {
         let mut scoped = self.clone();
         scoped.generation = Some(self.epoch.load(std::sync::atomic::Ordering::SeqCst));
+        scoped.work_generation = Some(self.work_epoch.load(std::sync::atomic::Ordering::SeqCst));
         scoped
+    }
+
+    /// Invalidate queued history work without changing the account or active call.
+    pub(crate) fn advance_work(&self) -> Self {
+        self.work_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.scoped()
+    }
+
+    /// Calls follow the account lifetime and survive a local-history wipe.
+    pub(crate) fn for_call(&self) -> Self {
+        let mut call = self.clone();
+        call.work_generation = None;
+        call
     }
 
     /// Invalidate all tasks and queued events belonging to the previous account.
@@ -639,6 +664,8 @@ impl GuiTx {
     pub(crate) fn is_current(&self) -> bool {
         self.generation.is_none_or(|generation| {
             generation == self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+        }) && self.work_generation.is_none_or(|generation| {
+            generation == self.work_epoch.load(std::sync::atomic::Ordering::SeqCst)
         })
     }
 
@@ -753,6 +780,15 @@ impl GuiTx {
     /// Same contract as `Sender::send` (callers already `let _ =` it), plus the wake-up.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, ev: GuiEvent) -> Result<(), std::sync::mpsc::SendError<GuiEvent>> {
+        let ev = if let Some(generation) = self.work_generation {
+            GuiEvent::AccountScoped {
+                epoch: self.work_epoch.clone(),
+                generation,
+                event: Box::new(ev),
+            }
+        } else {
+            ev
+        };
         let ev = if let Some(generation) = self.generation {
             GuiEvent::AccountScoped {
                 epoch: self.epoch.clone(),
@@ -775,7 +811,13 @@ impl GuiEvent {
                 epoch,
                 generation,
                 event,
-            } => (epoch.load(std::sync::atomic::Ordering::SeqCst) == generation).then(|| *event),
+            } => {
+                if epoch.load(std::sync::atomic::Ordering::SeqCst) == generation {
+                    event.for_current_account()
+                } else {
+                    None
+                }
+            }
             event => Some(event),
         }
     }
@@ -1337,23 +1379,33 @@ impl ZaloGuiApp {
                 GuiEvent::LoginSuccess { name, uin, avatar } => {
                     // On session refresh under the same account, keep thread list & unread counts.
                     // Clearing + re-fetching counts all existing history as brand-new unread (#119).
-                    let is_refresh = self.is_logged_in;
+                    let is_refresh = same_history_owner(&self.user_uin, &uin);
                     self.saved_accounts.invalidate();
                     self.is_logged_in = true;
                     self.user_name = name;
                     self.user_uin = uin;
-                    if let Some(tx) = WORKER_TX.get() {
-                        tx.set_visible_account(&self.user_uin);
-                    }
-                    if avatar.is_some() {
+                    if avatar.is_some() || !is_refresh {
                         self.user_avatar = avatar;
                     }
                     if !is_refresh {
                         self.threads.clear();
+                        self.reaction_inbox = Default::default();
+                        self.input_message.clear();
+                        self.replying_to = None;
+                        self.forward_msg = None;
+                        self.forward_filter.clear();
+                        self.incoming_popup = None;
+                        self.phone_sync_progress = 0.0;
+                        self.phone_sync_status.clear();
                         self.unread_counts.clear();
                         self.history_reached_start.clear();
                         self.selected_thread_index = 0;
                     }
+                    self.publish_known_threads();
+                    if let Some(tx) = WORKER_TX.get() {
+                        tx.set_visible_account(&self.user_uin);
+                    }
+                    self.refresh_scheduled_items();
                     self.login_in_progress = false;
                     self.composer_sticker_cache.retain(|_, v| !v.is_empty());
                     self.status_msg = "Trực tuyến · Đồng bộ thời gian thực".into();
@@ -1625,12 +1677,50 @@ impl ZaloGuiApp {
                     self.status_msg = format!("⚠️ {reason} — đang thử lại…");
                 }
                 GuiEvent::LocalDataWiped => {
+                    self.saved_accounts.invalidate();
+                    if let Some(tx) = WORKER_TX.get() {
+                        tx.rebind_visible_scope();
+                    }
                     self.threads.clear();
+                    self.reaction_inbox = Default::default();
+                    self.replying_to = None;
+                    self.forward_msg = None;
+                    self.forward_filter.clear();
+                    self.unread_counts.clear();
+                    self.history_reached_start.clear();
+                    self.incoming_popup = None;
+                    self.publish_known_threads();
                     self.selected_thread_index = 0;
                     self.status_msg = "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên)".into();
                 }
+                GuiEvent::AccountSwitchFailed(error) => {
+                    self.active_call = None;
+                    self.resume_account_work(error);
+                }
+                GuiEvent::LocalDataWipeFailed(error) => {
+                    self.resume_account_work(error);
+                }
+                GuiEvent::AuthenticationRestarted => {
+                    self.saved_accounts.invalidate();
+                    self.is_logged_in = false;
+                    if let Some(tx) = WORKER_TX.get() {
+                        tx.set_visible_account("");
+                    }
+                    self.active_call = None;
+                    self.scheduled_items.clear();
+                    self.qr_texture = None;
+                    self.qr_status = "Đang xin mã QR mới…".into();
+                    if !self.user_uin.is_empty() && !self.threads.is_empty() {
+                        self.status_msg =
+                            "Đang đăng nhập lại; lịch sử đã lưu vẫn có thể xem được.".into();
+                    }
+                }
                 GuiEvent::LoggedOut => {
                     self.reaction_inbox = Default::default();
+                    self.input_message.clear();
+                    self.replying_to = None;
+                    self.forward_msg = None;
+                    self.forward_filter.clear();
                     self.saved_accounts.invalidate();
                     self.is_logged_in = false;
                     self.user_name.clear();
@@ -1645,6 +1735,9 @@ impl ZaloGuiApp {
                     self.qr_texture = None;
                     self.qr_status = "Đang xin mã QR mới…".into();
                     self.status_msg = "Đã đăng xuất".into();
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::RequestQr);
+                    }
                 }
                 GuiEvent::AccountSwitched {
                     uin,
@@ -1669,6 +1762,9 @@ impl ZaloGuiApp {
                     self.phone_sync_progress = 0.0;
                     self.phone_sync_status.clear();
                     self.input_message.clear();
+                    self.replying_to = None;
+                    self.forward_msg = None;
+                    self.forward_filter.clear();
                     self.selected_thread_index = 0;
                     self.status_msg = format!("Đã chuyển sang tài khoản {name}");
                     self.show_toast(format!("Đã chuyển sang tài khoản {name}"));
@@ -3489,6 +3585,16 @@ impl ZaloGuiApp {
         });
     }
 
+    fn resume_account_work(&mut self, status: String) {
+        self.saved_accounts.invalidate();
+        if let Some(tx) = WORKER_TX.get() {
+            tx.rebind_visible_scope();
+        }
+        self.publish_known_threads();
+        self.refresh_scheduled_items();
+        self.status_msg = status;
+    }
+
     fn show_toast(&mut self, msg: impl Into<String>) {
         let text = msg.into();
         self.status_msg = text.clone();
@@ -3496,9 +3602,22 @@ impl ZaloGuiApp {
     }
 }
 
+// Cached-history mode can look logged in while authentication is still pending.
+fn same_history_owner(displayed_uin: &str, authenticated_uin: &str) -> bool {
+    !displayed_uin.is_empty() && displayed_uin == authenticated_uin
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_newer_semver, phone_sync_completion_message};
+
+    #[test]
+    fn cached_history_is_preserved_only_for_its_authenticated_owner() {
+        assert!(super::same_history_owner("account-a", "account-a"));
+        assert!(!super::same_history_owner("account-a", "account-b"));
+        assert!(!super::same_history_owner("", "account-b"));
+        assert!(!super::same_history_owner("", ""));
+    }
 
     fn video_frame(color: eframe::egui::Color32) -> eframe::egui::ColorImage {
         eframe::egui::ColorImage::new([1, 1], color)
@@ -3693,6 +3812,38 @@ mod tests {
             rx.recv().unwrap().for_current_account(),
             Some(super::GuiEvent::ThreadsUpdated(_))
         ));
+    }
+
+    #[test]
+    fn wiping_history_rejects_old_work_without_interrupting_call_frames() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = super::GuiTx::new(tx, eframe::egui::Context::default());
+        let old = root.scoped();
+        let call = old.for_call();
+        let video = call.begin_video_generation();
+        // Drain the initial video wake before testing the queued history completion.
+        rx.try_recv().unwrap();
+        old.send(super::GuiEvent::ThreadsUpdated(Vec::new()))
+            .unwrap();
+        let current = root.advance_work();
+        assert!(!old.is_current());
+        assert!(call.is_current());
+        assert!(rx.recv().unwrap().for_current_account().is_none());
+        old.send(super::GuiEvent::ThreadsUpdated(Vec::new()))
+            .unwrap();
+        assert!(rx.recv().unwrap().for_current_account().is_none());
+        current.send(super::GuiEvent::LocalDataWiped).unwrap();
+        assert!(matches!(
+            rx.recv().unwrap().for_current_account(),
+            Some(super::GuiEvent::LocalDataWiped)
+        ));
+        assert!(call.send_video_frame(
+            video,
+            "call_remote_video",
+            video_frame(eframe::egui::Color32::WHITE)
+        ));
+        root.advance_account();
+        assert!(!call.is_current());
     }
 
     #[test]

@@ -14,6 +14,42 @@ impl Drop for RunningPermit {
     }
 }
 
+// Track the blocking closure itself: cancelling an async waiter cannot stop its disk write.
+fn spawn_history_write<T: Send + 'static>(
+    writes: &mut tokio::task::JoinSet<()>,
+    write: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> tokio::sync::oneshot::Receiver<anyhow::Result<T>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    writes.spawn_blocking(move || {
+        // The waiter may be cancelled during a wipe; the write remains tracked until exit.
+        let _ = tx.send(write());
+    });
+    rx
+}
+
+async fn stop_history_tasks(
+    tasks: &mut tokio::task::JoinSet<()>,
+    writes: &mut tokio::task::JoinSet<()>,
+) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    // Already-running blocking jobs are not abortable. Finish them before deleting rows.
+    while writes.join_next().await.is_some() {}
+}
+
+async fn restore_failed_switch(
+    session: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+    previous: Session,
+    events: &GuiTx,
+    error: &str,
+) {
+    *session.lock().await = previous;
+    // The UI must rebind its command sender even though its displayed UIN did not change.
+    let _ = events.send(GuiEvent::AccountSwitchFailed(format!(
+        "⚠️ Lỗi chuyển tài khoản: {error}"
+    )));
+}
+
 pub enum WorkerCmd {
     /// Discover native audio/video devices outside the UI thread.
     RefreshMediaDevices,
@@ -203,7 +239,7 @@ pub enum WorkerCmd {
     Logout,
     /// Preserve this account's saved session before opening login for another account.
     BeginAddAccount,
-    /// Delete local message data (`zalo_history.db` + `threads_cache.json`) without
+    /// Clear the account history database and thread cache without
     /// touching credentials. Separate from [`WorkerCmd::Logout`] by design (#21).
     WipeLocalData,
     PinThread {
@@ -338,6 +374,13 @@ impl WorkerTx {
         }
     }
 
+    /// Refresh cancelled work scopes without changing the authenticated identity.
+    pub(super) fn rebind_visible_scope(&self) {
+        if let Ok(mut visible) = self.visible_account.lock() {
+            visible.1 = self.root_events.scoped();
+        }
+    }
+
     pub(super) fn send(
         &self,
         command: WorkerCmd,
@@ -393,6 +436,59 @@ impl WorkerTx {
 }
 
 impl WorkerCmd {
+    fn stale_notice(&self) -> Option<GuiEvent> {
+        // Background reads must not overwrite the status of the transition that cancelled them.
+        let user_action = matches!(
+            self,
+            Self::RefreshThreadsManual
+                | Self::LoginPassword { .. }
+                | Self::SendMessage { .. }
+                | Self::SendQuote { .. }
+                | Self::Forward { .. }
+                | Self::React { .. }
+                | Self::DeleteForMe { .. }
+                | Self::RecallMessage { .. }
+                | Self::SendSticker { .. }
+                | Self::PickAndSendAttachment { .. }
+                | Self::TriggerScreenshot
+                | Self::StartCall { .. }
+                | Self::AnswerCall { .. }
+                | Self::SetCallMediaState { .. }
+                | Self::InviteGroupCallMembers { .. }
+                | Self::EndCall
+                | Self::AddFriend { .. }
+                | Self::AcceptFriend { .. }
+                | Self::RejectFriend { .. }
+                | Self::UndoFriend { .. }
+                | Self::DeleteSavedAccount { .. }
+                | Self::ImportHistory { .. }
+                | Self::CancelScheduledMessage { .. }
+                | Self::SendScheduledMessageNow { .. }
+                | Self::Logout
+                | Self::BeginAddAccount
+                | Self::WipeLocalData
+                | Self::SwitchAccount { .. }
+                | Self::PinThread { .. }
+                | Self::PinMessage { .. }
+                | Self::MarkThreadUnread { .. }
+                | Self::MuteThread { .. }
+                | Self::HideThread { .. }
+                | Self::DeleteThread { .. }
+                | Self::SyncHistory { .. }
+                | Self::SyncPhoneMessages {
+                    send_phone_prompt: true,
+                    ..
+                }
+                | Self::SetProxy { .. }
+                | Self::DownloadFile { .. }
+        );
+        user_action.then(|| {
+            GuiEvent::StatusUpdate(
+                "Dữ liệu tài khoản đã thay đổi; vui lòng thực hiện lại thao tác.".into(),
+            )
+        })
+    }
+
     fn is_transition(&self) -> bool {
         matches!(
             self,
@@ -487,7 +583,10 @@ fn authentication_events(
     ) {
         let next = events.advance_account();
         call_bridge.end_call();
-        let _ = next.send(GuiEvent::LoggedOut);
+        if let Ok(mut known) = KNOWN_THREADS.lock() {
+            known.clear();
+        }
+        let _ = next.send(GuiEvent::AuthenticationRestarted);
         next
     } else {
         events
@@ -687,6 +786,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     let gui_tx_sched = gui_tx.clone();
                     let ctx_sched = egui_ctx.clone();
                     tokio::spawn(async move {
+                        // Keep account ownership across switches; this sequential loop finishes
+                        // every active delivery before visiting another account.
+                        let mut delivery_workers = std::collections::HashMap::new();
                         let mut tick = tokio::time::interval(Duration::from_secs(2));
                         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
@@ -695,11 +797,26 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let s = s_sched.lock().await.clone();
                             let Some(login) = s.login.as_ref() else { continue; };
                             let db_path = crate::store::db_path_for_account(&login.uin);
+                            let worker = match delivery_workers.entry(db_path.clone()) {
+                                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                                std::collections::hash_map::Entry::Vacant(entry) => {
+                                    let startup_path = db_path.clone();
+                                    match tokio::task::spawn_blocking(move || {
+                                        crate::scheduler::DeliveryWorker::start(&startup_path)
+                                    }).await.unwrap_or_else(|error| Err(error.into())) {
+                                        Ok(worker) => {
+                                            let _ = gui_tx_sched.send(GuiEvent::ScheduledListUpdated);
+                                            entry.insert(worker)
+                                        }
+                                        Err(error) => {
+                                            crate::logger::log_error("scheduler::startup", &error.to_string());
+                                            continue;
+                                        }
+                                    }
+                                }
+                            };
                             let now_ts = crate::login::unix_now() as i64;
-                            let due = crate::scheduler::claim_due_scheduled_messages(
-                                &db_path,
-                                now_ts,
-                            )
+                            let due = worker.claim_due(now_ts)
                             .unwrap_or_default();
                             if due.is_empty() {
                                 continue;
@@ -1140,14 +1257,18 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
 
                 let mut current_qr_task: Option<tokio::task::JoinHandle<()>> = None;
                 let mut account_tasks = tokio::task::JoinSet::new();
+                let mut history_writes = tokio::task::JoinSet::new();
                 let mut global_tasks = tokio::task::JoinSet::new();
                 let mut deferred = std::collections::VecDeque::new();
 
                 while let Some(queued) = next_worker_command(&mut cmd_rx, &mut deferred).await {
                     while account_tasks.try_join_next().is_some() {}
+                    while history_writes.try_join_next().is_some() {}
                     while global_tasks.try_join_next().is_some() {}
                     if !queued.origin_is_current() {
-                        let _ = gui_tx.send(GuiEvent::StatusUpdate("Tài khoản đã thay đổi; vui lòng thực hiện lại thao tác.".into()));
+                        if let Some(notice) = queued.command.stale_notice() {
+                            let _ = gui_tx.send(notice);
+                        }
                         continue;
                     }
                     // Login tasks can hold the session across network awaits. Cancel them
@@ -1167,7 +1288,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     let current_uin = snapshot.as_ref().and_then(|snapshot| snapshot.login.as_ref())
                         .map(|login| login.uin.clone()).unwrap_or_default();
                     if !queued.accepts_account(&current_uin) {
-                        let _ = gui_tx.send(GuiEvent::StatusUpdate("Tài khoản đã thay đổi; vui lòng thực hiện lại thao tác.".into()));
+                        if let Some(notice) = queued.command.stale_notice() {
+                            let _ = gui_tx.send(notice);
+                        }
                         continue;
                     }
                     let command_origin = queued.origin_uin.clone().unwrap_or_default();
@@ -1248,7 +1371,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             if uin.is_empty() {
                                 continue;
                             }
-                            tokio::task::spawn_blocking(move || {
+                            let _completion = spawn_history_write(&mut history_writes, move || {
                                 if let Ok(mut store) =
                                     crate::store::MessageStore::open_account(&uin)
                                 {
@@ -1256,11 +1379,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         crate::store::persist_threads(&mut store, &threads_snapshot);
                                 }
                                 crate::chat::save_threads_cache_for_account(&uin, &threads_snapshot);
+                                Ok(())
                             });
                         }
                         WorkerCmd::ImportHistory { uin, path } => {
-                            tasks.spawn(async move {
-                                let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                            let completion = spawn_history_write(&mut history_writes, move || -> anyhow::Result<_> {
                                     crate::store::MessageStore::open_account(&uin)?;
                                     let summary = crate::store::import_history_from_path(
                                         &path, &crate::store::db_path_for_account(&uin),
@@ -1271,7 +1394,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     )?;
                                     crate::chat::save_threads_cache_for_account(&uin, &threads);
                                     Ok((summary, threads))
-                                }).await.unwrap_or_else(|error| Err(error.into()));
+                            });
+                            tasks.spawn(async move {
+                                let result = completion.await.unwrap_or_else(|error| Err(error.into()));
                                 match result {
                                     Ok((summary, threads)) => {
                                         let _ = gui_tx.send(GuiEvent::ThreadsUpdated(threads));
@@ -1403,13 +1528,18 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     });
                                 }
                                 Err(error) => {
-                                    *session.lock().await = rollback;
-                                    let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("⚠️ Lỗi chuyển tài khoản: {error}")));
+                                    restore_failed_switch(&session, rollback, &gui_tx, &error.to_string()).await;
                                 }
                             }
                             egui_ctx.request_repaint();
                         }
                         WorkerCmd::WipeLocalData => {
+                            let gui_tx = gui_tx.advance_work();
+                            crate::history_sync::CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+                            crate::history_sync::PHONE_SYNC_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+                            stop_history_tasks(&mut account_tasks, &mut history_writes).await;
+                            poll_state = Default::default();
+                            if let Ok(mut known) = KNOWN_THREADS.lock() { known.clear(); }
                             let uin = current_uin.clone();
                             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                                 let store = crate::store::MessageStore::open_account(&uin)?;
@@ -1418,7 +1548,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 Ok(())
                             }).await.unwrap_or_else(|error| Err(error.into()));
                             if let Err(error) = result {
-                                let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Không thể xoá lịch sử: {error}")));
+                                let _ = gui_tx.send(GuiEvent::LocalDataWipeFailed(format!("Không thể xoá lịch sử: {error}")));
                                 continue;
                             }
                             let _ = gui_tx.send(GuiEvent::LocalDataWiped);
@@ -1592,19 +1722,19 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             last_cli_msg_id,
                         } => {
 
-                            let session_clone = command_session.clone();
-                            tasks.spawn(async move {
-
-                                let s = session_clone.lock().await.clone();
-                                let uin = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
-                                let deleted_id = thread_id.clone();
-                                let local_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                            let uin = current_uin.clone();
+                            let deleted_id = thread_id.clone();
+                            let completion = spawn_history_write(&mut history_writes, move || -> anyhow::Result<()> {
                                     crate::store::MessageStore::open_account(&uin)?.delete_thread(&deleted_id)?;
                                     let mut threads = crate::chat::load_threads_cache_for_account(&uin);
                                     threads.retain(|thread| thread.id != deleted_id);
                                     crate::chat::save_threads_cache_for_account(&uin, &threads);
                                     Ok(())
-                                }).await.unwrap_or_else(|error| Err(error.into()));
+                            });
+                            let session_clone = command_session.clone();
+                            tasks.spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let local_result = completion.await.unwrap_or_else(|error| Err(error.into()));
                                 if let Err(error) = local_result {
                                     crate::logger::log_error("history::delete_thread", &error.to_string());
                                 }
@@ -4607,6 +4737,121 @@ mod account_task_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[test]
+    fn stale_background_work_is_quiet_but_user_mutations_get_a_notice() {
+        let automatic = [
+            WorkerCmd::PollMessages {
+                known_threads: Vec::new(),
+            },
+            WorkerCmd::RefreshThreads,
+            WorkerCmd::PersistThreads {
+                uin: "account-a".into(),
+                threads: Vec::new(),
+            },
+            WorkerCmd::LoadScheduledMessages {
+                uin: "account-a".into(),
+                notify_sent: false,
+            },
+        ];
+        for command in automatic {
+            assert!(command.stale_notice().is_none());
+        }
+        assert!(WorkerCmd::SendMessage {
+            to_id: "peer-1".into(),
+            text: "Test".into(),
+            is_group: false
+        }
+        .stale_notice()
+        .is_some());
+        assert!(WorkerCmd::RefreshThreadsManual.stale_notice().is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_switch_restores_credentials_and_emits_a_scope_rebind() {
+        let mut previous = Session::new(false, false, false).unwrap();
+        previous.login = Some(crate::session::LoginInfo {
+            uin: "account-a".into(),
+            ..Default::default()
+        });
+        previous.zpw_sek = Some("fake-original-credential".into());
+        let live = std::sync::Arc::new(tokio::sync::Mutex::new(previous.clone()));
+        let (sender, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let (events, completions) = std::sync::mpsc::channel();
+        let root = GuiTx::new(events, egui::Context::default());
+        let tx = WorkerTx::new(sender, "account-a".into(), &root);
+        tx.send(WorkerCmd::RefreshThreads).unwrap();
+        let current = root.advance_account();
+        live.lock().await.logout();
+        restore_failed_switch(&live, previous, &current, "Test missing profile").await;
+        let restored = live.lock().await.clone();
+        assert_eq!(
+            restored.zpw_sek.as_deref(),
+            Some("fake-original-credential")
+        );
+        assert!(matches!(
+            completions.try_recv().unwrap().for_current_account(),
+            Some(GuiEvent::AccountSwitchFailed(_))
+        ));
+        // This is the same rebind performed when the GUI consumes the terminal event.
+        assert_eq!(restored.login.unwrap().uin, "account-a");
+        tx.rebind_visible_scope();
+        assert!(!commands.try_recv().unwrap().origin_is_current());
+        tx.send(WorkerCmd::RefreshThreads).unwrap();
+        assert!(commands.try_recv().unwrap().origin_is_current());
+    }
+
+    #[tokio::test]
+    async fn wipe_waits_for_non_abortable_history_writes() {
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut writes = tokio::task::JoinSet::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let did_finish = finished.clone();
+        let result = spawn_history_write(&mut writes, move || -> anyhow::Result<()> {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            did_finish.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        tasks.spawn(async move {
+            let _ = result.await;
+        });
+        started_rx.await.unwrap();
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        let drain = stop_history_tasks(&mut tasks, &mut writes);
+        tokio::pin!(drain);
+        assert!(std::future::Future::poll(
+            drain.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_pending());
+        release_tx.send(()).unwrap();
+        drain.await;
+        assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn work_reset_keeps_queued_old_snapshots_rejected_until_ui_rebinds() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _) = std::sync::mpsc::channel();
+        let root = GuiTx::new(events, egui::Context::default());
+        let tx = WorkerTx::new(sender, "account-a".into(), &root);
+        tx.send(WorkerCmd::PersistThreads {
+            uin: "account-a".into(),
+            threads: Vec::new(),
+        })
+        .unwrap();
+        root.advance_work();
+        assert!(!receiver.try_recv().unwrap().origin_is_current());
+        tx.send(WorkerCmd::RefreshThreads).unwrap();
+        assert!(!receiver.try_recv().unwrap().origin_is_current());
+        tx.set_visible_account("account-a");
+        tx.send(WorkerCmd::RefreshThreads).unwrap();
+        assert!(receiver.try_recv().unwrap().origin_is_current());
+    }
+
     #[tokio::test]
     async fn replacement_login_invalidates_expired_account_completions() {
         let session = Session::new(false, false, false).unwrap();
@@ -4624,7 +4869,7 @@ mod account_task_tests {
         assert!(current.is_current());
         assert!(matches!(
             rx.try_recv().unwrap().for_current_account(),
-            Some(GuiEvent::LoggedOut)
+            Some(GuiEvent::AuthenticationRestarted)
         ));
     }
 

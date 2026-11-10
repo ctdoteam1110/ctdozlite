@@ -33,6 +33,17 @@ Bảng tra cứu các mã lỗi trả về từ máy chủ Zalo và các vấn �
 
 ---
 
+### 2.4. Thiếu lịch sử cũ sau khi nâng cấp
+
+Lịch sử hiện dùng kho riêng `accounts/<uin>_history.db`. Nếu file cũ
+`zalo_history.db` không có thông tin chủ sở hữu phù hợp, ứng dụng giữ nguyên
+file và không tự nhập vào tài khoản đang đăng nhập.
+
+Mở **Cài đặt → Đồng bộ tin nhắn → Di chuyển / Nhập lịch sử tin nhắn có sẵn**,
+bấm **Chọn file lịch sử** và chọn `zalo_history.db` trong thư mục dữ liệu của
+ứng dụng. Chỉ chọn file thuộc chính tài khoản hiện tại. Lịch sử được ghép vào
+kho tài khoản mà không xoá tin nhắn đang có; việc chọn file là xác nhận của bạn.
+
 ## 3. Sự cố phiên đăng nhập
 
 ### 3.1. "Phiên đăng nhập trong session.json đã hết hạn" dù vừa đăng nhập

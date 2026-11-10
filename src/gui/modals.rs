@@ -512,7 +512,6 @@ impl ZaloGuiApp {
             // `threads_cache.json` but keeps `zalo_history.db` (#21).
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::Logout);
-                let _ = tx.send(WorkerCmd::RequestQr);
             }
         }
         if do_wipe {
@@ -2343,6 +2342,7 @@ impl ZaloGuiApp {
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
                                                         ui.label(RichText::new("Nhập lịch sử tin nhắn từ bản sao lưu SQLite (.db / .sqlite) hoặc JSON (threads_cache.json / bản xuất lịch sử) vào lịch sử của tài khoản hiện tại mà không làm mất tin nhắn đang có.").color(pal.text_secondary).size(12.2));
+                                                        ui.label(RichText::new("Sau khi nâng cấp, nếu thiếu lịch sử cũ, hãy chọn zalo_history.db trong thư mục dữ liệu tại đây. Ứng dụng không tự nhập lịch sử chưa xác định chủ sở hữu; chỉ chọn file của chính tài khoản đang đăng nhập.").color(pal.text_secondary).size(12.2));
                                                         ui.add_space(8.0);
                                                         if ui.button(RichText::new("Chọn file lịch sử (.db / .sqlite / .json) để nhập…").size(12.8).strong()).clicked() {
                                                             pick_migrate_file = true;
@@ -3526,7 +3526,6 @@ impl ZaloGuiApp {
             self.status_msg = "Đã đăng xuất".into();
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::Logout);
-                let _ = tx.send(WorkerCmd::RequestQr);
             }
         }
         if let Some(target) = switch_to_uin {
@@ -3548,7 +3547,6 @@ impl ZaloGuiApp {
             self.status_msg = "Đang xin mã QR đăng nhập tài khoản mới…".into();
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::BeginAddAccount);
-                let _ = tx.send(WorkerCmd::RequestQr);
             }
         }
         if theme_switched {

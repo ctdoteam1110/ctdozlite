@@ -104,8 +104,8 @@ struct PromptState {
 enum ConfirmKind {
     Logout,
     DeleteMessage,
-    /// Drop local message history (`zalo_history.db` + `threads_cache.json`) while
-    /// keeping the session (#21).
+    /// Clear `accounts/<uin>_history.db` and remove `accounts/<uin>_threads.json`
+    /// and shared `threads_cache.json`, keeping the session and migration marker (#21).
     WipeLocalData,
 }
 
@@ -164,7 +164,10 @@ enum BgEvent {
     UpdateAvailable(crate::gui::UpdateCheckResult),
     SendFailed(String),
     ActionFailed(String),
-    LocalResetDone(std::result::Result<String, String>),
+    LocalResetDone {
+        logout: bool,
+        result: std::result::Result<String, String>,
+    },
 }
 
 pub struct TuiApp<'a> {
@@ -1017,17 +1020,22 @@ impl<'a> TuiApp<'a> {
     }
 
     fn run_confirm(&mut self, action: ConfirmAction) {
+        self.run_confirm_in(action, std::path::Path::new("."));
+    }
+
+    fn run_confirm_in(&mut self, action: ConfirmAction, root: &std::path::Path) {
         match action.kind {
             ConfirmKind::Logout | ConfirmKind::WipeLocalData => {
                 if self.local_reset_pending {
                     return;
                 }
                 let Some(uin) = self.account_uin() else {
+                    self.status = "Không xác định được tài khoản; vui lòng đăng nhập lại trước khi xoá dữ liệu.".into();
                     return;
                 };
                 let logout = action.kind == ConfirmKind::Logout;
                 self.local_reset_pending = true;
-                self.store = None;
+                let store = self.store.take();
                 let tasks = self
                     .background_tasks
                     .get_mut()
@@ -1036,36 +1044,30 @@ impl<'a> TuiApp<'a> {
                 for task in &tasks {
                     task.abort();
                 }
-                if logout {
-                    self.session.logout();
-                    self.threads.clear();
-                    self.filtered.clear();
-                    self.list_state.select(None);
-                    self.unread.clear();
-                    self.selected_thread = 0;
-                    self.selected_msg = None;
-                }
                 self.status = "Đang xoá dữ liệu cục bộ…".into();
                 let tx = self.bg_tx.clone();
+                let root = root.to_path_buf();
                 tokio::spawn(async move {
                     // Await cancelled tasks before deleting so an old snapshot cannot restore history.
                     for task in tasks {
                         let _ = task.await;
                     }
                     let result = tokio::task::spawn_blocking(move || -> Result<String> {
+                        // SQLite close/checkpoint belongs on the blocking worker too.
+                        drop(store);
                         if logout {
-                            crate::account_manager::logout_account(&uin)?;
-                            remove_owned_thread_caches(std::path::Path::new("."), &uin)?;
+                            crate::account_manager::logout_account_in(&root, &uin)?;
+                            remove_owned_thread_caches(&root, &uin)?;
                             Ok("Đã đăng xuất. Bấm 'q' để thoát.".into())
                         } else {
-                            wipe_account_history_in(std::path::Path::new("."), &uin)?;
+                            wipe_account_history_in(&root, &uin)?;
                             Ok("Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên).".into())
                         }
                     })
                     .await
                     .map_err(|error| error.to_string())
                     .and_then(|result| result.map_err(|error| error.to_string()));
-                    let _ = tx.send(BgEvent::LocalResetDone(result));
+                    let _ = tx.send(BgEvent::LocalResetDone { logout, result });
                 });
             }
             ConfirmKind::DeleteMessage => {
@@ -1272,7 +1274,7 @@ impl<'a> TuiApp<'a> {
             }
             KeyCode::Char('w') if self.focus != Focus::Input => {
                 self.confirm = Some(ConfirmAction {
-                    question: "Xoá lịch sử tin nhắn cục bộ (zalo_history.db, threads_cache.json)?"
+                    question: "Xoá lịch sử tin nhắn cục bộ (accounts/<uin>_history.db, accounts/<uin>_threads.json, threads_cache.json)?"
                         .into(),
                     detail: "Session đăng nhập giữ nguyên. Thao tác này không thể hoàn tác.".into(),
                     kind: ConfirmKind::WipeLocalData,
@@ -1283,7 +1285,7 @@ impl<'a> TuiApp<'a> {
             }
             KeyCode::Char('x') if self.focus != Focus::Input => {
                 self.confirm = Some(ConfirmAction {
-                    question: "Đăng xuất và xoá session.json, threads_cache.json?".into(),
+                    question: "Đăng xuất và xoá session.json, accounts/<uin>.json, accounts/<uin>_threads.json, threads_cache.json?".into(),
                     detail: "Thao tác này không thể hoàn tác.".into(),
                     kind: ConfirmKind::Logout,
                     thread_id: String::new(),
@@ -1467,25 +1469,34 @@ impl<'a> TuiApp<'a> {
 
     fn check_background_events(&mut self) {
         while let Ok(event) = self.bg_rx.try_recv() {
-            if self.local_reset_pending && !matches!(&event, BgEvent::LocalResetDone(_)) {
+            if self.local_reset_pending && !matches!(&event, BgEvent::LocalResetDone { .. }) {
                 continue;
             }
             if self.session.login.is_none()
                 && !matches!(
                     &event,
-                    BgEvent::LocalResetDone(_) | BgEvent::UpdateAvailable(_)
+                    BgEvent::LocalResetDone { .. } | BgEvent::UpdateAvailable(_)
                 )
             {
                 continue;
             }
             match event {
-                BgEvent::LocalResetDone(result) => {
+                BgEvent::LocalResetDone { logout, result } => {
                     self.local_reset_pending = false;
                     self.poll_inflight = false;
                     // Aborted sticker requests cannot send their completion events.
                     self.sticker.loading = false;
                     match result {
                         Ok(status) => {
+                            if logout {
+                                self.session.logout();
+                                self.threads.clear();
+                                self.filtered.clear();
+                                self.list_state.select(None);
+                                self.unread.clear();
+                                self.selected_thread = 0;
+                                self.selected_msg = None;
+                            }
                             for thread in &mut self.threads {
                                 thread.messages.clear();
                                 thread.preview.clear();
@@ -2597,7 +2608,7 @@ fn render_sticker_overlay(f: &mut Frame, area: Rect, app: &TuiApp<'_>) {
 }
 
 fn render_confirm(f: &mut Frame, area: Rect, action: &ConfirmAction) {
-    let modal_area = centered_rect(60, 26, area);
+    let modal_area = centered_rect(60, 50, area);
     f.render_widget(Clear, modal_area);
 
     let content = vec![
@@ -2618,7 +2629,7 @@ fn render_confirm(f: &mut Frame, area: Rect, action: &ConfirmAction) {
             Style::default().fg(Color::Cyan),
         )),
     ];
-    let paragraph = Paragraph::new(content).block(
+    let paragraph = Paragraph::new(content).wrap(Wrap { trim: true }).block(
         Block::default()
             .title(" Xác nhận ")
             .borders(Borders::ALL)
@@ -2813,6 +2824,78 @@ fn wipe_account_history_in(root: &std::path::Path, uin: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn logout_without_an_account_reports_why_no_cleanup_was_started() {
+        let mut session = Session::new(false, false, false).unwrap();
+        let mut app = TuiApp::new(&mut session, Vec::new());
+        app.run_confirm(ConfirmAction {
+            question: String::new(),
+            detail: String::new(),
+            kind: ConfirmKind::Logout,
+            thread_id: String::new(),
+            msg_id: String::new(),
+        });
+        assert!(!app.local_reset_pending);
+        assert!(app.status.contains("đăng nhập lại"));
+    }
+
+    #[tokio::test]
+    async fn failed_logout_keeps_its_identity_until_cleanup_can_be_retried() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-logout-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("accounts/account-a.json")).unwrap();
+        std::fs::write(root.join("session.json"), b"synthetic test fixture").unwrap();
+        let mut session = Session::new(false, false, false).unwrap();
+        let mut app = TuiApp::new(&mut session, Vec::new());
+        app.session.login = Some(crate::session::LoginInfo {
+            uin: "account-a".into(),
+            ..Default::default()
+        });
+        let action = || ConfirmAction {
+            question: String::new(),
+            detail: String::new(),
+            kind: ConfirmKind::Logout,
+            thread_id: String::new(),
+            msg_id: String::new(),
+        };
+        app.run_confirm_in(action(), &root);
+        let kept_until_completion = app.account_uin().is_some();
+        wait_for_test_reset(&mut app).await;
+        let can_retry = app.account_uin().as_deref() == Some("account-a");
+        let error_shown = app.status.contains("Không thể xoá");
+        let credentials_remain = root.join("session.json").is_file();
+        std::fs::remove_dir(root.join("accounts/account-a.json")).unwrap();
+        app.run_confirm_in(action(), &root);
+        let retry_started = app.local_reset_pending;
+        wait_for_test_reset(&mut app).await;
+        let cleanup_finished = app.session.login.is_none() && !root.join("session.json").exists();
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            kept_until_completion,
+            "memory logout must follow successful disk cleanup"
+        );
+        assert!(can_retry && error_shown && credentials_remain);
+        assert!(retry_started && cleanup_finished);
+    }
+
+    async fn wait_for_test_reset(app: &mut TuiApp<'_>) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while app.local_reset_pending {
+                app.check_background_events();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
     fn wipe_preserves_migration_marker_and_removes_only_owned_caches() {
         let root = std::env::temp_dir().join(format!(
             "ctdozlite-tui-wipe-{}-{}",
@@ -2828,6 +2911,17 @@ mod tests {
                 .unwrap();
         legacy.conn.execute("INSERT INTO messages(msg_id, thread_id, ts, is_outgoing) VALUES ('old', 'thread-a', 1, 0)", []).unwrap();
         drop(legacy);
+        let store = crate::store::MessageStore::open_account_in(&root, "user-a").unwrap();
+        store.conn.execute("INSERT INTO messages(msg_id, thread_id, ts, is_outgoing) VALUES ('owned', 'thread-a', 1, 0)", []).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO account_store_metadata(key, value) VALUES ('legacy_imported', '1')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.messages_for("thread-a", 10).unwrap().len(), 1);
+        drop(store);
         for cache in [
             "threads_cache.json",
             "accounts/user-a_threads.json",
@@ -2838,6 +2932,17 @@ mod tests {
         super::wipe_account_history_in(&root, "user-a").unwrap();
         let store = crate::store::MessageStore::open_account_in(&root, "user-a").unwrap();
         assert!(store.messages_for("thread-a", 10).unwrap().is_empty());
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT value FROM account_store_metadata WHERE key = 'legacy_imported'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "1"
+        );
         assert!(!root.join("accounts/user-a_threads.json").exists());
         assert!(!root.join("threads_cache.json").exists());
         assert!(root.join("accounts/user-b_threads.json").exists());
@@ -2945,8 +3050,6 @@ mod tests {
         assert!(app.msg_ranges.len() >= 2);
     }
 
-    /// The "clear local data" confirmation must reach the terminal with its Vietnamese
-    /// text intact — it is the only guard in front of an irreversible delete (#21).
     #[test]
     fn quit_during_reset_is_remembered_without_abandoning_the_reset() {
         let mut session = Session::new(false, false, false).unwrap();
@@ -2956,13 +3059,18 @@ mod tests {
         assert!(app.should_quit);
         assert!(app.local_reset_pending);
         app.bg_tx
-            .send(BgEvent::LocalResetDone(Ok("Test".into())))
+            .send(BgEvent::LocalResetDone {
+                logout: false,
+                result: Ok("Test".into()),
+            })
             .unwrap();
         app.check_background_events();
         assert!(app.should_quit);
         assert!(!app.local_reset_pending);
     }
 
+    /// The "clear local data" confirmation must reach the terminal with its Vietnamese
+    /// text intact — it is the only guard in front of an irreversible delete (#21).
     #[test]
     fn wipe_confirmation_renders_its_vietnamese_text() {
         let mut session = crate::session::Session::new(false, false, false).unwrap();
@@ -2994,20 +3102,14 @@ mod tests {
             log_scroll: 0,
             sticker: StickerState::default(),
             prompt: None,
-            confirm: Some(ConfirmAction {
-                question: "Xoá lịch sử tin nhắn cục bộ (zalo_history.db, threads_cache.json)?"
-                    .into(),
-                detail: "Session đăng nhập giữ nguyên. Thao tác này không thể hoàn tác.".into(),
-                kind: ConfirmKind::WipeLocalData,
-                thread_id: String::new(),
-                msg_id: String::new(),
-            }),
+            confirm: None,
             poll_inflight: false,
             bg_rx: rx,
             bg_tx: tx,
             background_tasks: RefCell::new(Vec::new()),
             local_reset_pending: false,
         };
+        app.handle_key(KeyCode::Char('w'), KeyModifiers::NONE);
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| ui_draw(f, &mut app)).unwrap();
@@ -3027,5 +3129,16 @@ mod tests {
             screen.contains("Xoá lịch sử tin nhắn cục bộ"),
             "confirmation question missing from the frame"
         );
+        for target in [
+            "accounts/<uin>_history.db",
+            "accounts/<uin>_threads.json",
+            "threads_cache.json",
+        ] {
+            assert!(
+                screen.contains(target),
+                "confirmation target missing: {target}"
+            );
+        }
+        assert!(!screen.contains("zalo_history.db"));
     }
 }
