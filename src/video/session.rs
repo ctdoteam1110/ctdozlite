@@ -244,24 +244,33 @@ fn supervise(
             if let Ok(mut bus) = bus.lock() {
                 bus.invalidate();
             }
+            let discovery_complete = crate::media::camera_discovery_complete();
+            let devices = crate::media::cached_camera_devices();
             let result = (|| -> anyhow::Result<_> {
-                let devices = crate::media::cached_camera_devices();
-                let selection = devices
-                    .iter()
-                    .find(|device| format!("{} [{}]", device.label, device.id) == requested)
-                    .map(|device| device.id.as_str())
-                    .unwrap_or(&requested);
-                let id = camera::resolve_device(&devices, selection)?;
-                Ok((camera::CameraProcess::spawn(&id)?, VideoEncoder::new()?))
+                let Some(id) =
+                    select_camera_after_discovery(&devices, &requested, discovery_complete)?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    camera::CameraProcess::spawn(&id)?,
+                    VideoEncoder::new()?,
+                )))
             })();
             match result {
-                Ok((process, codec)) => {
+                Ok(Some((process, codec))) => {
                     camera = Some(process);
                     encoder = Some(codec);
                     selected = requested;
                     last_frame = Instant::now();
                     next_frame = Instant::now();
                     received_frame = false;
+                }
+                Ok(None) => {
+                    // Discovery has its own cancellable helper. Never block capture shutdown on it.
+                    crate::media::list_media_devices(false);
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
                 }
                 Err(error) => {
                     camera_failure(&bus, &gui, error);
@@ -349,6 +358,22 @@ fn supervise(
     }
 }
 
+fn select_camera_after_discovery(
+    devices: &[camera::CameraDevice],
+    requested: &str,
+    complete: bool,
+) -> anyhow::Result<Option<String>> {
+    if devices.is_empty() && !complete {
+        return Ok(None);
+    }
+    let selection = devices
+        .iter()
+        .find(|device| format!("{} [{}]", device.label, device.id) == requested)
+        .map(|device| device.id.as_str())
+        .unwrap_or(requested);
+    camera::resolve_device(devices, selection).map(Some)
+}
+
 fn camera_failure(bus: &Mutex<Fanout>, gui: &Option<crate::gui::GuiTx>, error: anyhow::Error) {
     crate::voip_log::line("VCAM", format!("native camera failed: {error}"));
     if let Ok(mut bus) = bus.lock() {
@@ -369,6 +394,20 @@ fn camera_failure(bus: &Mutex<Fanout>, gui: &Option<crate::gui::GuiTx>, error: a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_selection_waits_for_discovery_without_requiring_camera_reenablement() {
+        assert_eq!(select_camera_after_discovery(&[], "", false).unwrap(), None);
+        assert!(select_camera_after_discovery(&[], "", true).is_err());
+        let devices = vec![camera::CameraDevice {
+            id: "nokhwa:index:0".into(),
+            label: "Camera".into(),
+        }];
+        assert_eq!(
+            select_camera_after_discovery(&devices, "Camera [nokhwa:index:0]", true).unwrap(),
+            Some("nokhwa:index:0".into())
+        );
+    }
 
     #[test]
     fn late_video_leg_inherits_camera_off_permission() {

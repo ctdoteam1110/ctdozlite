@@ -149,6 +149,26 @@ pub fn refresh_media_devices() -> Result<()> {
         }
     }
     let result = crate::video::camera::list_devices();
+    // Publish both snapshots under a short lock in native-camera -> display-cache order.
+    let publication = (|| {
+        let mut cameras = NATIVE_CAMERAS
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Không thể cập nhật danh sách camera."))?;
+        let mut cache = CACHED_DEVICES
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Không thể cập nhật danh sách thiết bị."))?;
+        update_device_snapshots(&mut cameras, &mut cache, microphones, result)
+    })();
+    DEVICE_REFRESH_PENDING.store(false, Ordering::Release);
+    publication
+}
+
+fn update_device_snapshots(
+    cameras: &mut Vec<crate::video::camera::CameraDevice>,
+    cache: &mut Option<(Vec<String>, Vec<String>)>,
+    microphones: Vec<String>,
+    result: Result<Vec<crate::video::camera::CameraDevice>>,
+) -> Result<()> {
     let devices = result
         .as_ref()
         .map(|devices| {
@@ -158,19 +178,20 @@ pub fn refresh_media_devices() -> Result<()> {
                 .cloned()
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|_| cameras.clone());
     let labels = devices
         .iter()
         .map(|device| format!("{} [{}]", device.label, device.id))
         .collect();
-    if let Ok(mut cameras) = NATIVE_CAMERAS.lock() {
-        *cameras = devices;
-    }
-    if let Ok(mut cache) = CACHED_DEVICES.lock() {
-        *cache = Some((microphones, labels));
-    }
-    DEVICE_REFRESH_PENDING.store(false, Ordering::Release);
+    *cameras = devices;
+    *cache = Some((microphones, labels));
     result.map(|_| ())
+}
+
+/// Whether the first device snapshot is available and no refresh is pending.
+pub(crate) fn camera_discovery_complete() -> bool {
+    !DEVICE_REFRESH_PENDING.load(Ordering::Acquire)
+        && CACHED_DEVICES.lock().is_ok_and(|cache| cache.is_some())
 }
 
 /// Native device identities from the last worker discovery; no driver calls.
@@ -1250,6 +1271,37 @@ type IncomingVideoStream = (
     Option<std::time::Instant>,
 );
 
+fn video_pli_targets(
+    peer_ssrc: u32,
+    primary_needs_pli: bool,
+    extras: &[IncomingVideoStream],
+) -> Vec<u32> {
+    let mut targets = Vec::new();
+    if primary_needs_pli {
+        targets.push(peer_ssrc);
+    }
+    for (ssrc, _, _, queue, last_rx) in extras {
+        if last_rx.is_some() && !queue.synced.load(Ordering::Acquire) && !targets.contains(ssrc) {
+            targets.push(*ssrc);
+        }
+    }
+    targets
+}
+
+fn should_force_video_keyframe(
+    camera_on: bool,
+    transition: bool,
+    frame: u32,
+    synthetic_gop: usize,
+    peer_request: bool,
+) -> bool {
+    transition
+        || frame == 0
+        || peer_request
+        || (!camera_on
+            && (synthetic_gop >= H264_PSLICES.len() || frame % VIDEO_IDR_INTERVAL_FRAMES == 0))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_media_loop(
     stop: Arc<AtomicBool>,
@@ -1592,16 +1644,18 @@ fn run_media_loop(
             let camera_on = cam_enabled.load(Ordering::Acquire);
             let camera_transition = camera_on != camera_was_enabled;
             camera_was_enabled = camera_on;
-            let force_kf = camera_transition
-                || vid_frame_no == 0
-                || vid_gop_pos >= H264_PSLICES.len()
-                || vid_frame_no % VIDEO_IDR_INTERVAL_FRAMES == 0
-                || want_keyframe.swap(false, Ordering::Relaxed);
+            let force_kf = should_force_video_keyframe(
+                camera_on,
+                camera_transition,
+                vid_frame_no,
+                vid_gop_pos,
+                want_keyframe.swap(false, Ordering::Relaxed),
+            );
 
             if force_kf {
                 camera.request_keyframe();
             }
-            let au_opt = if cam_enabled.load(Ordering::Acquire) {
+            let au_opt = if camera_on {
                 // Never skip encoded P frames or inject synthetic pictures into a live chain.
                 camera.try_recv()
             } else {
@@ -2076,12 +2130,12 @@ fn run_media_loop(
         wl.tick();
         // --- PLI towards the peer: its video is undecodable until a keyframe (SPS/IDR) reaches the decoder ---
         // Ask for new reference frames while the native decoder is waiting for SPS/PPS and IDR.
+        let primary_needs_pli = !video_synced.load(Ordering::Relaxed) || pli_gap;
         if (is_video || rx_video.started || cam_enabled.load(Ordering::Relaxed))
             && decoder_active
             && (rx_video.started || rx_audio.started)
             && peer_ssrc != 0
-            && (!video_synced.load(Ordering::Relaxed)
-                || pli_gap
+            && (primary_needs_pli
                 || extra_vid_streams.iter().any(|(_, _, _, queue, last_rx)| {
                     last_rx.is_some() && !queue.synced.load(Ordering::Acquire)
                 }))
@@ -2091,15 +2145,7 @@ fn run_media_loop(
             pli_gap = false;
             if let (Some(ref rtcp_s), Some(target)) = (&udp_rtcp_sock, rtcp_sock_addr) {
                 let rtcp_sender = udp_rtp_sock.as_ref().unwrap_or(rtcp_s);
-                let mut targets = vec![peer_ssrc];
-                for (ssrc, _, _, queue, last_rx) in &extra_vid_streams {
-                    if last_rx.is_some()
-                        && !queue.synced.load(Ordering::Acquire)
-                        && !targets.contains(ssrc)
-                    {
-                        targets.push(*ssrc);
-                    }
-                }
+                let targets = video_pli_targets(peer_ssrc, primary_needs_pli, &extra_vid_streams);
                 for requested_ssrc in targets {
                     // Compound packet: empty RR first (RFC 3550 6.1), then the PLI.
                     let mut pkt = vec![0x80u8, 201, 0, 1];
@@ -2375,6 +2421,11 @@ fn receive_video_packet(
         Err(error) => {
             queue.reset();
             crate::voip_log::line("VDEC", format!("video access unit lost: {error}"));
+            // The packet following loss may already start the next recovery unit.
+            ingress.reset();
+            if let Ok(Some(au)) = ingress.push(sequence, timestamp, rtp[1] & 0x80 != 0, payload) {
+                queue.push(au);
+            }
         }
     }
 }
@@ -2443,6 +2494,105 @@ pub fn play_notification_chime() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_stream_recovery_does_not_request_healthy_primary_keyframes() {
+        let make_stream = |ssrc: u32, synced: bool, active: bool| {
+            let queue = Arc::new(crate::video::decode_queue::DecodeQueue::default());
+            queue.synced.store(synced, Ordering::Release);
+            (
+                ssrc,
+                String::new(),
+                crate::video::ingress::VideoIngress::default(),
+                queue,
+                active.then(std::time::Instant::now),
+            )
+        };
+        let streams = vec![
+            make_stream(11, false, true),
+            make_stream(12, true, true),
+            make_stream(13, false, false),
+            make_stream(11, false, true),
+        ];
+        assert_eq!(video_pli_targets(10, false, &streams), vec![11]);
+        assert_eq!(video_pli_targets(10, true, &streams), vec![10, 11]);
+    }
+
+    #[test]
+    fn first_recovery_unit_survives_sequence_loss_and_timestamp_change() {
+        for next_sequence in [2_u16, 3] {
+            let mut ingress = crate::video::ingress::VideoIngress::default();
+            let queue = crate::video::decode_queue::DecodeQueue::default();
+            let packet = |sequence: u16, timestamp: u32| {
+                let mut rtp = [0_u8; 12];
+                rtp[2..4].copy_from_slice(&sequence.to_be_bytes());
+                rtp[4..8].copy_from_slice(&timestamp.to_be_bytes());
+                rtp
+            };
+            receive_video_packet(
+                &mut ingress,
+                &queue,
+                &packet(1, 1),
+                &[0x1c, 0x80, 0, 0, 1, 0x61],
+            );
+            receive_video_packet(
+                &mut ingress,
+                &queue,
+                &packet(next_sequence, 2),
+                &[0x1c, 0x80, 0, 0, 1, 0x65],
+            );
+            receive_video_packet(
+                &mut ingress,
+                &queue,
+                &packet(next_sequence + 1, 2),
+                &[0x1c, 0x40, 9],
+            );
+            assert_eq!(
+                queue.pop(Duration::ZERO),
+                (true, Some(vec![0, 0, 1, 0x65, 9]))
+            );
+        }
+    }
+
+    #[test]
+    fn live_camera_uses_native_gop_instead_of_frozen_synthetic_counters() {
+        assert!(!should_force_video_keyframe(
+            true,
+            false,
+            15,
+            H264_PSLICES.len(),
+            false
+        ));
+        assert!(should_force_video_keyframe(
+            false,
+            false,
+            15,
+            H264_PSLICES.len(),
+            false
+        ));
+        assert!(should_force_video_keyframe(true, true, 16, 0, false));
+        assert!(should_force_video_keyframe(true, false, 16, 0, true));
+    }
+
+    #[test]
+    fn failed_camera_rescan_retains_both_camera_snapshots_and_updates_microphones() {
+        let original = crate::video::camera::CameraDevice {
+            id: "nokhwa:index:0".into(),
+            label: "Camera".into(),
+        };
+        let mut cameras = vec![original.clone()];
+        let label = "Camera [nokhwa:index:0]".to_string();
+        let mut cache = Some((vec!["Old microphone".into()], vec![label.clone()]));
+        assert!(update_device_snapshots(
+            &mut cameras,
+            &mut cache,
+            vec!["New microphone".into()],
+            Err(anyhow::anyhow!("enumeration failed"))
+        )
+        .is_err());
+        assert_eq!(cameras, vec![original]);
+        assert_eq!(cache, Some((vec!["New microphone".into()], vec![label])));
+    }
 
     #[test]
     fn native_codec_roundtrips_zalo_fragments_and_recovers_after_loss() {

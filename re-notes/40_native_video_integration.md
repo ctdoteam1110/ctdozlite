@@ -93,3 +93,28 @@ binary-module royalty coverage.
 Evidence logs are local build artifacts under `target/native-*.log`,
 `target/native-dependency-audit.json`, `target/native-executable-smoke.json` and
 `target/native-executable-dependents.txt`. No commit, push or publication was made.
+
+## Recovery after a lost access unit (2026-11-10)
+
+The receive path resets its decoder queue after sequence loss or an incomplete
+unit's timestamp change, then retries the triggering packet once with a clean
+assembler. That packet may be the first fragment of the recovery IDR. Malformed
+continuation fragments still fail validation. The wire formats remain those
+documented in re-notes/08. The synthetic regression
+`first_recovery_unit_survives_sequence_loss_and_timestamp_change` checks both a
+sequence gap and an in-order timestamp boundary, using the observed Zalo fragment
+headers and ensuring that no bytes from the damaged unit reach the next unit.
+
+Slice-header inspection now unescapes at most 64 RBSP bytes; compressed slice
+data stays with the native decoder. A terminal `00 00 03` is accepted for CABAC
+padding, as described by H.264 (02/2016), clause 7.4.2.10
+([ITU recommendation](https://www.itu.int/rec/T-REC-H.264-201602-S/en)). The
+`slice_header_unescape_ignores_coded_data_and_accepts_terminal_prevention` test
+checks terminal prevention, rejects invalid prevention sequences, and confirms
+that slice data beyond the bounded header is not parsed as header syntax.
+
+PLI targets are selected independently for the primary and extra SSRCs. An
+unsynchronized extra stream does not request an IDR from a healthy primary.
+`extra_stream_recovery_does_not_request_healthy_primary_keyframes` checks this
+selection, inactive streams and deduplication. RTP/RTCP packet layouts and the
+existing 500 ms PLI interval are unchanged.

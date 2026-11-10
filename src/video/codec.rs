@@ -208,7 +208,8 @@ impl VideoDecoder {
             if matches!(nal[0] & 0x1f, 1 | 5) {
                 has_slice = true;
                 has_idr |= nal[0] & 0x1f == 5;
-                let rbsp = unescape(&nal[1..])?;
+                // Only the first three Exp-Golomb fields are needed before native decoding.
+                let rbsp = unescape_prefix(&nal[1..], 64)?;
                 let mut bits = Bits::new(&rbsp);
                 bits.ue()?;
                 let slice_type = bits.ue()?;
@@ -397,14 +398,18 @@ fn annexb_nals(bytes: &[u8]) -> Result<Vec<&[u8]>> {
 }
 
 fn unescape(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(bytes.len());
+    unescape_prefix(bytes, bytes.len())
+}
+
+fn unescape_prefix(bytes: &[u8], limit: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(bytes.len().min(limit));
     let mut zeros = 0;
     let mut i = 0;
-    while i < bytes.len() {
+    while i < bytes.len() && out.len() < limit {
         let byte = bytes[i];
         if zeros >= 2 && byte == 3 {
             ensure!(
-                bytes.get(i + 1).is_some_and(|n| *n <= 3),
+                bytes.get(i + 1).is_none_or(|n| *n <= 3),
                 "invalid H264 emulation prevention"
             );
             zeros = 0;
@@ -549,6 +554,15 @@ fn inspect_sps(nal: &[u8]) -> Result<SpsInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slice_header_unescape_ignores_coded_data_and_accepts_terminal_prevention() {
+        assert_eq!(unescape(&[0, 0, 3]).unwrap(), vec![0, 0]);
+        assert!(unescape(&[0, 0, 3, 4]).is_err());
+        let mut nal = vec![1; 1024 * 1024];
+        nal.extend_from_slice(&[0, 0, 3, 4]);
+        assert_eq!(unescape_prefix(&nal, 64).unwrap(), vec![1; 64]);
+    }
 
     fn red_rgb(width: usize, height: usize) -> Vec<u8> {
         [240, 20, 20].repeat(width * height)
