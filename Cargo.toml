@@ -2,6 +2,7 @@
 name = "ctdozlite"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.97"
 authors = ["TIPC1110 <tienichpc1110@gmail.com>"]
 description = "Lightweight, high-performance native Zalo PC client written in Rust (zero Node.js, zero Electron)"
 homepage = "https://ctdozlite.ctdo.net/"
@@ -40,6 +41,8 @@ lzma-rs = "0.3.0"
 zstd = "0.14.3"
 wasmtime = { version = "50.0.1", default-features = false, features = ["runtime", "cranelift", "std", "anyhow"] }
 getrandom = { version = "0.3", features = ["std"] }
+nokhwa = { version = "=0.10.11", default-features = false, features = ["input-native"] }
+openh264 = { version = "=0.9.9", default-features = false, features = ["source"] }
 
 [lib]
 name = "zalo_rust"
@@ -79,7 +82,7 @@ maintainer = "TIPC1110 <tienichpc1110@gmail.com>"
 copyright = "2026, TIPC1110 <tienichpc1110@gmail.com>"
 license-file = ["LICENSE-MIT", "0"]
 depends = "libc6 (>= 2.31), libasound2 | libasound2t64, libx11-6, libxcb1, libxkbcommon0, libgl1"
-recommends = "ffmpeg, zenity, xclip, wl-clipboard, fonts-noto-core"
+recommends = "zenity, xclip, wl-clipboard, fonts-noto-core"
 section = "net"
 priority = "optional"
 assets = [
@@ -88,6 +91,7 @@ assets = [
     ["packaging/linux/ctdozlite.desktop", "usr/share/applications/", "644"],
     ["src/assets/app_icon.png", "usr/share/icons/hicolor/256x256/apps/ctdozlite.png", "644"],
     ["README.md", "usr/share/doc/ctdozlite/README.md", "644"],
+    ["packaging/licenses/*.txt", "usr/share/doc/ctdozlite/licenses/", "644"],
 ]
 
 [profile.release]

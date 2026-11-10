@@ -35,6 +35,8 @@ What we will do, in one paragraph, present tense.
 
 | ADR | Title | Status |
 | :--- | :--- | :--- |
-| — | No decisions recorded yet | — |
+| [0004](0004-account-history-and-sync-failure-policy.md) | Account history ownership and unsupported sync handling | accepted |
+| [0005](0005-native-call-video.md) | Native call video and cancellable camera isolation | local implementation; release checks pending |
+| [0006](0006-native-video-on-v010.md) | Native video on upstream v0.1.0 | accepted for PR #129 integration |
 
 Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).

@@ -21,7 +21,7 @@ Client Zalo Desktop viết bằng Rust (`eframe`/`egui` + `ratatui`), giao tiế
 [![Website](https://img.shields.io/badge/website-ctdozlite.ctdo.net-0068FF.svg)](https://ctdozlite.ctdo.net/)
 [![Release](https://img.shields.io/github/v/release/ctdoteam1110/ctdozlite?label=release)](https://github.com/ctdoteam1110/ctdozlite/releases)
 [![CI & Release](https://github.com/ctdoteam1110/ctdozlite/actions/workflows/ci-release.yml/badge.svg)](https://github.com/ctdoteam1110/ctdozlite/actions/workflows/ci-release.yml)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue.svg)](https://github.com/ctdoteam1110/ctdozlite/releases)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
@@ -39,7 +39,7 @@ Bản Zalo PC chính thức đóng gói trên Electron thường chiếm 350–6
 | **Số tiến trình chạy nền** | 7 tiến trình | **1 tiến trình duy nhất** |
 | **Kích thước file thực thi** | ~136 MB | **~17,2 MB** (bản phát hành strip symbols) |
 | **Thời gian khởi chạy cửa sổ** | 2.5 – 4.0s | **~0,18 – 0,19 giây** (< 200ms) |
-| **Phụ thuộc runtime** | Chromium, Node.js | Native binary thuần (`ffmpeg` tùy chọn nếu gọi video) |
+| **Phụ thuộc runtime** | Chromium, Node.js | Native binary; camera hệ điều hành + OpenH264 tích hợp |
 
 > *Dữ liệu đo thực tế trên Windows 11 (Intel Core i7-12700H, PowerShell `Get-Process WorkingSet64`, đo trung vị sau 15 giây chạy ổn định ở trạng thái chờ).*
 
@@ -67,7 +67,7 @@ Bản Zalo PC chính thức đóng gói trên Electron thường chiếm 350–6
   - **Tương thích iOS:** Đã hoàn thiện giao thức bắt tay Sync v2 (Curve25519 / X25519 Double-Ratchet), tuy nhiên quy trình nén đa lô của Zalo iOS vẫn đang tiếp tục được hoàn thiện trong các bản cập nhật tiếp theo.
 - **Gọi thoại & Gọi video 1-1 (`src/call.rs`, `src/media.rs`, `src/audio.rs`)**
   - Triển khai trực tiếp luồng báo hiệu cuộc gọi (`401`/`416`/`407`/`402`/`408`/`409`) và bắt tay ZRTP relay bằng Rust, không phụ thuộc `ZaloCall.exe`.
-  - Audio hai chiều qua `cpal` + `opus`; video H.264 đóng gói theo khung relay của Zalo (RTP PT 97/98, RTCP SR/PLI/REMB) kết hợp `ffmpeg` để thu webcam và giải mã khung hình.
+  - Audio hai chiều qua `cpal` + `opus`; video H.264 đóng gói theo khung relay của Zalo (RTP PT 97/98, RTCP SR/PLI/REMB) kết hợp camera native và OpenH264 tích hợp để thu, mã hoá và giải mã video; không cần FFmpeg.
 - **Hai chế độ giao diện (`src/gui/`, `src/tui.rs`)**
   - **GUI (`eframe`/`egui`)**: Giao diện desktop native, hỗ trợ Dark/Light theme, điều hướng sticker bằng phím mũi tên, thông báo tin nhắn chưa đọc và khay Dev Inspector (`--dev`).
   - **TUI (`ratatui`/`crossterm`)**: Giao diện terminal gọn nhẹ cho môi trường CLI/SSH.
@@ -149,9 +149,9 @@ Hướng dẫn cài đặt chi tiết (Linux, Windows, macOS Apple Silicon `arm6
 ## Tự biên dịch từ mã nguồn (Windows / Linux / macOS)
 
 ### 1. Yêu cầu chung
-- **Rust** 1.75 trở lên ([rustup.rs](https://rustup.rs/))
+- **Rust** 1.97 trở lên ([rustup.rs](https://rustup.rs/)); Wasmtime của Sync v2 yêu cầu phiên bản này.
 - **CMake** (3.15+), `pkg-config` và trình biên dịch C/C++ (để biên dịch tĩnh `libopus` và `sqlite3`)
-- **FFmpeg** trong `PATH` (tùy chọn — chỉ cần khi sử dụng tính năng gọi video H.264)
+- **Clang/libclang** trên Linux (biên dịch backend V4L2); NASM là công cụ biên dịch tuỳ chọn để tăng tốc codec. Bản chạy không cần FFmpeg hoặc tải codec.
 
 > Nếu máy dùng CMake 4.0+ gặp lỗi kiểm tra phiên bản tối thiểu trong `opus-sys`, đặt biến môi trường `CMAKE_POLICY_VERSION_MINIMUM=3.5` khi chạy `cargo build`.
 
@@ -159,7 +159,6 @@ Hướng dẫn cài đặt chi tiết (Linux, Windows, macOS Apple Silicon `arm6
 Cài đặt *Visual Studio Build Tools* (chọn *Desktop development with C++* và *CMake tools for Windows*):
 
 ```powershell
-winget install Gyan.FFmpeg
 git clone https://github.com/ctdoteam1110/ctdozlite.git
 cd ctdozlite
 $env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"
@@ -173,21 +172,21 @@ Cài đặt các gói thư viện hệ thống cho âm thanh (`ALSA`) và cửa 
 - **Ubuntu / Debian:**
   ```bash
   sudo apt update
-  sudo apt install -y build-essential cmake pkg-config \
+  sudo apt install -y build-essential cmake pkg-config clang libclang-dev nasm \
     libasound2-dev libxcb-render0-dev libxcb-shape0-dev \
     libxcb-xfixes0-dev libxkbcommon-dev libssl-dev \
-    libgtk-3-dev zenity xclip wl-clipboard ffmpeg
+    libgtk-3-dev zenity xclip wl-clipboard
   ```
 - **Fedora:**
   ```bash
-  sudo dnf install -y gcc gcc-c++ make cmake pkgconf-pkg-config \
+  sudo dnf install -y gcc gcc-c++ make cmake pkgconf-pkg-config clang clang-devel nasm \
     alsa-lib-devel libxcb-devel libxkbcommon-devel openssl-devel \
-    gtk3-devel zenity xclip wl-clipboard ffmpeg
+    gtk3-devel zenity xclip wl-clipboard
   ```
 - **Arch Linux:**
   ```bash
-  sudo pacman -S --needed base-devel cmake pkgconf alsa-lib \
-    libxcb libxkbcommon openssl gtk3 zenity xclip wl-clipboard ffmpeg
+  sudo pacman -S --needed base-devel cmake pkgconf clang nasm alsa-lib \
+    libxcb libxkbcommon openssl gtk3 zenity xclip wl-clipboard
   ```
 
 Biên dịch:
@@ -201,7 +200,7 @@ Binary đầu ra: `target/release/ctdozlite`
 ### 4. macOS (Apple Silicon ARM64 & Intel x86_64)
 ```bash
 xcode-select --install
-brew install cmake ffmpeg
+brew install cmake
 git clone https://github.com/ctdoteam1110/ctdozlite.git
 cd ctdozlite
 cargo build --release

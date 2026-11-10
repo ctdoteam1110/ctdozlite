@@ -1,6 +1,6 @@
 //! Scheduled message delivery (`Hẹn giờ gửi tin nhắn` & `Nhắc hẹn`, #38, #24).
 //!
-//! Persists scheduled messages in SQLite (`zalo_history.db`, table `scheduled_messages`)
+//! Persists scheduled messages in account SQLite stores (table `scheduled_messages`)
 //! so pending deliveries survive application restarts. The background worker polls
 //! [`claim_due_scheduled_messages`] and dispatches due items through `chat::send_message`.
 
@@ -10,6 +10,46 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_DB_PATH: &str = "zalo_history.db";
+
+/// Owns delivery for one account until the scheduler task exits.
+/// The file lock excludes another process before recovering ambiguous crash leftovers.
+pub(crate) struct DeliveryWorker {
+    db_path: String,
+    _lock: std::fs::File,
+}
+
+impl DeliveryWorker {
+    /// Acquire exclusive delivery ownership and fail abandoned sends without retrying.
+    ///
+    /// # Errors
+    /// Returns an error if another worker owns delivery or storage cannot be updated.
+    pub(crate) fn start(db_path: &str) -> Result<Self> {
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(format!("{db_path}.scheduler.lock"))?;
+        lock.try_lock()?;
+        let conn = open_scheduler_db(db_path)?;
+        conn.execute(
+            "UPDATE scheduled_messages SET status = 'failed', error_msg = ?1 WHERE status = 'sending'",
+            ["Ứng dụng đã dừng khi đang gửi; tin nhắn có thể đã được gửi. Hãy kiểm tra hội thoại trước khi thử lại."],
+        )?;
+        Ok(Self {
+            db_path: db_path.into(),
+            _lock: lock,
+        })
+    }
+
+    /// Claim due schedules while retaining exclusive delivery ownership.
+    ///
+    /// # Errors
+    /// Returns an error if the account's schedules cannot be read or claimed.
+    pub(crate) fn claim_due(&self, now_ts: i64) -> Result<Vec<ScheduledMessage>> {
+        claim_due_scheduled_messages(&self.db_path, now_ts)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulePreset {
@@ -393,8 +433,22 @@ pub fn update_scheduled_message(
 pub fn cancel_scheduled_message(db_path: &str, id: i64) -> Result<bool> {
     let conn = open_scheduler_db(db_path)?;
     let changed = conn.execute(
-        "DELETE FROM scheduled_messages WHERE id = ?1 AND status != 'sent'",
+        "DELETE FROM scheduled_messages WHERE id = ?1 AND status IN ('pending', 'failed')",
         params![id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Makes an unclaimed schedule due without creating a second delivery path.
+///
+/// # Errors
+/// Returns an error if the account's schedule database cannot be opened or updated.
+pub fn send_scheduled_now(db_path: &str, id: i64, now_ts: i64) -> Result<bool> {
+    let conn = open_scheduler_db(db_path)?;
+    let changed = conn.execute(
+        "UPDATE scheduled_messages SET deliver_at = ?1, status = 'pending', error_msg = ''
+         WHERE id = ?2 AND status IN ('pending', 'failed')",
+        params![now_ts, id],
     )?;
     Ok(changed > 0)
 }
@@ -455,6 +509,87 @@ pub fn mark_scheduled_failed(db_path: &str, id: i64, err: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abandoned_delivery_recovery_requires_exclusive_worker_ownership() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-scheduler-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("history.db");
+        let db = path.to_str().unwrap();
+        let now = 1_762_000_000;
+        let item = schedule_message(db, "thread-1", "Test", false, "Test", now + 60, now).unwrap();
+        let worker = DeliveryWorker::start(db).unwrap();
+        assert_eq!(worker.claim_due(now + 60).unwrap().len(), 1);
+        assert!(DeliveryWorker::start(db).is_err());
+        // Ordinary history reads and scheduler reads must not reset an active send.
+        drop(crate::store::MessageStore::open(db).unwrap());
+        assert_eq!(
+            list_pending_scheduled(db, None).unwrap()[0].status,
+            "sending"
+        );
+        let pending =
+            schedule_message(db, "thread-2", "Test", false, "Pending", now + 120, now).unwrap();
+        let failed =
+            schedule_message(db, "thread-3", "Test", false, "Failed", now + 120, now).unwrap();
+        mark_scheduled_failed(db, failed.id, "Existing failure").unwrap();
+        drop(worker);
+        let worker = DeliveryWorker::start(db).unwrap();
+        let rows = list_pending_scheduled(db, None).unwrap();
+        let recovered = rows.iter().find(|row| row.id == item.id).unwrap();
+        assert_eq!(recovered.status, "failed");
+        assert!(recovered.error_msg.contains("có thể đã được gửi"));
+        assert_eq!(
+            rows.iter().find(|row| row.id == pending.id).unwrap().status,
+            "pending"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == failed.id)
+                .unwrap()
+                .error_msg,
+            "Existing failure"
+        );
+        assert!(
+            worker.claim_due(now + 60).unwrap().is_empty(),
+            "ambiguous deliveries must never retry automatically"
+        );
+        drop(worker);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn send_now_and_cancel_cannot_duplicate_a_claimed_schedule() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-send-now-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("history.db");
+        let db = path.to_str().unwrap();
+        let now = 1_762_000_000;
+        let item = schedule_message(db, "thread-1", "Test", false, "Test", now + 60, now).unwrap();
+        assert!(send_scheduled_now(db, item.id, now).unwrap());
+        let due = claim_due_scheduled_messages(db, now).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, item.id);
+        assert!(!send_scheduled_now(db, item.id, now).unwrap());
+        assert!(!cancel_scheduled_message(db, item.id).unwrap());
+        assert!(claim_due_scheduled_messages(db, now + 60)
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn presets_and_custom_input_parsing_produce_future_timestamps() {

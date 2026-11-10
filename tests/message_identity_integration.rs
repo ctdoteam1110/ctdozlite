@@ -29,6 +29,44 @@ fn thread(messages: Vec<ChatMessage>) -> Thread {
 }
 
 #[test]
+fn incoming_history_does_not_imply_outgoing_read_receipts() {
+    for state in [
+        DeliveryState::Pending,
+        DeliveryState::Failed,
+        DeliveryState::Delivered,
+    ] {
+        let mut outgoing = message("server-a", "client-a");
+        outgoing.delivery = state;
+        let mut incoming = message("server-b", "client-b");
+        incoming.is_outgoing = false;
+        incoming.ts += 1000;
+        let mut target = thread(vec![outgoing]);
+        merge_thread_into(&mut target, thread(vec![incoming]), false);
+        assert_eq!(target.messages[0].delivery, state);
+    }
+}
+
+#[test]
+fn incoming_preview_does_not_imply_outgoing_read_receipts() {
+    for state in [
+        DeliveryState::Pending,
+        DeliveryState::Failed,
+        DeliveryState::Delivered,
+    ] {
+        let mut outgoing = message("server-a", "client-a");
+        outgoing.delivery = state;
+        let mut threads = vec![thread(vec![outgoing])];
+        let response = json!({"data":{"msgs":[{
+            "msgId":"server-b", "cliMsgId":"client-b", "uidFrom":"contact-1", "idTo":"0",
+            "ts":1_793_425_681_000i64, "msgType":"webchat", "content":"reply"
+        }]}});
+        zalo_rust::chat::merge_previews(&mut threads, &response);
+        assert_eq!(threads[0].messages.len(), 2);
+        assert_eq!(threads[0].messages[0].delivery, state);
+    }
+}
+
+#[test]
 fn distinct_server_ids_survive_when_text_and_time_match() {
     let mut target = thread(vec![message("server-a", "client-a")]);
     merge_thread_into(
@@ -204,12 +242,18 @@ fn group_history_preserves_distinct_server_ids_when_text_and_time_match() {
 #[test]
 fn preview_parser_retains_legacy_id_and_explicit_wire_namespaces() {
     let mut threads = vec![thread(Vec::new())];
-    zalo_rust::chat::merge_previews(&mut threads, &json!({"error_code":0,"data":[{"messages":[
-        {"globalMsgId":"server-a","cliMsgId":"client-a","idTo":"contact-1","uidFrom":"0","content":"First"},
-        {"cliMsgId":"client-only","idTo":"contact-1","uidFrom":"0","content":"Second"}
-    ]}]}));
+    zalo_rust::chat::merge_previews(
+        &mut threads,
+        &json!({"error_code":0,"data":[{"messages":[
+            {"globalMsgId":"server-a","cliMsgId":"client-a","idTo":"contact-1","uidFrom":"0","content":"First"},
+            {"cliMsgId":"client-only","idTo":"contact-1","uidFrom":"0","content":"Second"}
+        ]}]}),
+    );
     assert_eq!(threads[0].messages[0].id, "client-a");
-    assert_eq!(threads[0].messages[0].wire_ref.server_id, Some(json!("server-a")));
+    assert_eq!(
+        threads[0].messages[0].wire_ref.server_id,
+        Some(json!("server-a"))
+    );
     assert_eq!(threads[0].messages[0].client_message_id, "client-a");
     assert_eq!(threads[0].messages[1].id, "client-only");
     assert_eq!(threads[0].messages[1].client_message_id, "client-only");
@@ -262,7 +306,10 @@ fn legacy_stored_client_id_reconciles_without_changing_canonical_id() {
     zalo_rust::chat::merge_previews(&mut threads, &response);
     assert_eq!(threads[0].messages.len(), 1);
     assert_eq!(threads[0].messages[0].id, "client-legacy");
-    assert_eq!(threads[0].messages[0].wire_ref.server_id, Some(json!("server-a")));
+    assert_eq!(
+        threads[0].messages[0].wire_ref.server_id,
+        Some(json!("server-a"))
+    );
     zalo_rust::chat::merge_previews(&mut threads, &response);
     assert_eq!(threads[0].messages.len(), 1);
 }

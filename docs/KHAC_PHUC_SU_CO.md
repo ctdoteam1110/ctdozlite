@@ -28,10 +28,21 @@ Bảng tra cứu các mã lỗi trả về từ máy chủ Zalo và các vấn �
 - **Cách khắc phục:** Hàm `setup_custom_fonts` trong `src/gui/theme.rs` tự động tìm và nạp các font hệ thống hỗ trợ tiếng Việt (`Segoe UI`, `Arial`, `Tahoma`, `NotoSans`, `DejaVuSans`, `Ubuntu`). Nếu chạy trên bản Linux tối giản chưa có font, hãy cài gói `fonts-noto-core` hoặc `fonts-dejavu-core`.
 
 ### 2.3. Không giải mã được hình ảnh cuộc gọi video
-- **Nguyên nhân:** Tính năng gọi video H.264 sử dụng `ffmpeg` để thu hình từ thiết bị camera và giải mã luồng video nhận về.
-- **Cách khắc phục:** Kiểm tra `ffmpeg -version` trong terminal và đảm bảo `ffmpeg` đã nằm trong `PATH` của hệ thống.
+- **Nguyên nhân:** Camera chưa được cấp quyền, thiết bị đang bận hoặc luồng H.264 chưa nhận được SPS/PPS và khung hình khoá.
+- **Cách khắc phục:** Cấp quyền camera trong cài đặt hệ điều hành, đóng ứng dụng đang giữ camera rồi quét lại thiết bị. Ứng dụng dùng camera native và OpenH264 tích hợp, không cần cài FFmpeg. Nếu hình nhận về bị treo, kiểm tra voip.log để xác định mất gói hoặc định dạng không được hỗ trợ.
 
 ---
+
+### 2.4. Thiếu lịch sử cũ sau khi nâng cấp
+
+Lịch sử hiện dùng kho riêng `accounts/<uin>_history.db`. Nếu file cũ
+`zalo_history.db` không có thông tin chủ sở hữu phù hợp, ứng dụng giữ nguyên
+file và không tự nhập vào tài khoản đang đăng nhập.
+
+Mở **Cài đặt → Đồng bộ tin nhắn → Di chuyển / Nhập lịch sử tin nhắn có sẵn**,
+bấm **Chọn file lịch sử** và chọn `zalo_history.db` trong thư mục dữ liệu của
+ứng dụng. Chỉ chọn file thuộc chính tài khoản hiện tại. Lịch sử được ghép vào
+kho tài khoản mà không xoá tin nhắn đang có; việc chọn file là xác nhận của bạn.
 
 ## 3. Sự cố phiên đăng nhập
 

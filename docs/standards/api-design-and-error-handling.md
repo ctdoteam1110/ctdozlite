@@ -49,7 +49,7 @@ Use `anyhow::Result` at module boundaries. Add typed errors only where callers m
 | `Protocol` | bad `signkey`, cipher mismatch, decode failure | No (bug) | Log + generic error |
 | `RateLimit` | `429` | Yes, honoring delay | "Thao tác quá nhanh, thử lại sau" |
 | `Io` | SQLite, file, media read/write | Conditional | Context-specific |
-| `Unsupported` | missing `ffmpeg`, missing audio device | No | Actionable hint |
+| `Unsupported` | camera permission denied, unsupported video format, missing audio device | No | Actionable hint |
 
 Rules:
 

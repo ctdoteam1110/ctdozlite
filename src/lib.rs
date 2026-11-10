@@ -11,6 +11,8 @@ pub mod history_sync;
 pub mod logger;
 pub mod login;
 pub mod media;
+/// Native camera capture, bounded H.264 transport, and bundled video codecs.
+pub mod video;
 pub mod message_model;
 /// Exact quoted-message references in loaded conversations.
 pub mod message_navigation;

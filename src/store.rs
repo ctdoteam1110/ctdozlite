@@ -2,8 +2,8 @@
 //!
 //! Persists every message seen via polling or group history so chat history accumulates locally.
 
-use anyhow::Result;
-use rusqlite::{params, Connection};
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::chat::{ChatMessage, Thread};
@@ -41,25 +41,168 @@ pub fn db_path_for_account(uin: &str) -> String {
     if uin.is_empty() {
         "zalo_history.db".to_string()
     } else {
-        let _ = std::fs::create_dir_all("accounts");
         format!("accounts/{uin}_history.db")
     }
 }
 
 impl MessageStore {
+    /// Open canonical account history, importing already-owned legacy history once.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid UIN or a failed database operation.
+    pub fn open_account(uin: &str) -> Result<Self> {
+        Self::open_account_in(std::path::Path::new("."), uin)
+    }
+
+    /// Open account history below an explicit application root without changing the process directory.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid UIN or a failed migration. Legacy history is never
+    /// imported without an existing matching ownership record.
+    pub fn open_account_in(root: &std::path::Path, uin: &str) -> Result<Self> {
+        crate::account_manager::validate_uin(uin)?;
+        std::fs::create_dir_all(root.join("accounts"))?;
+        let path = root.join(db_path_for_account(uin));
+        let mut store = Self::open(
+            path.to_str()
+                .ok_or_else(|| anyhow::anyhow!("Đường dẫn dữ liệu không hợp lệ"))?,
+        )
+        .context("Không thể mở kho dữ liệu tài khoản")?;
+        let imported: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM account_store_metadata WHERE key = 'legacy_imported')",
+                [],
+                |row| row.get(0),
+            )
+            .context("Không thể đọc trạng thái nhập lịch sử")?;
+        if imported {
+            return Ok(store);
+        }
+        let legacy_path = root.join("zalo_history.db");
+        if !legacy_path.is_file() {
+            return Ok(store);
+        }
+        // The current login does not prove who wrote a database left behind by logout.
+        // Unowned history stays untouched for explicit import through Settings.
+        // The Sync settings and docs/KHAC_PHUC_SU_CO.md explain this upgrade step.
+        let probe =
+            Connection::open_with_flags(&legacy_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let has_metadata: bool = probe.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'account_store_metadata')",
+            [], |row| row.get(0),
+        )?;
+        if !has_metadata {
+            return Ok(store);
+        }
+        let owner: Option<String> = probe
+            .query_row(
+                "SELECT value FROM account_store_metadata WHERE key = 'legacy_owner'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if owner.as_deref() != Some(uin) {
+            return Ok(store);
+        }
+        drop(probe);
+        let legacy = Self::open(
+            legacy_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Đường dẫn dữ liệu không hợp lệ"))?,
+        )
+        .context("Không thể mở kho dữ liệu cũ")?;
+        let has_scheduled_messages: bool = legacy.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_messages')", [], |row| row.get(0))?;
+        if has_scheduled_messages {
+            crate::scheduler::init_scheduler_schema(&store.conn)?;
+        }
+        store
+            .conn
+            .execute(
+                "ATTACH DATABASE ?1 AS legacy_history",
+                [legacy_path.to_string_lossy().as_ref()],
+            )
+            .context("Không thể gắn kho dữ liệu cũ")?;
+        let tx = store
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("Không thể khóa giao dịch nhập lịch sử cũ")?;
+        let imported: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_store_metadata WHERE key = 'legacy_imported')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !imported {
+            // Read through SQLite so committed WAL rows are included. Canonical rows
+            // win on ID collisions; migration must not overwrite newer account data.
+            tx.execute_batch("INSERT OR IGNORE INTO messages(msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json)
+                SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json FROM legacy_history.messages;
+                INSERT OR IGNORE INTO threads(thread_id, name, is_group, last_ts, last_read_msg_id)
+                SELECT thread_id, name, is_group, last_ts, last_read_msg_id FROM legacy_history.threads;
+                INSERT INTO account_store_metadata(key, value) VALUES ('legacy_imported', '1');")?;
+            if has_scheduled_messages {
+                // Scheduler IDs are local autoincrement values, so both databases can
+                // contain unrelated ID 1. Allocate fresh IDs instead of dropping either row.
+                tx.execute_batch("INSERT INTO scheduled_messages(thread_id, thread_name, is_group, text, deliver_at, created_at, status, error_msg)
+                    SELECT thread_id, thread_name, is_group, text, deliver_at, created_at, status, error_msg FROM legacy_history.scheduled_messages;")?;
+            }
+        }
+        tx.commit()
+            .context("Không thể hoàn tất giao dịch nhập lịch sử cũ")?;
+        store
+            .conn
+            .execute_batch("DETACH DATABASE legacy_history")
+            .context("Không thể đóng kho dữ liệu cũ")?;
+        Ok(store)
+    }
+
     /// Messages per thread loaded at startup / on refresh. The list only needs the newest one
     /// for ordering and preview; opening a thread reads deeper (`LoadGroupHistory`).
     pub const PRELOAD_MSGS: usize = 20;
 
     /// Open SQLite database at `path` and initialize table schemas and indices if absent.
     pub fn open(path: &str) -> Result<Self> {
-        let conn = if path == ":memory:" {
+        let mut conn = if path == ":memory:" {
             Connection::open_in_memory()?
         } else {
             Connection::open(path)?
         };
 
-        conn.execute_batch(
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match conn.pragma_update(None, "journal_mode", "WAL") {
+                Ok(()) => break,
+                // Concurrent first opens can race while switching a new file to WAL;
+                // SQLite does not always invoke the busy handler for that transition.
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > 2 {
+            anyhow::bail!("Dữ liệu được tạo bởi phiên bản mới hơn; vui lòng nâng cấp ứng dụng");
+        }
+        if version == 2 {
+            return Ok(Self { conn });
+        }
+        // Only migrations need the writer lock; recheck after a concurrent first open.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > 2 {
+            anyhow::bail!("Dữ liệu được tạo bởi phiên bản mới hơn; vui lòng nâng cấp ứng dụng");
+        }
+        if version == 2 {
+            tx.commit()?;
+            return Ok(Self { conn });
+        }
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
                 msg_id TEXT PRIMARY KEY,
                 thread_id TEXT NOT NULL,
@@ -82,28 +225,31 @@ impl MessageStore {
         )?;
 
         // Ensure `last_read_msg_id` column exists for databases created before this migration (#119).
-        let cols = conn
+        let cols = tx
             .prepare("PRAGMA table_info(threads)")?
             .query_map([], |r| r.get::<_, String>(1))?
             .filter_map(std::result::Result::ok)
             .collect::<Vec<_>>();
         if !cols.iter().any(|c| c == "last_read_msg_id") {
-            let _ = conn.execute(
+            tx.execute(
                 "ALTER TABLE threads ADD COLUMN last_read_msg_id TEXT NOT NULL DEFAULT ''",
                 [],
-            );
+            )?;
         }
 
         // Migration 1: one-time cleanup of placeholder rows. This DELETE used to run (a full
         // table scan) on every hydrate; new rows are filtered in `persist_threads` instead.
-        if conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? < 1 {
-            conn.execute_batch(
-                "BEGIN;
-                 DELETE FROM messages WHERE text = 'sendBubbleMessage';
-                 PRAGMA user_version = 1;
-                 COMMIT;",
+        if version < 1 {
+            tx.execute_batch(
+                "DELETE FROM messages WHERE text = 'sendBubbleMessage';
+                 PRAGMA user_version = 1;",
             )?;
         }
+        if version < 2 {
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS account_store_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                PRAGMA user_version = 2;")?;
+        }
+        tx.commit()?;
 
         Ok(Self { conn })
     }
@@ -126,10 +272,19 @@ impl MessageStore {
             ],
         )?;
         if rows == 0 && !msg.raw_json.is_empty() {
-            let _ = self.conn.execute(
-                "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3",
-                params![msg.raw_json, msg.msg_type, msg.msg_id, msg.text],
+            let previous: Option<String> = self.conn.query_row(
+                "SELECT raw_json FROM messages WHERE msg_id = ?1",
+                [&msg.msg_id],
+                |row| row.get(0),
+            )?;
+            let raw_json = preserve_reaction_replay_metadata(
+                previous.as_deref().unwrap_or_default(),
+                &msg.raw_json,
             );
+            self.conn.execute(
+                "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3",
+                params![raw_json, msg.msg_type, msg.msg_id, msg.text],
+            )?;
         }
         Ok(rows > 0)
     }
@@ -447,6 +602,7 @@ impl MessageStore {
                 let mut reply_to_text = None;
                 let mut reactions = Vec::new();
                 let mut reaction_summaries = Vec::new();
+                let mut reaction_versions = std::collections::BTreeMap::new();
                 let mut is_pinned = false;
                 let mut is_starred = false;
                 let mut link_url = None;
@@ -490,6 +646,10 @@ impl MessageStore {
                             {
                                 reaction_summaries = parsed_sums;
                             }
+                        }
+                        if let Some(versions) = val.get("reaction_versions") {
+                            reaction_versions =
+                                serde_json::from_value(versions.clone()).unwrap_or_default();
                         }
                         if reaction_summaries.is_empty() && !reactions.is_empty() {
                             reaction_summaries = reactions
@@ -550,6 +710,7 @@ impl MessageStore {
                     reply_to_text,
                     reactions,
                     reaction_summaries,
+                    reaction_versions,
                     is_pinned,
                     is_starred,
                     link_url,
@@ -601,6 +762,15 @@ impl MessageStore {
                         );
                         existing.reaction_summaries = cm.reaction_summaries;
                     }
+                    for (sender, version) in cm.reaction_versions {
+                        let current = existing
+                            .reaction_versions
+                            .entry(sender)
+                            .or_insert_with(|| version.clone());
+                        for event in version.events.iter().chain(&version.covered_events) {
+                            current.cover(event);
+                        }
+                    }
                     existing.is_pinned = existing.is_pinned || cm.is_pinned;
                     existing.is_starred = existing.is_starred || cm.is_starred;
                 } else {
@@ -623,6 +793,38 @@ impl MessageStore {
         crate::chat::deduplicate_threads(threads, None);
         Ok(loaded_count)
     }
+}
+
+// Counts may be refreshed from history without event IDs. Retain replay identities across
+// metadata upserts; an older or incomplete writer cannot erase the local deduplication ledger.
+fn preserve_reaction_replay_metadata(previous: &str, incoming: &str) -> String {
+    type Versions = std::collections::BTreeMap<String, crate::reactions::ReactionVersion>;
+    let old: Versions = serde_json::from_str::<serde_json::Value>(previous)
+        .ok()
+        .and_then(|value| value.get("reaction_versions").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    if old.is_empty() {
+        return incoming.to_string();
+    }
+    let Ok(serde_json::Value::Object(mut metadata)) = serde_json::from_str(incoming) else {
+        return incoming.to_string();
+    };
+    let mut versions: Versions = metadata
+        .get("reaction_versions")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    for (sender, old_version) in old {
+        let current = versions
+            .entry(sender)
+            .or_insert_with(|| old_version.clone());
+        for event in old_version.events.iter().chain(&old_version.covered_events) {
+            current.cover(event);
+        }
+    }
+    metadata.insert("reaction_versions".into(), serde_json::json!(versions));
+    serde_json::Value::Object(metadata).to_string()
 }
 
 impl From<&ChatMessage> for StoredMessage {
@@ -654,6 +856,12 @@ impl From<&ChatMessage> for StoredMessage {
             meta.insert(
                 "reaction_summaries".into(),
                 serde_json::json!(m.reaction_summaries),
+            );
+        }
+        if !m.reaction_versions.is_empty() {
+            meta.insert(
+                "reaction_versions".into(),
+                serde_json::json!(m.reaction_versions),
             );
         }
         if m.is_pinned {
@@ -805,6 +1013,21 @@ pub fn import_history_from_path(src: &std::path::Path, dst_db_path: &str) -> Res
         );
     }
 
+    // Classify every selected source before committing any plaintext export.
+    for file_path in &files_to_import {
+        let bytes = std::fs::read(file_path)?;
+        if !bytes.starts_with(b"SQLite format 3")
+            && std::str::from_utf8(&bytes).is_err()
+            && bytes.len() >= 4096
+        {
+            anyhow::bail!("Chưa hỗ trợ nhập cơ sở dữ liệu Zalo PC được mã hóa khi chưa xác minh được khóa của tài khoản");
+        }
+    }
+    // Reject unsupported encrypted directory layouts before plaintext writes, too.
+    if src.is_dir() {
+        scan_and_import_zalo_data_dir(src, &mut dst, &mut report)?;
+    }
+
     for file_path in files_to_import {
         if let Ok(canon_src) = std::fs::canonicalize(&file_path) {
             if let Ok(canon_dst) = std::fs::canonicalize(dst_db_path) {
@@ -902,31 +1125,8 @@ pub fn import_history_from_path(src: &std::path::Path, dst_db_path: &str) -> Res
                 }
             }
         } else if bytes.len() >= 4096 {
-            if let Some(decrypted_bytes) = try_decrypt_zalo_pc_database(&bytes) {
-                let tmp_dir = std::env::temp_dir();
-                let tmp_name = format!(
-                    "ctdozlite_import_{}_{}.db",
-                    std::process::id(),
-                    report.sources_read.len()
-                );
-                let tmp_path = tmp_dir.join(tmp_name);
-                if std::fs::write(&tmp_path, &decrypted_bytes).is_ok() {
-                    if let Ok(src_conn) = Connection::open(&tmp_path) {
-                        let _ = import_official_zalo_pc_db(
-                            &src_conn,
-                            &mut dst,
-                            &file_path,
-                            &mut report,
-                        );
-                    }
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
-            }
+            anyhow::bail!("Chưa hỗ trợ nhập cơ sở dữ liệu Zalo PC được mã hóa khi chưa xác minh được khóa của tài khoản");
         }
-    }
-
-    if src.is_dir() {
-        let _ = scan_and_import_zalo_data_dir(src, &mut dst, &mut report);
     }
 
     Ok(report)
@@ -938,12 +1138,6 @@ fn scan_and_import_zalo_data_dir(
     dst: &mut MessageStore,
     report: &mut ImportReport,
 ) -> Result<()> {
-    // 1. Recover the 32-char XOR key from Local Storage LevelDB if present
-    let mut cipher_key = recover_zalo_localstorage_key(root);
-    if cipher_key.is_empty() {
-        cipher_key = "de039414865b856ea650d3305b1f387f".to_string();
-    }
-
     // 2. Discover user folders under Database/_production
     let mut message_dirs = Vec::new();
     let mut index_files = Vec::new();
@@ -968,6 +1162,11 @@ fn scan_and_import_zalo_data_dir(
             }
         }
     }
+
+    if message_dirs.is_empty() && index_files.is_empty() {
+        return Ok(());
+    }
+    let cipher_key = recover_zalo_localstorage_key(root)?;
 
     // 3. Build contact/group name dictionary from Index.db
     let mut id_to_name: std::collections::HashMap<String, (String, bool)> =
@@ -1201,91 +1400,24 @@ fn import_message_table(
     Ok(())
 }
 
-/// Recover the 32-character XOR key from LevelDB in `Partitions/zalo/Local Storage/leveldb`.
-pub fn recover_zalo_localstorage_key(base_dir: &std::path::Path) -> String {
-    let cand_dirs = vec![base_dir
-        .join("Partitions")
-        .join("zalo")
-        .join("Local Storage")
-        .join("leveldb")];
-
-    let mut key = vec![None; 32];
-    let u_pat = "z_ecrp_"
-        .encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect::<Vec<u8>>();
-
-    for ldb_dir in cand_dirs {
-        let Ok(entries) = std::fs::read_dir(ldb_dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
-            if ext != "ldb" && ext != "log" {
-                continue;
-            }
-            let Ok(b) = std::fs::read(&p) else {
-                continue;
-            };
-            let mut pos = 0;
-            while let Some(rel) = b[pos..]
-                .windows(u_pat.len())
-                .position(|w| w == u_pat.as_slice())
-            {
-                let idx = pos + rel + u_pat.len();
-                pos = idx;
-                let mut chars = Vec::new();
-                for i in (0..64).step_by(2) {
-                    if idx + i + 1 < b.len() {
-                        chars.push((b[idx + i] as u16 | ((b[idx + i + 1] as u16) << 8)) as u32);
-                    }
-                }
-                if chars.len() >= 32 {
-                    let prefix = b"{\"version\":";
-                    let cand: Vec<u32> = chars
-                        .iter()
-                        .take(prefix.len())
-                        .zip(prefix.iter())
-                        .map(|(c, p)| c ^ (*p as u32))
-                        .collect();
-                    if cand.iter().all(|x| (*x as u8 as char).is_ascii_hexdigit()) {
-                        for (i, v) in cand.iter().enumerate() {
-                            key[i] = Some(*v as u8 as char);
-                        }
-                        let suffix = b",\"list_recent\":[{\"";
-                        if chars.len() >= 14 + suffix.len() {
-                            let cand2: Vec<u32> = chars[14..14 + suffix.len()]
-                                .iter()
-                                .zip(suffix.iter())
-                                .map(|(c, p)| c ^ (*p as u32))
-                                .collect();
-                            if cand2.iter().all(|x| (*x as u8 as char).is_ascii_hexdigit()) {
-                                for (i, v) in cand2.iter().enumerate() {
-                                    key[14 + i] = Some(*v as u8 as char);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut full_key = String::new();
-    for k in key {
-        match k {
-            Some(c) => full_key.push(c),
-            None => return "de039414865b856ea650d3305b1f387f".to_string(),
-        }
-    }
-    full_key
+/// Recover an account's XOR key only when all key material can be verified.
+///
+/// # Errors
+/// Returns an unsupported error: the observed prefix and suffix leave three key
+/// positions unknown, so the existing evidence cannot establish a complete key.
+pub fn recover_zalo_localstorage_key(_base_dir: &std::path::Path) -> Result<String> {
+    anyhow::bail!(
+        "Chưa hỗ trợ khôi phục đầy đủ khóa dữ liệu Zalo PC; không thể nhập dữ liệu mã hóa an toàn"
+    )
 }
 
-/// Decrypt single official Zalo PC database bytes using PBKDF2-HMAC-SHA512 + AES-256-CBC (SQLCipher v4 profile).
-pub fn try_decrypt_zalo_pc_database(bytes: &[u8]) -> Option<Vec<u8>> {
-    let key = "de039414865b856ea650d3305b1f387f";
-    decrypt_sqlcipher_bytes(bytes, key.as_bytes())
+/// Decrypt an official database with an explicitly supplied account passphrase.
+/// Returns `None` if the data cannot be decrypted using the supplied key.
+pub fn try_decrypt_zalo_pc_database(bytes: &[u8], passphrase: &[u8]) -> Option<Vec<u8>> {
+    if passphrase.is_empty() {
+        return None;
+    }
+    decrypt_sqlcipher_bytes(bytes, passphrase)
 }
 
 /// Decrypt SQLCipher v4 database pages with 80-byte reserve, 4096 page size, SHA-512 256k iterations.
@@ -1628,31 +1760,289 @@ fn extract_zalo_message_text_and_meta(
     (xored.to_string(), meta)
 }
 
-fn import_official_zalo_pc_db(
-    src_conn: &Connection,
-    dst: &mut MessageStore,
-    file_path: &std::path::Path,
-    report: &mut ImportReport,
-) -> Result<()> {
-    let stem = file_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("import_pc");
-    let cipher_key = "de039414865b856ea650d3305b1f387f";
-    import_message_table(
-        src_conn,
-        dst,
-        stem,
-        stem,
-        stem.starts_with('g'),
-        cipher_key,
-        report,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_recovery_does_not_invent_a_key_when_local_storage_is_absent() {
+        let absent = std::env::temp_dir().join(format!("ctdozlite-no-key-{}", std::process::id()));
+        assert!(recover_zalo_localstorage_key(&absent).is_err());
+    }
+
+    #[test]
+    fn unsupported_encrypted_directory_is_rejected_before_plaintext_rows_are_written() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-mixed-import-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("Database/_production/user-1/Core/Message")).unwrap();
+        std::fs::write(
+            source.join("export.json"),
+            serde_json::to_vec(&vec![Thread {
+                id: "thread-1".into(),
+                messages: vec![ChatMessage {
+                    id: "message-1".into(),
+                    text: "Test".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let destination = root.join("destination.db");
+        let result = import_history_from_path(&source, destination.to_str().unwrap());
+        let store = MessageStore::open(destination.to_str().unwrap()).unwrap();
+        let count = store.messages_for("thread-1", 10).unwrap().len();
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            count, 0,
+            "an unsupported source must not leave a partially committed import"
+        );
+    }
+
+    #[test]
+    fn unowned_legacy_history_is_not_claimed_by_a_new_account() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-unowned-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy = MessageStore::open(root.join("zalo_history.db").to_str().unwrap()).unwrap();
+        legacy.conn.execute("INSERT INTO messages(msg_id,thread_id,text) VALUES ('message-a','thread-a','Private')", []).unwrap();
+        drop(legacy);
+        let account = MessageStore::open_account_in(&root, "new-account-b").unwrap();
+        let count: usize = account
+            .conn
+            .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        drop(account);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn loose_encrypted_file_is_rejected_before_other_exports_are_committed() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-loose-import-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("export.json"),
+            serde_json::to_vec(&vec![Thread {
+                id: "thread-1".into(),
+                messages: vec![ChatMessage {
+                    id: "message-1".into(),
+                    text: "Test".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(source.join("encrypted.db"), vec![0xff; 4096]).unwrap();
+        let destination = root.join("destination.db");
+        let result = import_history_from_path(&source, destination.to_str().unwrap());
+        let store = MessageStore::open(destination.to_str().unwrap()).unwrap();
+        let count = store.messages_for("thread-1", 10).unwrap().len();
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(result.is_err());
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn concurrent_first_account_opens_import_legacy_history_once() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-concurrent-import-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy = MessageStore::open(root.join("zalo_history.db").to_str().unwrap()).unwrap();
+        legacy
+            .conn
+            .execute(
+                "INSERT INTO account_store_metadata(key,value) VALUES ('legacy_owner','account-1')",
+                [],
+            )
+            .unwrap();
+        legacy.conn.execute_batch("WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n<2000)
+            INSERT INTO messages(msg_id,thread_id,sender_id,sender_name,text,msg_type,ts,is_outgoing,raw_json)
+            SELECT 'message-'||n,'thread-1','user-1','Test','Test','chat.text',n,0,'' FROM ids;").unwrap();
+        drop(legacy);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    MessageStore::open_account_in(&root, "account-1").map(|store| {
+                        store
+                            .conn
+                            .query_row("SELECT count(*) FROM messages", [], |row| {
+                                row.get::<_, usize>(0)
+                            })
+                            .unwrap()
+                    })
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        std::fs::remove_dir_all(root).unwrap();
+        for result in results {
+            assert_eq!(result.unwrap(), 2000);
+        }
+    }
+
+    #[test]
+    fn current_schema_open_does_not_wait_for_an_active_writer() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-read-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("history.db");
+        let path = path.to_str().unwrap();
+        let writer = MessageStore::open(path).unwrap();
+        writer.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let reader = MessageStore::open(path);
+        writer.conn.execute_batch("ROLLBACK").unwrap();
+        let opened = reader.is_ok();
+        drop(reader);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            opened,
+            "opening a current WAL schema must not require the writer lock"
+        );
+    }
+
+    #[test]
+    fn account_open_merges_legacy_wal_once_for_its_owner() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-owner-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("accounts")).unwrap();
+        let mut legacy =
+            MessageStore::open(root.join("zalo_history.db").to_str().unwrap()).unwrap();
+        legacy
+            .conn
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        legacy
+            .conn
+            .execute(
+                "INSERT INTO account_store_metadata(key,value) VALUES ('legacy_owner','user-a')",
+                [],
+            )
+            .unwrap();
+        let message = |id: &str| StoredMessage {
+            msg_id: id.into(),
+            thread_id: "thread-1".into(),
+            sender_id: "user-1".into(),
+            sender_name: "Example".into(),
+            text: id.into(),
+            msg_type: "chat.text".into(),
+            ts: 1,
+            is_outgoing: false,
+            raw_json: String::new(),
+        };
+        legacy.upsert_message(&message("msg-legacy")).unwrap();
+        legacy
+            .upsert_thread(&StoredThread {
+                thread_id: "thread-1".into(),
+                name: "Example".into(),
+                is_group: false,
+                last_ts: 1,
+                last_read_msg_id: "msg-legacy".into(),
+            })
+            .unwrap();
+        crate::scheduler::init_scheduler_schema(&legacy.conn).unwrap();
+        legacy.conn.execute("INSERT INTO scheduled_messages(thread_id, text, deliver_at, created_at) VALUES ('thread-1', 'legacy schedule', 2, 1)", []).unwrap();
+        {
+            let mut existing =
+                MessageStore::open(root.join("accounts/user-a_history.db").to_str().unwrap())
+                    .unwrap();
+            existing.upsert_message(&message("msg-canonical")).unwrap();
+            crate::scheduler::init_scheduler_schema(&existing.conn).unwrap();
+            existing.conn.execute("INSERT INTO scheduled_messages(thread_id, text, deliver_at, created_at) VALUES ('thread-1', 'canonical schedule', 2, 1)", []).unwrap();
+        }
+        {
+            let account = MessageStore::open_account_in(&root, "user-a").unwrap();
+            assert_eq!(account.messages_for("thread-1", 20).unwrap().len(), 2);
+            assert_eq!(
+                account.all_threads().unwrap()[0].last_read_msg_id,
+                "msg-legacy"
+            );
+            let count: i64 = account
+                .conn
+                .query_row("SELECT COUNT(*) FROM scheduled_messages", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 2);
+        }
+        {
+            let account = MessageStore::open_account_in(&root, "user-a").unwrap();
+            assert_eq!(account.messages_for("thread-1", 20).unwrap().len(), 2); // (INV-4)
+            let count: i64 = account
+                .conn
+                .query_row("SELECT COUNT(*) FROM scheduled_messages", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 2);
+        }
+        let other = MessageStore::open_account_in(&root, "user-b").unwrap();
+        assert!(other.messages_for("thread-1", 20).unwrap().is_empty());
+        drop(other);
+        drop(legacy);
+        std::fs::write(
+            root.join("zalo_history.db"),
+            b"unusable retired legacy file",
+        )
+        .unwrap();
+        let migrated = MessageStore::open_account_in(&root, "user-a").unwrap();
+        assert_eq!(migrated.messages_for("thread-1", 20).unwrap().len(), 2);
+        drop(migrated);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn local_time_when_hydrating_seconds_and_milliseconds() {
@@ -1972,13 +2362,13 @@ mod tests {
 
     #[test]
     fn jxl_to_jpg_url_and_decode_zalo_cipher_payload_work() {
-        let jxl = "https://photo-stal-17.zdn.vn/no/jxl/ba5262149ded4eb317fc/2aOboR74hO3nF0sTxZSJAzpYZhLbEB780ODEOKsS.jxl?jxlstatus=1";
+        let jxl = "https://example.invalid/no/jxl/fixture.jxl?jxlstatus=1";
         assert_eq!(
             jxl_to_jpg_url(jxl),
-            "https://photo-stal-17.zdn.vn/no/jpg/ba5262149ded4eb317fc/2aOboR74hO3nF0sTxZSJAzpYZhLbEB780ODEOKsS.jpg"
+            "https://example.invalid/no/jpg/fixture.jpg"
         );
-        let key = "de039414865b856ea650d3305b1f387f";
-        let plain = "\"Này bố kiểm tra mail xem ạ\"";
+        let key = "0123456789abcdef0123456789abcdef";
+        let plain = "\"Synthetic fixture\"";
         let key_chars: Vec<char> = key.chars().collect();
         let enc: String = plain
             .chars()
@@ -1987,9 +2377,6 @@ mod tests {
                 char::from_u32((c as u32) ^ (key_chars[i % key_chars.len()] as u32)).unwrap()
             })
             .collect();
-        assert_eq!(
-            decode_zalo_cipher_payload(&enc, key),
-            "Này bố kiểm tra mail xem ạ"
-        );
+        assert_eq!(decode_zalo_cipher_payload(&enc, key), "Synthetic fixture");
     }
 }
