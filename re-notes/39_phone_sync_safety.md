@@ -10,8 +10,10 @@ Luồng nhập hiện có gọi `/api/znoise` để ánh xạ `fids` của tên 
 
 Đường dẫn trước đây gọi Node.js và WASM ở ngoài gói ứng dụng để sinh khóa, giải mã metadata và giải mã tin nhắn. Khóa công khai dự phòng chỉ là dữ liệu ngẫu nhiên mang tiền tố đường cong, không có khóa riêng tương ứng được quản lý bởi mã Rust.
 
-Cho đến khi có triển khai mật mã native cùng mẫu kiểm chứng, yêu cầu Sync v2 và nhập các gói Sync v2 trả lỗi rõ ràng trước khi tạo khóa, đánh thức điện thoại, tải gói hoặc ghi dữ liệu. Luồng Android RSA và các luồng Cloud/Nhóm vẫn độc lập. Các script nghiên cứu có thể còn trong kho mã, nhưng chương trình Rust không thực thi chúng.
+Ở bản v0.0.9, yêu cầu Sync v2 và nhập các gói Sync v2 trả lỗi rõ ràng trước khi tạo khóa, đánh thức điện thoại, tải gói hoặc ghi dữ liệu vì chưa có triển khai mật mã native cùng mẫu kiểm chứng. Luồng Android RSA và các luồng Cloud/Nhóm vẫn độc lập.
+
+Giới hạn v0.0.9 này đã được thay thế bởi triển khai Wasmtime native trên `main`; xem [ADR 0006](../docs/adr/0006-native-video-on-v010.md). Chương trình Rust không thực thi các script Node.js nghiên cứu. Luồng hiện tại kiểm tra khóa, phiên metadata và khả năng nạp WASM trước khi tải gói tương ứng. Thiếu điều kiện cục bộ thì dừng trước yêu cầu HTTP; kiểm chứng đồng bộ điện thoại trực tiếp vẫn cần mẫu thực tế.
 
 ## Kiểm chứng
 
-Các kiểm thử dùng định danh giả để kiểm tra ánh xạ của hai tài khoản, trường hợp không xác định hoặc mâu thuẫn, cách ly bộ nhớ đệm theo tài khoản và từ chối Sync v2. Không kiểm thử với phiên thật, không gọi máy chủ Zalo. Chưa xác nhận giao thức bằng một lần đồng bộ điện thoại trực tiếp; tài liệu này ghi lại giới hạn và điều kiện dừng an toàn, không khẳng định đã xác minh giải mã native.
+Các kiểm thử dùng định danh giả để kiểm tra ánh xạ của hai tài khoản, trường hợp không xác định hoặc mâu thuẫn, cách ly bộ nhớ đệm theo tài khoản, từ chối Sync v2 khi chưa đăng nhập và kiểm tra điều kiện giải mã cục bộ trước khi tải gói. Không kiểm thử với phiên thật, không gọi máy chủ Zalo. Chưa xác nhận giao thức bằng một lần đồng bộ điện thoại trực tiếp; tài liệu này ghi lại giới hạn và điều kiện dừng an toàn, không khẳng định đã xác minh giải mã native.

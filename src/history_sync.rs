@@ -837,6 +837,9 @@ pub struct SyncV2Meta {
 }
 
 pub async fn import_sync_v2_meta(s: &Session, url: &str) -> Result<SyncV2Meta> {
+    // Validate local decryption prerequisites before downloading a peer package.
+    let keys = current_v2_keys()?;
+    let host = crate::zproto_host::ZprotoHost::load()?;
     let uin = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
     let sek = s.zpw_sek.clone().unwrap_or_default();
     let cookie_hdr = format!("zpw_sek={sek}; zpw_uin={uin}");
@@ -856,8 +859,6 @@ pub async fn import_sync_v2_meta(s: &Session, url: &str) -> Result<SyncV2Meta> {
     let bytes = resp.bytes().await?;
     // wasmtime host (không cần Node.js). Keys phải tồn tại trong bộ nhớ tiến
     // trình (generate_sync_v2_keys đã chạy trước khi request sync).
-    let keys = current_v2_keys()?;
-    let host = crate::zproto_host::ZprotoHost::load()?;
     let mut session_record: Option<Vec<u8>> = None;
     let mut last: Option<crate::zproto_host::DecryptedMeta> = None;
     for chunk in crate::zproto_host::split_frames(&bytes)? {
@@ -1104,6 +1105,9 @@ pub fn parse_sync_chunk(buf: &[u8]) -> Option<Vec<ParsedProtoPartition>> {
 }
 
 pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
+    // A message package cannot be imported before its metadata session exists.
+    let session_record = current_v2_session()?;
+    let host = crate::zproto_host::ZprotoHost::load()?;
     let uin = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
     let sek = s.zpw_sek.clone().unwrap_or_default();
     let cookie_hdr = format!("zpw_sek={sek}; zpw_uin={uin}");
@@ -1123,8 +1127,6 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
     let bytes = resp.bytes().await?;
     // wasmtime host (không cần Node.js). Multi-chunk: decrypt + unpack từng
     // chunk, nối protobuf bytes lại (đúng luồng HistoryCodec mẫu).
-    let host = crate::zproto_host::ZprotoHost::load()?;
-    let session_record = current_v2_session()?;
     let mut parts: Vec<u8> = Vec::new();
     for chunk in crate::zproto_host::split_frames(&bytes)? {
         let res = host.decrypt_message(&chunk, &session_record)?;
@@ -1257,6 +1259,19 @@ mod tests {
             .await
             .expect_err("logged-out Sync v2 must not generate keys or queue a wakeup");
         assert!(error.to_string().contains("chưa đăng nhập"));
+    }
+
+    #[tokio::test]
+    async fn sync_v2_import_checks_local_prerequisites_before_building_http_requests() {
+        let session = Session::new(false, false, false).unwrap();
+        let meta = import_sync_v2_meta(&session, "invalid-url")
+            .await
+            .unwrap_err();
+        assert!(meta.to_string().contains("khóa Sync V2"), "{meta}");
+        let messages = import_sync_v2_messages(&session, "invalid-url")
+            .await
+            .unwrap_err();
+        assert!(messages.to_string().contains("metadata"), "{messages}");
     }
 
     #[test]

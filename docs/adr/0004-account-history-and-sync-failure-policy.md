@@ -21,7 +21,11 @@ development account's numeric ID.
 
 Use accounts/<uin>_history.db as the canonical store for each validated account.
 Read legacy history through SQLite, including committed WAL rows, and merge it
-once into the first owning account. Canonical rows win on message-ID collisions;
+once only when an existing `legacy_owner` record matches that account. A new
+login cannot establish ownership of an unmarked legacy file. Leave such files
+untouched for an explicit user-selected import in Settings; never auto-claim
+them from a current session that may belong to a different person.
+Canonical rows win on message-ID collisions;
 scheduler rows retain their content with newly allocated local IDs. Versioned
 metadata records ownership and migration completion. Wipe operations delete
 history rows and owned caches while preserving the completion marker.

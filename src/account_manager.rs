@@ -193,9 +193,11 @@ mod tests {
     use super::*;
 
     fn root() -> PathBuf {
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "ctdozlite-account-test-{}-{}",
+            "ctdozlite-account-test-{}-{}-{}",
             std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -267,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn switch_claims_legacy_for_current_account_without_overwriting_canonical_history() {
+    fn switch_imports_owned_legacy_without_overwriting_canonical_history() {
         let root = root();
         session_file(&root.join("session.json"), "user-a");
         session_file(&root.join("accounts/user-b.json"), "user-b");
@@ -279,6 +281,9 @@ mod tests {
             let store =
                 crate::store::MessageStore::open(root.join(path).to_str().unwrap()).unwrap();
             store.conn.execute("INSERT INTO messages(msg_id, thread_id, ts, is_outgoing) VALUES (?1, 'thread-1', 1, 0)", [msg_id]).unwrap();
+            if path == "zalo_history.db" {
+                store.conn.execute("INSERT INTO account_store_metadata(key,value) VALUES ('legacy_owner','user-a')", []).unwrap();
+            }
         }
         switch_to_account_in(&root, "user-a", "user-b").unwrap();
         let active: crate::session::SavedSession =
