@@ -70,7 +70,7 @@ the current rebased branch; see the follow-up section below and ADR-0006.
 ## Follow-up review on upstream v0.1.0 (2026-11-10)
 
 The current manifest requires Rust **1.97**, matching the locked Wasmtime
-50.0.1 manifest's `rust-version`. Current verification uses **Rust 1.99**:
+50.0.1 manifest's `rust-version`. Initial follow-up verification used **Rust 1.99**:
 `cargo +stable test --locked` reports **373 passed, zero failed, one ignored**.
 The earlier Rust 1.89 results above remain historical results for v0.0.9 only.
 
@@ -109,3 +109,116 @@ The earlier Rust 1.89 results above remain historical results for v0.0.9 only.
 
 The earlier release-binary results above remain historical. Physical devices,
 peer calls and cross-platform release verification remain pending.
+
+## Lifecycle and per-member call fallback review (2026-11-10)
+
+Local-history wipes invalidate an independent work generation, cancel and drain
+account tasks, and wait for tracked blocking persistence/import/cache writes.
+Queued pre-wipe events and persistence commands cannot repopulate the cleared
+view. Calls retain their account generation and survive a history wipe. Failed
+switches restore the previous session and send a terminal event that rebinds the
+visible command scope; failed wipes also rebind that scope. Regressions exercise
+the queued-event boundary, blocking-write barrier, credential rollback and call
+frame lifetime without devices or network requests.
+
+Source evidence in `src/call.rs`: when native group creation (`12433`) fails,
+the existing per-member fallback dials each peer with `401` / `416`, retains
+`is_group` for the conversation, and sets `group_host_call` to an empty string.
+That state must use the existing direct-leg protocol rather than native-group
+builders. A common predicate now requires an actual group host for native-group
+cancellation/hangup, media state, relay setup, group SRTP selection and group
+control handling. Adding members through the native-group endpoint is rejected
+clearly for a per-member fallback call.
+
+The audio/video cancellation regression failed before the fix: it produced
+`12437` with an empty `hostCall` rather than `405` with the primary peer ID and
+direct `callType` (audio `1`, video `3`). The same predicate selects the existing
+EndCall paths (`405` while ringing, `409` / `406` once connected). Native groups
+retain `12437` / `12438` and their original fields. Cancellation request formats,
+signing, encryption algorithms and endpoints are unchanged. This is source-level and
+synthetic regression evidence; live peer fallback interoperability is pending.
+
+### H.264-only capability advertisement
+
+The native decoder uses OpenH264 and cannot decode HEVC. Unlike the previous
+FFmpeg-availability-dependent value, `extendData.supportHevcDecode` is now
+always `0` in caller invites (`401` / `416`) and callee answers (`402`). This is
+an intentional outbound capability-value change: advertising HEVC would allow
+a peer to choose a codec that the application cannot decode. Both builders
+continue to advertise the existing H.264 video codec with payload `97`.
+Caller and callee regression assertions cover the capability field; the caller
+assertion also checks the H.264 codec entry. This checks the local advertisement,
+not actual peer negotiation.
+
+Manual verification remains pending: on a test account with FFmpeg absent,
+place and accept video calls with an actual Zalo peer, record the sanitized
+invite/answer capability and negotiated codec, and confirm received H.264
+SPS/PPS/IDR decoding on direct, relay and group paths. Do not record session
+keys, cookies or personal identifiers. No peer capture or completed manual
+negotiation check is available in this environment, so this remains a release
+verification gate rather than a claimed interoperability result.
+
+### Per-stream recovery and current-schema opens
+
+Primary video PLI targets and receiver-report identities now use the remembered
+primary video SSRC, falling back to the last peer SSRC only before discovery.
+Interleaved extra streams do not update the primary sequence-loss tracker;
+their existing per-SSRC ingress and decoder queues request their own recovery.
+Synthetic regressions cover a last-packet sender different from the primary,
+deduplicated extra-stream recovery, initial SSRC fallback, and an interleaved
+sequence that must not create a false primary loss. RTCP packet layouts and the
+500 ms PLI interval are unchanged.
+
+Current SQLite schema version 2 opens now read `user_version` without taking
+the writer lock. Older schemas still migrate under `BEGIN IMMEDIATE` with a
+second version check, preserving concurrent-first-open safety. The isolated
+WAL regression failed before the fix while another connection held a write
+transaction; migration/import concurrency coverage is retained.
+
+Device discovery releases its enumeration lock before publishing completion.
+The deterministic regression reproduces a refresh requested at that publication
+boundary and verifies it can acquire enumeration, avoiding a permanently pending
+refresh flag. It uses private test locks and makes no driver calls.
+
+Authentication restarts invalidate old work and rebind commands to the empty
+authenticated identity without discarding locally viewable history. Explicit
+logout/add-account events still clear that view. Login success compares the
+cached history's UIN with the authenticated UIN, rather than relying on the GUI's
+cached-history display mode; a different owner clears old threads, reactions,
+draft/reply state and avatar before publishing the new identity. Failure-scope
+rebinds preserve the authenticated identity instead of taking it from a cached
+history view. Stale background polling, cache and read-refresh commands are
+quiet, while stale user mutations retain an actionable cancellation notice.
+Explicit logout/add-account completion queues the next QR request only after
+rebinding the anonymous scope; a request queued before logout would be stale.
+Account switches, new-owner logins and explicit logout discard pending reply/
+forward messages and recipient filters, so an old account's quote cannot be
+sent into a new account's conversation. History wipes discard those history
+references too, while retaining an unsent plain-text draft for the same account.
+
+TUI logout keeps its in-memory account identity until credential/cache cleanup
+succeeds. A disk error leaves the identity available for another confirmation;
+the terminal reset event distinguishes logout from history-only wipe. Closing
+SQLite is part of the blocking job, and a missing account gets an explicit
+status rather than a silent return. An isolated profile regression makes a
+saved-session path a directory to force deletion failure, verifies credentials
+and retry identity survive, removes that obstruction, and verifies retry cleanup.
+
+### Final local verification for these follow-ups
+
+- Windows x64, Rust 1.99: `cargo +stable test --locked` passed 385 tests with
+  zero failures and one ignored live-network test. The two upstream key tests
+  still self-skip without the Zalo WASM module; they do not verify phone sync.
+- The final plain CodeRabbit review exited successfully with no new findings.
+  Its retained historical reply/forward finding was checked against the current
+  owner-transition handlers and is fixed; review history was not cleared.
+- The rebuilt executable's bundled codec smoke check encoded and decoded ten
+  320×240 frames with PATH restricted to Windows system tools. Embedded Nokhwa
+  version and attribution checks pass. This is not a camera or latency result.
+- Focused Rust formatting and patch whitespace checks pass. Strict Clippy still
+  stops at the unchanged build-script `manual_is_multiple_of` diagnostic on
+  Rust 1.99; an additional diagnostic run found no errors on changed lines.
+  Repository-wide formatting and dependency-audit findings remain separate
+  existing gates. No code suppression or unrelated formatting sweep was added.
+- Physical cameras, peer negotiation/calls, repeated-call resources, latency,
+  Linux, both macOS architectures and distribution checks remain pending.

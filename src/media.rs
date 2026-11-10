@@ -130,7 +130,7 @@ pub fn list_media_devices(refresh: bool) -> (Vec<String>, Vec<String>) {
 /// # Errors
 /// Returns a native camera discovery failure; microphone snapshots remain available.
 pub fn refresh_media_devices() -> Result<()> {
-    let Ok(_enumeration) = DEVICE_ENUMERATION.try_lock() else {
+    let Ok(enumeration) = DEVICE_ENUMERATION.try_lock() else {
         return Ok(());
     };
     DEVICE_REFRESH_PENDING.store(true, Ordering::Release);
@@ -159,8 +159,15 @@ pub fn refresh_media_devices() -> Result<()> {
             .map_err(|_| anyhow::anyhow!("Không thể cập nhật danh sách thiết bị."))?;
         update_device_snapshots(&mut cameras, &mut cache, microphones, result)
     })();
-    DEVICE_REFRESH_PENDING.store(false, Ordering::Release);
+    finish_device_refresh(enumeration, || {
+        DEVICE_REFRESH_PENDING.store(false, Ordering::Release)
+    });
     publication
+}
+
+fn finish_device_refresh(enumeration: std::sync::MutexGuard<'_, ()>, publish: impl FnOnce()) {
+    drop(enumeration);
+    publish();
 }
 
 fn update_device_snapshots(
@@ -1272,13 +1279,14 @@ type IncomingVideoStream = (
 );
 
 fn video_pli_targets(
+    primary_video_ssrc: u32,
     peer_ssrc: u32,
     primary_needs_pli: bool,
     extras: &[IncomingVideoStream],
 ) -> Vec<u32> {
     let mut targets = Vec::new();
     if primary_needs_pli {
-        targets.push(peer_ssrc);
+        targets.push(primary_video_target(primary_video_ssrc, peer_ssrc));
     }
     for (ssrc, _, _, queue, last_rx) in extras {
         if last_rx.is_some() && !queue.synced.load(Ordering::Acquire) && !targets.contains(ssrc) {
@@ -1286,6 +1294,24 @@ fn video_pli_targets(
         }
     }
     targets
+}
+
+fn primary_video_target(primary_video_ssrc: u32, peer_ssrc: u32) -> u32 {
+    if primary_video_ssrc != 0 {
+        primary_video_ssrc
+    } else {
+        peer_ssrc
+    }
+}
+
+fn record_primary_video_sequence(
+    stats: &mut RxStats,
+    primary_video_ssrc: u32,
+    packet_ssrc: u32,
+    sequence: u16,
+) -> bool {
+    // Independently sequenced group streams cannot share the primary loss tracker.
+    (primary_video_ssrc == 0 || packet_ssrc == primary_video_ssrc) && stats.update(sequence)
 }
 
 fn should_force_video_keyframe(
@@ -1749,7 +1775,11 @@ fn run_media_loop(
                         vid_ts,
                         vid_pkts_tx,
                         vid_octets_tx,
-                        rx_video.block(peer_ssrc, lsr, dlsr),
+                        rx_video.block(
+                            primary_video_target(primary_video_ssrc, peer_ssrc),
+                            lsr,
+                            dlsr,
+                        ),
                     );
                     let mut c = sr;
                     c.extend_from_slice(&build_sdes_empty(vid_ssrc));
@@ -1994,7 +2024,12 @@ fn run_media_loop(
                         rx_audio.update(h.seq);
                         peer_ssrc = h.ssrc;
                     } else if matches!(pt, 96 | 97 | VIDEO_PT_FRAG | 121 | 122) {
-                        if rx_video.update(h.seq) {
+                        if record_primary_video_sequence(
+                            &mut rx_video,
+                            primary_video_ssrc,
+                            h.ssrc,
+                            h.seq,
+                        ) {
                             pli_gap = true; // hole in the peer's video: ask for a keyframe
                         }
                         peer_ssrc = h.ssrc;
@@ -2145,7 +2180,12 @@ fn run_media_loop(
             pli_gap = false;
             if let (Some(ref rtcp_s), Some(target)) = (&udp_rtcp_sock, rtcp_sock_addr) {
                 let rtcp_sender = udp_rtp_sock.as_ref().unwrap_or(rtcp_s);
-                let targets = video_pli_targets(peer_ssrc, primary_needs_pli, &extra_vid_streams);
+                let targets = video_pli_targets(
+                    primary_video_ssrc,
+                    peer_ssrc,
+                    primary_needs_pli,
+                    &extra_vid_streams,
+                );
                 for requested_ssrc in targets {
                     // Compound packet: empty RR first (RFC 3550 6.1), then the PLI.
                     let mut pkt = vec![0x80u8, 201, 0, 1];
@@ -2496,6 +2536,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_refresh_completion_allows_the_next_enumeration_to_start() {
+        let enumeration = Mutex::new(());
+        let pending = AtomicBool::new(true);
+        finish_device_refresh(enumeration.lock().unwrap(), || {
+            pending.store(false, Ordering::Release);
+            assert!(!pending.swap(true, Ordering::AcqRel));
+            assert!(
+                enumeration.try_lock().is_ok(),
+                "a refresh requested after completion must be able to acquire enumeration"
+            );
+        });
+    }
+
+    #[test]
     fn extra_stream_recovery_does_not_request_healthy_primary_keyframes() {
         let make_stream = |ssrc: u32, synced: bool, active: bool| {
             let queue = Arc::new(crate::video::decode_queue::DecodeQueue::default());
@@ -2514,8 +2568,18 @@ mod tests {
             make_stream(13, false, false),
             make_stream(11, false, true),
         ];
-        assert_eq!(video_pli_targets(10, false, &streams), vec![11]);
-        assert_eq!(video_pli_targets(10, true, &streams), vec![10, 11]);
+        assert_eq!(video_pli_targets(10, 11, false, &streams), vec![11]);
+        assert_eq!(video_pli_targets(10, 11, true, &streams), vec![10, 11]);
+        assert_eq!(video_pli_targets(0, 11, true, &streams), vec![11]);
+    }
+
+    #[test]
+    fn extra_stream_sequences_cannot_create_primary_video_loss() {
+        let mut stats = RxStats::default();
+        assert!(!record_primary_video_sequence(&mut stats, 10, 10, 1));
+        assert!(!record_primary_video_sequence(&mut stats, 10, 11, 777));
+        assert!(!record_primary_video_sequence(&mut stats, 10, 10, 2));
+        assert!(record_primary_video_sequence(&mut stats, 10, 10, 4));
     }
 
     #[test]

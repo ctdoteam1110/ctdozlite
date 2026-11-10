@@ -1172,6 +1172,11 @@ struct PureRustCallState {
 }
 
 impl PureRustCallState {
+    fn uses_group_protocol(&self) -> bool {
+        // Per-member fallback retains the group conversation but uses direct peer legs.
+        self.is_group && !self.group_host_call.is_empty()
+    }
+
     fn swap_with_extra_leg(&mut self, idx: usize) {
         if idx >= self.extra_legs.len() {
             return;
@@ -1223,7 +1228,7 @@ async fn try_install_dialed_call(
 
 fn pending_dial_cancel_signals(state: &PureRustCallState) -> Vec<(i64, Value)> {
     let mut signals = Vec::new();
-    if state.is_group {
+    if state.uses_group_protocol() {
         let host = state
             .group_host_call
             .parse::<u64>()
@@ -3111,7 +3116,7 @@ impl CallBridge {
                                 let rtcp_ip = st.rtcp_ip.clone();
                                 let sess_id = st.sess_id.clone();
                                 let ext = st.extend_data.clone();
-                                let is_group = st.is_group;
+                                let is_group = st.uses_group_protocol();
                                 let is_video = st.is_video;
                                 let group_host_call = st.group_host_call.clone();
                                 let group_partners_str = st.group_partners_str.clone();
@@ -3124,7 +3129,7 @@ impl CallBridge {
                                         &st.udp_rtp_sock,
                                         st.rtp_ip.parse::<std::net::SocketAddr>(),
                                     ) {
-                                        if st.is_group {
+                                        if st.uses_group_protocol() {
                                             let pkt_gp = build_zrtp_group_ping_packet(
                                                 st.from_uid_u32,
                                                 st.relay_token,
@@ -3164,7 +3169,7 @@ impl CallBridge {
                                             let _ = rsock.try_send_to(&pkt_p, target);
                                         }
                                     }
-                                    if st.is_group {
+                                    if st.uses_group_protocol() {
                                         crate::media::set_group_srtp_key(
                                             Some(st.sess_id.clone()),
                                             true,
@@ -3351,7 +3356,7 @@ impl CallBridge {
                                     media.set_cam_enabled(is_on_cam);
                                 }
                             }
-                            let is_group = st.is_group;
+                            let is_group = st.uses_group_protocol();
                             let group_tid = st.thread_id.clone();
                             let group_host = st.group_host_call.clone();
                             let self_uid32 = st.from_uid_u32;
@@ -3416,6 +3421,12 @@ impl CallBridge {
                         let s_snap = session.lock().await.clone();
                         let mut guard = active_call.lock().await;
                         if let Some(ref mut st) = *guard {
+                            if !st.uses_group_protocol() {
+                                let _ = gui_tx.send(GuiEvent::StatusUpdate(
+                                    "Cuộc gọi đang dùng kết nối riêng với từng thành viên; hãy kết thúc và gọi nhóm mới để thêm người.".into(),
+                                ));
+                                continue;
+                            }
                             let call_id = st.call_id;
                             let thread_id = st.thread_id.clone();
                             let grp_name = st.partner_name.clone();
@@ -3517,7 +3528,7 @@ impl CallBridge {
                             let rtp_ip = st.rtp_ip.clone();
                             let rtcp_ip = st.rtcp_ip.clone();
                             let sess_id = st.sess_id.clone();
-                            let is_group = st.is_group;
+                            let is_group = st.uses_group_protocol();
                             let is_caller = st.is_caller;
                             let is_connected = st.is_connected;
                             let group_host_call = st.group_host_call.clone();
@@ -3995,7 +4006,7 @@ impl CallBridge {
                                             &st.udp_rtp_sock,
                                             st.rtp_ip.parse::<std::net::SocketAddr>(),
                                         ) {
-                                            if st.is_group {
+                                            if st.uses_group_protocol() {
                                                 let pkt_gp = build_zrtp_group_ping_packet(
                                                     st.from_uid_u32,
                                                     st.relay_token,
@@ -4027,13 +4038,13 @@ impl CallBridge {
                                                 let _ = rsock.try_send_to(&pkt_p, target);
                                             }
                                         }
-                                        let is_group_call = st.is_group;
+                                        let is_group_call = st.uses_group_protocol();
                                         if !(is_group_call
                                             && st.media.is_some()
                                             && st.relay_token != 0)
                                         {
                                             st.media = None;
-                                            if st.is_group {
+                                            if st.uses_group_protocol() {
                                                 crate::media::set_group_srtp_key(
                                                     Some(st.sess_id.clone()),
                                                     true,
@@ -4146,7 +4157,7 @@ impl CallBridge {
                                             st.extra_legs.remove(0);
                                             continue;
                                         }
-                                        if st.is_group {
+                                        if st.uses_group_protocol() {
                                             if let Some(fid) = data
                                                 .get("fromId")
                                                 .and_then(|v| {
@@ -4273,7 +4284,7 @@ impl CallBridge {
                                         st.extra_legs.remove(0);
                                         continue;
                                     }
-                                    if st.is_group && act == "group_end_call" {
+                                    if st.uses_group_protocol() && act == "group_end_call" {
                                         let leaver_uid = data
                                             .get("fromId")
                                             .and_then(|v| {
@@ -4869,6 +4880,24 @@ mod tests {
     }
 
     #[test]
+    fn fallback_group_dial_cancels_primary_as_a_direct_leg() {
+        for is_video in [false, true] {
+            let mut state = pending_test_call();
+            state.is_group = true;
+            state.is_video = is_video;
+            state.thread_id = "group_42".into();
+            assert!(!state.uses_group_protocol());
+            assert_eq!(
+                pending_dial_cancel_signals(&state),
+                vec![(
+                    405,
+                    json!({"toId":"peer-1","callId":1,"callType":if is_video { 3 } else { 1 }})
+                )],
+            );
+        }
+    }
+
+    #[test]
     fn queued_call_action_retains_its_originating_account() {
         let (cmd_tx, mut receiver) = mpsc::unbounded_channel();
         let bridge = CallBridge {
@@ -5372,11 +5401,14 @@ mod tests {
             "sessId": "sess_incoming_456",
             "extendData": r#"{"callType":1,"serverAddr":[{"rtp":"171.244.128.62:4200","rtcp":"171.244.128.62:4200"}],"video":{"codec":[{"name":"h264","payload":97}]}}"#,
         });
-        let (rtp, rtcp, sess, _, _) =
+        let (rtp, rtcp, sess, _, extend) =
             build_pure_rust_invite_fields_with_probe(&req_params, true, Some(55000), None);
         assert_eq!(rtp, "171.244.128.62:4200");
         assert_eq!(rtcp, "171.244.128.62:4200");
         assert_eq!(sess, "sess_incoming_456");
+        let extend: Value = serde_json::from_str(extend.trim()).unwrap();
+        assert_eq!(extend["supportHevcDecode"], 0);
+        assert_eq!(extend["video"]["codec"][0]["name"], "h264");
     }
 
     #[test]
