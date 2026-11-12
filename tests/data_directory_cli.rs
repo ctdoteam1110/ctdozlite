@@ -139,7 +139,9 @@ fn finder_bundle_with_root_cwd_selects_private_application_support() {
 }
 
 #[test]
-fn legacy_cli_keeps_cwd_and_version_does_not_prepare_storage() {
+fn cli_uses_shared_application_support_by_default() {
+    // Unified data dir: GUI + CLI/TUI/agent share Application Support so the
+    // bridge and TUI see the same session/threads as the desktop app.
     eprintln!(
         "CARGO_BIN_EXE_zlite={}",
         env!("CARGO_BIN_EXE_zlite")
@@ -151,9 +153,10 @@ fn legacy_cli_keeps_cwd_and_version_does_not_prepare_storage() {
         .output()
         .unwrap();
     assert!(result.status.success());
+    let home = std::env::var("HOME").expect("HOME set in test env");
     assert_eq!(
         String::from_utf8_lossy(&result.stdout).trim(),
-        fixture.0.to_str().unwrap()
+        format!("{home}/Library/Application Support/ctdozlite"),
     );
     let data = fixture.0.join("not-created");
     let result = Command::new(env!("CARGO_BIN_EXE_zlite"))
