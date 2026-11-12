@@ -149,6 +149,30 @@ impl TgClient {
         Ok(out)
     }
 
+    /// Create a forum topic, returns topic id. Requires supergroup with forum enabled.
+    pub async fn create_topic(&self, chat: &str, name: &str) -> Result<i64> {
+        let resp = self
+            .client
+            .post(self.url("createForumTopic"))
+            .json(&serde_json::json!({"chat_id": chat, "name": name}))
+            .send()
+            .await?;
+        let v: serde_json::Value = resp.json().await?;
+        v.pointer("/result/message_thread_id")
+            .and_then(|m| m.as_i64())
+            .ok_or_else(|| anyhow::anyhow!("createForumTopic failed: {}", v.to_string().chars().take(200).collect::<String>()))
+    }
+
+    /// True if chat is a forum supergroup (topics available).
+    pub async fn is_forum(&self, chat: &str) -> bool {
+        let resp = match self.client.get(self.url("getChat")).query(&[("chat_id", chat)]).send().await {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        let v: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        v.pointer("/result/is_forum").and_then(|b| b.as_bool()).unwrap_or(false)
+    }
+
     pub async fn send_text(&self, chat: &str, thread: Option<i64>, text: &str, reply_to: Option<i64>) -> Result<i64> {
         let mut body = serde_json::json!({"chat_id": chat, "text": text});
         if let Some(t) = thread {
@@ -403,6 +427,34 @@ async fn run_bridge_loop_inner(
     }
     println!("[bridge] start: {} pairs, quota {}MB{}",
         topic_map.len(), quota_bytes / 1024 / 1024, if dry_run { " [dry-run]" } else { "" });
+    let mut topic_map = topic_map;
+    {
+        let guesses: Vec<(String, String)> = topic_map
+            .iter()
+            .filter(|(k, _)| !k.contains('/'))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (chat, ztid) in guesses {
+            let tname = threads.iter().find(|t| t.id == ztid).map(|t| t.name.clone()).unwrap_or_else(|| ztid.clone());
+            if dry_run {
+                println!("[bridge dry] would ensure topic in {chat} for '{tname}'");
+                continue;
+            }
+            if !tg.is_forum(&chat).await {
+                eprintln!("[bridge] chat {chat} is not a forum supergroup — tạo topic thất bại; hãy bật Topics trong group settings hoặc map tới topic có sẵn chat/topic");
+                continue;
+            }
+            let short: String = tname.chars().take(100).collect();
+            match tg.create_topic(&chat, &short).await {
+                Ok(tid) => {
+                    println!("[bridge] created topic {tid} in {chat} for '{tname}'");
+                    topic_map.remove(&chat);
+                    topic_map.insert(format!("{chat}/{tid}"), ztid);
+                }
+                Err(e) => eprintln!("[bridge] create topic FAIL {chat}: {e}"),
+            }
+        }
+    }
     loop {
         // --- Zalo → TG ---
         let mut st = state.clone();
@@ -541,6 +593,7 @@ async fn run_bridge_loop_inner(
 
 /// Forward one Zalo message to Telegram. Downloads attachments into the
 /// buffer dir (quota-checked), uploads, records mapping. Returns TG msg id.
+#[allow(clippy::too_many_arguments)]
 pub async fn forward_zalo_to_tg(
     tg: &TgClient,
     store: &mut crate::store::MessageStore,
