@@ -504,6 +504,9 @@ pub async fn run_bridge_loop(
             }
             Err(e) => eprintln!("[bridge] tg poll: {e}"),
         }
+        if dry_run {
+            eprintln!("[bridge dry] tick ok (tg poll attempted, no sends)");
+        }
     }
 }
 
