@@ -167,6 +167,7 @@ async fn main() -> Result<()> {
         .filter(|&n| n >= 1)
         .unwrap_or(10);
     let tg_dry = args.iter().any(|a| a == "--dry-run");
+    let tg_media = args.iter().any(|a| a == "--media");
     let api_port: Option<u16> = args
         .iter()
         .position(|a| a == "--api-port")
@@ -267,7 +268,7 @@ async fn main() -> Result<()> {
         }
         let db = store::db_path_for_account(s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or(""));
         let data_dir = data_dir::initialize(&args)?;
-        return tg_bridge::run_bridge_loop(
+        return tg_bridge::run_bridge_loop_full(
             s,
             db,
             data_dir,
@@ -275,6 +276,7 @@ async fn main() -> Result<()> {
             map,
             tg_owner,
             tg_dry,
+            tg_media,
         )
         .await;
     }
