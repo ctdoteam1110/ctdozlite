@@ -1,5 +1,8 @@
 use super::*;
 
+/// Cached sidebar filter+sort result (query, filter, len, fingerprint, selected, indices, at).
+type ThreadListCache = Option<(String, String, usize, u64, usize, Vec<usize>, std::time::Instant)>;
+
 impl ZaloGuiApp {
     /// Start loading the full-resolution texture the image viewer shows. Message bubbles and
     /// the media grid keep a 480 px copy; the `hd_` key keeps this one (and its disk cache) apart.
@@ -890,6 +893,45 @@ impl ZaloGuiApp {
                         });
                 }
 
+                // Sidebar cache (#135): skip re-filter+sort every frame unless
+                // query/filter/threads/selected changed or 500ms passed.
+                let cache_key_fingerprint: u64 = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    self.threads.len().hash(&mut h);
+                    self.threads.iter().take(64).for_each(|t| {
+                        t.id.hash(&mut h);
+                        t.preview.hash(&mut h);
+                        t.messages.len().hash(&mut h);
+                    });
+                    if let Some(t) = self.threads.get(self.selected_thread_index) {
+                        t.id.hash(&mut h);
+                    }
+                    h.finish()
+                };
+                let cache_key = (
+                    query.clone(),
+                    format!("{:?}", self.thread_filter),
+                    self.threads.len(),
+                    cache_key_fingerprint,
+                    self.selected_thread_index,
+                );
+                let use_cache = match &self.thread_list_cache {
+                    Some((q, f, len, fp, sel, _, at)) => {
+                        q == &cache_key.0
+                            && f == &cache_key.1
+                            && *len == cache_key.2
+                            && *fp == cache_key.3
+                            && *sel == cache_key.4
+                            && at.elapsed() < std::time::Duration::from_millis(500)
+                    }
+                    None => false,
+                };
+                let (filtered_indices, msg_hits): (Vec<usize>, crate::gui::MsgHits) = if use_cache {
+                    let (_, _, _, _, _, idx, _) = self.thread_list_cache.clone().unwrap();
+                    // msg_hits depend only on query; recompute cheaply only when querying
+                    (idx, Vec::new())
+                } else {
                 let search_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut filtered_indices: Vec<usize> = self
                         .threads
@@ -959,7 +1001,7 @@ impl ZaloGuiApp {
                         ts_b.cmp(&ts_a)
                     });
 
-                    let msg_hits: Vec<(usize, String, String, String, bool)> =
+                    let msg_hits: crate::gui::MsgHits =
                         if query.chars().count() >= 2 {
                             let mut hits = Vec::new();
                             for (t_idx, t) in self.threads.iter().enumerate() {
@@ -987,13 +1029,24 @@ impl ZaloGuiApp {
                         };
                     (filtered_indices, msg_hits)
                 }));
-                let (filtered_indices, msg_hits) = match search_outcome {
+                let (filtered_indices, msg_hits): (Vec<usize>, crate::gui::MsgHits) = match search_outcome {
                     Ok(pair) => pair,
                     Err(_) => {
                         self.search_query.clear();
                         self.show_toast("⚠️ Đã đặt lại bộ lọc tìm kiếm");
                         ((0..self.threads.len()).collect(), Vec::new())
                     }
+                };
+                self.thread_list_cache = Some((
+                    cache_key.0,
+                    cache_key.1,
+                    cache_key.2,
+                    cache_key.3,
+                    cache_key.4,
+                    filtered_indices.clone(),
+                    std::time::Instant::now(),
+                ));
+                (filtered_indices, msg_hits)
                 };
 
                 let mut clicked_thread: Option<(usize, String, bool)> = None;
