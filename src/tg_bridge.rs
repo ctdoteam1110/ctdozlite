@@ -345,6 +345,35 @@ pub async fn run_bridge_loop(
     owner_id: i64,
     dry_run: bool,
 ) -> Result<()> {
+    run_bridge_loop_inner(session, db_path, data_dir, quota_bytes, topic_map, owner_id, dry_run, false).await
+}
+
+/// Full loop with explicit media switch (PR1: text-only default).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_bridge_loop_full(
+    session: crate::session::Session,
+    db_path: String,
+    data_dir: PathBuf,
+    quota_bytes: u64,
+    topic_map: TopicMap,
+    owner_id: i64,
+    dry_run: bool,
+    media: bool,
+) -> Result<()> {
+    run_bridge_loop_inner(session, db_path, data_dir, quota_bytes, topic_map, owner_id, dry_run, media).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_bridge_loop_inner(
+    session: crate::session::Session,
+    db_path: String,
+    data_dir: PathBuf,
+    quota_bytes: u64,
+    topic_map: TopicMap,
+    owner_id: i64,
+    dry_run: bool,
+    media: bool,
+) -> Result<()> {
     let token = std::env::var("TELEGRAM_BOT_TOKEN")
         .unwrap_or_default();
     if token.trim().is_empty() && !dry_run {
@@ -396,7 +425,7 @@ pub async fn run_bridge_loop(
                         continue;
                     }
                     if let Ok(mut store) = crate::store::MessageStore::open(&db_path) {
-                        match forward_zalo_to_tg(&tg, &mut store, &data_dir, quota_bytes, target, &t, m).await {
+                        match forward_zalo_to_tg(&tg, &mut store, &data_dir, quota_bytes, target, &t, m, media).await {
                             Ok(mid) => println!("[bridge] Z->TG {} mid={mid}", m.id),
                             Err(e) => eprintln!("[bridge] Z->TG {} FAIL: {e}", m.id),
                         }
@@ -412,10 +441,10 @@ pub async fn run_bridge_loop(
                     tg_offset = tg_offset.max(u.update_id + 1);
                     let Some(msg) = u.message else { continue };
                     // owner gate
-                    if owner_id != 0 {
-                        if msg.from.as_ref().map(|f| f.id).unwrap_or(0) != owner_id {
-                            continue;
-                        }
+                    if owner_id != 0
+                        && msg.from.as_ref().map(|f| f.id).unwrap_or(0) != owner_id
+                    {
+                        continue;
                     }
                     // echo guard: our own forwarded messages start with sender line? We tag via caption; skip text starting with our marker is fragile — instead track sent ids in KV.
                     let key = format!("{}:{}", msg.chat.id, msg.message_id);
@@ -436,7 +465,7 @@ pub async fn run_bridge_loop(
                     let body = if !msg.text.trim().is_empty() { msg.text.clone() } else if !msg.caption.trim().is_empty() { msg.caption.clone() } else { String::new() };
                     // attachments: download tg file → buffer → Zalo send_attachment
                     let mut sent_ok = false;
-                    if (msg.photo.is_some() || msg.document.is_some()) && !dry_run {
+                    if media && (msg.photo.is_some() || msg.document.is_some()) && !dry_run {
                         // need file_path: getFile
                         let fid = msg.photo.as_ref().and_then(|p| p.last()).map(|p| p.file_id.clone())
                             .or_else(|| msg.document.as_ref().map(|d| d.file_id.clone()))
@@ -520,13 +549,17 @@ pub async fn forward_zalo_to_tg(
     tg_target: &str,
     thread: &crate::chat::Thread,
     msg: &crate::chat::ChatMessage,
+    media: bool,
 ) -> Result<i64> {
     let (chat, topic) = split_tg_target(tg_target);
     let caption = format!("{} · {}", msg.sender, msg.time);
-    // Attachment?
+    // Attachment? PR1 is text-only: describe it, skip download.
     let url = msg.link_url.clone().filter(|u| !u.is_empty());
-    if url.is_none() {
-        let text = if msg.text.trim().is_empty() { "(tin nhắn rỗng)".to_string() } else { msg.text.clone() };
+    if url.is_none() || !media {
+        let mut text = if msg.text.trim().is_empty() { "(tin nhắn rỗng)".to_string() } else { msg.text.clone() };
+        if url.is_some() && !media {
+            text.push_str("\n[đính kèm: xem trên Zalo — media ở PR2]");
+        }
         // Reply-chain: if this Zalo msg quotes another, map to its TG msg.
         // reply_to_* fields carry original sender/text; resolve via recent mappings is
         // best-effort here (full chain in PR3). Pass None for now.
