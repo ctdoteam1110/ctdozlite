@@ -497,11 +497,13 @@ async fn test_outbound_forward_dispatch_direct_and_group() {
         .await
         .expect("Dispatch 1 failed");
 
-    // 2. Direct photo message forward (URL in link_url, placeholder in text)
+    // 2. Direct photo message forward (URL in link_url, placeholder in text).
+    // Uses a photo view link without direct image extension (.png/.jpg) so forwarding
+    // does not attempt an external CDN download, keeping the test network-isolated.
     let msg2 = ChatMessage {
         id: "orig_msg_2".into(),
         text: "[Hình ảnh]".into(),
-        link_url: Some("https://photos.example.invalid/screenshot.png".into()),
+        link_url: Some("https://media.example.invalid/photos/screenshot_link".into()),
         kind: MessageKind::Photo,
         ..Default::default()
     };
@@ -573,7 +575,7 @@ async fn test_outbound_forward_dispatch_direct_and_group() {
                 );
                 assert_eq!(
                     json_body.get("message").and_then(|v| v.as_str()),
-                    Some("https://photos.example.invalid/screenshot.png")
+                    Some("https://media.example.invalid/photos/screenshot_link")
                 );
                 assert_eq!(
                     json_body.get("clientId").and_then(|v| v.as_u64()),
@@ -765,11 +767,11 @@ async fn test_rich_link_forward_priority_over_photo_cdn() {
 
     let link_msg = ChatMessage {
         id: "link_msg_1".into(),
-        text: "https://example.com/news".into(),
-        link_url: Some("https://example.com/news".into()),
+        text: "https://news.example.invalid/item".into(),
+        link_url: Some("https://news.example.invalid/item".into()),
         link_title: Some("Tin tức nổi bật".into()),
         link_desc: Some("Mô tả bài viết".into()),
-        link_thumb: Some("https://example.com/thumb.jpg".into()),
+        link_thumb: Some("https://images.example.invalid/thumb.jpg".into()),
         kind: MessageKind::Link,
         ..Default::default()
     };
