@@ -48,6 +48,7 @@ pub mod llm;
 /// (DailyNotifier is intentionally NOT used: its payload is hardcoded generic).
 pub mod os_notify;
 pub mod thread_script;
+pub mod tg_bridge;
 
 /// Native notification authorization without delivery.
 pub mod native_notifications;

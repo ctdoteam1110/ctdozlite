@@ -415,7 +415,23 @@ impl MessageStore {
                 msg TEXT NOT NULL DEFAULT '',
                 ts INTEGER NOT NULL DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_thread_script_logs_thread ON thread_script_logs(thread_id, id);",
+            CREATE TABLE IF NOT EXISTS bridge_files (
+                msg_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL DEFAULT '',
+                path TEXT NOT NULL DEFAULT '',
+                tg_file_id TEXT NOT NULL DEFAULT '',
+                zalo_url TEXT NOT NULL DEFAULT '',
+                bytes INTEGER NOT NULL DEFAULT 0,
+                offset INTEGER NOT NULL DEFAULT 0,
+                done INTEGER NOT NULL DEFAULT 0,
+                last_access INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_bridge_files_thread ON bridge_files(thread_id);
+            CREATE TABLE IF NOT EXISTS bridge_sent (
+                tg_key TEXT PRIMARY KEY,
+                zalo_msg_id TEXT NOT NULL DEFAULT '',
+                ts INTEGER NOT NULL DEFAULT 0
+            );",
         )?;
         Ok(())
     }
@@ -673,6 +689,70 @@ impl MessageStore {
     }
 
     /// Liệt kê key KV của 1 thread (A–Z).
+    /// Bridge file mapping upsert.
+    pub fn bridge_file_put(&mut self, f: &crate::tg_bridge::BridgeFile) -> Result<()> {
+        let _ = Self::ensure_script_schema(&self.conn);
+        self.conn.execute(
+            "INSERT INTO bridge_files (msg_id, thread_id, path, tg_file_id, zalo_url, bytes, offset, done, last_access)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(msg_id) DO UPDATE SET path = excluded.path, tg_file_id = excluded.tg_file_id,
+                 zalo_url = excluded.zalo_url, bytes = excluded.bytes, offset = excluded.offset,
+                 done = excluded.done, last_access = excluded.last_access",
+            rusqlite::params![f.msg_id, f.thread_id, f.path, f.tg_file_id, f.zalo_url, f.bytes as i64, f.offset as i64, if f.done {1} else {0}, f.last_access],
+        )?;
+        Ok(())
+    }
+
+    /// All bridge files (for quota LRU).
+    pub fn bridge_files_all(&self) -> Result<Vec<crate::tg_bridge::BridgeFile>> {
+        let _ = Self::ensure_script_schema(&self.conn);
+        let mut stmt = self.conn.prepare(
+            "SELECT msg_id, thread_id, path, tg_file_id, zalo_url, bytes, offset, done, last_access FROM bridge_files",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::tg_bridge::BridgeFile {
+                msg_id: row.get(0)?,
+                thread_id: row.get(1)?,
+                path: row.get(2)?,
+                tg_file_id: row.get(3)?,
+                zalo_url: row.get(4)?,
+                bytes: row.get::<_, i64>(5).unwrap_or(0) as u64,
+                offset: row.get::<_, i64>(6).unwrap_or(0) as u64,
+                done: row.get::<_, i64>(7).unwrap_or(0) != 0,
+                last_access: row.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(anyhow::Error::from)
+    }
+
+    /// Mark a TG message as bridge-originated (echo-guard).
+    pub fn bridge_sent_put(&mut self, tg_key: &str, zalo_msg_id: &str) -> Result<()> {
+        let _ = Self::ensure_script_schema(&self.conn);
+        self.conn.execute(
+            "INSERT OR REPLACE INTO bridge_sent (tg_key, zalo_msg_id, ts) VALUES (?1, ?2, ?3)",
+            rusqlite::params![tg_key, zalo_msg_id, crate::login::unix_now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn bridge_sent_has(&self, tg_key: &str) -> bool {
+        let _ = Self::ensure_script_schema(&self.conn);
+        self.conn
+            .query_row(
+                "SELECT 1 FROM bridge_sent WHERE tg_key = ?1",
+                rusqlite::params![tg_key],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
+    /// Delete one bridge mapping (file itself removed by caller).
+    pub fn bridge_file_delete(&mut self, msg_id: &str) -> Result<()> {
+        let _ = Self::ensure_script_schema(&self.conn);
+        self.conn.execute("DELETE FROM bridge_files WHERE msg_id = ?1", rusqlite::params![msg_id])?;
+        Ok(())
+    }
+
     pub fn thread_kv_list(&self, thread_id: &str) -> Vec<String> {
         if thread_id.is_empty() { return Vec::new(); }
         let mut stmt = match self.conn.prepare(

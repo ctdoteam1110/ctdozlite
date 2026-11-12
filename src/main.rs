@@ -13,7 +13,7 @@ use session::Session;
 pub use zalo_rust::{
     account_manager, agent, api_mcp, auth, audio, call, chat, clock, crypto, data_dir, endpoints, feed,
     gui, history_sync, llm, logger, login, media, media_resources, message_model, param_cipher,
-    qr, reactions, scheduler, session, socket, store, tui, ui, unread, updater, voip_log,
+    qr, reactions, scheduler, session, socket, store, tg_bridge, tui, ui, unread, updater, voip_log,
 };
 
 pub const POLL_SECS: u64 = 4;
@@ -146,6 +146,27 @@ async fn main() -> Result<()> {
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(30);
+    let tg_bridge = args.iter().any(|a| a == "--tg-bridge");
+    let tg_map: String = args
+        .iter()
+        .position(|a| a == "--tg-map")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let tg_owner: i64 = args
+        .iter()
+        .position(|a| a == "--tg-owner")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let tg_quota_gb: u64 = args
+        .iter()
+        .position(|a| a == "--bridge-quota-gb")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(10);
+    let tg_dry = args.iter().any(|a| a == "--dry-run");
     let api_port: Option<u16> = args
         .iter()
         .position(|a| a == "--api-port")
@@ -236,6 +257,26 @@ async fn main() -> Result<()> {
         };
         let db = store::db_path_for_account(s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or(""));
         return agent::run_agent_loop(s, db, tid, agent_poll, agent_send).await;
+    }
+
+    // `--tg-bridge --tg-map "<tg_chat>[/topic]:<zalo_tid>[,...]" [--tg-owner ID] [--dry-run]`.
+    if tg_bridge {
+        let map = tg_bridge::parse_topic_map(&tg_map);
+        if map.is_empty() {
+            anyhow::bail!("--tg-bridge yêu cầu --tg-map \"<tg_chat>[/topic]:<zalo_tid>[,...]\"");
+        }
+        let db = store::db_path_for_account(s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or(""));
+        let data_dir = data_dir::initialize(&args)?;
+        return tg_bridge::run_bridge_loop(
+            s,
+            db,
+            data_dir,
+            tg_quota_gb * 1024 * 1024 * 1024,
+            map,
+            tg_owner,
+            tg_dry,
+        )
+        .await;
     }
 
     // If `--mcp` is requested, run the Model Context Protocol JSON-RPC 2.0 server over stdio (#35).
