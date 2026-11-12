@@ -11,9 +11,9 @@
 use anyhow::Result;
 use session::Session;
 pub use zalo_rust::{
-    account_manager, api_mcp, audio, call, chat, clock, crypto, data_dir, endpoints, feed, gui, history_sync,
-    logger, login, media, media_resources, message_model, param_cipher, qr, reactions, scheduler,
-    session, socket, store, tui, ui, unread, updater, voip_log,
+    account_manager, agent, api_mcp, auth, audio, call, chat, clock, crypto, data_dir, endpoints, feed,
+    gui, history_sync, llm, logger, login, media, media_resources, message_model, param_cipher,
+    qr, reactions, scheduler, session, socket, store, tui, ui, unread, updater, voip_log,
 };
 
 pub const POLL_SECS: u64 = 4;
@@ -100,6 +100,52 @@ async fn main() -> Result<()> {
     let force_qr = args.iter().any(|a| a == "--qr");
     let force_logout = args.iter().any(|a| a == "--logout");
     let force_mcp = args.iter().any(|a| a == "--mcp");
+    // --auth status|set <key>|clear : manage the LLM API key (own auth, never opencode's).
+    if let Some(i) = args.iter().position(|a| a == "--auth") {
+        let sub = args.get(i + 1).cloned().unwrap_or_else(|| "status".into());
+        match sub.as_str() {
+            "status" => {
+                // settings key for source display: read raw file (no GUI loaded here)
+                let set_key = std::fs::read_to_string("app_settings.json")
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v.get("llm_api_key").and_then(|k| k.as_str()).map(str::to_string))
+                    .unwrap_or_default();
+                let (key, src) = auth::resolve_key(&set_key);
+                println!("LLM key: {} ({})", auth::mask(&key), auth::describe_source(src));
+                return Ok(());
+            }
+            "set" => {
+                let key = args.get(i + 2).cloned().unwrap_or_default();
+                if key.trim().is_empty() {
+                    anyhow::bail!("--auth set <key>: thiếu key");
+                }
+                auth::keychain_set(key.trim())?;
+                println!("Đã lưu key vào OS keychain (ctdozlite/llm-api-key).");
+                return Ok(());
+            }
+            "clear" => {
+                auth::keychain_clear()?;
+                println!("Đã xóa key khỏi OS keychain.");
+                return Ok(());
+            }
+            _ => anyhow::bail!("--auth status|set <key>|clear"),
+        }
+    }
+    let offline_mode = args.iter().any(|a| a == "--offline");
+    let thread_arg: Option<String> = args
+        .iter()
+        .position(|a| a == "--thread")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let agent_mode = args.iter().any(|a| a == "--agent");
+    let agent_send = args.iter().any(|a| a == "--agent-send");
+    let agent_poll: u64 = args
+        .iter()
+        .position(|a| a == "--agent-poll")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
     let api_port: Option<u16> = args
         .iter()
         .position(|a| a == "--api-port")
@@ -130,18 +176,29 @@ async fn main() -> Result<()> {
 
     logger::init(dev_mode);
 
+    // MCP stdio mode: stdout is JSON-RPC only — human logs go to stderr.
+    macro_rules! user_msg {
+        ($($arg:tt)*) => {
+            if force_mcp {
+                eprintln!($($arg)*);
+            } else {
+                println!($($arg)*);
+            }
+        };
+    }
+
     if dev_mode {
-        println!(
+        user_msg!(
             "🔧 [DEV MODE ACTIVATED] – Quét log, chẩn đoán giao thức và trace chi tiết được bật."
         );
     } else {
-        println!("🔒 [PRODUCTION MODE] – Toàn bộ nhật ký và dev inspector được ẩn.");
+        user_msg!("🔒 [PRODUCTION MODE] – Toàn bộ nhật ký và dev inspector được ẩn.");
     }
 
     let mut s = Session::new(dev_mode, dump, dump_raw)?;
     if let Some(ref p) = cli_proxy {
         if let Some(norm) = s.set_proxy(Some(p))? {
-            println!(
+            user_msg!(
                 "🌐 Đã kích hoạt Proxy cho phiên này: {}",
                 session::redact_proxy_url(&norm)
             );
@@ -157,7 +214,7 @@ async fn main() -> Result<()> {
                 } else {
                     &li.display_name
                 };
-                println!(
+                user_msg!(
                     "✓ Đã khôi phục phiên từ session.json: {name} (UIN: {})",
                     li.uin
                 );
@@ -172,10 +229,20 @@ async fn main() -> Result<()> {
         false
     };
 
+    // `--agent --thread <id>`: per-thread autonomous loop (dry-run unless --agent-send).
+    if agent_mode {
+        let Some(tid) = thread_arg.clone() else {
+            anyhow::bail!("--agent yêu cầu --thread <id>");
+        };
+        let db = store::db_path_for_account(s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or(""));
+        return agent::run_agent_loop(s, db, tid, agent_poll, agent_send).await;
+    }
+
     // If `--mcp` is requested, run the Model Context Protocol JSON-RPC 2.0 server over stdio (#35).
+    // `--thread <id>` locks thread-scoped tools to one thread (per-thread agent session).
     if force_mcp {
         let shared = std::sync::Arc::new(tokio::sync::Mutex::new(s));
-        return api_mcp::run_mcp_stdio_server(shared, "zalo_history.db").await;
+        return api_mcp::run_mcp_stdio_server_bound(shared, "zalo_history.db", thread_arg).await;
     }
 
     // If `--api-port <PORT>` is set without `--gui`/`--tui`, run headless REST + MCP server if `--api-only` is passed;
@@ -278,7 +345,7 @@ async fn main() -> Result<()> {
             "⚠️ Phiên trong session.json đã bị máy chủ từ chối ở lần chạy trước. Cần đăng nhập lại."
         );
         session_restored = false;
-    } else if session_restored {
+    } else if session_restored && !offline_mode {
         match s.session_status().await {
             session::SessionStatus::Valid => server_ok = true,
             session::SessionStatus::Expired => {
@@ -305,7 +372,9 @@ async fn main() -> Result<()> {
 
     // Login via QR or credentials if not already restored
     let mut logged_in_now = false;
-    if force_qr || !session_restored {
+    if offline_mode && !session_restored {
+        println!("📴 Chế độ offline: chạy với dữ liệu cục bộ, không kết nối máy chủ.");
+    } else if force_qr || !session_restored {
         if force_qr {
             println!("… Đang tạo mã QR");
             let _ = qr::login_via_qr(&mut s, "vi").await?;
@@ -358,7 +427,7 @@ async fn main() -> Result<()> {
     let tui_uin = s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or("");
     let tui_db = store::db_path_for_account(tui_uin);
     store::load_history_into_threads(&tui_db, &mut initial_threads, 200);
-    if s.login.is_some() && server_ok {
+    if s.login.is_some() && server_ok && !offline_mode {
         match chat::get_friends(&s).await {
             Ok(list) => {
                 for ft in list {
@@ -386,7 +455,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    let tui_app = tui::TuiApp::new(&mut s, initial_threads);
+    let mut tui_app = tui::TuiApp::new(&mut s, initial_threads);
+    if let Some(ref want) = thread_arg {
+        if tui_app.select_thread_by_id(want) {
+            println!("✓ Đã mở hội thoại: {want}");
+        } else {
+            eprintln!("! Không tìm thấy hội thoại: {want}");
+        }
+    }
     tui::run_tui(tui_app).await?;
 
     Ok(())
