@@ -2195,11 +2195,47 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         None => {
                                             temp_threads.retain(|t| !t.messages.is_empty());
                                             if !temp_threads.is_empty() {
-                                                // Deliver polled messages to UI immediately without blocking on profile HTTP
-                                                let _ = gui_tx_clone
-                                                    .send(GuiEvent::ThreadsUpdated(temp_threads.clone()));
-                                                ctx_clone.request_repaint();
-
+                                                // Skip UI churn when nothing actually changed (#135:
+                                                // 1.2s poll used to relayout the whole message list
+                                                // every tick even with zero new messages).
+                                                let fingerprint = |ts: &[Thread]| -> u64 {
+                                                    use std::hash::{Hash, Hasher};
+                                                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                                                    for th in ts {
+                                                        th.id.hash(&mut h);
+                                                        th.preview.hash(&mut h);
+                                                        th.messages.len().hash(&mut h);
+                                                        th.messages
+                                                            .last()
+                                                            .map(|m| m.id.clone())
+                                                            .unwrap_or_default()
+                                                            .hash(&mut h);
+                                                        th.unread.last_seen_id.hash(&mut h);
+                                                        th.unread.unread_ids.len().hash(&mut h);
+                                                        th.unread.marked_unread.hash(&mut h);
+                                                    }
+                                                    h.finish()
+                                                };
+                                                static LAST_SENT: std::sync::Mutex<u64> =
+                                                    std::sync::Mutex::new(0);
+                                                let fp = fingerprint(&temp_threads);
+                                                let is_fresh = match LAST_SENT.lock() {
+                                                    Ok(mut g) => {
+                                                        if *g == fp {
+                                                            false
+                                                        } else {
+                                                            *g = fp;
+                                                            true
+                                                        }
+                                                    }
+                                                    Err(_) => true,
+                                                };
+                                                if is_fresh {
+                                                    // Deliver polled messages to UI immediately without blocking on profile HTTP
+                                                    let _ = gui_tx_clone
+                                                        .send(GuiEvent::ThreadsUpdated(temp_threads.clone()));
+                                                    ctx_clone.request_repaint();
+                                                }
                                                 let needs_resolve = temp_threads.iter().any(|t| {
                                                     !t.presentation.contact_name
                                                         && (t.name.is_empty()
