@@ -5,6 +5,11 @@ use super::*;
 pub(super) static KNOWN_THREADS: std::sync::Mutex<Vec<(String, String, bool)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Cache thread-id có bật vanish (memory-only) để sweep tick 2s early-return ngay
+/// khi không thread nào bật — KHÔNG query DB mỗi tick.
+pub(super) static VANISH_THREADS: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
 pub enum WorkerCmd {
     /// Read OS authorization without prompting.
     ReadNotificationAuthorization {
@@ -68,6 +73,14 @@ pub enum WorkerCmd {
         is_group: bool,
         msg: ChatMessage,
     },
+    /// Sửa tin (WaveA3): recall tin cũ rồi gửi tin mới; worker báo
+    /// `GuiEvent::MessageEdited` để GUI gắn cờ + lưu bản cũ.
+    EditMessageCommit {
+        to_id: String,
+        is_group: bool,
+        old_msg: ChatMessage,
+        new_text: String,
+    },
     SendSticker {
         to_id: String,
         sticker_id: u64,
@@ -95,6 +108,14 @@ pub enum WorkerCmd {
         original_hd: bool,
     },
     TriggerScreenshot,
+    SendVoice {
+        to_id: String,
+        is_group: bool,
+        voice_path: std::path::PathBuf,
+        voice_dir: Option<std::path::PathBuf>,
+        mime: String,
+        duration_secs: u64,
+    },
     SendTyping {
         thread_id: String,
         is_group: bool,
@@ -116,6 +137,16 @@ pub enum WorkerCmd {
     },
     ParseLinkPreview {
         url: String,
+    },
+    TranslateMessage {
+        thread_id: String,
+        msg_id: String,
+        text: String,
+        target_lang: String,
+        /// Nguồn do user chọn ("auto" = heuristic), đi kèm để worker báo đúng.
+        source_lang: String,
+        /// Generation do GUI cấp, tăng mỗi lần bấm Dịch trên cùng tin.
+        generation: u64,
     },
     LookupPhone {
         phone: String,
@@ -207,6 +238,11 @@ pub enum WorkerCmd {
         is_group: bool,
         hide: bool,
     },
+    /// Bật/tắt tin nhắn tự xoá local-only (`duration_sec <= 0` = tắt).
+    SetThreadVanish {
+        thread_id: String,
+        duration_sec: i64,
+    },
     DeleteThread {
         thread_id: String,
         is_group: bool,
@@ -237,6 +273,16 @@ pub enum WorkerCmd {
         url: String,
         file_name: String,
         download_dir: String,
+    },
+    /// Tải bytes tài liệu (giới hạn 10MB) + trích text xem trước trong app.
+    FetchDocPreview {
+        msg_id: String,
+        url: String,
+        file_name: String,
+    },
+    FetchVideoThumbnail {
+        key: String,
+        url: String,
     },
     SendSeen {
         thread_id: String,
@@ -489,6 +535,283 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     });
                 }
                 {
+                    // Vanish sweep (tin nhắn tự xoá local-only): nhịp tick 2s riêng.
+                    // RẺ: early-return ngay khi `VANISH_THREADS` rỗng (cache memory, không
+                    // query DB mỗi tick). Chỉ thread có vanish mới đọc SQLite + gửi event.
+                    let gui_tx_vanish = gui_tx.clone();
+                    let ctx_vanish = egui_ctx.clone();
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(Duration::from_secs(2));
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        loop {
+                            tick.tick().await;
+                            let watch: Vec<String> = VANISH_THREADS
+                                .lock()
+                                .map(|v| v.clone())
+                                .unwrap_or_default();
+                            if watch.is_empty() {
+                                continue;
+                            }
+                            let now_ms = crate::login::unix_now().saturating_mul(1000);
+                            let swept: Vec<(String, Vec<String>)> =
+                                tokio::task::spawn_blocking(move || {
+                                    let mut out = Vec::new();
+                                    let Ok(store) =
+                                        crate::store::MessageStore::open("zalo_history.db")
+                                    else {
+                                        return out;
+                                    };
+                                    for tid in watch {
+                                        let Ok(msgs) = store.messages_for(&tid, 500) else {
+                                            continue;
+                                        };
+                                        if msgs.is_empty() {
+                                            continue;
+                                        }
+                                        let Some((dur, start)) =
+                                            store.load_thread_vanish(&tid)
+                                        else {
+                                            continue;
+                                        };
+                                        let setting = crate::chat::VanishSetting {
+                                            duration_sec: dur,
+                                            started_at_sec: start,
+                                        };
+                                        let dur_ms = dur.saturating_mul(1000);
+                                        let start_ms = start.saturating_mul(1000);
+                                        let mut expired_ids = Vec::new();
+                                        for sm in msgs {
+                                            // Tombstone đã persist (text + marker): bỏ qua,
+                                            // không gửi event lại mỗi 2s (#1908).
+                                            if sm.text.trim()
+                                                == crate::chat::VANISH_EXPIRED_TEXT
+                                                || sm.raw_json.trim()
+                                                    == crate::store::VANISH_TOMBSTONE_JSON
+                                            {
+                                                continue;
+                                            }
+                                            let ts =
+                                                crate::clock::normalize_ts_ms(sm.ts);
+                                            if ts < start_ms {
+                                                continue;
+                                            }
+                                            if now_ms.saturating_sub(ts) >= dur_ms
+                                                && setting.is_expired(ts, now_ms)
+                                            {
+                                                expired_ids.push(sm.msg_id.clone());
+                                            }
+                                        }
+                                        if !expired_ids.is_empty() {
+                                            out.push((tid, expired_ids));
+                                        }
+                                    }
+                                    out
+                                })
+                                .await
+                                .unwrap_or_default();
+                            if swept.is_empty() {
+                                continue;
+                            }
+                            for (tid, ids) in swept {
+                                let _ = gui_tx_vanish.send(GuiEvent::VanishExpired {
+                                    thread_id: tid,
+                                    expired_ids: ids,
+                                });
+                            }
+                            ctx_vanish.request_repaint();
+                        }
+                    });
+                }
+                {
+                    // Reminder tick (WaveA1): ké nhịp 2s của vanish sweep — claim
+                    // message_reminders tới hạn qua mọi DB acc rồi bắn ReminderDue 1 lần.
+                    // Không early-return theo VANISH_THREADS (reminder độc lập vanish).
+                    let gui_tx_rem = gui_tx.clone();
+                    let ctx_rem = egui_ctx.clone();
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(Duration::from_secs(2));
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        loop {
+                            tick.tick().await;
+                            let now_sec = crate::login::unix_now() as i64;
+                            let due: Vec<crate::store::ReminderItem> =
+                                tokio::task::spawn_blocking(move || {
+                                    let mut out = Vec::new();
+                                    let mut seen: std::collections::HashSet<i64> =
+                                        std::collections::HashSet::new();
+                                    // DB mặc định + mọi DB acc (accounts/*_history.db).
+                                    let mut dbs = vec!["zalo_history.db".to_string()];
+                                    if let Ok(entries) = std::fs::read_dir("accounts") {
+                                        for e in entries.flatten() {
+                                            let p = e.path();
+                                            if p.extension().and_then(|x| x.to_str())
+                                                == Some("db")
+                                            {
+                                                dbs.push(p.to_string_lossy().into_owned());
+                                            }
+                                        }
+                                    }
+                                    for db in dbs {
+                                        if let Ok(mut store) =
+                                            crate::store::MessageStore::open(&db)
+                                        {
+                                            for r in store.claim_due_reminders(now_sec) {
+                                                if seen.insert(r.id) {
+                                                    out.push(r);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    out.sort_by_key(|r| r.due_at);
+                                    out
+                                })
+                                .await
+                                .unwrap_or_default();
+                            if due.is_empty() {
+                                continue;
+                            }
+                            let _ = gui_tx_rem.send(GuiEvent::ReminderDue(due));
+                            ctx_rem.request_repaint();
+                        }
+                    });
+                }
+                {
+                    // Script per-thread trigger on_interval: nhịp 60s, chỉ DB acc đang dùng.
+                    // RẺ: mở DB 1 lần/tick, chỉ chạy script tới hạn; outbox drain qua SendMessage.
+                    let gui_tx_script = gui_tx.clone();
+                    let ctx_script = egui_ctx.clone();
+                    let session_script = session.clone();
+                    tokio::spawn(async move {
+                        // Lấy uin async trong task (blocking_lock panic trong runtime).
+                        let login_uin = session_script
+                            .lock()
+                            .await
+                            .login
+                            .as_ref()
+                            .map(|l| l.uin.clone())
+                            .unwrap_or_default();
+                        let mut tick = tokio::time::interval(Duration::from_secs(60));
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        loop {
+                            tick.tick().await;
+                            let now_sec = crate::login::unix_now();
+                            let due: Vec<(
+                                String,
+                                String,
+                                Vec<crate::chat::Thread>,
+                                Vec<crate::thread_script::ThreadScript>,
+                            )> = tokio::task::spawn_blocking({
+                                let login_uin = login_uin.clone();
+                                move || {
+                                    let mut out = Vec::new();
+                                    // DB của acc đang dùng (per-acc path).
+                                    let mut dbs = vec![crate::store::db_path_for_account(&login_uin)];
+                                    // Fallback DB mặc định khi chưa login.
+                                    if dbs[0].is_empty() || dbs[0] == "zalo_history.db" {
+                                        dbs = vec!["zalo_history.db".to_string()];
+                                    }
+                                    for db in dbs {
+                                        let store = match crate::store::MessageStore::open(&db) {
+                                            Ok(s) => s,
+                                            Err(_) => continue,
+                                        };
+                                        let enabled = store.all_enabled_scripts();
+                                        if enabled.is_empty() {
+                                            continue;
+                                        }
+                                        // RAM snapshot threads từ cache disk (không block UI).
+                                        let threads = crate::chat::load_threads_cache();
+                                        // Gom theo thread: chỉ script interval + tới hạn.
+                                        let mut by_thread: std::collections::HashMap<
+                                            String,
+                                            Vec<crate::thread_script::ThreadScript>,
+                                        > = std::collections::HashMap::new();
+                                        for s in enabled {
+                                            if let crate::thread_script::TriggerKind::OnInterval(
+                                                every,
+                                            ) = crate::thread_script::parse_trigger(
+                                                &s.trigger,
+                                                &s.trigger_arg,
+                                            ) {
+                                                let last: i64 = store
+                                                    .thread_kv_get(
+                                                        &s.thread_id,
+                                                        &crate::thread_script::last_run_key(s.id),
+                                                    )
+                                                    .and_then(|v| v.parse().ok())
+                                                    .unwrap_or(0);
+                                                if crate::thread_script::interval_due(
+                                                    last, every, now_sec,
+                                                ) {
+                                                    by_thread
+                                                        .entry(s.thread_id.clone())
+                                                        .or_default()
+                                                        .push(s);
+                                                }
+                                            }
+                                        }
+                                        for (tid, scripts) in by_thread {
+                                            out.push((db.clone(), tid, threads.clone(), scripts));
+                                        }
+                                    }
+                                    out
+                                }
+                            })
+                            .await
+                            .unwrap_or_default();
+                            for (db, tid, snapshot, scripts) in due {
+                                let ev = crate::thread_script::ScriptEvent::interval();
+                                for s in &scripts {
+                                    match crate::thread_script::run_script(
+                                        &db, &snapshot, &tid, s, &ev,
+                                    ) {
+                                        Ok(res) => {
+                                            for o in res.outbox {
+                                                if let Some(wtx) = WORKER_TX.get() {
+                                                    let is_group = snapshot
+                                                        .iter()
+                                                        .find(|t| t.id == o.thread_id)
+                                                        .map(|t| t.is_group)
+                                                        .unwrap_or(false);
+                                                    // Drain outbox qua SendMessage có sẵn.
+                                                    let _ = wtx.send(WorkerCmd::SendMessage {
+                                                        to_id: o.thread_id.clone(),
+                                                        text: o.text.clone(),
+                                                        is_group,
+                                                    });
+                                                }
+                                            }
+                                            for t in res.toasts {
+                                                let _ = gui_tx_script.send(
+                                                    GuiEvent::ScriptToast {
+                                                        thread_id: tid.clone(),
+                                                        message: t,
+                                                    },
+                                                );
+                                            }
+                                            let _ = gui_tx_script.send(
+                                                GuiEvent::ScriptLogsUpdated { thread_id: tid.clone() },
+                                            );
+                                            ctx_script.request_repaint();
+                                        }
+                                        Err(e) => {
+                                            crate::thread_script::persist_error_log(
+                                                &db,
+                                                &tid,
+                                                &s.name,
+                                                &e.to_string(),
+                                            );
+                                            let _ = gui_tx_script.send(
+                                                GuiEvent::ScriptLogsUpdated { thread_id: tid.clone() },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                {
                     let s_kw = session.clone();
                     let gui_tx_kw = gui_tx.clone();
                     let ctx_kw = egui_ctx.clone();
@@ -660,7 +983,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                         url,
                                                         sync_id,
                                                         batch_type,
-                                                        is_last: _,
+                                                        is_last,
                                                     } => {
                                                         let s_sync = s_snap.clone();
                                                         let gui_tx_sync = gui_tx_ws.clone();
@@ -671,12 +994,15 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                 crate::history_sync::set_last_mobile_sync_status(Some(note.clone()));
                                                                 let _ = gui_tx_sync.send(GuiEvent::StatusUpdate(note));
                                                                 ctx_sync.request_repaint();
+                                                                crate::logger::log_sync(&format!("batch meta về: sync={}", sync_id));
                                                                 match crate::history_sync::import_sync_v2_meta(&s_sync, &url).await {
                                                                     Ok(meta) => {
                                                                         crate::history_sync::record_sync_v2_session(&sync_id, &meta.session_id);
+                                                                        crate::logger::log_sync(&format!("meta OK: sync={} session={}", sync_id, meta.session_id));
                                                                     }
                                                                     Err(e) => {
                                                                         let err = format!("⚠️ Lỗi giải mã phiên Sync v2 ({sync_id}): {e}");
+                                                                        crate::logger::log_sync(&format!("meta FAIL: sync={} err={}", sync_id, e));
                                                                         crate::history_sync::set_last_mobile_sync_status(Some(err.clone()));
                                                                         let _ = gui_tx_sync.send(GuiEvent::StatusUpdate(err));
                                                                     }
@@ -696,8 +1022,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                 let _ = gui_tx_sync.send(GuiEvent::StatusUpdate(note));
                                                                 ctx_sync.request_repaint();
 
-                                                                match crate::history_sync::import_sync_v2_messages(&s_sync, &url).await {
+                                                                crate::logger::log_sync(&format!("batch msg về: sync={} last={}", sync_id, is_last));
+                                                                match crate::history_sync::import_sync_v2_messages_inner(&s_sync, &url, Some(&sync_id), is_last).await {
                                                                     Ok(count) => {
+                                                                        crate::logger::log_sync(&format!("msg OK: sync={} count={}", sync_id, count));
                                                                         let fin = format!("🎉 Đã giải mã & đồng bộ thành công {count} tin nhắn từ điện thoại vào ứng dụng!");
                                                                         crate::history_sync::set_last_mobile_sync_status(Some(fin.clone()));
                                                                         let _ = gui_tx_sync.send(GuiEvent::StatusUpdate(fin));
@@ -705,6 +1033,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                         let _ = gui_tx_sync.send(GuiEvent::ThreadsUpdated(updated));
                                                                     }
                                                                     Err(e) => {
+                                                                        crate::logger::log_sync(&format!("msg FAIL: sync={} err={}", sync_id, e));
                                                                         let err = format!("⚠️ Lỗi giải mã tin nhắn Sync v2 ({sync_id}): {e}");
                                                                         crate::history_sync::set_last_mobile_sync_status(Some(err.clone()));
                                                                         let _ = gui_tx_sync.send(GuiEvent::StatusUpdate(err));
@@ -731,6 +1060,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                             avatar: None,
                                                             is_group: false,
                                                             messages: Vec::new(),
+                                                            vanish: None,
                                                         });
                                                     }
                                                 }
@@ -747,6 +1077,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                 avatar: None,
                                                                 is_group: *is_group,
                                                                 messages: Vec::new(),
+                                                                vanish: None,
                                                             });
                                                         }
                                                     }
@@ -763,9 +1094,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                     );
                                                     ctx_ws.request_repaint();
                                                     let needs_resolve = ws_threads.iter().any(|t| {
-                                                        t.name.is_empty()
-                                                            || t.name.starts_with("Người dùng ")
-                                                            || crate::chat::is_generic_thread_name(&t.name)
+                                                        !t.presentation.contact_name
+                                                            && (t.name.is_empty()
+                                                                || crate::chat::is_placeholder_thread_name(&t.name, &t.id)
+                                                                || crate::chat::is_generic_thread_name(&t.name))
                                                     });
                                                     if needs_resolve {
                                                         let s_bg = s_snap.clone();
@@ -893,9 +1225,16 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::PersistThreads(threads_snapshot) => {
+                            let uin = session
+                                .lock()
+                                .await
+                                .login
+                                .as_ref()
+                                .map(|l| l.uin.clone())
+                                .unwrap_or_default();
+                            let db_path = crate::store::db_path_for_account(&uin);
                             tokio::task::spawn_blocking(move || {
-                                if let Ok(mut store) =
-                                    crate::store::MessageStore::open("zalo_history.db")
+                                if let Ok(mut store) = crate::store::MessageStore::open(&db_path)
                                 {
                                     let _ =
                                         crate::store::persist_threads(&mut store, &threads_snapshot);
@@ -909,6 +1248,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default()
                             };
                             if !cur_uin.is_empty() {
+                                // Snapshot acc cũ vào accounts/ trước khi QR acc mới đè file dùng chung (#1008).
                                 let _ = crate::account_manager::save_current_account_snapshot(&cur_uin);
                             }
                             if let Some(task) = current_qr_task.take() {
@@ -916,7 +1256,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             }
                             let _ = std::fs::remove_file("session.json");
                             let _ = std::fs::remove_file("threads_cache.json");
-                            let _ = std::fs::remove_file("zalo_history.db");
+                            // KHÔNG xóa zalo_history.db ở đây (#21, #103): history đã
+                            // snapshot ở trên; muốn xóa dùng WipeLocalData.
                             {
                                 let mut s = session.lock().await;
                                 s.logout();
@@ -943,7 +1284,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     let name = s.login.as_ref().map(|l| l.display_name.clone()).unwrap_or_default();
                                     let ava = s.login.as_ref().and_then(|l| if l.avatar.is_empty() { None } else { Some(l.avatar.clone()) });
                                     let mut threads = crate::chat::load_threads_cache();
-                                    if let Ok(store) = crate::store::MessageStore::open("zalo_history.db") {
+                                    let db_path = crate::store::db_path_for_account(&uin);
+                                    if let Ok(store) = crate::store::MessageStore::open(&db_path) {
                                         let _ = store.hydrate_threads(&mut threads, 50);
                                     }
                                     let _ = gui_tx.send(GuiEvent::AccountSwitched {
@@ -1116,6 +1458,72 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 .await;
                             });
                         }
+                        WorkerCmd::SetThreadVanish {
+                            thread_id,
+                            duration_sec,
+                        } => {
+                            // Vanish là local-only: không gọi server, chỉ persist SQLite + báo GUI
+                            // để apply ngay vào thread đang hiển thị. Ghi vào BOTH DB:
+                            // account DB (theo uin, nguồn thật cho sweep/hydrate) VÀ
+                            // active `zalo_history.db` (worker sweep/hydrate đọc path này;
+                            // chỉ ghi history DB thì sweep skip vì active DB không có
+                            // setting → tin đủ hạn vẫn hiển thị, #1156). Lỗi persist
+                            // chỉ log, GUI vẫn giữ trạng thái RAM.
+                            let db_path = {
+                                let s = session.lock().await;
+                                let uin =
+                                    s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
+                                crate::store::db_path_for_account(&uin)
+                            };
+                            let now_sec = crate::login::unix_now();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                // 1) Account DB — nguồn thật.
+                                if let Ok(mut store) =
+                                    crate::store::MessageStore::open(&db_path)
+                                {
+                                    if duration_sec > 0 {
+                                        let _ = store.upsert_thread_vanish(
+                                            &thread_id,
+                                            duration_sec,
+                                            now_sec,
+                                        );
+                                    } else {
+                                        let _ = store
+                                            .upsert_thread_vanish(&thread_id, 0, 0);
+                                    }
+                                }
+                                // 2) Active DB — worker sweep + hydrate đang đọc path này.
+                                // Trùng khi chưa login multi-account thì open cùng file, rẻ.
+                                if db_path != "zalo_history.db" {
+                                    if let Ok(mut active) =
+                                        crate::store::MessageStore::open("zalo_history.db")
+                                    {
+                                        if duration_sec > 0 {
+                                            let _ = active.upsert_thread_vanish(
+                                                &thread_id,
+                                                duration_sec,
+                                                now_sec,
+                                            );
+                                        } else {
+                                            let _ = active
+                                                .upsert_thread_vanish(&thread_id, 0, 0);
+                                        }
+                                    }
+                                }
+                                let _ = gui_tx_clone.send(GuiEvent::VanishSettingChanged {
+                                    thread_id,
+                                    duration_sec,
+                                    started_at_sec: if duration_sec > 0 {
+                                        now_sec
+                                    } else {
+                                        0
+                                    },
+                                });
+                                ctx_clone.request_repaint();
+                            });
+                        }
                         WorkerCmd::DeleteThread {
                             thread_id,
                             is_group,
@@ -1246,7 +1654,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                             .as_ref()
                                                             .map(|l| l.uin.clone())
                                                             .unwrap_or_default();
-                                                        let _ = crate::account_manager::save_current_account_snapshot(&uin);
                                                         let dname = s
                                                             .login
                                                             .as_ref()
@@ -1275,9 +1682,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                     .iter_mut()
                                                                     .find(|t| t.id == ft.id)
                                                                 {
-                                                                    if !ft.name.is_empty() {
-                                                                        ex.name = ft.name;
-                                                                    }
+                                                                    crate::chat::adopt_thread_name(
+                                                                        ex,
+                                                                        ft.name,
+                                                                        ft.presentation.contact_name,
+                                                                    );
                                                                     if crate::chat::should_replace_avatar(
                                                                         ex.avatar.as_deref(),
                                                                         ft.avatar.as_deref(),
@@ -1469,9 +1878,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         Ok(friends) => {
                                             for ft in friends {
                                                 if let Some(ex) = list.iter_mut().find(|t| t.id == ft.id) {
-                                                    if !ft.name.is_empty() {
-                                                        ex.name = ft.name;
-                                                    }
+                                                    crate::chat::adopt_thread_name(
+                                                        ex,
+                                                        ft.name,
+                                                        ft.presentation.contact_name,
+                                                    );
                                                     if crate::chat::should_replace_avatar(
                                                         ex.avatar.as_deref(),
                                                         ft.avatar.as_deref(),
@@ -1598,6 +2009,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             avatar: None,
                                             is_group,
                                             messages: Vec::new(),
+                                            vanish: None,
                                         })
                                         .collect();
 
@@ -1680,7 +2092,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                             url,
                                                             sync_id,
                                                             batch_type,
-                                                            is_last: _,
+                                                            is_last,
                                                         } => {
                                                             let s_sync = s.clone();
                                                             let gui_tx_sync = gui_tx_clone.clone();
@@ -1691,12 +2103,15 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                     crate::history_sync::set_last_mobile_sync_status(Some(note.clone()));
                                                                     let _ = gui_tx_sync.send(GuiEvent::StatusUpdate(note));
                                                                     ctx_sync.request_repaint();
+                                                                    crate::logger::log_sync(&format!("batch meta về: sync={}", sync_id));
                                                                     match crate::history_sync::import_sync_v2_meta(&s_sync, &url).await {
                                                                         Ok(meta) => {
                                                                             crate::history_sync::record_sync_v2_session(&sync_id, &meta.session_id);
+                                                                            crate::logger::log_sync(&format!("meta OK: sync={} session={}", sync_id, meta.session_id));
                                                                         }
                                                                         Err(e) => {
                                                                             let err = format!("⚠️ Lỗi giải mã phiên Sync v2 ({sync_id}): {e}");
+                                                                            crate::logger::log_sync(&format!("meta FAIL: sync={} err={}", sync_id, e));
                                                                             crate::history_sync::set_last_mobile_sync_status(Some(err.clone()));
                                                                             let _ = gui_tx_sync.send(GuiEvent::StatusUpdate(err));
                                                                         }
@@ -1714,8 +2129,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                     let _ = gui_tx_sync.send(GuiEvent::StatusUpdate(note));
                                                                     ctx_sync.request_repaint();
 
-                                                                    match crate::history_sync::import_sync_v2_messages(&s_sync, &url).await {
+                                                                    crate::logger::log_sync(&format!("batch msg về: sync={} last={}", sync_id, is_last));
+                                                                    match crate::history_sync::import_sync_v2_messages_inner(&s_sync, &url, Some(&sync_id), is_last).await {
                                                                         Ok(count) => {
+                                                                            crate::logger::log_sync(&format!("msg OK: sync={} count={}", sync_id, count));
                                                                             let fin = format!("🎉 Đã giải mã & đồng bộ thành công {count} tin nhắn từ điện thoại vào ứng dụng!");
                                                                             crate::history_sync::set_last_mobile_sync_status(Some(fin.clone()));
                                                                             let _ = gui_tx_sync.send(GuiEvent::StatusUpdate(fin));
@@ -1723,6 +2140,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                             let _ = gui_tx_sync.send(GuiEvent::ThreadsUpdated(updated));
                                                                         }
                                                                         Err(e) => {
+                                                                            crate::logger::log_sync(&format!("msg FAIL: sync={} err={}", sync_id, e));
                                                                             let err = format!("⚠️ Lỗi giải mã tin nhắn Sync v2 ({sync_id}): {e}");
                                                                             crate::history_sync::set_last_mobile_sync_status(Some(err.clone()));
                                                                             let _ = gui_tx_sync.send(GuiEvent::StatusUpdate(err));
@@ -1794,9 +2212,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 ctx_clone.request_repaint();
 
                                                 let needs_resolve = temp_threads.iter().any(|t| {
-                                                    t.name.is_empty()
-                                                        || t.name.starts_with("Người dùng ")
-                                                        || crate::chat::is_generic_thread_name(&t.name)
+                                                    !t.presentation.contact_name
+                                                        && (t.name.is_empty()
+                                                            || crate::chat::is_placeholder_thread_name(&t.name, &t.id)
+                                                            || crate::chat::is_generic_thread_name(&t.name))
                                                 });
                                                 if needs_resolve {
                                                     crate::chat::resolve_thread_names(
@@ -1917,6 +2336,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         avatar: None,
                                         is_group: is_group && !is_send2me,
                                         messages: Vec::new(),
+                                        vanish: None,
                                     };
                                     let mut t_list = vec![t];
                                     let uin = s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or_default();
@@ -2116,6 +2536,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 time: now,
                                                 is_outgoing: true,
                                                 ts: (crate::login::unix_now() * 1000) as i64,
+                                                delivery: crate::message_model::DeliveryState::ServerAccepted,
                                                 link_url: Some(meta.url),
                                                 link_title: if meta.title.is_empty() {
                                                     None
@@ -2287,6 +2708,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 time: crate::ui::clock(),
                                                 is_outgoing: true,
                                                 ts: (crate::login::unix_now() * 1000) as i64,
+                                                delivery: crate::message_model::DeliveryState::ServerAccepted,
                                                 link_url: msg.link_url.clone(),
                                                 link_thumb: msg.link_thumb.clone(),
                                                 link_src: msg.link_src.clone(),
@@ -2478,6 +2900,78 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         crate::logger::log_error("gui::recall", &e.to_string());
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                             "Không thể thu hồi trên máy chủ: {e}"
+                                        )));
+                                    }
+                                }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::EditMessageCommit {
+                            to_id,
+                            is_group,
+                            old_msg,
+                            new_text,
+                        } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let old_id = old_msg.id.clone();
+                                let old_text = old_msg.text.clone();
+                                // 1. Recall tin cũ (local-only thì bỏ qua gọi mạng).
+                                let local_only = old_id.is_empty()
+                                    || old_id.starts_with("out_")
+                                    || old_id.starts_with("local_");
+                                if !local_only {
+                                    let _ =
+                                        crate::chat::recall_message(&s, &to_id, is_group, &old_msg)
+                                            .await;
+                                }
+                                // 2. Gửi tin mới với text đã sửa.
+                                let client_id = crate::chat::next_client_message_id();
+                                let res = if is_group {
+                                    crate::chat::send_group_message_with_client_id(
+                                        &s, &to_id, &new_text, client_id,
+                                    )
+                                    .await
+                                } else {
+                                    crate::chat::send_message_with_client_id(
+                                        &s, &to_id, &new_text, client_id,
+                                    )
+                                    .await
+                                };
+                                match res {
+                                    Ok(resp) if resp_error_code(&resp).is_none() => {
+                                        let msg_id = extract_msg_id(&resp);
+                                        let final_id = if msg_id.is_empty() {
+                                            format!("out_{client_id}")
+                                        } else {
+                                            msg_id
+                                        };
+                                        let _ = gui_tx_clone.send(GuiEvent::MessageEdited {
+                                            thread_id: to_id,
+                                            old_msg_id: old_id,
+                                            old_text,
+                                            new_text,
+                                            new_msg_id: final_id,
+                                            new_ts: (crate::login::unix_now() * 1000) as i64,
+                                        });
+                                    }
+                                    Ok(resp) => {
+                                        let err_s = format!(
+                                            "server error {}",
+                                            resp_error_code(&resp).unwrap_or(0)
+                                        );
+                                        crate::logger::log_error("gui::edit", &err_s);
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                            "Sửa tin nhắn thất bại: {err_s}"
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        crate::logger::log_error("gui::edit", &e.to_string());
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                            "Sửa tin nhắn thất bại: {e}"
                                         )));
                                     }
                                 }
@@ -2681,10 +3175,14 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             .send()
                                             .await
                                         {
-                                            Ok(resp) if resp.status().is_success() => {
-                                                resp.bytes().await.ok()
+                                            Ok(resp) => {
+                                                if resp.status().is_success() {
+                                                    resp.bytes().await.ok()
+                                                } else {
+                                                    None
+                                                }
                                             }
-                                            _ => None,
+                                            Err(_) => None,
                                         };
                                         (body.map(|b| b.to_vec()), true)
                                     };
@@ -2695,6 +3193,17 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 };
 
                                 let _ = tokio::task::spawn_blocking(move || {
+                                    let is_svg = bytes.len() >= 5
+                                        && (bytes.starts_with(b"<svg")
+                                            || bytes.starts_with(b"<?xml")
+                                            || bytes.windows(5).any(|w| w == b"<svg "));
+                                    if is_svg {
+                                        // SVG không decode được bằng image crate: fail vĩnh viễn,
+                                        // không xoá cache, bubble hiển thị link fallback (#5508).
+                                        let _ = gui_tx_clone.send(GuiEvent::StickerImageFailed { key });
+                                        ctx_clone.request_repaint();
+                                        return;
+                                    }
                                     let Ok(mut dyn_img) = image::load_from_memory(&bytes) else {
                                         if !from_network {
                                             // Corrupt cache entry: drop it so the next request refetches.
@@ -2709,7 +3218,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     }
                                     // Bubbles draw images up to 360 pt wide; resize large photos to 720px max
                                     // so inline thumbnails stay crisp on Retina/HiDPI displays (#72).
-                                    // The viewer's `hd_` textures stay full size.
                                     if !key.starts_with("ava_")
                                         && !key.starts_with("hd_")
                                         && (dyn_img.width() > 720 || dyn_img.height() > 720)
@@ -2906,6 +3414,76 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 }
                             });
                         }
+                        WorkerCmd::TranslateMessage {
+                            thread_id,
+                            msg_id,
+                            text,
+                            target_lang,
+                            source_lang,
+                            generation,
+                        } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let target_norm = target_lang.trim();
+                                let target_norm = if target_norm.is_empty() { "vi" } else { target_norm };
+                                let manual_src = {
+                                    let m = source_lang.trim();
+                                    if m.is_empty() || m.eq_ignore_ascii_case("auto") {
+                                        None
+                                    } else {
+                                        Some(m.to_ascii_lowercase())
+                                    }
+                                };
+                                // Tách 2 nhánh để tránh Box::leak lifetime: manual dùng
+                                // String sở hữu riêng, auto dùng &'static từ heuristic.
+                                let send_result = if let Some(m) = manual_src {
+                                    if m.eq_ignore_ascii_case(target_norm) {
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
+                                            "Tin nhắn đã đúng ngôn ngữ đích, không cần dịch".into(),
+                                        ));
+                                        ctx_clone.request_repaint();
+                                        return;
+                                    }
+                                    crate::chat::translate_via_mymemory(&s.http, &text, &m, target_norm).await
+                                } else {
+                                    let Some(source) = crate::chat::translate_source_for_target(&text, target_norm)
+                                    else {
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
+                                            "Tin nhắn đã đúng ngôn ngữ đích (hoặc quá ngắn), không cần dịch".into(),
+                                        ));
+                                        ctx_clone.request_repaint();
+                                        return;
+                                    };
+                                    if source.eq_ignore_ascii_case(target_norm) {
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
+                                            "Tin nhắn đã đúng ngôn ngữ đích, không cần dịch".into(),
+                                        ));
+                                        ctx_clone.request_repaint();
+                                        return;
+                                    }
+                                    crate::chat::translate_via_mymemory(&s.http, &text, source, target_norm).await
+                                };
+                                match send_result {
+                                    Ok(translated) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::MessageTranslated {
+                                            thread_id,
+                                            msg_id,
+                                            text: translated,
+                                            generation,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                            "⚠️ Lỗi dịch: {e}"
+                                        )));
+                                    }
+                                }
+                                ctx_clone.request_repaint();
+                            });
+                        }
                         WorkerCmd::PickAttachments { mode } => {
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -3048,6 +3626,64 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let ctx_clone = egui_ctx.clone();
                             tokio::task::spawn_blocking(move || {
                                 capture_screen_interactive(gui_tx_clone, ctx_clone);
+                            });
+                        }
+                        WorkerCmd::SendVoice {
+                            to_id,
+                            is_group,
+                            voice_path,
+                            voice_dir,
+                            mime,
+                            duration_secs,
+                        } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                // Dọn file + dir tạm đúng cả khi gửi xong lẫn khi lỗi:
+                                // không để lại bản ghi âm riêng tư trong thư mục chia sẻ.
+                                let cleanup = || {
+                                    let _ = std::fs::remove_file(&voice_path);
+                                    if let Some(d) = voice_dir.as_ref() {
+                                        let _ = std::fs::remove_dir(d);
+                                    }
+                                };
+                                let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
+                                    "⏳ Đang tải lên và gửi tin nhắn thoại…".into(),
+                                ));
+                                ctx_clone.request_repaint();
+                                // send_voice_message tự đọc file voice + trả (resp, ChatMessage).
+                                let s = session_clone.lock().await.clone();
+                                let path_clone = voice_path.clone();
+                                match crate::chat::send_voice_message(
+                                    &s,
+                                    &to_id,
+                                    is_group,
+                                    &path_clone,
+                                    &mime,
+                                    duration_secs,
+                                )
+                                .await
+                                {
+                                    Ok((_resp, cm)) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::AttachmentSent {
+                                            thread_id: to_id,
+                                            msg: cm,
+                                        });
+                                        cleanup();
+                                    }
+                                    Err(e) => {
+                                        let err_s = e.to_string();
+                                        crate::logger::log_error("gui::send_voice", &err_s);
+                                        cleanup();
+                                        let _ = gui_tx_clone.send(GuiEvent::SendFailed {
+                                            thread_id: to_id,
+                                            text: String::new(),
+                                            error: format!("Lỗi gửi thoại: {err_s}"),
+                                        });
+                                    }
+                                }
+                                ctx_clone.request_repaint();
                             });
                         }
                         WorkerCmd::StartCall {
@@ -3304,9 +3940,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                         if let Some(ex) =
                                                             list.iter_mut().find(|t| t.id == ft.id)
                                                         {
-                                                            if !ft.name.is_empty() {
-                                                                ex.name = ft.name;
-                                                            }
+                                                            crate::chat::adopt_thread_name(
+                                                                ex,
+                                                                ft.name,
+                                                                ft.presentation.contact_name,
+                                                            );
                                                             if crate::chat::should_replace_avatar(
                                                                 ex.avatar.as_deref(),
                                                                 ft.avatar.as_deref(),
@@ -3701,6 +4339,105 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 ctx_clone.request_repaint();
                             });
                         }
+                        WorkerCmd::FetchDocPreview {
+                            msg_id,
+                            url,
+                            file_name,
+                        } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let client = { session_clone.lock().await.clone().http };
+                                let res = download_preview_bytes(&client, &url).await;
+                                match res {
+                                    Ok(bytes) => {
+                                        let ext = file_name
+                                            .rsplit('.')
+                                            .next()
+                                            .unwrap_or_default()
+                                            .to_ascii_lowercase();
+                                        // Extract trên blocking thread (zip/pdf CPU-bound).
+                                        let extracted = tokio::task::spawn_blocking(move || {
+                                            crate::doc_preview::extract_text(&bytes, &ext)
+                                        })
+                                        .await
+                                        .map_err(|e| format!("Lỗi tác vụ trích text: {e}"))
+                                        .and_then(|r| r);
+                                        match extracted {
+                                            Ok(text) => {
+                                                let _ = gui_tx_clone.send(
+                                                    GuiEvent::DocPreviewReady { msg_id, text },
+                                                );
+                                            }
+                                            Err(err) => {
+                                                let _ = gui_tx_clone.send(
+                                                    GuiEvent::DocPreviewFailed { msg_id, err },
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let _ = gui_tx_clone
+                                            .send(GuiEvent::DocPreviewFailed { msg_id, err });
+                                    }
+                                }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchVideoThumbnail { key, url } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                // No ffmpeg -> no thumbnail, no crash: the bubble
+                                // keeps its fallback card below.
+                                if !crate::media::is_ffmpeg_available() {
+                                    let _ = gui_tx_clone
+                                        .send(GuiEvent::StickerImageFailed { key });
+                                    ctx_clone.request_repaint();
+                                    return;
+                                }
+                                let bytes = {
+                                    let client = { session_clone.lock().await.clone().http };
+                                    match client.get(&url).send().await {
+                                        Ok(resp) if resp.status().is_success() => {
+                                            resp.bytes().await.ok().map(|b| b.to_vec())
+                                        }
+                                        _ => None,
+                                    }
+                                };
+                                let Some(bytes) = bytes else {
+                                    let _ = gui_tx_clone
+                                        .send(GuiEvent::StickerImageFailed { key });
+                                    ctx_clone.request_repaint();
+                                    return;
+                                };
+                                let frame = tokio::task::spawn_blocking(move || {
+                                    extract_first_video_frame(&bytes)
+                                })
+                                .await
+                                .ok()
+                                .flatten();
+                                let Some(rgba) = frame else {
+                                    let _ = gui_tx_clone
+                                        .send(GuiEvent::StickerImageFailed { key });
+                                    ctx_clone.request_repaint();
+                                    return;
+                                };
+                                let size = [rgba.width() as usize, rgba.height() as usize];
+                                let pixels = rgba.as_flat_samples();
+                                let color_img = egui::ColorImage::from_rgba_unmultiplied(
+                                    size,
+                                    pixels.as_slice(),
+                                );
+                                let _ = gui_tx_clone.send(GuiEvent::StickerImageReady {
+                                    key,
+                                    image: color_img,
+                                });
+                                ctx_clone.request_repaint();
+                            });
+                        }
                         WorkerCmd::SendTyping {
                             thread_id,
                             is_group,
@@ -4037,6 +4774,74 @@ async fn download_attachment_with_original_name(
     .await
     .map_err(|e| format!("Lỗi tác vụ lưu file: {e}"))?
 }
+/// Download attachment bytes for in-app preview, bounded at 10 MiB (no disk write).
+async fn download_preview_bytes(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<Vec<u8>, String> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Không thể tải tập tin: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Máy chủ trả về mã HTTP {}", resp.status()));
+    }
+    if resp
+        .content_length()
+        .is_some_and(|len| len > crate::doc_preview::MAX_PREVIEW_BYTES as u64)
+    {
+        return Err("File quá lớn để xem trước (>10MB), hãy tải về.".to_string());
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Lỗi đọc dữ liệu tập tin: {e}"))?;
+    if bytes.len() > crate::doc_preview::MAX_PREVIEW_BYTES {
+        return Err("File quá lớn để xem trước (>10MB), hãy tải về.".to_string());
+    }
+    Ok(bytes.to_vec())
+}
+
+/// Extract the first video frame via the system `ffmpeg` into a downscaled RGBA thumbnail.
+/// Called on a blocking thread; returns `None` on any failure (no ffmpeg, bad bytes,
+/// decode error) so the caller can keep the fallback card.
+fn extract_first_video_frame(bytes: &[u8]) -> Option<image::RgbaImage> {
+    // Lấy kích thước frame đã scale trực tiếp từ header PNG của ffmpeg
+    // (image2pipe + png): không còn lệch 480x360 vs 320x240 (#4226).
+    let mut child = std::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-vframes",
+            "1",
+            "-vf",
+            "scale=480:-1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "pipe:1",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    use std::io::Write;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(bytes);
+    }
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    image::load_from_memory(&out.stdout).ok().map(|d| d.to_rgba8())
+}
+
 
 pub(crate) fn capture_screen_interactive(gui_tx: crate::gui::GuiTx, ctx: egui::Context) {
     #[cfg(target_os = "windows")]

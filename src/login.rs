@@ -27,8 +27,11 @@ pub fn encrypt_password(phone: &str, imei: &str, password: &str, salt: &str) -> 
 
     let even: Vec<char> = hex.chars().step_by(2).collect();
     let odd: Vec<char> = hex.chars().skip(1).step_by(2).collect();
-    let enk: String = even[..16].iter().collect::<String>()
-        + &odd.iter().rev().take(16).collect::<String>();
+    let enk: String = format!(
+        "{}{}",
+        even[..16].iter().collect::<String>(),
+        odd.iter().rev().take(16).collect::<String>()
+    );
 
     let mut plain = salt.to_string();
     plain.extend(password.chars().rev());

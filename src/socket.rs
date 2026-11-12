@@ -99,6 +99,22 @@ pub fn send_sync_message_ws_request(payload: &Value) -> bool {
     });
     send_ws_frame(CMD_SYNC_REQUEST, 0, 1, Some(&body))
 }
+
+/// Emit `SYNC_MESSAGE.ACK_DELETE_SYNC_SESSION` (`cmd 591`, `subCmd 0`).
+/// Zalo PC gửi khi release session (xong/huỷ/lỗi) — server/phone dọn session.
+/// Thiếu 591 khiến session server-side sống mãi, phone kẹt "đang đồng bộ".
+pub fn send_sync_ack_delete(sync_id: &str, reason: &str) -> bool {
+    let req_id = format!("req_591_{}", now_ms());
+    let body = json!({
+        "reqId": req_id,
+        "data": {
+            "syncId": sync_id,
+            "toDevice": 0,
+            "reason": reason,
+        }
+    });
+    send_ws_frame(CMD_SYNC_ACK_DELETE, 0, 1, Some(&body))
+}
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) ZaloPC/26.10.11 Chrome/122.0.0.0 Electron/29.0.0 Safari/537.36";
 
@@ -592,6 +608,10 @@ async fn run_once(
                         ))
                         .await;
                     trace(format!("-> pull next {qkey} {id}"));
+                }
+                // Log response của Sync V2 (590/592) để biết server ack hay từ chối.
+                if cmd == CMD_SYNC_REQUEST || cmd == CMD_SYNC_MOBILE_WAKE_UP {
+                    crate::logger::log_sync(&format!("WS về cmd={cmd}: {}", payload.to_string().chars().take(400).collect::<String>()));
                 }
                 let _ = tx.send(WsEvent { cmd, sub_cmd, version, payload });
             }

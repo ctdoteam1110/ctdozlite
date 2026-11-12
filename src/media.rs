@@ -42,6 +42,11 @@ pub fn mic_gain_percent() -> u32 {
 pub fn mic_level_permille() -> u32 {
     MIC_LEVEL_PERMILLE.load(Ordering::Relaxed)
 }
+/// Đặt mức mic tức thời từ peak tuyến tính (`0.0..=1.0`) — dùng cho meter khi thu voice.
+pub fn set_mic_level_from_peak(peak: f32) {
+    MIC_LEVEL_PERMILLE.store((peak.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
+}
+
 
 /// Whether remote peer audio is currently above the speaking threshold.
 pub fn is_remote_speaking() -> bool {

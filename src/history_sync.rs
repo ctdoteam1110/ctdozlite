@@ -132,22 +132,48 @@ pub fn clear_sync_keys() {
     }
 }
 
-/// Generate a genuine 2048-bit RSA SubjectPublicKeyInfo (`SPKI`) DER Base64 key
-/// (`294 bytes` -> `392 chars` Base64 starting with `MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...`),
-/// matching `sync-message-key-generator` (`main-startup.js:598226`) for `pullMobileMsg` (`cmd 12000`).
+/// Load (hoặc gen 1 lần + lưu `sync_rsa_identity.json`) RSA-2048 key cố định của
+/// máy cho V1 `pullMobileMsg` (`cmd 12000`). Đúng Zalo PC: phone match
+/// `pc_name`+`public_key` khi gửi `user_confirm` về — key mới mỗi lần khiến
+/// phone thấy thiết bị lạ, bấm vào thông báo không mở được.
 pub fn generate_sync_public_key() -> String {
-    use rsa::pkcs8::EncodePublicKey;
+    use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
     use rsa::{RsaPrivateKey, RsaPublicKey};
     use base64::Engine;
 
+    const PATH: &str = "sync_rsa_identity.json";
+    // 1. Thử đọc key đã lưu.
+    if let Ok(raw) = std::fs::read_to_string(PATH) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(pem) = v.get("private_pem").and_then(|x| x.as_str()) {
+                if let Ok(priv_key) = RsaPrivateKey::from_pkcs8_pem(pem) {
+                    let pub_key = RsaPublicKey::from(&priv_key);
+                    if let Ok(der) = pub_key.to_public_key_der() {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(der.as_bytes());
+                        if let Ok(mut g) = CURRENT_SYNC_KEYS.lock() {
+                            *g = Some((priv_key, b64.clone()));
+                        }
+                        crate::logger::log_sync("rsa: dùng key đã lưu");
+                        return b64;
+                    }
+                }
+            }
+        }
+    }
+    // 2. Gen mới + lưu.
     let mut rng = rsa::rand_core::OsRng;
     if let Ok(priv_key) = RsaPrivateKey::new(&mut rng, 2048) {
         let pub_key = RsaPublicKey::from(&priv_key);
         if let Ok(der) = pub_key.to_public_key_der() {
             let b64 = base64::engine::general_purpose::STANDARD.encode(der.as_bytes());
+            if let Ok(pem) = priv_key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF) {
+                let doc = serde_json::json!({ "private_pem": pem.as_str() });
+                let _ = std::fs::write(PATH, serde_json::to_string_pretty(&doc).unwrap_or_default());
+            }
             if let Ok(mut g) = CURRENT_SYNC_KEYS.lock() {
                 *g = Some((priv_key, b64.clone()));
             }
+            crate::logger::log_sync("rsa: đã gen key mới + lưu");
             return b64;
         }
     }
@@ -198,26 +224,52 @@ where
     if send_phone_prompt {
         set_last_mobile_sync_status(None);
 
-        // Phase 1: Send mobile wake-up / pull request to phone (`cmd 12000` + WebSocket `cmd 592` & `cmd 590`)
+        // Phase 1 — Sync V2 đúng Zalo PC (`shared-worker.js` SyncSession.start):
+        // 590 là message mạng ĐẦU TIÊN (mở session, phone hiện màn xác nhận).
+        // KHÔNG gửi V1 `pull_mobile_msg` (legacy backup machine, tách biệt V2 —
+        // trộn 2 cơ chế tạo 2 phiên xung đột, văng app phone). KHÔNG gửi 592
+        // mở màn (chỉ wake session đã tồn tại). Sau confirm KHÔNG gửi lại 590
+        // (confirm chỉ mở khóa decrypt; dữ liệu tới qua batch → GET msgUrl).
+        // Kết thúc/huỷ/lỗi → gửi 591 để server/phone dọn session.
         on_progress(
             0.10,
             "📲 Đang gửi yêu cầu đồng bộ tới Zalo trên điện thoại (hãy mở Zalo trên điện thoại và bấm 'Đồng bộ ngay')…".to_string(),
         );
-        let r1 = chat::request_phone_sync(s, &pub_key).await;
-        if let Ok(ref val) = r1 {
-            chat::merge_previews(threads, val);
-        }
-        let _ = chat::request_phone_sync_v2(s, &pub_key).await;
+        let v2_sync_id = match chat::wake_phone_sync_v2(s).await {
+            Ok(sync_id) => match chat::send_sync_v2_request(s, &sync_id) {
+                Ok(true) => {
+                    crate::logger::log_sync(&format!("590 mở session: sync={}", &sync_id.chars().take(8).collect::<String>()));
+                    Some(sync_id)
+                }
+                Ok(false) => {
+                    on_progress(0.15, "⚠️ Không gửi được cmd 590 (mất kết nối WebSocket)".to_string());
+                    None
+                }
+                Err(e) => {
+                    on_progress(0.15, format!("⚠️ Sync V2: {e}"));
+                    None
+                }
+            },
+            Err(e) => {
+                crate::logger::log_sync(&format!("V2 mở session FAIL: {e}"));
+                on_progress(0.15, format!("⚠️ Sync V2: {e}"));
+                None
+            }
+        };
 
-        // Wait for user to confirm on phone (up to 90 seconds)
+        // Chờ user xác nhận trên phone (tối đa 90s). Không gửi lại gì cả.
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
         let mut confirmed = false;
+        let mut rejected = false;
         while std::time::Instant::now() < deadline {
             if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
-                let _ = chat::cancel_phone_sync(s, &pub_key).await;
+                if let Some(sid) = v2_sync_id.as_deref() {
+                    crate::socket::send_sync_ack_delete(sid, "PC_USER_CANCELS_SYNC");
+                    crate::logger::log_sync("591 huỷ sync (user cancel)");
+                }
                 return Ok((0, 0));
             }
-            if let Some(ref st) = last_mobile_sync_status() {
+            if let Some(st) = last_mobile_sync_status().as_deref() {
                 if st.contains("đã xác nhận")
                     || st.contains("đang nén")
                     || st.contains("giải mã")
@@ -225,37 +277,60 @@ where
                     || st.contains("thành công")
                 {
                     confirmed = true;
-                    on_progress(0.40, st.clone());
+                    on_progress(0.40, st.to_string());
                     break;
                 } else if st.contains("từ chối") {
-                    on_progress(1.0, st.clone());
-                    return Ok((0, 0));
+                    rejected = true;
+                    on_progress(1.0, st.to_string());
+                    break;
                 } else {
-                    on_progress(0.20, st.clone());
+                    on_progress(0.20, st.to_string());
                 }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+        if rejected {
+            if let Some(sid) = v2_sync_id.as_deref() {
+                crate::socket::send_sync_ack_delete(sid, "USER_REJECT");
+            }
+            return Ok((0, 0));
+        }
 
         if confirmed {
-            let finish_deadline = std::time::Instant::now() + Duration::from_secs(45);
+            // Đã xác nhận → chỉ chờ batch (meta + message), không gửi lại 590.
+            on_progress(0.50, "📲 Đã xác nhận — chờ điện thoại nén & gửi gói tin…".to_string());
+            let finish_deadline = std::time::Instant::now() + Duration::from_secs(180);
+            let mut ok = false;
             while std::time::Instant::now() < finish_deadline {
-                if let Some(ref st) = last_mobile_sync_status() {
+                if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Some(st) = last_mobile_sync_status().as_deref() {
                     if st.contains("thành công") {
-                        on_progress(1.0, st.clone());
+                        ok = true;
+                        on_progress(1.0, st.to_string());
                         break;
                     } else if st.contains("Không thể") || st.contains("thất bại") {
-                        on_progress(1.0, st.clone());
+                        on_progress(1.0, st.to_string());
                         break;
                     } else {
-                        on_progress(0.70, st.clone());
+                        on_progress(0.70, st.to_string());
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
+            // Xong (hoặc hết chờ) → 591 dọn session, đúng Zalo `release()`.
+            if let Some(sid) = v2_sync_id.as_deref() {
+                let reason = if ok { "SYNC_FULL_COMPLETED" } else { "BATCH_TIMEOUT" };
+                crate::socket::send_sync_ack_delete(sid, reason);
+                crate::logger::log_sync(&format!("591 dọn session ({reason})"));
+            }
+        } else if let Some(sid) = v2_sync_id.as_deref() {
+            // Hết 90s không confirm → dọn session.
+            crate::socket::send_sync_ack_delete(sid, "CONFIRM_TIMEOUT");
+            crate::logger::log_sync("591 dọn session (CONFIRM_TIMEOUT)");
         }
     }
-
     // Phase 1b: Synchronize pinned conversations from server (/api/pinconvers/list, #87)
     on_progress(
         0.18,
@@ -728,6 +803,7 @@ pub struct SyncV2Keys {
 struct SyncV2KeysRaw {
     ik_pub: Vec<u8>,
     ik_priv: Vec<u8>,
+    ek_pub: Vec<u8>,
     ek_priv: Vec<u8>,
 }
 
@@ -737,8 +813,12 @@ static CURRENT_V2_KEYS: std::sync::Mutex<Option<SyncV2KeysRaw>> = std::sync::Mut
 pub fn generate_sync_v2_keys() -> Result<SyncV2Keys> {
     // wasmtime host (không cần Node.js). scripts/sync_v2_helper.js chỉ còn
     // là tài liệu tham khảo cho luồng JS gốc (deprecated path).
+    // QUAN TRỌNG (đúng Zalo PC `genSyncKeyPair`): ik là IDENTITY key cố định
+    // của máy (lưu `sync_identity.json`, gen 1 lần duy nhất), chỉ ek là
+    // ephemeral (gen mới mỗi lần sync). Gen ik mới mỗi lần khiến điện thoại
+    // thấy key lạ → văng app khi bấm vào thông báo đồng bộ.
     let host = crate::zproto_host::ZprotoHost::load()?;
-    let (ik_pub, ik_priv) = host.generate_keypair()?;
+    let (ik_pub, ik_priv) = load_or_create_identity_key(&host)?;
     let (ek_pub, ek_priv) = host.generate_keypair()?;
     use base64::Engine;
     let keys = SyncV2Keys {
@@ -748,7 +828,7 @@ pub fn generate_sync_v2_keys() -> Result<SyncV2Keys> {
         ek_priv: hex_encode(&ek_priv),
     };
     if let Ok(mut g) = CURRENT_V2_KEYS.lock() {
-        *g = Some(SyncV2KeysRaw { ik_pub, ik_priv, ek_priv });
+        *g = Some(SyncV2KeysRaw { ik_pub, ik_priv, ek_pub: ek_pub.clone(), ek_priv });
     }
     Ok(keys)
 }
@@ -761,6 +841,38 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push(H[(b & 15) as usize] as char);
     }
     s
+}
+
+/// Đọc identity key từ `sync_identity.json`, gen mới + lưu nếu chưa có.
+/// File nằm cùng data dir (app đã `set_current_dir` về đó lúc khởi động).
+fn load_or_create_identity_key(
+    host: &crate::zproto_host::ZprotoHost,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    use base64::Engine;
+    const PATH: &str = "sync_identity.json";
+    if let Ok(raw) = std::fs::read_to_string(PATH) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let dec = |k: &str| {
+                v.get(k)
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+            };
+            if let (Some(pubk), Some(privk)) = (dec("public_key"), dec("private_key")) {
+                if pubk.len() == 33 && privk.len() == 32 {
+                    crate::logger::log_sync("ik: dùng identity key đã lưu");
+                    return Ok((pubk, privk));
+                }
+            }
+        }
+    }
+    let (pubk, privk) = host.generate_keypair()?;
+    let doc = serde_json::json!({
+        "public_key": base64::engine::general_purpose::STANDARD.encode(&pubk),
+        "private_key": base64::engine::general_purpose::STANDARD.encode(&privk),
+    });
+    let _ = std::fs::write(PATH, serde_json::to_string_pretty(&doc).unwrap_or_default());
+    crate::logger::log_sync("ik: đã gen identity key mới + lưu");
+    Ok((pubk, privk))
 }
 /// Kết quả giải mã metadata Sync V2: session id để đối chiếu với event batch.
 #[derive(Debug, Default)]
@@ -789,7 +901,7 @@ pub async fn import_sync_v2_meta(s: &Session, url: &str) -> Result<SyncV2Meta> {
     let bytes = resp.bytes().await?;
     // wasmtime host (không cần Node.js). Keys phải tồn tại trong bộ nhớ tiến
     // trình (generate_sync_v2_keys đã chạy trước khi request sync).
-    let keys = current_v2_keys()?;
+    let keys = current_v2_keys_raw()?;
     let host = crate::zproto_host::ZprotoHost::load()?;
     let mut session_record: Option<Vec<u8>> = None;
     let mut last: Option<crate::zproto_host::DecryptedMeta> = None;
@@ -807,7 +919,18 @@ pub async fn import_sync_v2_meta(s: &Session, url: &str) -> Result<SyncV2Meta> {
 }
 
 
-fn current_v2_keys() -> Result<SyncV2KeysRaw> {
+pub fn current_v2_keys() -> Result<SyncV2Keys> {
+    use base64::Engine;
+    let raw = current_v2_keys_raw()?;
+    Ok(SyncV2Keys {
+        ik_pub: base64::engine::general_purpose::STANDARD.encode(&raw.ik_pub),
+        ik_priv: hex_encode(&raw.ik_priv),
+        ek_pub: base64::engine::general_purpose::STANDARD.encode(&raw.ek_pub),
+        ek_priv: hex_encode(&raw.ek_priv),
+    })
+}
+
+fn current_v2_keys_raw() -> Result<SyncV2KeysRaw> {
     CURRENT_V2_KEYS
         .lock()
         .ok()
@@ -849,6 +972,12 @@ pub fn has_sync_v2_session(sync_id: &str) -> bool {
         .lock()
         .map(|m| m.iter().any(|(k, _)| k == sync_id))
         .unwrap_or(false)
+}
+
+pub fn remove_sync_v2_session(sync_id: &str) {
+    if let Ok(mut m) = SYNC_V2_SESSIONS.lock() {
+        m.retain(|(k, _)| k != sync_id);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1026,7 +1155,16 @@ pub fn parse_sync_chunk(buf: &[u8]) -> Option<Vec<ParsedProtoPartition>> {
     Some(parts)
 }
 
-pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
+pub async fn import_sync_v2_messages(s: &Session, url: &str, is_last: bool) -> Result<usize> {
+    import_sync_v2_messages_inner(s, url, None, is_last).await
+}
+
+pub(crate) async fn import_sync_v2_messages_inner(
+    s: &Session,
+    url: &str,
+    sync_id: Option<&str>,
+    is_last: bool,
+) -> Result<usize> {
     let uin = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
     let sek = s.zpw_sek.clone().unwrap_or_default();
     let cookie_hdr = format!("zpw_sek={sek}; zpw_uin={uin}");
@@ -1048,9 +1186,16 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
     // chunk, nối protobuf bytes lại (đúng luồng HistoryCodec mẫu).
     let host = crate::zproto_host::ZprotoHost::load()?;
     let session_record = current_v2_session()?;
+    let frames = crate::zproto_host::split_frames(&bytes)?;
+    if frames.is_empty() {
+        anyhow::bail!("gói sync rỗng (không có frame nào)");
+    }
     let mut parts: Vec<u8> = Vec::new();
-    for chunk in crate::zproto_host::split_frames(&bytes)? {
+    for chunk in frames {
         let res = host.decrypt_message(&chunk, &session_record)?;
+        if res.plaintext.is_empty() {
+            anyhow::bail!("giải mã sync trả về rỗng (payload lỗi)");
+        }
         parts.extend_from_slice(&decompress_sync_payload(&res.plaintext));
     }
     let decrypted_bytes = parts;
@@ -1058,7 +1203,12 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
     // (zstd/zlib/gzip — Zalo dùng cả 3 theo HistoryCodec mẫu).
     let decompressed = decompress_sync_payload(&decrypted_bytes);
 
-    let partitions = parse_sync_chunk(&decompressed).unwrap_or_default();
+    let partitions = parse_sync_chunk(&decompressed).ok_or_else(|| {
+        anyhow::anyhow!(
+            "payload sync hỏng ({} bytes sau giải mã, parse thất bại)",
+            decompressed.len()
+        )
+    })?;
     let db_path = crate::store::db_path_for_account(&uin);
     let mut store = crate::store::MessageStore::open(&db_path)?;
     let my_name = s.login.as_ref().map(|l| l.display_name.clone()).unwrap_or_else(|| "Tôi".into());
@@ -1097,8 +1247,16 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str) -> Result<usize> {
     let _ = store.hydrate_threads(&mut cached_threads, 50);
     crate::chat::save_threads_cache(&cached_threads);
 
-    if let Some(pub_k) = get_sync_public_key() {
-        let _ = crate::chat::clean_sync(s, &pub_k).await;
+    // Chỉ cleanup khi batch cuối: batch giữa giữ session/keys để batch sau
+    // còn giải mã được; lỗi payload không cleanup để có thể retry (#851).
+    if is_last {
+        if let Some(sid) = sync_id {
+            remove_sync_v2_session(sid);
+        }
+        if let Some(pub_k) = get_sync_public_key() {
+            let _ = crate::chat::clean_sync(s, &pub_k).await;
+        }
+        clear_sync_keys();
     }
 
     // Keys/session giữ trong bộ nhớ tiến trình (CURRENT_V2_KEYS/_SESSION),
@@ -1152,9 +1310,12 @@ mod tests {
     #[test]
     fn generate_sync_public_key_produces_valid_rsa2048_spki_der_base64() {
         use base64::Engine;
+        // Key cố định của máy (lưu file): 2 lần gọi phải TRÙNG nhau.
+        let _ = std::fs::remove_file("sync_rsa_identity.json");
         let k1 = generate_sync_public_key();
         let k2 = generate_sync_public_key();
-        assert_ne!(k1, k2);
+        assert_eq!(k1, k2);
+        let _ = std::fs::remove_file("sync_rsa_identity.json");
         assert!(
             k1.starts_with("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA"),
             "must have valid ASN.1 RSA-2048 SPKI DER prefix: {k1}"

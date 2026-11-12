@@ -272,6 +272,29 @@ pub fn format_schedule_time(deliver_at: i64) -> String {
         format!("{deliver_at}")
     }
 }
+/// Nhãn mốc nhắc tương đối ("15 phút nữa · HH:MM · DD/MM/YYYY") cho modal nhắc tin (WaveA1).
+/// Quá khứ → "tới hạn". Không dep mới, chỉ dùng `chrono::Local`.
+pub fn format_reminder_time(due_at: i64, now_ts: i64) -> String {
+    let when = format_schedule_time(due_at);
+    let delta = due_at.saturating_sub(now_ts);
+    if delta <= 0 {
+        return format!("tới hạn · {when}");
+    }
+    let rel = if delta < 3600 {
+        format!("{} phút nữa", (delta + 59) / 60)
+    } else if delta < 86_400 {
+        let h = delta / 3600;
+        let m = (delta % 3600) / 60;
+        if m == 0 {
+            format!("{h} giờ nữa")
+        } else {
+            format!("{h} giờ {m} phút nữa")
+        }
+    } else {
+        format!("{} ngày nữa", delta / 86_400)
+    };
+    format!("{rel} · {when}")
+}
 
 /// Insert a new scheduled message into SQLite.
 pub fn schedule_message(
@@ -538,5 +561,15 @@ mod tests {
         assert!(list_pending_scheduled(db, None).unwrap().is_empty());
 
         let _ = std::fs::remove_file(&path);
+    }
+    #[test]
+    fn reminder_time_labels_relative_and_past() {
+        let now = 1_762_000_000_i64;
+        let lbl15 = format_reminder_time(now + 900, now);
+        assert!(lbl15.contains("15 phút nữa"), "{lbl15}");
+        let lbl2h = format_reminder_time(now + 7500, now);
+        assert!(lbl2h.contains("2 giờ"), "{lbl2h}");
+        let past = format_reminder_time(now - 10, now);
+        assert!(past.contains("tới hạn"), "{past}");
     }
 }

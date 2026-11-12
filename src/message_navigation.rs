@@ -28,6 +28,21 @@ pub fn unique_reference_index(messages: &[ChatMessage], reference: &str) -> Opti
     matches.next().is_none().then_some(index)
 }
 
+/// Khớp 1 tin với reference: id → client_message_id → wire ids.
+/// Dùng cho MessageTranslated (msg id có thể là client id khi tin vừa gửi).
+pub fn message_matches_reference(message: &ChatMessage, reference: &str) -> bool {
+    if !valid_reference(reference) {
+        return false;
+    }
+    if message.id == reference || message.client_message_id == reference {
+        return true;
+    }
+    [&message.wire_ref.server_id, &message.wire_ref.client_id]
+        .into_iter()
+        .flatten()
+        .any(|id| exact_id(id).as_deref() == Some(reference))
+}
+
 fn valid_reference(reference: &str) -> bool {
     !reference.trim().is_empty() && !reference.bytes().all(|byte| byte == b'0')
 }

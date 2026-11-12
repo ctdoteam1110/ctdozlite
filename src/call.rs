@@ -1169,6 +1169,12 @@ struct PureRustCallState {
     media: Option<crate::media::MediaHandle>,
     /// Additional concurrent member legs for multi-member group calls.
     extra_legs: Vec<GroupMemberLeg>,
+    /// Invite gốc (media/data) để probe UDP + answer SAU khi user bấm Nghe.
+    /// Passive ringing: invite tới chỉ hiện chuông, không gửi 407/probe,
+    /// tránh chiếm relay khiến mobile không vào được call.
+    invite_payload: Value,
+    /// Đã gửi 407 ringing lên server chưa (chỉ gửi khi user bấm Nghe).
+    ringing_sent: bool,
 }
 
 impl PureRustCallState {
@@ -2219,6 +2225,11 @@ impl CallBridge {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<CallEngineCmd>();
         let active_call: Arc<Mutex<Option<PureRustCallState>>> = Arc::new(Mutex::new(None));
         let cmd_tx_inner = cmd_tx.clone();
+        // Call đã dismiss vì thiết bị khác xử lý (nghe/từ chối/kết thúc):
+        // decline sau đó chỉ đóng UI local, TUYỆT ĐỐI không gửi 402 lên server
+        // (server đã chuyển call cho mobile, 402 lúc này gây -101 + chập chờn).
+        let mut dismissed_by_peer: std::collections::HashSet<i64> =
+            std::collections::HashSet::new();
 
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
@@ -2655,6 +2666,8 @@ impl CallBridge {
                                             audio: None,
                                             media: media_handle,
                                             extra_legs: Vec::new(),
+                                            invite_payload: Value::Null,
+                                            ringing_sent: true,
                                         });
                                         let _ = gui_tx_clone
                                             .send(GuiEvent::CallStateChanged("calling".into()));
@@ -2926,6 +2939,8 @@ impl CallBridge {
                                 audio: None,
                                 media: None,
                                 extra_legs: dialed_legs,
+                                invite_payload: Value::Null,
+                                ringing_sent: true,
                             });
                             let _ = gui_tx_clone.send(GuiEvent::CallStateChanged("calling".into()));
                             let status_txt = if n_ringing > 1 {
@@ -2952,21 +2967,166 @@ impl CallBridge {
                         let ctx_clone = egui_ctx.clone();
                         tokio::spawn(async move {
                             if accept {
-                                // Wait up to 350ms if the incoming ZRTP UDP probe is still finishing
-                                for _ in 0..14 {
-                                    let ready = active_clone
-                                        .lock()
-                                        .await
-                                        .as_ref()
-                                        .map(|s| s.udp_rtp_sock.is_some())
-                                        .unwrap_or(true);
-                                    if ready {
-                                        break;
+                                // Passive ringing: probe + 407 chỉ chạy KHI user bấm Nghe
+                                // (invite tới không chạm gì để khỏi xung đột mobile).
+                                let need_probe = active_clone
+                                    .lock()
+                                    .await
+                                    .as_ref()
+                                    .map(|s| !s.is_caller && !s.ringing_sent)
+                                    .unwrap_or(false);
+                                if need_probe {
+                                    // Gửi 407 ringing trước.
+                                    let (cid, caller, grp, gid, imei) = {
+                                        let g = active_clone.lock().await;
+                                        match g.as_ref() {
+                                            Some(s) => (
+                                                s.call_id,
+                                                s.partner_id.clone(),
+                                                s.is_group,
+                                                s.group_id_u32,
+                                                s_snap.imei.clone(),
+                                            ),
+                                            None => return,
+                                        }
+                                    };
+                                    if grp && gid != 0 {
+                                        let g = active_clone.lock().await;
+                                        let host = g
+                                            .as_ref()
+                                            .map(|s| s.group_host_call.clone())
+                                            .unwrap_or_default();
+                                        drop(g);
+                                        let host_val: Value = host
+                                            .parse::<u64>()
+                                            .map(|n| json!(n))
+                                            .unwrap_or_else(|_| json!(host));
+                                        let gid_str = active_clone
+                                            .lock()
+                                            .await
+                                            .as_ref()
+                                            .map(|s| {
+                                                // group_id dạng số; server nhận cả string.
+                                                gid.to_string()
+                                            })
+                                            .unwrap_or_default();
+                                        let req_12439 = json!({
+                                            "calleeId": host_val,
+                                            "hostCall": host_val,
+                                            "callId": cid,
+                                            "groupId": gid_str,
+                                            "status": 0,
+                                            "imei": imei,
+                                        });
+                                        let _ =
+                                            dispatch_send_signal(&s_snap, 12439, &req_12439).await;
                                     }
-                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                    let req_407 = json!({
+                                        "callerId": caller,
+                                        "callId": cid,
+                                        "status": 0,
+                                        "imei": imei,
+                                    });
+                                    let _ = dispatch_send_signal(&s_snap, 407, &req_407).await;
+                                    // Probe UDP relay + ZRTP (logic cũ chuyển từ invite sang).
+                                    let (
+                                        relay_src,
+                                        from_u,
+                                        part_u,
+                                        is_vid,
+                                        sess_raw,
+                                        grp_u32,
+                                    ) = {
+                                        let g = active_clone.lock().await;
+                                        match g.as_ref() {
+                                            Some(s) => (
+                                                s.invite_payload.clone(),
+                                                s.from_uid_u32,
+                                                s.partner_uid_u32,
+                                                s.is_video,
+                                                s.sess_id.clone(),
+                                                s.group_id_u32,
+                                            ),
+                                            None => return,
+                                        }
+                                    };
+                                    let (
+                                        udp_rtp_sock,
+                                        udp_rtcp_sock,
+                                        keepalive_abort,
+                                        zrtp_probe,
+                                    ) = start_zrtp_udp_relay_session_with_probe(
+                                        &relay_src,
+                                        from_u,
+                                        part_u,
+                                        cid as u32,
+                                        false,
+                                        &sess_raw,
+                                        if grp && grp_u32 != 0 {
+                                            Some(grp_u32)
+                                        } else {
+                                            None
+                                        },
+                                    )
+                                    .await;
+                                    let (
+                                        mut rtp_ip,
+                                        mut rtcp_ip,
+                                        sess_from_inv,
+                                        _codec,
+                                        _caller_ext,
+                                    ) = build_pure_rust_invite_fields_with_probe(
+                                        &relay_src,
+                                        is_vid,
+                                        Some(zrtp_probe.local_port),
+                                        Some(&zrtp_probe),
+                                    );
+                                    if rtp_ip.is_empty() {
+                                        if let Some(sel) = &zrtp_probe.selected_rtp {
+                                            rtp_ip = sel.clone();
+                                            rtcp_ip = sel.clone();
+                                        }
+                                    }
+                                    let sess_id = if !sess_raw.is_empty() {
+                                        sess_raw
+                                    } else {
+                                        sess_from_inv
+                                    };
+                                    let extend_str = build_callee_extend_data(
+                                        &rtp_ip,
+                                        &rtcp_ip,
+                                        is_vid,
+                                        Some(zrtp_probe.local_port),
+                                        Some(&zrtp_probe),
+                                    );
+                                    let mut g = active_clone.lock().await;
+                                    if let Some(st) = g.as_mut() {
+                                        if st.call_id == cid {
+                                            st.sess_id = sess_id;
+                                            if !rtp_ip.is_empty() {
+                                                st.rtp_ip = rtp_ip;
+                                                st.rtcp_ip = rtcp_ip;
+                                            }
+                                            st.extend_data = extend_str;
+                                            st.relay_token = zrtp_probe.token;
+                                            st.server_tokens = zrtp_probe.server_tokens;
+                                            st.udp_rtp_sock = udp_rtp_sock;
+                                            st.udp_rtcp_sock = udp_rtcp_sock;
+                                            st.keepalive_abort = keepalive_abort;
+                                            st.ringing_sent = true;
+                                        }
+                                    }
                                 }
                             }
                             let mut guard = active_clone.lock().await;
+                            eprintln!(
+                                "[call] AnswerCall accept={} guard={}",
+                                accept,
+                                guard.as_ref().map(|st| format!(
+                                    "call_id={} connected={} ringing_sent={}",
+                                    st.call_id, st.is_connected, st.ringing_sent
+                                )).unwrap_or_else(|| "None".into())
+                            );
                             if let Some(ref mut st) = *guard {
                                 let call_id = st.call_id;
                                 let caller_id = st.partner_id.clone();
@@ -3174,10 +3334,7 @@ impl CallBridge {
                                     req_402["extendData"] = json!(ext);
                                     req_402["subCommand"] = json!(3);
                                 }
-                                match dispatch_send_signal(&s_snap, 402, &req_402).await {
-                                    Ok(r) => eprintln!("[call] 402 answer resp: {}", r),
-                                    Err(e) => eprintln!("[call] 402 answer err: {e}"),
-                                }
+                                let _ = dispatch_send_signal(&s_snap, 402, &req_402).await;
                             }
                         });
                     }
@@ -3557,6 +3714,15 @@ impl CallBridge {
                                     })
                                     .unwrap_or(0);
                                 let mut guard = active_call.lock().await;
+                                eprintln!(
+                                    "[call] answer evt: ev_call_id={} status={} state={}",
+                                    ev_call_id,
+                                    status,
+                                    guard.as_ref().map(|st| format!(
+                                        "call_id={} connected={} caller={}",
+                                        st.call_id, st.is_connected, st.is_caller
+                                    )).unwrap_or_else(|| "None".into())
+                                );
                                 if guard.is_none() {
                                     let self_uin = s_snap
                                         .login
@@ -3724,7 +3890,9 @@ impl CallBridge {
                                     //    or rejected/ended on another device (eff_status != 0).
                                     // Dismiss ringing on this desktop client and clean up active call resources.
                                     let is_group = st_check.is_group;
+                                    eprintln!("[call] dismiss: mobile handled call {}, eff_status={}", ev_call_id, eff_status);
                                     let _taken = guard.take();
+                                    dismissed_by_peer.insert(ev_call_id);
                                     let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
                                     let msg = if eff_status == 0 {
                                         if is_group {
@@ -4374,7 +4542,6 @@ impl CallBridge {
                                     .unwrap_or("")
                                     .to_string();
 
-                                let active_clone = active_call.clone();
                                 let gui_tx_clone = gui_tx.clone();
                                 let ctx_clone = egui_ctx.clone();
                                 let relay_source = if media.is_object() {
@@ -4383,8 +4550,10 @@ impl CallBridge {
                                     data.clone()
                                 };
 
-                                // Populate `active_call` immediately so clicking Accept/Decline or receiving
-                                // `cancel` during the 280ms UDP probe works without racing!
+                                // Passive ringing: chỉ tạo state + hiện chuông, KHÔNG gửi
+                                // 407/12439, KHÔNG probe UDP — tránh chiếm relay khiến
+                                // mobile không vào được call. Probe + answer chỉ chạy khi
+                                // user bấm Nghe trên chính PC này.
                                 let init_rtp = collect_relay_servers(&relay_source)
                                     .into_iter()
                                     .next()
@@ -4426,7 +4595,14 @@ impl CallBridge {
                                             audio: None,
                                             media: None,
                                             extra_legs: Vec::new(),
+                                            invite_payload: relay_source.clone(),
+                                            ringing_sent: false,
                                         });
+                                    } else if let Some(st) = g.as_mut() {
+                                        // Invite lặp lại (re-invite): cập nhật payload mới nhất.
+                                        if st.call_id == call_id {
+                                            st.invite_payload = relay_source.clone();
+                                        }
                                     }
                                 }
 
@@ -4442,100 +4618,35 @@ impl CallBridge {
                                     ctx_clone.request_repaint();
                                 }
 
-                                tokio::spawn(async move {
-                                    if !is_upgrade {
-                                        if is_group && !group_id_str.is_empty() {
-                                            let host_val: Value = group_host_call
-                                                .parse::<u64>()
-                                                .map(|n| json!(n))
-                                                .unwrap_or_else(|_| json!(group_host_call));
-                                            let req_12439 = json!({
-                                                "calleeId": host_val,
-                                                "hostCall": host_val,
-                                                "callId": call_id,
-                                                "groupId": group_id_str,
-                                                "status": 0,
-                                                "imei": s_snap.imei,
-                                            });
-                                            let _ =
-                                                dispatch_send_signal(&s_snap, 12439, &req_12439)
-                                                    .await;
-                                        }
-                                        // Notify caller that our client is ringing (`407`) right away
-                                        let req_407 = json!({
-                                            "callerId": caller_id,
-                                            "callId": call_id,
-                                            "status": 0,
-                                            "imei": s_snap.imei,
-                                        });
-                                        let _ = dispatch_send_signal(&s_snap, 407, &req_407).await;
-                                    }
-
-                                    let (udp_rtp_sock, udp_rtcp_sock, keepalive_abort, zrtp_probe) =
-                                        start_zrtp_udp_relay_session_with_probe(
-                                            &relay_source,
-                                            from_uid_u32,
-                                            partner_uid_u32,
-                                            call_id as u32,
-                                            false,
-                                            &sess_id_raw,
-                                            if is_group && group_id_u32 != 0 {
-                                                Some(group_id_u32)
-                                            } else {
-                                                None
-                                            },
-                                        )
-                                        .await;
-
-                                    let (
-                                        mut rtp_ip,
-                                        mut rtcp_ip,
-                                        sess_from_inv,
-                                        _codec,
-                                        _caller_ext,
-                                    ) = build_pure_rust_invite_fields_with_probe(
-                                        &relay_source,
-                                        is_video,
-                                        Some(zrtp_probe.local_port),
-                                        Some(&zrtp_probe),
-                                    );
-                                    if rtp_ip.is_empty() {
-                                        if let Some(sel) = &zrtp_probe.selected_rtp {
-                                            rtp_ip = sel.clone();
-                                            rtcp_ip = sel.clone();
-                                        }
-                                    }
-                                    let sess_id = if !sess_id_raw.is_empty() {
-                                        sess_id_raw
-                                    } else {
-                                        sess_from_inv
-                                    };
-                                    let extend_str = build_callee_extend_data(
-                                        &rtp_ip,
-                                        &rtcp_ip,
-                                        is_video,
-                                        Some(zrtp_probe.local_port),
-                                        Some(&zrtp_probe),
-                                    );
-
-                                    let mut g = active_clone.lock().await;
-                                    if let Some(st) = g.as_mut() {
-                                        if st.call_id == call_id {
-                                            st.is_video = is_video;
-                                            st.sess_id = sess_id;
-                                            if !rtp_ip.is_empty() {
-                                                st.rtp_ip = rtp_ip;
-                                                st.rtcp_ip = rtcp_ip;
+                                // Tự dismiss chuông sau 60s nếu không ai bấm gì và không
+                                // có event nào (tránh treo vĩnh viễn khi miss event).
+                                {
+                                    let active_timeout = active_call.clone();
+                                    let gui_tx_timeout = gui_tx.clone();
+                                    let ctx_timeout = egui_ctx.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                                        let mut g = active_timeout.lock().await;
+                                        if let Some(st) = g.as_ref() {
+                                            if st.call_id == call_id
+                                                && !st.is_connected
+                                                && !st.is_caller
+                                                && !st.ringing_sent
+                                            {
+                                                *g = None;
+                                                let _ = gui_tx_timeout.send(
+                                                    GuiEvent::CallStateChanged("free".into()),
+                                                );
+                                                let _ = gui_tx_timeout.send(
+                                                    GuiEvent::StatusUpdate(
+                                                        "Cuộc gọi đến đã kết thúc (hết chuông)".into(),
+                                                    ),
+                                                );
+                                                ctx_timeout.request_repaint();
                                             }
-                                            st.extend_data = extend_str;
-                                            st.relay_token = zrtp_probe.token;
-                                            st.server_tokens = zrtp_probe.server_tokens;
-                                            st.udp_rtp_sock = udp_rtp_sock;
-                                            st.udp_rtcp_sock = udp_rtcp_sock;
-                                            st.keepalive_abort = keepalive_abort;
                                         }
-                                    }
-                                });
+                                    });
+                                }
                             }
                             _ => {}
                         }

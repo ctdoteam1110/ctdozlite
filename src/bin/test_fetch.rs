@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
                     avatar: None,
                     is_group: false,
                     messages: Vec::new(),
+                    vanish: None,
                 });
             }
             list.push(zalo_rust::chat::Thread {
@@ -63,6 +64,7 @@ async fn main() -> Result<()> {
                 avatar: None,
                 is_group: false,
                 messages: Vec::new(),
+                vanish: None,
             });
             list
         }

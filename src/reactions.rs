@@ -648,6 +648,18 @@ fn event_key(event: &ReactionEvent) -> Option<String> {
         None
     }
 }
+/// Stable identity for one reaction event, mirroring `ReactionInbox::record`
+/// dedup: event id, else client event id, else sender/ts/type triple.
+/// GUI uses it to count/banner each accepted event exactly once (#473).
+pub fn event_identity(ev: &ReactionEvent) -> String {
+    if known_id(&ev.event_id) {
+        ev.event_id.clone()
+    } else if known_id(&ev.client_event_id) {
+        format!("c{}", ev.client_event_id)
+    } else {
+        format!("{}:{}:{}", ev.sender_id, ev.ts, ev.r_type)
+    }
+}
 
 /// Effective per-type counts and per-sender counts after replaying events in order.
 /// A clear (`rType == -1`) removes that sender's earlier reactions.
@@ -676,25 +688,28 @@ fn effective_counts(
     }
     (totals, per_sender)
 }
-
 impl ReactionInbox {
-    /// Store events by message and event id. Replays and duplicates are ignored.
-    pub fn record(&mut self, events: &[ReactionEvent]) {
+    /// Store events by message and event id. Returns the subset actually
+    /// inserted (replays and duplicates excluded) so callers can count each
+    /// accepted event exactly once (#473, gui.rs:1773).
+    pub fn record_new(&mut self, events: &[ReactionEvent]) -> Vec<ReactionEvent> {
+        let mut accepted = Vec::new();
         for ev in events {
             let Some(key) = event_key(ev) else { continue };
-            let id = if known_id(&ev.event_id) {
-                ev.event_id.clone()
-            } else if known_id(&ev.client_event_id) {
-                format!("c{}", ev.client_event_id)
-            } else {
-                format!("{}:{}:{}", ev.sender_id, ev.ts, ev.r_type)
-            };
-            self.events
-                .entry(key)
-                .or_default()
-                .entry(id)
-                .or_insert_with(|| ev.clone());
+            let id = event_identity(ev);
+            let slot = self.events.entry(key).or_default();
+            if slot.contains_key(&id) {
+                continue;
+            }
+            slot.insert(id, ev.clone());
+            accepted.push(ev.clone());
         }
+        accepted
+    }
+
+    /// Legacy bulk insert (keeps old callers working; ignores acceptance).
+    pub fn record(&mut self, events: &[ReactionEvent]) {
+        let _ = self.record_new(events);
     }
 
     /// Events whose message has not been loaded yet.
@@ -897,6 +912,36 @@ mod tests {
         inbox.ingest(&live, &mut loaded);
         assert_eq!(total_count(&loaded[0].reaction_summaries), 6);
     }
+
+    #[test]
+    fn record_new_accepts_each_event_once() {
+        // #473/#1773: replays must not inflate counts — only newly accepted
+        // events are returned, so GUI counts/banners each exactly once.
+        let ids: Vec<String> = (0..3).map(|i| format!("84605{i:08}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let events = parse_reaction_events(&wire_frame(&id_refs)["data"]);
+        assert_eq!(events.len(), 3);
+        let mut inbox = ReactionInbox::default();
+        assert_eq!(inbox.record_new(&events).len(), 3);
+        assert!(inbox.record_new(&events).is_empty(), "replay must accept none");
+        // Same message + same sender + same ts/type but no event ids: one identity
+        // (needs a target message id — id-less events have no key by design).
+        let no_id = ReactionEvent {
+            message_id: "m1".into(),
+            sender_id: "u1".into(),
+            r_type: 5,
+            ts: 123,
+            ..Default::default()
+        };
+        let mut inbox2 = ReactionInbox::default();
+        assert_eq!(inbox2.record_new(std::slice::from_ref(&no_id)).len(), 1);
+        assert!(inbox2.record_new(std::slice::from_ref(&no_id)).is_empty());
+        assert_eq!(
+            event_identity(&no_id),
+            "u1:123:5",
+            "fallback identity must be stable"
+        );
+    }
     #[test]
     fn heart_count_is_not_unique_user_count() {
         let r =
@@ -1008,6 +1053,25 @@ mod tests {
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].thread_id, "peer");
         assert_eq!(r[1].thread_id, "g99");
+    }
+    #[test]
+    fn unread_gate_skips_own_removal_and_historical() {
+        // Documents the reaction-unread counting gate: peer adds count;
+        // own reactions, removals (r_type == -1) and historical replays never do.
+        let mine = ReactionEvent { sender_id: "me".into(), r_type: 5, historical: false, ..Default::default() };
+        let removal = ReactionEvent { sender_id: "peer".into(), r_type: -1, historical: false, ..Default::default() };
+        let replay = ReactionEvent { sender_id: "peer".into(), r_type: 5, historical: true, ..Default::default() };
+        let peer_add = ReactionEvent { sender_id: "peer".into(), r_type: 5, historical: false, ..Default::default() };
+        for ev in [&mine, &removal, &replay] {
+            let gated = !(ev.r_type < 0 || ev.historical)
+                && !ev.sender_id.is_empty()
+                && ev.sender_id != "me";
+            assert!(!gated, "must skip r_type={} hist={}", ev.r_type, ev.historical);
+        }
+        let gated = !(peer_add.r_type < 0 || peer_add.historical)
+            && !peer_add.sender_id.is_empty()
+            && peer_add.sender_id != "me";
+        assert!(gated);
     }
     #[test]
     fn malformed_events_do_not_create_reactions() {

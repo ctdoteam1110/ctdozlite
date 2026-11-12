@@ -291,12 +291,32 @@ pub(super) fn render_call_card_widget(
     action
 }
 
-/// Open an `http://` or `https://` URL in the user's default system browser.
-pub(super) fn open_external_url(url: &str) {
+/// Open a URL in the user's default system browser. Trả `Err` thân thiện để
+/// caller toast cho user thay vì fail im lặng (#107).
+pub(super) fn open_external_url(url: &str) -> Result<(), String> {
+    open_external_url_with_monitor(url, true)
+}
+
+/// Mở URL; `monitor_exit=true` thì spawn watcher báo lỗi khi opener exit fail
+/// (xdg-open start được nhưng không mở được URL vẫn toast, #2311).
+pub(super) fn open_external_url_with_monitor(
+    url: &str,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] monitor_exit: bool,
+) -> Result<(), String> {
     let trimmed = url.trim();
-    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
-        return;
+    if trimmed.is_empty() {
+        return Err("Liên kết trống".into());
     }
+    // Chuẩn hoá link không scheme (www.x, x.com/abc) thay vì bỏ qua im lặng.
+    let owned;
+    let target = if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        trimmed
+    } else if trimmed.contains('.') && !trimmed.contains(' ') && !trimmed.contains("://") {
+        owned = format!("https://{trimmed}");
+        &owned
+    } else {
+        return Err(format!("Không mở được liên kết: {trimmed}"));
+    };
     #[cfg(target_os = "windows")]
     {
         #[link(name = "shell32")]
@@ -311,26 +331,308 @@ pub(super) fn open_external_url(url: &str) {
             ) -> isize;
         }
         let op: Vec<u16> = "open\0".encode_utf16().collect();
-        let mut file: Vec<u16> = trimmed.encode_utf16().collect();
+        let mut file: Vec<u16> = target.encode_utf16().collect();
         file.push(0);
-        unsafe {
-            let _ = ShellExecuteW(
+        let rc = unsafe {
+            ShellExecuteW(
                 std::ptr::null_mut(),
                 op.as_ptr(),
                 file.as_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
                 5, // SW_SHOW
-            );
+            )
+        };
+        // ShellExecuteW trả <= 32 khi lỗi (không có handler, bị chặn AV/policy).
+        // Không fallback qua `cmd /C start`: cmd diễn giải `&` trong URL thành
+        // toán tử shell (`https://x/?a=1&calc` → chạy `calc`). Trả lỗi để caller
+        // hiện toast thay vì thực thi lệnh ngoài ý muốn.
+        if rc > 32 {
+            return Ok(());
+        }
+        Err("Không mở được liên kết (hệ thống chặn mở URL)".into())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        match std::process::Command::new("open").arg(target).spawn() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("Không mở được liên kết ({e})")),
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        match std::process::Command::new("xdg-open").arg(target).spawn() {
+            Ok(mut child) => {
+                if monitor_exit {
+                    // Free function không có GuiTx: watcher log stderr; launch-fail
+                    // vẫn trả Err để caller toast ngay (#2311).
+                    std::thread::spawn(move || {
+                        if let Ok(status) = child.wait() {
+                            if !status.success() {
+                                eprintln!("xdg-open exit {status}");
+                            }
+                        }
+                    });
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!("Không mở được liên kết ({e})")),
+        }
+    }
+}
+/// Open a native OS file-picker dialog on a worker thread and return the selected path.
+pub(super) fn pick_native_file_dialog(images_only: bool) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct OpenFileNameW {
+            l_struct_size: u32,
+            hwnd_owner: *mut std::ffi::c_void,
+            h_instance: *mut std::ffi::c_void,
+            lpstr_filter: *const u16,
+            lpstr_custom_filter: *mut u16,
+            n_max_cust_filter: u32,
+            n_filter_index: u32,
+            lpstr_file: *mut u16,
+            n_max_file: u32,
+            lpstr_file_title: *mut u16,
+            n_max_file_title: u32,
+            lpstr_initial_dir: *const u16,
+            lpstr_title: *const u16,
+            flags: u32,
+            n_file_offset: u16,
+            n_file_extension: u16,
+            lpstr_def_ext: *const u16,
+            l_cust_data: usize,
+            lpfn_hook: *const std::ffi::c_void,
+            lp_template_name: *const u16,
+            pv_reserved: *mut std::ffi::c_void,
+            dw_reserved: u32,
+            flags_ex: u32,
+        }
+        #[link(name = "comdlg32")]
+        extern "system" {
+            fn GetOpenFileNameW(lpofn: *mut OpenFileNameW) -> i32;
+        }
+        let filter_raw = if images_only {
+            "Image Files (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp)\0*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp\0All Files (*.*)\0*.*\0\0"
+        } else {
+            "All Files (*.*)\0*.*\0Video & Media (*.mp4;*.mov;*.mkv;*.mp3;*.wav)\0*.mp4;*.mov;*.mkv;*.mp3;*.wav\0Documents (*.pdf;*.zip;*.docx;*.xlsx;*.txt)\0*.pdf;*.zip;*.docx;*.xlsx;*.txt\0\0"
+        };
+        let title_raw = if images_only {
+            "Chọn hình ảnh để gửi qua Zalo\0"
+        } else {
+            "Chọn video hoặc tập tin đính kèm để gửi qua Zalo\0"
+        };
+        let filter_u16: Vec<u16> = filter_raw.encode_utf16().collect();
+        let title_u16: Vec<u16> = title_raw.encode_utf16().collect();
+        let mut file_buf = vec![0u16; 1024];
+        // OFN_EXPLORER (0x00080000) | OFN_FILEMUSTEXIST (0x00001000) | OFN_PATHMUSTEXIST (0x00000800) | OFN_NOCHANGEDIR (0x00000008)
+        let mut ofn = OpenFileNameW {
+            l_struct_size: std::mem::size_of::<OpenFileNameW>() as u32,
+            hwnd_owner: std::ptr::null_mut(),
+            h_instance: std::ptr::null_mut(),
+            lpstr_filter: filter_u16.as_ptr(),
+            lpstr_custom_filter: std::ptr::null_mut(),
+            n_max_cust_filter: 0,
+            n_filter_index: 1,
+            lpstr_file: file_buf.as_mut_ptr(),
+            n_max_file: file_buf.len() as u32,
+            lpstr_file_title: std::ptr::null_mut(),
+            n_max_file_title: 0,
+            lpstr_initial_dir: std::ptr::null(),
+            lpstr_title: title_u16.as_ptr(),
+            flags: 0x0008_0000 | 0x0000_1000 | 0x0000_0800 | 0x0000_0008,
+            n_file_offset: 0,
+            n_file_extension: 0,
+            lpstr_def_ext: std::ptr::null(),
+            l_cust_data: 0,
+            lpfn_hook: std::ptr::null(),
+            lp_template_name: std::ptr::null(),
+            pv_reserved: std::ptr::null_mut(),
+            dw_reserved: 0,
+            flags_ex: 0,
+        };
+        let ok = unsafe { GetOpenFileNameW(&mut ofn) };
+        if ok != 0 {
+            let end = file_buf
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(file_buf.len());
+            let s = String::from_utf16_lossy(&file_buf[..end]);
+            if !s.is_empty() {
+                Some(std::path::PathBuf::from(s))
+            } else {
+                None
+            }
+        } else {
+            None
         }
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg(trimmed).spawn();
+        let prompt = if images_only {
+            "POSIX path of (choose file with prompt \"Chọn hình ảnh để gửi qua Zalo\" of type {\"public.image\"})"
+        } else {
+            "POSIX path of (choose file with prompt \"Chọn tập tin đính kèm để gửi qua Zalo\")"
+        };
+        if let Ok(out) = std::process::Command::new("osascript")
+            .args(["-e", prompt])
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return Some(std::path::PathBuf::from(s));
+                }
+            }
+        }
+        None
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let _ = std::process::Command::new("xdg-open").arg(trimmed).spawn();
+        let mut zcmd = std::process::Command::new("zenity");
+        zcmd.arg("--file-selection");
+        if images_only {
+            zcmd.arg("--file-filter=Images | *.png *.jpg *.jpeg *.webp *.gif *.bmp");
+        }
+        if let Ok(out) = zcmd.output() {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return Some(std::path::PathBuf::from(s));
+                }
+            }
+        }
+        if let Ok(out) = std::process::Command::new("kdialog")
+            .arg("--getopenfilename")
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return Some(std::path::PathBuf::from(s));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Native OS folder-picker dialog. Dùng cho chọn thư mục (download dir, data
+/// dir, migrate cả thư mục) — khác `pick_native_file_dialog` chỉ chọn được file
+/// (#106: nút Open xám vì OFN_FILEMUSTEXIST / `choose file` không cho chọn folder).
+pub(super) fn pick_native_folder_dialog(title: &str) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        // IFileDialog với FOS_PICKFOLDERS qua PowerShell (tránh COM-FFI tay):
+        // mở dialog chọn thư mục, in ra FullName khi OK.
+        let title_esc = title.replace('\'', "''");
+        let ps = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             $d = New-Object System.Windows.Forms.FolderBrowserDialog; \
+             $d.Description = '{title_esc}'; $d.ShowNewFolderButton = $true; \
+             if ($d.ShowDialog() -eq 'OK') {{ $d.SelectedPath }}"
+        );
+        if let Ok(out) = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return Some(std::path::PathBuf::from(s));
+                }
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let prompt = format!("POSIX path of (choose folder with prompt \"{title}\")");
+        if let Ok(out) = std::process::Command::new("osascript")
+            .args(["-e", &prompt])
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return Some(std::path::PathBuf::from(s));
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        if let Ok(out) = std::process::Command::new("zenity")
+            .args(["--file-selection", "--directory", "--title", title])
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return Some(std::path::PathBuf::from(s));
+                }
+            }
+        }
+        if let Ok(out) = std::process::Command::new("kdialog")
+            .args(["--getexistingdirectory", "."])
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return Some(std::path::PathBuf::from(s));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Kết quả folder picker: phân biệt user cancel với launch fail (#3609).
+pub(super) enum FolderPick {
+    Picked(std::path::PathBuf),
+    Cancelled,
+    LaunchFailed(String),
+}
+
+pub(super) fn pick_native_folder_dialog_result(title: &str) -> FolderPick {
+    match pick_native_folder_dialog(title) {
+        Some(p) => FolderPick::Picked(p),
+        None => {
+            // Thiếu helper → launch fail có hướng dẫn; user bấm Cancel vẫn là Cancel.
+            #[cfg(target_os = "windows")]
+            let missing = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", "exit 0"])
+                .output()
+                .is_err();
+            #[cfg(target_os = "macos")]
+            let missing = std::process::Command::new("osascript")
+                .args(["-e", "return 1"])
+                .output()
+                .is_err();
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            let missing = std::process::Command::new("zenity")
+                .arg("--version")
+                .output()
+                .is_err()
+                && std::process::Command::new("kdialog")
+                    .arg("--version")
+                    .output()
+                    .is_err();
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            let hint = "Không mở được hộp chọn thư mục (thiếu zenity/kdialog) — hãy cài một trong hai rồi thử lại";
+            #[cfg(target_os = "macos")]
+            let hint = "Không mở được hộp chọn thư mục (osascript lỗi)";
+            #[cfg(target_os = "windows")]
+            let hint = "Không mở được hộp chọn thư mục (thiếu PowerShell)";
+            if missing {
+                return FolderPick::LaunchFailed(hint.into());
+            }
+            FolderPick::Cancelled
+        }
     }
 }
 /// Detect `Ctrl+V` or `Shift+Insert` reliably on Windows even when `egui-winit` swallows `Key::V`
@@ -838,13 +1140,176 @@ fn strip_markdown_syntax_for_width(s: &str) -> String {
         .replace("~~", "")
         .replace('`', "")
 }
+/// Pure markdown helpers (không cần egui::Ui → test được bằng cargo test).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum MdBlock {
+    Code { lang: String, body: String },
+    Table { headers: Vec<String>, rows: Vec<Vec<String>> },
+    Lines(Vec<String>),
+}
 
+/// Tách text thành các block: code fence / bảng / dòng thường.
+/// Bảng = header `| a | b |` + dòng separator `| --- | --- |` + ≥1 dòng `|...|`.
+/// Bảng hỏng cú pháp (separator sai, số cột lệch) → trả về Lines để vẽ plaintext.
+fn split_md_blocks(raw: &str) -> Vec<MdBlock> {
+    let mut out: Vec<MdBlock> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    let mut in_code = false;
+    let mut code_lang = String::new();
+    let mut code_body: Vec<String> = Vec::new();
+    let flush = |pending: &mut Vec<String>, out: &mut Vec<MdBlock>| {
+        if !pending.is_empty() {
+            out.push(MdBlock::Lines(std::mem::take(pending)));
+        }
+    };
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let t = line.trim_end();
+        if in_code {
+            if t.trim_start().starts_with("```") {
+                in_code = false;
+                out.push(MdBlock::Code { lang: std::mem::take(&mut code_lang), body: code_body.join("\n") });
+                code_body.clear();
+            } else {
+                code_body.push(line.to_string());
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(lang) = t.trim_start().strip_prefix("```") {
+            flush(&mut pending, &mut out);
+            in_code = true;
+            code_lang = lang.trim().to_string();
+            i += 1;
+            continue;
+        }
+        if is_table_header(t) && i + 1 < lines.len() && is_table_separator(lines[i + 1].trim_end()) {
+            let headers = split_table_row(t);
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            let mut j = i + 2;
+            let mut ok = false;
+            while j < lines.len() {
+                let rl = lines[j].trim_end();
+                if !rl.trim_start().starts_with('|') || !rl.trim_end().ends_with('|') {
+                    break;
+                }
+                let cells = split_table_row(rl);
+                if cells.len() != headers.len() {
+                    break;
+                }
+                rows.push(cells);
+                ok = true;
+                j += 1;
+            }
+            if ok {
+                flush(&mut pending, &mut out);
+                out.push(MdBlock::Table { headers, rows });
+                i = j;
+                continue;
+            }
+        }
+        pending.push(line.to_string());
+        i += 1;
+    }
+    if in_code {
+        // Fence không đóng → vẽ nguyên văn như code (vẫn đẹp hơn rớt mất nội dung).
+        let mut all = vec![format!("```{}", code_lang)];
+        all.extend(code_body);
+        pending.extend(all);
+        flush(&mut pending, &mut out);
+    } else {
+        flush(&mut pending, &mut out);
+    }
+    out
+}
+
+fn is_table_header(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.ends_with('|') && t.contains('|') && split_table_row(line).len() >= 2
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    if !t.starts_with('|') || !t.ends_with('|') {
+        return false;
+    }
+    let cells: Vec<&str> = t.trim_matches('|').split('|').map(str::trim).collect();
+    if cells.len() < 2 {
+        return false;
+    }
+    cells.iter().all(|c| {
+        let c = c.trim_matches(':');
+        !c.is_empty() && c.len() >= 3 && c.chars().all(|ch| ch == '-')
+    })
+}
+
+fn split_table_row(line: &str) -> Vec<String> {
+    line.trim().trim_matches('|').split('|').map(|c| c.trim().to_string()).collect()
+}
+
+/// Detect list số `1. ` (1-3 số, dấu chấm + space). Trả về (số, indent, nội dung).
+fn parse_ordered_item(line: &str) -> Option<(String, usize, String)> {
+    let indent = line.bytes().take_while(|&b| b == b' ').count().min(12);
+    let t = line.trim_start();
+    let dot = t.find(". ")?;
+    let (num, _) = t.split_at(dot);
+    if !num.is_empty() && num.len() <= 3 && num.chars().all(|c| c.is_ascii_digit()) {
+        Some((num.to_string(), indent, t[dot + 2..].to_string()))
+    } else {
+        None
+    }
+}
+
+/// LỰA CHỌN `*đậm*` kiểu Zalo: `*x*` → ĐẬM khi `zalo_bold` bật; `**x**` luôn đậm;
+/// `_x_` luôn nghiêng. Trả về true khi đã tiêu thụ `*...*` tại đầu `rest`.
+/// Không phá URL/mention: caller chỉ gọi khi đã loại trừ link/mention, và yêu cầu
+/// nội dung trong `*...*` không chứa whitespace biên + không phải `**`.
+fn consume_zalo_bold(job: &mut egui::text::LayoutJob, rest: &str, base_size: f32, base_color: Color32, pal: &ThemePalette) -> Option<usize> {
+    if !rest.starts_with('*') || rest.starts_with("**") {
+        return None;
+    }
+    let after = &rest[1..];
+    let end = after.find('*')?;
+    if end == 0 || end > 120 {
+        return None;
+    }
+    let inner = &after[..end];
+    if inner.starts_with(char::is_whitespace) || inner.ends_with(char::is_whitespace) || inner.contains('\n') || inner.contains("http") || inner.contains('@') {
+        return None;
+    }
+    job.append(
+        inner,
+        0.0,
+        egui::TextFormat {
+            font_id: FontId::proportional(base_size + 0.4),
+            color: if pal.is_dark { Color32::WHITE } else { pal.text_primary },
+            ..Default::default()
+        },
+    );
+    let _ = base_color;
+    Some(1 + end + 1)
+}
+
+#[allow(dead_code)]
 fn render_markdown_inline_rich(
     ui: &mut egui::Ui,
     text: &str,
     base_size: f32,
     base_color: Color32,
     pal: &ThemePalette,
+) {
+    render_markdown_inline_rich_opts(ui, text, base_size, base_color, pal, true)
+}
+
+fn render_markdown_inline_rich_opts(
+    ui: &mut egui::Ui,
+    text: &str,
+    base_size: f32,
+    base_color: Color32,
+    pal: &ThemePalette,
+    zalo_bold: bool,
 ) {
     let mut job = egui::text::LayoutJob::default();
     let mut first_link: Option<String> = None;
@@ -1109,8 +1574,37 @@ fn render_markdown_inline_rich(
             }
         }
         if rest.starts_with('*') && !rest.starts_with("**") {
+            // Zalo: `*đậm*` (1 sao = đậm) khi bật toggle; `_x_` vẫn là nghiêng chuẩn.
+            // URL/mention đã được xử lý ở nhánh link/mention phía trên nên tới đây
+            // `*` ở đầu token là an toàn để thử parse đậm.
+            if zalo_bold {
+                if let Some(consumed) = consume_zalo_bold(&mut job, rest, base_size, base_color, pal) {
+                    rest = &rest[consumed..];
+                    continue;
+                }
+            }
+            // Fallback: nghiêng kiểu markdown chuẩn; kỳ vọng `_x_` được xử lý ở dưới.
             let after = &rest[1..];
             if let Some(end_i) = after.find('*') {
+                if end_i > 0 && !zalo_bold {
+                    job.append(
+                        &after[..end_i],
+                        0.0,
+                        egui::TextFormat {
+                            font_id: FontId::proportional(base_size),
+                            color: base_color,
+                            italics: true,
+                            ..Default::default()
+                        },
+                    );
+                    rest = &after[end_i + 1..];
+                    continue;
+                }
+            }
+        }
+        if rest.starts_with('_') && !rest.starts_with("__") {
+            let after = &rest[1..];
+            if let Some(end_i) = after.find('_') {
                 if end_i > 0 {
                     job.append(
                         &after[..end_i],
@@ -1171,95 +1665,116 @@ fn render_markdown_inline_rich(
             .on_hover_text(&url)
             .clicked()
         {
-            open_external_url(&url);
+            let _ = open_external_url(&url);
         }
     } else {
         ui.add(egui::Label::new(job).wrap());
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn render_chat_markdown_block(
     ui: &mut egui::Ui,
     raw: &str,
     text_col: Color32,
     pal: &ThemePalette,
 ) {
-    let mut in_code_block = false;
-    let mut code_lines: Vec<&str> = Vec::new();
+    render_chat_markdown_block_opts(ui, raw, text_col, pal, true, true)
+}
 
-    for line in raw.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.trim_start().starts_with("```") {
-            if in_code_block {
-                let code_text = code_lines.join("\n");
-                code_lines.clear();
-                in_code_block = false;
-                egui::Frame::none()
-                    .fill(pal.bg_input)
-                    .stroke(Stroke::new(1.0_f32, pal.border))
-                    .rounding(Rounding::same(6.0))
-                    .inner_margin(Margin::symmetric(10.0, 7.0))
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(code_text)
-                                    .font(FontId::monospace(12.6))
-                                    .color(pal.primary_hover),
-                            )
-                            .wrap(),
-                        );
-                    });
-            } else {
-                in_code_block = true;
+/// Bản có toggle: `enabled=false` → plaintext nguyên văn (không parse gì);
+/// `zalo_bold` điều khiển `*đậm*` kiểu Zalo (xem consume_zalo_bold).
+pub(super) fn render_chat_markdown_block_opts(
+    ui: &mut egui::Ui,
+    raw: &str,
+    text_col: Color32,
+    pal: &ThemePalette,
+    enabled: bool,
+    zalo_bold: bool,
+) {
+    if !enabled {
+        ui.add(egui::Label::new(RichText::new(raw).size(14.0).color(text_col)).wrap());
+        return;
+    }
+    for block in split_md_blocks(raw) {
+        match block {
+            MdBlock::Code { lang, body } => render_code_block(ui, &lang, &body, pal),
+            MdBlock::Table { headers, rows } => render_md_table(ui, &headers, &rows, text_col, pal, zalo_bold),
+            MdBlock::Lines(lines) => {
+                for line in &lines {
+                    let trimmed = line.trim_end();
+                    let t_start = trimmed.trim_start();
+                    if let Some(h3) = t_start.strip_prefix("### ") {
+                        render_markdown_inline_rich_opts(ui, h3, 15.0, text_col, pal, zalo_bold);
+                    } else if let Some(h2) = t_start.strip_prefix("## ") {
+                        render_markdown_inline_rich_opts(ui, h2, 16.0, text_col, pal, zalo_bold);
+                    } else if let Some(h1) = t_start.strip_prefix("# ") {
+                        render_markdown_inline_rich_opts(ui, h1, 17.0, text_col, pal, zalo_bold);
+                    } else if let Some(quote) = t_start.strip_prefix("> ") {
+                        ui.horizontal(|ui| {
+                            let (bar_r, _) = ui.allocate_exact_size(Vec2::new(3.0, 16.0), Sense::hover());
+                            ui.painter().rect_filled(bar_r, Rounding::same(1.5), pal.primary_hover);
+                            render_markdown_inline_rich_opts(ui, quote, 13.8, text_col.linear_multiply(0.88), pal, zalo_bold);
+                        });
+                    } else if let Some((num, indent, body)) = parse_ordered_item(trimmed) {
+                        ui.horizontal(|ui| {
+                            ui.add_space(indent as f32 * 4.0);
+                            ui.label(RichText::new(format!("{num}.")).size(14.0).color(text_col));
+                            render_markdown_inline_rich_opts(ui, &body, 14.0, text_col, pal, zalo_bold);
+                        });
+                    } else if let Some(bullet) = t_start.strip_prefix("- ").or_else(|| t_start.strip_prefix("* ")) {
+                        let bullet_line = format!("• {bullet}");
+                        render_markdown_inline_rich_opts(ui, &bullet_line, 14.0, text_col, pal, zalo_bold);
+                    } else {
+                        render_markdown_inline_rich_opts(ui, trimmed, 14.0, text_col, pal, zalo_bold);
+                    }
+                }
             }
-            continue;
         }
-        if in_code_block {
-            code_lines.push(line);
-            continue;
-        }
-        let t_start = trimmed.trim_start();
-        if let Some(h3) = t_start.strip_prefix("### ") {
-            render_markdown_inline_rich(ui, h3, 15.0, text_col, pal);
-        } else if let Some(h2) = t_start.strip_prefix("## ") {
-            render_markdown_inline_rich(ui, h2, 16.0, text_col, pal);
-        } else if let Some(h1) = t_start.strip_prefix("# ") {
-            render_markdown_inline_rich(ui, h1, 17.0, text_col, pal);
-        } else if let Some(quote) = t_start.strip_prefix("> ") {
+    }
+}
+
+fn render_code_block(ui: &mut egui::Ui, lang: &str, body: &str, pal: &ThemePalette) {
+    let title = if lang.is_empty() { "code".to_string() } else { lang.to_string() };
+    egui::Frame::none()
+        .fill(pal.bg_input)
+        .stroke(Stroke::new(1.0_f32, pal.border))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::symmetric(10.0, 7.0))
+        .show(ui, |ui| {
             ui.horizontal(|ui| {
-                let (bar_r, _) = ui.allocate_exact_size(Vec2::new(3.0, 16.0), Sense::hover());
-                ui.painter()
-                    .rect_filled(bar_r, Rounding::same(1.5), pal.primary_hover);
-                render_markdown_inline_rich(ui, quote, 13.8, text_col.linear_multiply(0.88), pal);
+                ui.label(RichText::new(title).size(11.5).color(pal.text_muted).monospace());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("📋 Copy").on_hover_text("Sao chép code").clicked() {
+                        ui.ctx().copy_text(body.to_string());
+                    }
+                });
             });
-        } else if let Some(bullet) = t_start
-            .strip_prefix("- ")
-            .or_else(|| t_start.strip_prefix("* "))
-        {
-            let bullet_line = format!("• {bullet}");
-            render_markdown_inline_rich(ui, &bullet_line, 14.0, text_col, pal);
-        } else {
-            render_markdown_inline_rich(ui, trimmed, 14.0, text_col, pal);
-        }
-    }
-    if !code_lines.is_empty() {
-        let code_text = code_lines.join("\n");
-        egui::Frame::none()
-            .fill(pal.bg_input)
-            .stroke(Stroke::new(1.0_f32, pal.border))
-            .rounding(Rounding::same(6.0))
-            .inner_margin(Margin::symmetric(10.0, 7.0))
-            .show(ui, |ui| {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(code_text)
-                            .font(FontId::monospace(12.6))
-                            .color(pal.primary_hover),
-                    )
-                    .wrap(),
-                );
+            ui.add_space(2.0);
+            ui.add(egui::Label::new(RichText::new(body).font(FontId::monospace(12.6)).color(pal.primary_hover)).wrap());
+        });
+}
+
+fn render_md_table(ui: &mut egui::Ui, headers: &[String], rows: &[Vec<String>], text_col: Color32, pal: &ThemePalette, zalo_bold: bool) {
+    egui::Frame::none()
+        .fill(pal.bg_input)
+        .stroke(Stroke::new(1.0_f32, pal.border))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::symmetric(8.0, 6.0))
+        .show(ui, |ui| {
+            egui::Grid::new(format!("md_table_{}", headers.len())).striped(true).spacing([10.0, 4.0]).show(ui, |ui| {
+                for h in headers {
+                    ui.label(RichText::new(h).size(13.5).color(text_col).strong());
+                }
+                ui.end_row();
+                for row in rows {
+                    for cell in row {
+                        render_markdown_inline_rich_opts(ui, cell, 13.5, text_col, pal, zalo_bold);
+                    }
+                    ui.end_row();
+                }
             });
-    }
+        });
 }
 
 pub(super) fn same_message_cluster(a: &ChatMessage, b: &ChatMessage) -> bool {
@@ -1280,6 +1795,19 @@ pub(super) fn same_message_cluster(a: &ChatMessage, b: &ChatMessage) -> bool {
     true
 }
 
+/// Cách render markdown của một bubble (truyền từ settings → ít đổi callsite nhất).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MdOptions {
+    pub enabled: bool,
+    pub zalo_bold: bool,
+}
+
+impl Default for MdOptions {
+    fn default() -> Self {
+        Self { enabled: true, zalo_bold: true }
+    }
+}
+
 pub(super) fn render_message_body(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
@@ -1291,6 +1819,10 @@ pub(super) fn render_message_body(
     loading_stickers: &mut HashSet<String>,
     emoji_textures: &HashMap<String, TextureHandle>,
     album: &[(usize, &ChatMessage)],
+    preview: Option<&str>,
+    preview_loading: bool,
+    preview_error: Option<&str>,
+    md: MdOptions,
 ) -> Option<BubbleAction> {
     let mut body_action = None;
     let (text_col, meta_col) = if outgoing {
@@ -1300,6 +1832,15 @@ pub(super) fn render_message_body(
     };
 
     let trimmed_text = msg.text.trim();
+    if trimmed_text == crate::chat::VANISH_EXPIRED_TEXT {
+        ui.label(
+            RichText::new(format!("{} {}", lucide::BAN, crate::chat::VANISH_EXPIRED_TEXT))
+                .color(meta_col)
+                .italics()
+                .size(13.8),
+        );
+        return None;
+    }
     if trimmed_text == "[Tin nhắn đã thu hồi]" {
         ui.label(
             RichText::new(format!("{} Tin nhắn đã được thu hồi", lucide::BAN))
@@ -1308,19 +1849,6 @@ pub(super) fn render_message_body(
                 .size(13.8),
         );
         return None;
-    }
-
-    if trimmed_text.starts_with("[Đã thu hồi]") {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("{} Đã thu hồi", lucide::BAN))
-                    .color(Color32::from_rgb(239, 68, 68))
-                    .italics()
-                    .strong()
-                    .size(12.0),
-            );
-        });
-        ui.add_space(2.0);
     }
 
     let sender_label = if msg.is_outgoing {
@@ -1360,7 +1888,8 @@ pub(super) fn render_message_body(
             let open_target = msg
                 .link_url
                 .as_deref()
-                .filter(|u| !u.is_empty() && crate::chat::is_zalo_photo_cdn_url(u))
+                .filter(|u| !u.is_empty() && crate::chat::is_safe_external_image_url(u))
+                .or(Some(thumb_url).filter(|u| crate::chat::is_safe_external_image_url(u)))
                 .unwrap_or(thumb_url)
                 .to_string();
             let title_label = msg
@@ -1421,7 +1950,7 @@ pub(super) fn render_message_body(
                         .on_hover_text("Bấm để thử mở liên kết ảnh gốc")
                         .clicked()
                     {
-                        open_external_url(&open_target);
+                        let _ = open_external_url(&open_target);
                     }
                 } else {
                     let tw_f = tw as f32;
@@ -1538,78 +2067,33 @@ pub(super) fn render_message_body(
             }
             if let Some(cap) = extract_photo_user_caption(msg) {
                 ui.add_space(5.0);
-                render_chat_markdown_block(ui, cap, text_col, pal);
+                render_chat_markdown_block_opts(ui, cap, text_col, pal, md.enabled, md.zalo_bold);
             }
             return body_action;
         }
     }
-    // Dedicated File / Video Attachment Card (#74)
-    let is_zalo_file_or_video = is_zalo_file_or_video_message(msg);
-    if is_zalo_file_or_video {
-        let is_vid =
-            msg.link_src.as_deref() == Some("Video Zalo") || trimmed_text.starts_with("[Video]");
+    // Classified File / Video / Voice / Doc Attachment Card (#74 follow-up)
+    if let Some(kind) = classify_attachment(msg) {
         let url_str = msg.link_url.as_deref().unwrap_or_default();
         let resolved_file_name = crate::chat::resolve_attachment_file_name(
             msg.link_title.as_deref(),
             trimmed_text,
             url_str,
         );
-        let title_str = if is_vid {
-            msg.link_title
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(trimmed_text)
-                .to_string()
-        } else {
-            resolved_file_name.clone()
-        };
-        let sub_str = if is_vid {
-            "Video đính kèm · Bấm để mở"
-        } else {
-            "Tập tin Zalo · Bấm để lưu về máy"
-        };
-        let link_col = if pal.is_dark {
-            Color32::from_rgb(97, 175, 239)
-        } else {
-            pal.primary
-        };
-        let resp = ui
-            .add(
-                egui::Label::new(
-                    RichText::new(&title_str)
-                        .size(13.8)
-                        .color(text_col)
-                        .strong(),
-                )
-                .wrap()
-                .sense(Sense::click()),
-            )
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text(if is_vid {
-                "Bấm để mở video"
-            } else {
-                "Bấm để tải và lưu tập tin với tên gốc"
-            });
-        ui.add_space(2.0);
-        let dom_resp = ui
-            .add(
-                egui::Label::new(RichText::new(sub_str).size(12.5).color(link_col))
-                    .sense(Sense::click()),
-            )
-            .on_hover_cursor(CursorIcon::PointingHand);
-        if resp.clicked() || dom_resp.clicked() {
-            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-                if is_vid && !url.to_ascii_lowercase().contains("/renewmedia") {
-                    open_external_url(url);
-                } else {
-                    return Some(BubbleAction::DownloadFile {
-                        url: url.to_string(),
-                        file_name: resolved_file_name,
-                    });
-                }
-            }
-        }
-        return None;
+        return render_attachment_card(
+            ui,
+            msg,
+            kind,
+            &resolved_file_name,
+            text_col,
+            pal,
+            max_text_width,
+            sticker_textures,
+            loading_stickers,
+            preview,
+            preview_loading,
+            preview_error,
+        );
     }
 
     let Some((caption, url, domain)) = extract_message_link_view(msg) else {
@@ -1618,12 +2102,12 @@ pub(super) fn render_message_body(
         } else {
             &msg.text
         };
-        render_chat_markdown_block(ui, display_text, text_col, pal);
+        render_chat_markdown_block_opts(ui, display_text, text_col, pal, md.enabled, md.zalo_bold);
         return None;
     };
 
     let link_col = if pal.is_dark {
-        Color32::from_rgb(97, 175, 239) // #61AFEF Zalo/Atom clean link blue
+        Color32::from_rgb(102, 166, 255) // #66A6FF Zalo dark link blue
     } else {
         pal.primary
     };
@@ -1651,7 +2135,7 @@ pub(super) fn render_message_body(
 
     // 1. Optional user comment above the link
     if !caption.is_empty() && caption != url {
-        render_chat_markdown_block(ui, &caption, text_col, pal);
+        render_chat_markdown_block_opts(ui, &caption, text_col, pal, md.enabled, md.zalo_bold);
         ui.add_space(4.0);
     }
 
@@ -1688,7 +2172,7 @@ pub(super) fn render_message_body(
                 .on_hover_text(&url)
                 .clicked()
             {
-                open_external_url(&url);
+                let _ = open_external_url(&url);
             }
             ui.add_space(5.0);
         }
@@ -1719,7 +2203,7 @@ pub(super) fn render_message_body(
         .on_hover_cursor(CursorIcon::PointingHand)
         .on_hover_text(&url);
     if title_resp.clicked() {
-        open_external_url(&url);
+        let _ = open_external_url(&url);
     }
 
     // 4. Optional short description (only if concise and distinct)
@@ -1743,25 +2227,602 @@ pub(super) fn render_message_body(
             .on_hover_cursor(CursorIcon::PointingHand)
             .on_hover_text(&url);
         if d_resp.clicked() {
-            open_external_url(&url);
+            let _ = open_external_url(&url);
         }
     }
 
-    // 5. Clean Domain line (`docs.google.com`, `drive.google.com`, `tiktok.com`)
+    // 5. URL rút gọn click được + domain (#111: trước đây chỉ hiện domain,
+    //    user không thấy/không copy được link gốc).
     ui.add_space(2.5);
+    let url_line = format!("{} · {}", clean_display_url(&url, 60), domain);
     let dom_resp = ui
         .add(
-            egui::Label::new(RichText::new(&domain).size(12.6).color(link_col))
+            egui::Label::new(RichText::new(&url_line).size(12.6).color(link_col))
                 .sense(Sense::click()),
         )
         .on_hover_cursor(CursorIcon::PointingHand)
         .on_hover_text(&url);
     if dom_resp.clicked() {
-        open_external_url(&url);
+        let _ = open_external_url(&url);
     }
+    dom_resp.context_menu(|ui| {
+        if ui.button("📋 Sao chép liên kết").clicked() {
+            ui.ctx().copy_text(url.clone());
+            ui.close_menu();
+        }
+    });
 
     body_action
 }
+
+/// Classified attachment kind for the file/video/voice/doc bubble (#74 follow-up).
+/// Pure filename + `link_src`/text-prefix heuristics; unknown extensions stay `GenericFile`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AttachmentKind {
+    Video,
+    Voice,
+    Audio,
+    Pdf,
+    Word,
+    Excel,
+    PowerPoint,
+    Archive,
+    Text,
+    GenericFile,
+}
+
+pub(super) fn classify_attachment(msg: &crate::chat::ChatMessage) -> Option<AttachmentKind> {
+    if !is_zalo_file_or_video_message(msg) {
+        return None;
+    }
+    let trimmed = msg.text.trim();
+    if msg.link_src.as_deref() == Some("Video Zalo") || trimmed.starts_with("[Video]") {
+        return Some(AttachmentKind::Video);
+    }
+    if msg.kind == crate::message_model::MessageKind::Voice
+        || trimmed.starts_with("[Tin nhắn thoại]")
+    {
+        return Some(AttachmentKind::Voice);
+    }
+    let name = crate::chat::resolve_attachment_file_name(
+        msg.link_title.as_deref(),
+        trimmed,
+        msg.link_url.as_deref().unwrap_or_default(),
+    );
+    let ext = name
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if ext.is_empty() || ext == name.to_ascii_lowercase() {
+        return Some(AttachmentKind::GenericFile);
+    }
+    Some(match ext.as_str() {
+        "mp4" | "mov" | "mkv" | "avi" | "webm" => AttachmentKind::Video,
+        "amr" | "awb" | "opus" => AttachmentKind::Voice,
+        "mp3" | "m4a" | "wav" | "ogg" | "flac" | "aac" => AttachmentKind::Audio,
+        "pdf" => AttachmentKind::Pdf,
+        "doc" | "docx" | "odt" | "rtf" => AttachmentKind::Word,
+        "xls" | "xlsx" | "csv" | "ods" => AttachmentKind::Excel,
+        "ppt" | "pptx" | "odp" | "key" => AttachmentKind::PowerPoint,
+        "zip" | "rar" | "7z" | "tar" | "gz" => AttachmentKind::Archive,
+        "txt" | "md" | "log" => AttachmentKind::Text,
+        _ => AttachmentKind::GenericFile,
+    })
+}
+
+pub(super) fn attachment_kind_label(kind: AttachmentKind) -> (&'static str, &'static str) {
+    match kind {
+        AttachmentKind::Video => (crate::gui::lucide::FILM, "Video"),
+        AttachmentKind::Voice => (crate::gui::lucide::MIC, "Tin nhắn thoại"),
+        AttachmentKind::Audio => (crate::gui::lucide::MIC, "Âm thanh"),
+        AttachmentKind::Pdf => (crate::gui::lucide::FILE_TEXT, "Tài liệu PDF"),
+        AttachmentKind::Word => (crate::gui::lucide::FILE_TEXT, "Tài liệu Word"),
+        AttachmentKind::Excel => (crate::gui::lucide::FILE_TEXT, "Bảng tính Excel"),
+        AttachmentKind::PowerPoint => (crate::gui::lucide::FILE_TEXT, "Bài thuyết trình"),
+        AttachmentKind::Archive => (crate::gui::lucide::FILE_TEXT, "Tập tin nén"),
+        AttachmentKind::Text => (crate::gui::lucide::FILE_TEXT, "Tập tin văn bản"),
+        AttachmentKind::GenericFile => (crate::gui::lucide::PAPERCLIP, "Tập tin"),
+    }
+}
+
+/// Cache key for a video-bubble thumbnail derived from the attachment URL.
+pub(super) fn video_thumb_key(url: &str) -> String {
+    format!("vid_{}", crate::crypto::md5_hex(url))
+}
+/// Render one classified attachment bubble: video w/ thumbnail, voice w/ play, doc/file card.
+#[allow(clippy::too_many_arguments)]
+fn render_attachment_card(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    kind: AttachmentKind,
+    file_name: &str,
+    text_col: Color32,
+    pal: &ThemePalette,
+    max_text_width: f32,
+    sticker_textures: &HashMap<String, TextureHandle>,
+    loading_stickers: &mut HashSet<String>,
+    preview: Option<&str>,
+    preview_loading: bool,
+    preview_error: Option<&str>,
+) -> Option<BubbleAction> {
+    match kind {
+        AttachmentKind::Video => render_video_card(
+            ui,
+            msg,
+            file_name,
+            text_col,
+            pal,
+            max_text_width,
+            sticker_textures,
+            loading_stickers,
+        ),
+        AttachmentKind::Voice | AttachmentKind::Audio => {
+            render_voice_card(ui, msg, kind, file_name, text_col, pal)
+        }
+        _ => render_doc_card(
+            ui,
+            msg,
+            kind,
+            file_name,
+            text_col,
+            pal,
+            preview,
+            preview_loading,
+            preview_error,
+        ),
+    }
+}
+
+/// Video bubble: inline thumbnail (Zalo `link_thumb`, photo CDN, or ffmpeg frame) + play overlay.
+/// Missing ffmpeg or missing thumbnail falls back to the plain clickable card, never a crash.
+#[allow(clippy::too_many_arguments)]
+fn render_video_card(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    file_name: &str,
+    text_col: Color32,
+    pal: &ThemePalette,
+    max_text_width: f32,
+    sticker_textures: &HashMap<String, TextureHandle>,
+    loading_stickers: &mut HashSet<String>,
+) -> Option<BubbleAction> {
+    let title_str = msg
+        .link_title
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(file_name)
+        .to_string();
+    let thumb_url = msg
+        .link_thumb
+        .as_deref()
+        .filter(|u| {
+            !u.is_empty()
+                && (u.starts_with("http://") || u.starts_with("https://"))
+                && !u.to_ascii_lowercase().contains("/renewmedia")
+        })
+        .or_else(|| {
+            msg.link_url
+                .as_deref()
+                .filter(|u| !u.is_empty() && crate::chat::is_zalo_photo_cdn_url(u))
+        });
+    if let Some(thumb_url) = thumb_url {
+        let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
+        if !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::FetchStickerImage {
+                    key: key.clone(),
+                    url: thumb_url.to_string(),
+                });
+            }
+        }
+        if let Some(tex) = sticker_textures.get(&key) {
+            let [tw, th] = tex.size();
+            if tw > 2 && th > 2 {
+                let aspect = (th as f32 / tw as f32).clamp(0.45, 0.85);
+                let thumb_w = max_text_width.min(260.0);
+                let img_h = (thumb_w * aspect).min(150.0);
+                let img_resp = ui
+                    .add(
+                        egui::Image::new(tex)
+                            .fit_to_exact_size(Vec2::new(thumb_w, img_h))
+                            .rounding(Rounding::same(8.0))
+                            .sense(Sense::click()),
+                    )
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text("Bấm để phát video");
+                let pill_r =
+                    egui::Rect::from_center_size(img_resp.rect.center(), Vec2::new(46.0, 46.0));
+                ui.painter()
+                    .circle_filled(pill_r.center(), 23.0, Color32::from_black_alpha(140));
+                ui.painter().text(
+                    pill_r.center() + Vec2::new(1.5, 0.0),
+                    egui::Align2::CENTER_CENTER,
+                    "▶",
+                    FontId::proportional(20.0),
+                    Color32::WHITE,
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(truncate_chars(&title_str, 60))
+                        .size(12.5)
+                        .color(text_col),
+                );
+                if img_resp.clicked() {
+                    if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
+                        if !url.to_ascii_lowercase().contains("/renewmedia") {
+                            let _ = open_external_url(url);
+                        } else {
+                            return Some(BubbleAction::DownloadFile {
+                                url: url.to_string(),
+                                file_name: file_name.to_string(),
+                            });
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+    }
+    if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
+        let key = video_thumb_key(url);
+        if !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::FetchVideoThumbnail {
+                    key,
+                    url: url.to_string(),
+                });
+            }
+        }
+        if let Some(tex) = sticker_textures.get(&video_thumb_key(url)) {
+            let [tw, th] = tex.size();
+            if tw > 2 && th > 2 {
+                let aspect = (th as f32 / tw as f32).clamp(0.45, 0.85);
+                let thumb_w = max_text_width.min(260.0);
+                let img_h = (thumb_w * aspect).min(150.0);
+                let img_resp = ui
+                    .add(
+                        egui::Image::new(tex)
+                            .fit_to_exact_size(Vec2::new(thumb_w, img_h))
+                            .rounding(Rounding::same(8.0))
+                            .sense(Sense::click()),
+                    )
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text("Bấm để phát video");
+                let pill_r =
+                    egui::Rect::from_center_size(img_resp.rect.center(), Vec2::new(46.0, 46.0));
+                ui.painter()
+                    .circle_filled(pill_r.center(), 23.0, Color32::from_black_alpha(140));
+                ui.painter().text(
+                    pill_r.center() + Vec2::new(1.5, 0.0),
+                    egui::Align2::CENTER_CENTER,
+                    "▶",
+                    FontId::proportional(20.0),
+                    Color32::WHITE,
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(truncate_chars(&title_str, 60))
+                        .size(12.5)
+                        .color(text_col),
+                );
+                if img_resp.clicked() {
+                    if !url.to_ascii_lowercase().contains("/renewmedia") {
+                        let _ = open_external_url(url);
+                    } else {
+                        return Some(BubbleAction::DownloadFile {
+                            url: url.to_string(),
+                            file_name: file_name.to_string(),
+                        });
+                    }
+                }
+                return None;
+            }
+        }
+    }
+    render_video_fallback_card(ui, msg, &title_str, file_name, text_col, pal)
+}
+
+fn render_video_fallback_card(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    title_str: &str,
+    file_name: &str,
+    text_col: Color32,
+    pal: &ThemePalette,
+) -> Option<BubbleAction> {
+    let link_col = if pal.is_dark {
+        Color32::from_rgb(97, 175, 239)
+    } else {
+        pal.primary
+    };
+    let (icon, kind_label) = attachment_kind_label(AttachmentKind::Video);
+    ui.label(
+        RichText::new(format!("{icon}  {}", truncate_chars(title_str, 48)))
+            .size(13.8)
+            .color(text_col)
+            .strong(),
+    );
+    ui.add_space(2.0);
+    let sub_resp = ui
+        .add(
+            egui::Label::new(
+                RichText::new(format!("{kind_label} · Bấm để mở"))
+                    .size(12.5)
+                    .color(link_col),
+            )
+            .sense(Sense::click()),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand);
+    if sub_resp.clicked() {
+        if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
+            if !url.to_ascii_lowercase().contains("/renewmedia") {
+                let _ = open_external_url(url);
+            } else {
+                return Some(BubbleAction::DownloadFile {
+                    url: url.to_string(),
+                    file_name: file_name.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Voice bubble: play button + duration. Playback downloads bytes on the worker
+/// then opens them in the OS default player (no new audio dep).
+fn render_voice_card(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    kind: AttachmentKind,
+    file_name: &str,
+    text_col: Color32,
+    pal: &ThemePalette,
+) -> Option<BubbleAction> {
+    let (icon, kind_label) = attachment_kind_label(kind);
+    let duration = voice_duration_secs(msg);
+    let mut action = None;
+    ui.horizontal(|ui| {
+        let play_resp = ui
+            .add(
+                egui::Button::new(RichText::new("▶").size(15.0).color(Color32::WHITE))
+                    .min_size(Vec2::new(34.0, 34.0))
+                    .fill(pal.primary),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("Bấm để nghe tin nhắn thoại");
+        if play_resp.clicked() {
+            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
+                action = Some(BubbleAction::PlayVoice {
+                    url: url.to_string(),
+                    file_name: file_name.to_string(),
+                    msg_id: msg.id.clone(),
+                });
+            }
+        }
+        ui.vertical(|ui| {
+            ui.label(
+                RichText::new(format!("{icon}  {kind_label}"))
+                    .size(12.8)
+                    .color(text_col)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(format_duration_mmss(duration))
+                    .size(11.5)
+                    .color(text_col.linear_multiply(0.75)),
+            );
+        });
+    });
+    action
+}
+
+/// File/doc bubble: per-type icon + name + meta line + "Mở"/"Lưu về máy" buttons.
+/// PDF first-page render was evaluated and deliberately skipped: no pdf-render dep exists
+/// in the tree and adding a heavy renderer for a thumbnail is not worth it, so PDF/office
+/// files get a classified card + open-outside instead. Preview text (when extracted)
+/// renders inline below the buttons.
+/// Extensions whose text can be extracted in-app (matches `doc_preview::extract_text`).
+pub(super) fn previewable_ext(file_name: &str) -> bool {
+    matches!(
+        file_name
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "pdf" | "docx" | "xlsx" | "pptx" | "txt" | "csv" | "md" | "log" | "rtf"
+    )
+}
+
+fn render_doc_card(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    kind: AttachmentKind,
+    file_name: &str,
+    text_col: Color32,
+    pal: &ThemePalette,
+    preview: Option<&str>,
+    preview_loading: bool,
+    preview_error: Option<&str>,
+) -> Option<BubbleAction> {
+    let (icon, kind_label) = attachment_kind_label(kind);
+    let link_col = if pal.is_dark {
+        Color32::from_rgb(97, 175, 239)
+    } else {
+        pal.primary
+    };
+    ui.label(
+        RichText::new(format!("{icon}  {}", truncate_chars(file_name, 42)))
+            .size(13.8)
+            .color(text_col)
+            .strong(),
+    );
+    ui.add_space(2.0);
+    let ext = file_name
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let meta = if ext.is_empty() {
+        kind_label.to_string()
+    } else {
+        format!("{kind_label} · {ext}")
+    };
+    ui.label(
+        RichText::new(meta)
+            .size(12.0)
+            .color(text_col.linear_multiply(0.7)),
+    );
+    ui.add_space(4.0);
+    let mut action = None;
+    ui.horizontal(|ui| {
+        let open_resp = ui
+            .add(
+                egui::Button::new(RichText::new("Mở").size(12.5).color(link_col))
+                    .min_size(Vec2::new(64.0, 26.0)),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("Mở bằng ứng dụng ngoài / trình duyệt");
+        if open_resp.clicked() {
+            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
+                if !url.to_ascii_lowercase().contains("/renewmedia") {
+                    let _ = open_external_url(url);
+                } else {
+                    action = Some(BubbleAction::DownloadFile {
+                        url: url.to_string(),
+                        file_name: file_name.to_string(),
+                    });
+                }
+            }
+        }
+        let save_resp = ui
+            .add(
+                egui::Button::new(RichText::new("Lưu về máy").size(12.5).color(text_col))
+                    .min_size(Vec2::new(92.0, 26.0)),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("Tải và lưu tập tin với tên gốc");
+        if save_resp.clicked() {
+            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
+                action = Some(BubbleAction::DownloadFile {
+                    url: url.to_string(),
+                    file_name: file_name.to_string(),
+                });
+            }
+        }
+    });
+    // Inline preview snippet (text đã trích, session-only) hoặc nút "Xem trước".
+    if let Some(text) = preview {
+        let snippet = crate::doc_preview::snippet_lines(text, 6);
+        ui.add_space(2.0);
+        egui::Frame::none()
+            .fill(pal.bg_elevated)
+            .inner_margin(Margin::symmetric(8.0, 6.0))
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(snippet)
+                        .size(11.5)
+                        .color(text_col.linear_multiply(0.75)),
+                );
+            });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            let full_resp = ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Xem đầy đủ").size(12.5).color(text_col),
+                    )
+                    .min_size(Vec2::new(92.0, 26.0)),
+                )
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("Mở toàn bộ nội dung trong app");
+            if full_resp.clicked() {
+                action = Some(BubbleAction::OpenDocViewer {
+                    msg_id: msg.id.clone(),
+                    file_name: file_name.to_string(),
+                });
+            }
+        });
+    } else if preview_loading {
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(
+                RichText::new("Đang trích nội dung…")
+                    .size(12.0)
+                    .color(text_col.linear_multiply(0.7)),
+            );
+        });
+    } else if let Some(err) = preview_error {
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(format!("⚠️ {err}"))
+                .size(12.0)
+                .color(pal.danger),
+        );
+    } else if previewable_ext(file_name) {
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            let prev_resp = ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Xem trước").size(12.5).color(text_col),
+                    )
+                    .min_size(Vec2::new(92.0, 26.0)),
+                )
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("Đọc nội dung ngay trong app");
+            if prev_resp.clicked() {
+                if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
+                    action = Some(BubbleAction::FetchDocPreview {
+                        url: url.to_string(),
+                        file_name: file_name.to_string(),
+                        msg_id: msg.id.clone(),
+                    });
+                }
+            }
+        });
+    }
+    action
+}
+
+/// Best-effort voice duration in seconds from `history_source` params (`duration`, `fileSize`).
+/// Unknown durations render as `--:--`; never fabricates a value.
+fn voice_duration_secs(msg: &ChatMessage) -> Option<u64> {
+    let from_src = msg.history_source.as_ref().and_then(|v| {
+        v.get("meta")
+            .and_then(|m| m.get("attachsList"))
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .or(Some(v))
+    });
+    from_src.and_then(|node| {
+        let raw: u64 = node
+            .get("duration")
+            .or_else(|| node.get("dur"))
+            .or_else(|| node.get("time"))
+            .and_then(|d| match d {
+                serde_json::Value::Number(n) => {
+                    n.as_u64().or_else(|| n.as_i64().map(|i| i.max(0) as u64))
+                }
+                serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+                _ => None,
+            })?;
+        // Params voice Zalo là ms (vd 1610); >3600 thì chắc chắn là ms.
+        Some(if raw > 3600 { raw / 1000 } else { raw })
+    })
+}
+
+fn format_duration_mmss(secs: Option<u64>) -> String {
+    match secs {
+        Some(s) => format!("{:02}:{:02}", s / 60, s % 60),
+        None => "--:--".to_string(),
+    }
+}
+
 
 pub(super) fn is_zalo_file_or_video_message(msg: &ChatMessage) -> bool {
     let trimmed = msg.text.trim();
@@ -1994,10 +3055,26 @@ pub(super) fn is_zalo_photo_message(msg: &ChatMessage) -> bool {
     if is_sticker_message(msg).is_some() || is_zalo_file_or_video_message(msg) {
         return false;
     }
+    // msgType photo là authoritative (#118): server đã bảo đây là ảnh thì render
+    // ảnh, kể cả khi link_url lạ/không thuộc allowlist CDN (host mới, renewmedia).
+    let trimmed = msg.text.trim();
+    if msg.link_src.as_deref() == Some("Hình ảnh Zalo")
+        || trimmed == "[Hình ảnh]"
+        || trimmed.starts_with("[Hình ảnh] ")
+    {
+        return true;
+    }
+    // Marked photo (link_src/[Hình ảnh]) giữ photo card + viewer kể cả khi
+    // link_url extensionless/host lạ — mở bằng photo_primary_url an toàn (#2508).
+    let marked_photo = msg.link_src.as_deref() == Some("Hình ảnh Zalo")
+        || trimmed == "[Hình ảnh]"
+        || trimmed.starts_with("[Hình ảnh] ");
     // If link_url points to a non-image webpage (e.g. YouTube, Google Docs, News), it is a rich link card, not a photo message.
-    if let Some(ref lu) = msg.link_url {
-        if !lu.is_empty() && !crate::chat::is_zalo_photo_cdn_url(lu) {
-            return false;
+    if !marked_photo {
+        if let Some(lu) = msg.link_url.as_deref() {
+            if !lu.is_empty() && !crate::chat::is_zalo_photo_cdn_url(lu) {
+                return false;
+            }
         }
     }
     let trimmed = msg.text.trim();
@@ -2060,6 +3137,30 @@ pub(super) fn extract_photo_user_caption(msg: &ChatMessage) -> Option<&str> {
         None
     }
 }
+/// Badge `⏳ còn …` cho tin trong thread bật vanish. `None` = không hiển thị.
+pub(super) fn vanish_badge_label(remain_ms: Option<i64>) -> Option<String> {
+    let ms = remain_ms?;
+    if ms <= 0 {
+        return None;
+    }
+    Some(format!("⏳ {}", format_vanish_remaining(ms)))
+}
+
+/// Format thời gian còn lại ngắn gọn: `59p`, `23g`, `6ng`.
+pub(super) fn format_vanish_remaining(remain_ms: i64) -> String {
+    if remain_ms <= 0 {
+        return "hết hạn".to_string();
+    }
+    let secs = remain_ms / 1000;
+    if secs < 3600 {
+        let m = (secs / 60).max(1);
+        format!("{m}p")
+    } else if secs < 86_400 {
+        format!("{}g", secs / 3600)
+    } else {
+        format!("{}ng", secs / 86_400)
+    }
+}
 
 pub(super) fn render_chat_bubble(
     ui: &mut egui::Ui,
@@ -2076,17 +3177,28 @@ pub(super) fn render_chat_bubble(
     emoji_textures: &HashMap<String, TextureHandle>,
     idx: usize,
     album: &[(usize, &ChatMessage)],
+    vanish_remain: Option<i64>,
+    pending_translate: bool,
+    preview: Option<&str>,
+    preview_loading: bool,
+    preview_error: Option<&str>,
+    md: MdOptions,
 ) -> Option<BubbleAction> {
     let avail_w = ui.available_width();
     let max_bubble_width = (avail_w * 0.72).clamp(140.0, 520.0);
     let max_text_width = (max_bubble_width - 24.0).max(90.0);
-    let has_sticker = is_sticker_message(msg).is_some();
-    let call_card_opt = extract_call_card_view(msg);
+    // Tin đã biến mất: vô hiệu mọi media/link card — chỉ render text hệ thống.
+    let vanished = msg.text.trim() == crate::chat::VANISH_EXPIRED_TEXT;
+    let has_sticker = !vanished && is_sticker_message(msg).is_some();
+    let call_card_opt = if vanished { None } else { extract_call_card_view(msg) };
     let is_call_card = call_card_opt.is_some();
-    let is_photo_card = !has_sticker && is_zalo_photo_message(msg);
-    let is_file_card = !has_sticker && is_zalo_file_or_video_message(msg);
-    let has_link_card =
-        !has_sticker && !is_photo_card && !is_file_card && extract_message_link_view(msg).is_some();
+    let is_photo_card = !vanished && !has_sticker && is_zalo_photo_message(msg);
+    let is_file_card = !vanished && !has_sticker && is_zalo_file_or_video_message(msg);
+    let has_link_card = !vanished
+        && !has_sticker
+        && !is_photo_card
+        && !is_file_card
+        && extract_message_link_view(msg).is_some();
     let has_interactive_card = is_call_card || has_link_card || is_photo_card || is_file_card;
 
     let show_timestamp = !msg.time.is_empty()
@@ -2197,7 +3309,7 @@ pub(super) fn render_chat_bubble(
                 .max(measure(desc, 12.3))
                 .max(measure(&dom, 12.6))
                 + 8.0;
-            w.clamp(135.0, max_text_width.min(340.0)).ceil()
+            w.clamp(135.0, max_text_width.min(340.0).max(135.0)).ceil()
         }
     } else {
         let display_str = if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
@@ -2284,7 +3396,7 @@ pub(super) fn render_chat_bubble(
     let v_margin = if has_sticker || is_frameless_photo {
         2.0_f32
     } else {
-        8.5_f32
+        10.0_f32
     };
     let total_bubble_w = content_width + h_margin * 2.0;
 
@@ -2321,11 +3433,11 @@ pub(super) fn render_chat_bubble(
                     };
                     Stroke::new(1.2_f32, border_col)
                 } else if !pal.is_dark {
-                    Stroke::new(1.0_f32, Color32::from_rgb(186, 214, 255))
+                    Stroke::new(1.0_f32, Color32::from_rgb(199, 224, 255))
                 } else {
-                    Stroke::new(1.0_f32, Color32::from_rgb(53, 76, 104))
+                    Stroke::NONE
                 };
-                let rounding = Rounding::same(8.0);
+                let rounding = Rounding::same(12.0);
 
                 let mut card_action = None;
                 let mut quote_action = None;
@@ -2359,8 +3471,13 @@ pub(super) fn render_chat_bubble(
                                     loading_stickers,
                                     emoji_textures,
                                     album,
+                                    preview,
+                                    preview_loading,
+                                    preview_error,
+                                    md,
                                 );
                             }
+                            render_translation(ui, msg, pal);
                             if let Some(act) = render_reactions(ui, msg, pal, emoji_textures) {
                                 reaction_action = Some(act);
                             }
@@ -2385,7 +3502,31 @@ pub(super) fn render_chat_bubble(
                                 } else {
                                     (msg.time.clone(), pal.bubble_out_meta)
                                 };
-                                ui.label(RichText::new(status_str).size(11.0).color(status_col));
+                                // Nhãn "(đã sửa)": tooltip liệt kê bản cũ; click handled
+                                // qua menu "Xem lịch sử sửa" (BubbleAction::ShowEditHistory).
+                                let status_str = if msg.edited {
+                                    format!("{status_str} · (đã sửa)")
+                                } else {
+                                    status_str
+                                };
+                                ui.label(
+                                    RichText::new(status_str).size(11.0).color(status_col),
+                                )
+                                .on_hover_text(if msg.edited {
+                                    "Tin này đã được sửa (thu hồi + gửi lại). Mở menu chuột phải → Xem lịch sử sửa."
+                                } else {
+                                    ""
+                                });
+                            }
+                            if !vanished {
+                                if let Some(badge) = vanish_badge_label(vanish_remain) {
+                                    if show_timestamp && !has_sticker && !is_frameless_photo {
+                                        ui.add_space(1.0);
+                                    }
+                                    ui.label(
+                                        RichText::new(badge).size(10.5).color(pal.text_muted).italics(),
+                                    );
+                                }
                             }
                         });
                     });
@@ -2406,6 +3547,7 @@ pub(super) fn render_chat_bubble(
                             emoji_textures,
                             has_interactive_card,
                             "Bạn",
+                            pending_translate,
                         )
                     })
             });
@@ -2511,18 +3653,38 @@ pub(super) fn render_chat_bubble(
                                     loading_stickers,
                                     emoji_textures,
                                     album,
+                                    preview,
+                                    preview_loading,
+                                    preview_error,
+                                    md,
                                 );
                             }
+                            render_translation(ui, msg, pal);
                             if let Some(act) = render_reactions(ui, msg, pal, emoji_textures) {
                                 reaction_action = Some(act);
                             }
                             if show_timestamp && !has_sticker && !is_frameless_photo {
                                 ui.add_space(3.5);
+                                let ts = if msg.edited {
+                                    format!("{} · (đã sửa)", msg.time)
+                                } else {
+                                    msg.time.clone()
+                                };
                                 ui.label(
-                                    RichText::new(&msg.time)
+                                    RichText::new(ts)
                                         .color(pal.bubble_in_meta)
                                         .size(11.0),
                                 );
+                            }
+                            if !vanished {
+                                if let Some(badge) = vanish_badge_label(vanish_remain) {
+                                    if show_timestamp && !has_sticker && !is_frameless_photo {
+                                        ui.add_space(1.0);
+                                    }
+                                    ui.label(
+                                        RichText::new(badge).size(10.5).color(pal.bubble_in_meta).italics(),
+                                    );
+                                }
                             }
                         });
                     });
@@ -2543,6 +3705,7 @@ pub(super) fn render_chat_bubble(
                             emoji_textures,
                             has_interactive_card,
                             display_sender,
+                            pending_translate,
                         )
                     })
             })
@@ -2565,6 +3728,12 @@ pub(super) enum BubbleAction {
     TogglePin,
     ToggleStar,
     ScheduleReminder,
+    /// Mở editor sửa tin (chỉ text của mình, trong 15 phút).
+    EditMessage,
+    /// Mở modal lịch sử các bản cũ của tin đã sửa.
+    ShowEditHistory,
+    /// WaveA1: nhắc về tin này (modal chọn giờ). Xử lý ở workspace.
+    RemindMessage,
     DeleteForMe,
     RecallForEveryone,
     CallAgain {
@@ -2586,6 +3755,24 @@ pub(super) enum BubbleAction {
         idx: usize,
         action: Box<BubbleAction>,
     },
+    /// Tải + trích text xem trước tài liệu trong app (chỉ khi bấm, không tự fetch).
+    FetchDocPreview {
+        url: String,
+        file_name: String,
+        msg_id: String,
+    },
+    /// Mở popup xem đầy đủ text đã trích (session-only).
+    OpenDocViewer {
+        msg_id: String,
+        file_name: String,
+    },
+    PlayVoice {
+        url: String,
+        file_name: String,
+        msg_id: String,
+    },
+    Translate,
+    TranslateFrom(&'static str),
 }
 
 fn menu_item(ui: &mut egui::Ui, icon: &str, label: &str, text_color: Color32) -> egui::Response {
@@ -2608,9 +3795,11 @@ pub(super) fn bubble_context_menu(
     emoji_textures: &HashMap<String, TextureHandle>,
     _has_interactive_card: bool,
     _display_sender: &str,
+    pending_translate: bool,
 ) -> Option<BubbleAction> {
     let ctx_menu_key = Id::new("active_bubble_context_menu");
     let open_time_key = Id::new("bubble_context_menu_open_time");
+    let translate_sub_key = Id::new("bubble_translate_submenu");
     let this_key = format!("{}_{}", msg.id, msg.ts);
 
     let pointer_pos = ui
@@ -2685,6 +3874,9 @@ pub(super) fn bubble_context_menu(
                     ui.set_width(menu_w);
                     ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
 
+                    // Tin đã biến mất: vô hiệu mọi thao tác media/link (chỉ cho xoá).
+                    let vanished =
+                        msg.text.trim() == crate::chat::VANISH_EXPIRED_TEXT;
                     // 0. Hàng emoji thả cảm xúc (giống Zalo gốc khi chuột phải)
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
@@ -2709,26 +3901,83 @@ pub(super) fn bubble_context_menu(
                         }
                     });
                     ui.separator();
-
                     // 1. Trả lời (Quote)
-                    if menu_item(ui, lucide::QUOTE, "Trả lời", pal.text_primary).clicked() {
+                    if !vanished
+                        && menu_item(ui, lucide::QUOTE, "Trả lời", pal.text_primary).clicked()
+                    {
                         action = Some(BubbleAction::Reply);
                         close_menu = true;
                     }
 
                     // 2. Chia sẻ (Forward)
-                    if menu_item(ui, lucide::FORWARD, "Chia sẻ", pal.text_primary).clicked() {
+                    if !vanished
+                        && menu_item(ui, lucide::FORWARD, "Chia sẻ", pal.text_primary).clicked()
+                    {
                         action = Some(BubbleAction::Forward);
                         close_menu = true;
                     }
 
                     // 3. Copy tin nhắn
-                    if menu_item(ui, lucide::COPY, "Copy tin nhắn", pal.text_primary).clicked() {
+                    if !vanished
+                        && menu_item(ui, lucide::COPY, "Copy tin nhắn", pal.text_primary)
+                            .clicked()
+                    {
                         ui.ctx().copy_text(msg.text.clone());
                         close_menu = true;
                     }
+                    // 3b. Dịch tin nhắn (qua MyMemory). Có bản dịch → "Ẩn bản
+                    // dịch"; đang pending → disable; còn lại chọn nguồn
+                    // ("Tự động" = heuristic; Latin ngoài en nên chọn tay vì
+                    // MyMemory autodetect không đáng tin).
+                    if !vanished && !msg.text.trim().is_empty() {
+                        if msg.translation.is_some() {
+                            if menu_item(ui, "🌐", "Ẩn bản dịch", pal.text_primary).clicked() {
+                                action = Some(BubbleAction::Translate);
+                                close_menu = true;
+                            }
+                        } else if pending_translate {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::new(
+                                    RichText::new("🌐   Đang dịch…").size(13.0).color(pal.text_muted),
+                                ),
+                            );
+                        } else {
+                            let resp = menu_item(ui, "🌐", "Dịch tin nhắn ▸", pal.text_primary);
+                            if resp.clicked() {
+                                action = Some(BubbleAction::TranslateFrom("auto"));
+                                close_menu = true;
+                            }
+                            // Hover mở dải chọn nguồn ngay dưới (trong cùng menu).
+                            if resp.hovered() {
+                                ui.ctx().data_mut(|d| {
+                                    d.insert_temp(translate_sub_key, true);
+                                });
+                            }
+                            let sub_open: bool = ui
+                                .ctx()
+                                .data(|d| d.get_temp(translate_sub_key).unwrap_or(false));
+                            if sub_open {
+                                for (code, label) in [
+                                    ("auto", "Tự động"),
+                                    ("en", "Tiếng Anh"),
+                                    ("zh", "Tiếng Trung"),
+                                    ("ja", "Tiếng Nhật"),
+                                    ("ko", "Tiếng Hàn"),
+                                    ("fr", "Tiếng Pháp"),
+                                    ("es", "Tây Ban Nha"),
+                                    ("de", "Tiếng Đức"),
+                                    ("ru", "Tiếng Nga"),
+                                ] {
+                                    if menu_item(ui, "·", label, pal.text_primary).clicked() {
+                                        action = Some(BubbleAction::TranslateFrom(code));
+                                        close_menu = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
 
-                    // 4. Ghim tin nhắn
                     let pin_label = if msg.is_pinned {
                         "Bỏ ghim tin nhắn"
                     } else {
@@ -2739,26 +3988,37 @@ pub(super) fn bubble_context_menu(
                         close_menu = true;
                     }
 
-                    // 5. Đánh dấu tin nhắn
+                    // 5. Lưu tin (đồng bộ 2 chiều với star) — WaveA2.
                     let star_label = if msg.is_starred {
-                        "Bỏ đánh dấu tin nhắn"
+                        "Bỏ lưu tin nhắn"
                     } else {
-                        "Đánh dấu tin nhắn"
+                        "Lưu tin nhắn"
                     };
                     if menu_item(ui, lucide::STAR, star_label, pal.text_primary).clicked() {
                         action = Some(BubbleAction::ToggleStar);
                         close_menu = true;
                     }
 
+                    // 5b. Nhắc tôi về tin này (WaveA1 nhắc hẹn trên tin nhắn).
+                    if !vanished
+                        && menu_item(ui, lucide::BELL, "Nhắc tôi về tin này", pal.text_primary)
+                            .clicked()
+                    {
+                        action = Some(BubbleAction::RemindMessage);
+                        close_menu = true;
+                    }
+
                     // 5b. Hẹn giờ / Nhắc hẹn cho tin nhắn này (#94)
-                    if menu_item(ui, lucide::BELL, "Hẹn giờ / Nhắc hẹn", pal.text_primary).clicked()
+                    if !vanished
+                        && menu_item(ui, lucide::BELL, "Hẹn giờ / Nhắc hẹn", pal.text_primary)
+                            .clicked()
                     {
                         action = Some(BubbleAction::ScheduleReminder);
                         close_menu = true;
                     }
 
                     // 6. Nếu là ảnh: Xem ảnh phóng to
-                    if is_zalo_photo_message(msg) {
+                    if !vanished && is_zalo_photo_message(msg) {
                         if let Some(thumb_url) = photo_primary_url(msg) {
                             if menu_item(ui, lucide::SEARCH, "Xem ảnh phóng to", pal.text_primary)
                                 .clicked()
@@ -2791,8 +4051,8 @@ pub(super) fn bubble_context_menu(
                         }
                     }
 
-                    // 7. Nếu là file / video: Lưu tập tin
-                    if is_zalo_file_or_video_message(msg) {
+                    // 7. Nếu là file / video / voice: Lưu tập tin (+ Nghe thoại cho voice)
+                    if !vanished && is_zalo_file_or_video_message(msg) {
                         if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
                             let resolved_name = crate::chat::resolve_attachment_file_name(
                                 msg.link_title.as_deref(),
@@ -2804,6 +4064,19 @@ pub(super) fn bubble_context_menu(
                             } else {
                                 format!("Lưu \"{resolved_name}\"")
                             };
+                            if matches!(
+                                classify_attachment(msg),
+                                Some(AttachmentKind::Voice | AttachmentKind::Audio)
+                            ) && menu_item(ui, lucide::MIC, "Nghe tin nhắn thoại", pal.text_primary)
+                                .clicked()
+                            {
+                                action = Some(BubbleAction::PlayVoice {
+                                    url: url.to_string(),
+                                    file_name: resolved_name.clone(),
+                                    msg_id: msg.id.clone(),
+                                });
+                                close_menu = true;
+                            }
                             if menu_item(ui, lucide::PAPERCLIP, &label, pal.text_primary).clicked()
                             {
                                 action = Some(BubbleAction::DownloadFile {
@@ -2817,8 +4090,38 @@ pub(super) fn bubble_context_menu(
 
                     ui.separator();
 
-                    // 8. Thu hồi tin nhắn (với mọi người)
-                    if msg.is_outgoing
+                    // 7b. Sửa tin (WaveA3): chỉ text của mình trong 15 phút.
+                    // recall + gửi mới (hạn chế: bên kia thấy thu hồi + tin mới).
+                    {
+                        let now_ms = crate::login::unix_now() * 1000;
+                        if crate::chat::can_edit_message(msg, now_ms)
+                            && menu_item(ui, "✎", "Sửa", pal.text_primary).clicked()
+                        {
+                            action = Some(BubbleAction::EditMessage);
+                            close_menu = true;
+                        }
+                        if msg.is_outgoing
+                            && (msg.edited
+                                || !crate::store::MessageStore::open_no_migrate("zalo_history.db")
+                                    .map(|s| s.list_message_edits(&msg.id))
+                                    .unwrap_or_default()
+                                    .is_empty())
+                            && menu_item(
+                                ui,
+                                "🕘",
+                                "Xem lịch sử sửa",
+                                pal.text_primary,
+                            )
+                            .clicked()
+                        {
+                            action = Some(BubbleAction::ShowEditHistory);
+                            close_menu = true;
+                        }
+                    }
+
+                    ui.separator();
+                    if !vanished
+                        && msg.is_outgoing
                         && msg.text.trim() != "[Tin nhắn đã thu hồi]"
                         && !msg.text.starts_with("[Đã thu hồi]")
                     {
@@ -2868,6 +4171,8 @@ pub(super) fn bubble_context_menu(
     if close_menu {
         ui.ctx()
             .data_mut(|d| d.remove::<(String, Pos2, usize)>(ctx_menu_key));
+        ui.ctx()
+            .data_mut(|d| d.remove::<bool>(translate_sub_key));
         ui.ctx().request_repaint();
     }
 
@@ -2883,27 +4188,25 @@ pub(super) fn render_quote_block(
     max_w: f32,
 ) -> Option<BubbleAction> {
     let qt = msg.reply_to_text.as_ref()?;
-    let (text_col, meta_col) = if outgoing {
+    let (_text_col, meta_col) = if outgoing {
         (pal.bubble_out_text, pal.bubble_out_meta)
     } else {
         (pal.bubble_in_text, pal.bubble_in_meta)
     };
-    let bar_col = if outgoing && pal.is_dark {
-        Color32::from_rgb(147, 197, 253)
-    } else {
-        pal.primary
-    };
+    let bar_col = Color32::from_rgb(102, 166, 255); // #66A6FF
     let bg_col = if outgoing && pal.is_dark {
         Color32::from_rgba_unmultiplied(0, 0, 0, 42)
     } else if outgoing {
         Color32::from_rgba_unmultiplied(255, 255, 255, 150)
+    } else if pal.is_dark {
+        Color32::from_rgba_unmultiplied(0, 0, 0, 42)
     } else {
-        text_col.linear_multiply(0.06)
+        Color32::from_rgb(229, 241, 255)
     };
     let inner_col_w = (max_w - 28.0).max(72.0);
     let frame = egui::Frame::none()
         .fill(bg_col)
-        .rounding(Rounding::same(7.0))
+        .rounding(Rounding::same(8.0))
         .inner_margin(Margin::symmetric(8.0, 5.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -2945,15 +4248,213 @@ pub(super) fn render_quote_block(
 
 #[allow(dead_code)]
 pub(super) fn render_hover_reaction_bar(
-    _ui: &mut egui::Ui,
-    _bubble_rect: Rect,
-    _msg: &ChatMessage,
-    _idx: usize,
-    _outgoing: bool,
-    _pal: &ThemePalette,
-    _emoji_textures: &HashMap<String, TextureHandle>,
+    ui: &mut egui::Ui,
+    bubble_rect: Rect,
+    msg: &ChatMessage,
+    idx: usize,
+    outgoing: bool,
+    pal: &ThemePalette,
+    emoji_textures: &HashMap<String, TextureHandle>,
 ) -> Option<BubbleAction> {
-    None
+    // Suppress hover bar if any context menu is open
+    let ctx_menu_open: bool = ui.ctx().data(|d| {
+        d.get_temp::<(String, Pos2, usize)>(Id::new("active_bubble_context_menu"))
+            .is_some()
+    });
+    if ctx_menu_open || ui.memory(|m| m.any_popup_open()) {
+        return None;
+    }
+
+    let bar_w = 236.0_f32;
+    let bar_h = 32.0_f32;
+
+    let clip_right = ui.clip_rect().right();
+    let clip_left = ui.clip_rect().left();
+    // Vùng hẹp hơn bar (drawer mở + cửa sổ nhỏ): min>max sẽ panic f32::clamp.
+    // Không đủ chỗ thì dính sát mép trái, bar tràn ra cũng không crash.
+    let lo = clip_left + 8.0;
+    let hi = (clip_right - bar_w - 8.0).max(lo);
+
+    let x = if outgoing {
+        (bubble_rect.right() - bar_w).clamp(lo, hi)
+    } else {
+        let desired_x = (bubble_rect.right() - bar_w).max(bubble_rect.left());
+        desired_x.clamp(lo, hi)
+    };
+
+    // If there is enough room above the bubble, place above; otherwise place below
+    let y = if bubble_rect.top() >= bar_h + 6.0 {
+        bubble_rect.top() - bar_h - 4.0
+    } else {
+        bubble_rect.bottom() + 4.0
+    };
+
+    let bar_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(bar_w, bar_h));
+    // The unified hover zone covers both the message bubble and the floating bar + 10px buffer
+    let hover_zone = bubble_rect.union(bar_rect).expand2(Vec2::new(10.0, 10.0));
+
+    let hover_id = Id::new("active_hover_reaction_bubble");
+    let msg_key = format!("{}_{}", msg.id, msg.ts);
+
+    let pointer_pos = ui
+        .ctx()
+        .input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
+    let in_hover_zone = pointer_pos.map_or(false, |p| hover_zone.contains(p));
+    let in_bubble = pointer_pos.map_or(false, |p| {
+        bubble_rect.expand2(Vec2::new(4.0, 4.0)).contains(p)
+    });
+
+    // Active hover state: (message key, bar rect, frame it was last shown). The bar floats over the
+    // previous message, so without the rect a neighbour's bubble under the bar stole the hover and
+    // the bar vanished as soon as the pointer reached it.
+    let hover_state_id = hover_id.with("state");
+    let frame_now = ui.ctx().cumulative_pass_nr();
+    let active_state: Option<(String, Rect, u64)> = ui.ctx().data(|d| d.get_temp(hover_state_id));
+    let active_key: Option<String> = ui.ctx().data(|d| d.get_temp(hover_id));
+
+    let pointer_on_other_bar = match (&active_state, pointer_pos) {
+        (Some((key, rect, seen)), Some(p)) => {
+            key != &msg_key
+                && frame_now.saturating_sub(*seen) <= 2
+                && rect.expand2(Vec2::new(10.0, 10.0)).contains(p)
+        }
+        _ => false,
+    };
+
+    let should_show = if active_key.as_deref() == Some(&msg_key) {
+        if in_hover_zone {
+            true
+        } else {
+            ui.ctx().data_mut(|d| {
+                d.remove::<String>(hover_id);
+                d.remove::<(String, Rect, u64)>(hover_state_id);
+            });
+            false
+        }
+    } else if in_bubble && !pointer_on_other_bar {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(hover_id, msg_key.clone()));
+        true
+    } else {
+        false
+    };
+
+    if !should_show {
+        return None;
+    }
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(hover_state_id, (msg_key.clone(), bar_rect, frame_now)));
+
+    let mut action = None;
+
+    egui::Area::new(Id::new(("hover_reaction_bar", idx, msg.ts, &msg.id)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(Pos2::new(x, y))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::none()
+                .fill(if pal.is_dark {
+                    Color32::from_rgb(33, 37, 43)
+                } else {
+                    Color32::WHITE
+                })
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .rounding(Rounding::same(16.0))
+                .shadow(egui::epaint::Shadow {
+                    offset: Vec2::new(0.0, 3.0),
+                    blur: 10.0,
+                    spread: 0.0,
+                    color: Color32::from_black_alpha(if pal.is_dark { 110 } else { 35 }),
+                })
+                .inner_margin(Margin::symmetric(8.0, 4.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
+
+                        for &(code, key, tooltip) in &REACTION_LIST {
+                            let btn_resp = if let Some(tex) = emoji_textures.get(key) {
+                                let img =
+                                    egui::Image::new(tex).fit_to_exact_size(Vec2::splat(20.0));
+                                ui.add(egui::ImageButton::new(img).rounding(Rounding::same(6.0)))
+                            } else {
+                                ui.add(
+                                    egui::Button::new(RichText::new(code).size(16.0))
+                                        .fill(Color32::TRANSPARENT)
+                                        .rounding(Rounding::same(6.0)),
+                                )
+                            };
+
+                            let clicked = btn_resp.clicked();
+                            btn_resp.on_hover_text(tooltip);
+                            if clicked {
+                                action = Some(BubbleAction::React(code));
+                            }
+                        }
+
+                        let (sep_rect, _) =
+                            ui.allocate_exact_size(Vec2::new(6.0, 16.0), Sense::hover());
+                        ui.painter().line_segment(
+                            [sep_rect.center_top(), sep_rect.center_bottom()],
+                            Stroke::new(1.0_f32, pal.border),
+                        );
+
+                        // Quick Reply (Quote)
+                        let reply_btn = egui::Button::new(
+                            RichText::new(lucide::QUOTE)
+                                .size(13.5)
+                                .color(pal.text_secondary),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .min_size(Vec2::splat(22.0))
+                        .rounding(Rounding::same(6.0));
+
+                        let r_resp = ui.add(reply_btn);
+                        let r_clicked = r_resp.clicked();
+                        r_resp.on_hover_text("Trả lời");
+                        if r_clicked {
+                            action = Some(BubbleAction::Reply);
+                        }
+
+                        // Quick Forward / Share
+                        let fwd_btn = egui::Button::new(
+                            RichText::new(lucide::FORWARD)
+                                .size(13.5)
+                                .color(pal.text_secondary),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .min_size(Vec2::splat(22.0))
+                        .rounding(Rounding::same(6.0));
+
+                        let f_resp = ui.add(fwd_btn);
+                        let f_clicked = f_resp.clicked();
+                        f_resp.on_hover_text("Chia sẻ");
+                        if f_clicked {
+                            action = Some(BubbleAction::Forward);
+                        }
+                    });
+                });
+        });
+
+    if action.is_some() {
+        ui.ctx().data_mut(|d| d.remove::<String>(hover_id));
+        ui.ctx().request_repaint();
+    }
+
+    action
+}
+
+/// Vẽ bản dịch dưới tin gốc: đường kẻ + text nghiêng màu muted.
+pub(super) fn render_translation(ui: &mut egui::Ui, msg: &ChatMessage, pal: &ThemePalette) {
+    let Some(tr) = msg.translation.as_deref().filter(|t| !t.trim().is_empty()) else {
+        return;
+    };
+    ui.add_space(4.0);
+    ui.separator();
+    ui.label(
+        RichText::new(format!("🌐 {tr}"))
+            .size(12.5)
+            .color(pal.text_muted)
+            .italics(),
+    );
 }
 
 pub(super) fn render_reactions(
@@ -3026,11 +4527,11 @@ pub(super) fn render_reactions(
             if total > 0 {
                 // One compact pill like Zalo: up to 3 icons + the total. Separate pills per icon
                 // grew wider than a sticker bubble and were clipped at the window edge.
-                let fr_resp = egui::Frame::none()
-                    .fill(pal.bg_elevated)
-                    .stroke(Stroke::new(1.0_f32, pal.border))
-                    .rounding(Rounding::same(11.0))
-                    .inner_margin(Margin::symmetric(6.0, 2.5))
+            let fr_resp = egui::Frame::none()
+                .fill(pal.bg_elevated)
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .rounding(Rounding::same(17.5))
+                .inner_margin(Margin::symmetric(8.0, 3.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
@@ -3149,6 +4650,12 @@ mod quote_navigation_tests {
                                 &HashMap::new(),
                                 0,
                                 &[],
+                                None,
+                                false,
+                                None,
+                                false,
+                                None,
+                                MdOptions::default(),
                             );
                         });
                     },
@@ -3272,6 +4779,7 @@ mod quote_navigation_tests {
                         &HashMap::new(),
                         false,
                         "Tester",
+                        false,
                     );
                 });
             },
@@ -3303,6 +4811,7 @@ mod quote_navigation_tests {
                         &HashMap::new(),
                         false,
                         "Tester",
+                        false,
                     );
                 });
             },
@@ -3334,6 +4843,7 @@ mod quote_navigation_tests {
                         &HashMap::new(),
                         false,
                         "Tester",
+                        false,
                     );
                 });
             },
@@ -3359,6 +4869,7 @@ mod quote_navigation_tests {
                         &HashMap::new(),
                         false,
                         "Tester",
+                        false,
                     );
                 });
             },
@@ -3405,6 +4916,7 @@ mod quote_navigation_tests {
                         &HashMap::new(),
                         false,
                         "Tester",
+                        false,
                     );
                 });
             },
@@ -3437,6 +4949,7 @@ mod quote_navigation_tests {
                         &HashMap::new(),
                         false,
                         "Tester",
+                        false,
                     );
                 });
             },
@@ -3602,5 +5115,169 @@ mod album_grid_tests {
         assert_eq!((wide.min.y, wide.max.y), (0.0, 1.0));
         let tall = cover_uv(100.0, 400.0);
         assert!((tall.min.y - 0.375).abs() < 1e-6 && (tall.max.y - 0.625).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod attachment_card_tests {
+    use super::*;
+
+    fn file_msg(text: &str, title: Option<&str>, url: &str) -> ChatMessage {
+        ChatMessage {
+            text: text.into(),
+            link_url: Some(url.into()),
+            link_title: title.map(str::to_string),
+            link_src: Some("Tập tin Zalo".into()),
+            ..Default::default()
+        }
+    }
+
+        let tall = cover_uv(100.0, 400.0);
+        assert!((tall.min.y - 0.375).abs() < 1e-6 && (tall.max.y - 0.625).abs() < 1e-6);
+    }
+
+    fn classifies_video_voice_and_office_docs() {
+        let video = ChatMessage {
+            text: "[Video] clip.mp4".into(),
+            link_src: Some("Video Zalo".into()),
+            ..Default::default()
+        };
+        assert_eq!(classify_attachment(&video), Some(AttachmentKind::Video));
+
+        let voice = ChatMessage {
+            text: "[Tin nhắn thoại]".into(),
+            kind: crate::message_model::MessageKind::Voice,
+            ..Default::default()
+        };
+        assert_eq!(classify_attachment(&voice), Some(AttachmentKind::Voice));
+
+        let pdf = file_msg(
+            "[Tập tin] Bao_cao.pdf",
+            Some("Bao_cao.pdf"),
+            "https://f16-zpc.zdn.vn/renewMedia?p=abc",
+        );
+        assert_eq!(classify_attachment(&pdf), Some(AttachmentKind::Pdf));
+
+        let docx = file_msg(
+            "[Tập tin] De_cuong.docx",
+            Some("De_cuong.docx"),
+            "https://f16-zpc.zdn.vn/renewMedia?p=def",
+        );
+        assert_eq!(classify_attachment(&docx), Some(AttachmentKind::Word));
+
+        let xlsx = file_msg(
+            "[Tập tin] Bang.xlsx",
+            Some("Bang.xlsx"),
+            "https://f16-zpc.zdn.vn/renewMedia?p=ghi",
+        );
+        assert_eq!(classify_attachment(&xlsx), Some(AttachmentKind::Excel));
+
+        let pptx = file_msg(
+            "[Tập tin] Slide.pptx",
+            Some("Slide.pptx"),
+            "https://f16-zpc.zdn.vn/renewMedia?p=jkl",
+        );
+        assert_eq!(classify_attachment(&pptx), Some(AttachmentKind::PowerPoint));
+    }
+
+    #[test]
+    fn voice_duration_and_format_helpers() {
+        assert_eq!(format_duration_mmss(Some(75)), "01:15");
+        assert_eq!(format_duration_mmss(None), "--:--");
+        let no_dur = ChatMessage {
+            text: "[Tin nhắn thoại]".into(),
+            ..Default::default()
+        };
+        assert_eq!(voice_duration_secs(&no_dur), None);
+        let with_dur = ChatMessage {
+            text: "[Tin nhắn thoại]".into(),
+            history_source: Some(serde_json::json!({"duration": 12})),
+            ..Default::default()
+        };
+        assert_eq!(voice_duration_secs(&with_dur), Some(12));
+    }
+
+    #[test]
+    fn video_thumb_key_is_stable_and_namespaced() {
+        let url = "https://example.com/video.mp4";
+        let k1 = video_thumb_key(url);
+        assert!(k1.starts_with("vid_"));
+        assert_eq!(k1, video_thumb_key(url));
+        assert_ne!(k1, format!("thumb_{}", crate::crypto::md5_hex(url)));
+    }
+
+    #[test]
+    fn doc_labels_cover_office_kinds() {
+        assert_eq!(attachment_kind_label(AttachmentKind::Pdf).1, "Tài liệu PDF");
+        assert_eq!(attachment_kind_label(AttachmentKind::Word).1, "Tài liệu Word");
+        assert_eq!(attachment_kind_label(AttachmentKind::Excel).1, "Bảng tính Excel");
+        assert_eq!(
+            attachment_kind_label(AttachmentKind::PowerPoint).1,
+            "Bài thuyết trình"
+        );
+    }
+}
+
+#[cfg(test)]
+mod md_block_tests {
+    use super::*;
+
+    #[test]
+    fn splits_code_fence_with_lang() {
+        let blocks = split_md_blocks("hello\n```rust\nlet x = 1;\nlet y = 2;\n```\nbye");
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[0], MdBlock::Lines(l) if l == &vec!["hello".to_string()]));
+        match &blocks[1] {
+            MdBlock::Code { lang, body } => {
+                assert_eq!(lang, "rust");
+                assert!(body.contains("let x = 1;") && body.contains("let y = 2;"));
+            }
+            other => panic!("expected code, got {other:?}"),
+        }
+        assert!(matches!(&blocks[2], MdBlock::Lines(l) if l == &vec!["bye".to_string()]));
+    }
+
+    #[test]
+    fn unterminated_fence_keeps_content_as_text() {
+        let blocks = split_md_blocks("```py\nprint(1)");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            MdBlock::Lines(l) => assert!(l.iter().any(|s| s.contains("print(1)"))),
+            other => panic!("expected lines fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_table_and_rejects_col_mismatch() {
+        let good = "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |";
+        match &split_md_blocks(good)[..] {
+            [MdBlock::Table { headers, rows }] => {
+                assert_eq!(headers, &vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0], vec!["1".to_string(), "2".to_string()]);
+            }
+            other => panic!("expected table, got {other:?}"),
+        }
+        let bad_sep = "| a | b |\n| xxx | yyy |\n| 1 | 2 |";
+        assert!(matches!(&split_md_blocks(bad_sep)[..], [MdBlock::Lines(_)]));
+        let mismatch = "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 |";
+        let blocks = split_md_blocks(mismatch);
+        assert!(matches!(&blocks[0], MdBlock::Table { rows, .. } if rows.len() == 1));
+        assert!(matches!(&blocks[1], MdBlock::Lines(_)));
+    }
+
+    #[test]
+    fn parses_ordered_list_items() {
+        assert_eq!(
+            parse_ordered_item("1. mua sữa"),
+            Some(("1".to_string(), 0, "mua sữa".to_string()))
+        );
+        assert_eq!(
+            parse_ordered_item("  12. indent"),
+            Some(("12".to_string(), 2, "indent".to_string()))
+        );
+        assert_eq!(parse_ordered_item("- bullet"), None);
+        assert_eq!(parse_ordered_item("1.missing space"), None);
+        assert_eq!(parse_ordered_item("1234. too long"), None);
     }
 }

@@ -66,6 +66,49 @@ pub fn validate_asset_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Verify asset filename safety, optional SHA-256 digest, and platform binary/archive magic bytes.
+///
+/// # Errors
+/// Returns an error if the asset name is unsafe, the SHA-256 digest is malformed or mismatches,
+/// or the binary/archive magic header does not match its file extension.
+pub fn verify_asset_integrity(
+    asset_name: &str,
+    bytes: &[u8],
+    expected_sha256: Option<&str>,
+) -> Result<(), String> {
+    validate_asset_name(asset_name)?;
+    if let Some(expected) = expected_sha256 {
+        let clean_expected = expected.trim().strip_prefix("sha256:").unwrap_or(expected.trim());
+        if clean_expected.len() != 64 || !clean_expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("Mã SHA-256 của gói cập nhật không hợp lệ".into());
+        }
+        let actual = format!("{:x}", Sha256::digest(bytes));
+        if !actual.eq_ignore_ascii_case(clean_expected) {
+            return Err("Mã kiểm tra toàn vẹn SHA-256 không khớp".into());
+        }
+    }
+    let name = asset_name.to_ascii_lowercase();
+    if name.ends_with(".exe") && !bytes.starts_with(b"MZ") {
+        return Err("File cập nhật không có chữ ký PE hợp lệ".into());
+    }
+    if name.ends_with(".appimage") && !bytes.starts_with(b"\x7fELF") {
+        return Err("File cập nhật không có chữ ký ELF hợp lệ".into());
+    }
+    if (name.ends_with(".tar.gz") || name.ends_with(".tgz")) && !bytes.starts_with(&[0x1f, 0x8b]) {
+        return Err("File cập nhật .tar.gz không có chữ ký GZIP hợp lệ".into());
+    }
+    if name.ends_with(".deb") && !bytes.starts_with(b"!<arch>\n") {
+        return Err("File cập nhật .deb không có chữ ký Debian archive hợp lệ".into());
+    }
+    if name.ends_with(".rpm") && !bytes.starts_with(&[0xed, 0xab, 0xee, 0xdb]) {
+        return Err("File cập nhật .rpm không có chữ ký RPM hợp lệ".into());
+    }
+    if name.ends_with(".zip") && !bytes.starts_with(b"PK\x03\x04") {
+        return Err("File cập nhật .zip không có chữ ký PKZIP hợp lệ".into());
+    }
+    Ok(())
+}
+
 /// Download and validate an asset before any installation destination is touched.
 /// The caller supplies a dedicated, cookie-free client and a progress callback.
 ///
@@ -83,7 +126,8 @@ pub async fn download_release(
         return Err("Giới hạn dung lượng cập nhật không hợp lệ".into());
     }
     if let Some(hash) = request.expected_sha256 {
-        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let clean_hash = hash.trim().strip_prefix("sha256:").unwrap_or(hash.trim());
+        if clean_hash.len() != 64 || !clean_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("Mã SHA-256 của gói cập nhật không hợp lệ".into());
         }
     }
@@ -140,18 +184,13 @@ pub async fn download_release(
             return Err("Gói cập nhật tải về chưa hoàn tất".into());
         }
         if let Some(expected) = request.expected_sha256 {
-            let actual = format!("{:x}", hasher.finalize());
-            if !actual.eq_ignore_ascii_case(expected) {
+            let clean_expected = expected.trim().strip_prefix("sha256:").unwrap_or(expected.trim());
+            let actual_hash = format!("{:x}", hasher.finalize());
+            if !actual_hash.eq_ignore_ascii_case(clean_expected) {
                 return Err("Mã kiểm tra toàn vẹn SHA-256 không khớp".into());
             }
         }
-        let name = request.asset_name.to_ascii_lowercase();
-        if name.ends_with(".exe") && !bytes.starts_with(b"MZ") {
-            return Err("File cập nhật không có chữ ký PE hợp lệ".into());
-        }
-        if name.ends_with(".appimage") && !bytes.starts_with(b"\x7fELF") {
-            return Err("File cập nhật không có chữ ký ELF hợp lệ".into());
-        }
+        verify_asset_integrity(request.asset_name, &bytes, None)?;
         progress(actual, total.max(actual));
         Ok(bytes)
     };
@@ -397,65 +436,146 @@ pub fn select_platform_asset_score(name: &str, target_os: &str, target_arch: &st
         || n_low.ends_with(".json")
         || n_low.ends_with(".sig")
         || n_low.ends_with(".asc")
+        || n_low.ends_with(".sha256")
     {
         return -1;
     }
-    match target_os {
-        "windows" => {
-            if n_low.ends_with(".exe") && n_low.contains("portable") {
-                110
-            } else if n_low.ends_with(".exe") && n_low.contains("setup") {
-                90
-            } else if n_low.ends_with(".exe") {
-                80
+    let has_arm64 = n_low.contains("arm64") || n_low.contains("aarch64");
+    let has_x64 = n_low.contains("x86_64") || n_low.contains("amd64") || n_low.contains("intel");
+    let arch_bonus = match target_arch {
+        "aarch64" | "arm64" => {
+            if has_arm64 {
+                10
+            } else if has_x64 {
+                -40
             } else {
                 0
             }
         }
-        "macos" => {
-            if !n_low.ends_with(".dmg") {
+        "x86_64" | "amd64" => {
+            if has_x64 {
+                10
+            } else if has_arm64 {
+                -60
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
+
+    match target_os {
+        "windows" => {
+            if n_low.contains("macos") || n_low.contains("darwin") || n_low.contains("linux") {
                 return 0;
             }
-            if target_arch == "aarch64" && (n_low.contains("arm64") || n_low.contains("aarch64")) {
-                110
-            } else if target_arch == "x86_64"
-                && (n_low.contains("x86_64") || n_low.contains("intel"))
+            let base = if n_low.ends_with(".exe") && n_low.contains("portable") {
+                100
+            } else if n_low.ends_with(".exe")
+                && (n_low.contains("setup") || n_low.contains("installer"))
             {
+                80
+            } else if n_low.ends_with(".exe") {
+                70
+            } else if n_low.ends_with(".msi") {
+                65
+            } else if n_low.ends_with(".zip") && n_low.contains("windows") {
+                60
+            } else {
+                return 0;
+            };
+            (base + arch_bonus).max(0)
+        }
+        "macos" => {
+            if n_low.contains("windows") || n_low.contains("linux") {
+                return 0;
+            }
+            let is_dmg = n_low.ends_with(".dmg");
+            let is_mac_tar = (n_low.ends_with(".tar.gz") || n_low.ends_with(".tgz"))
+                && (n_low.contains("macos") || n_low.contains("darwin") || n_low.contains("apple"));
+            if !is_dmg && !is_mac_tar {
+                return 0;
+            }
+            let fmt_offset = if is_dmg { 0 } else { -15 };
+            let base = if (target_arch == "aarch64" || target_arch == "arm64") && has_arm64 {
                 110
-            } else if !n_low.contains("arm64")
-                && !n_low.contains("aarch64")
-                && !n_low.contains("x86_64")
-                && !n_low.contains("intel")
-            {
+            } else if (target_arch == "x86_64" || target_arch == "amd64") && has_x64 {
+                110
+            } else if !has_arm64 && !has_x64 {
                 100
             } else {
                 50
-            }
+            };
+            (base + fmt_offset).max(1)
         }
         _ => {
-            if n_low.ends_with(".appimage") {
-                100
-            } else if n_low.ends_with(".deb") && !n_low.contains("legacy") {
-                90
-            } else if n_low.ends_with(".tar.gz") && !n_low.contains("legacy") {
-                80
-            } else if n_low.ends_with(".rpm") {
-                70
-            } else {
-                0
+            if n_low.contains("macos")
+                || n_low.contains("darwin")
+                || n_low.contains("apple")
+                || n_low.contains("windows")
+                || n_low.contains("win64")
+                || n_low.contains("win32")
+            {
+                return 0;
             }
+            let base = if n_low.ends_with(".appimage") {
+                90
+            } else if n_low.ends_with(".deb") && !n_low.contains("legacy") {
+                80
+            } else if (n_low.ends_with(".tar.gz") || n_low.ends_with(".tgz"))
+                && !n_low.contains("legacy")
+            {
+                70
+            } else if n_low.ends_with(".rpm") {
+                60
+            } else if n_low.ends_with(".deb") || n_low.ends_with(".tar.gz") {
+                45
+            } else {
+                return 0;
+            };
+            (base + arch_bonus).max(0)
         }
     }
 }
 
 /// Extract a 64-character lowercase SHA-256 hex digest from `SHA256SUMS.txt` content for `asset_name`.
 pub fn parse_sha256sums_for_asset(sha256sums_text: &str, asset_name: &str) -> Option<String> {
-    for line in sha256sums_text.lines() {
+    for raw_line in sha256sums_text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Support BSD-style `SHA256 (filename) = <hash>`
+        if let Some(rest) = line.strip_prefix("SHA256 (").or_else(|| line.strip_prefix("sha256 ("))
+        {
+            if let Some((fname, hash_part)) = rest.split_once(") =") {
+                let clean_fname = fname
+                    .trim()
+                    .trim_start_matches('*')
+                    .trim_start_matches("./");
+                let base_fname = clean_fname.rsplit(['/', '\\']).next().unwrap_or(clean_fname);
+                let hash = hash_part
+                    .trim()
+                    .strip_prefix("sha256:")
+                    .unwrap_or(hash_part.trim());
+                if (clean_fname == asset_name || base_fname == asset_name)
+                    && hash.len() == 64
+                    && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return Some(hash.to_ascii_lowercase());
+                }
+            }
+        }
         let mut parts = line.split_whitespace();
-        let Some(hash) = parts.next() else { continue };
+        let Some(raw_hash) = parts.next() else { continue };
         let Some(fname) = parts.next() else { continue };
-        let clean_fname = fname.trim_start_matches('*').trim_start_matches("./");
-        if clean_fname == asset_name
+        let hash = raw_hash.strip_prefix("sha256:").unwrap_or(raw_hash);
+        let clean_fname = fname
+            .trim_matches(['`', '"', '\''])
+            .trim_start_matches('*')
+            .trim_start_matches("./");
+        let base_fname = clean_fname.rsplit(['/', '\\']).next().unwrap_or(clean_fname);
+        if (clean_fname == asset_name || base_fname == asset_name)
             && hash.len() == 64
             && hash.bytes().all(|b| b.is_ascii_hexdigit())
         {
@@ -577,6 +697,12 @@ pub fn parse_github_release_value(
             .and_then(|v| v.as_str())
             .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
             .map(|h| h.to_ascii_lowercase());
+    }
+
+    if best_sha256.is_none() {
+        if let Some(ref name) = best_name {
+            best_sha256 = parse_sha256sums_for_asset(&release_notes, name);
+        }
     }
 
     GitHubReleaseMetadata {
@@ -715,6 +841,12 @@ mod github_api_tests {
                     "size": 10200000,
                     "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
                     "browser_download_url": "https://github.com/ctdoteam1110/ctdozlite/releases/download/v0.0.4/ctdozlite-0.0.4-macos-arm64.dmg"
+                },
+                {
+                    "name": "ctdozlite-0.0.4-macos-arm64.tar.gz",
+                    "size": 9800000,
+                    "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                    "browser_download_url": "https://github.com/ctdoteam1110/ctdozlite/releases/download/v0.0.4/ctdozlite-0.0.4-macos-arm64.tar.gz"
                 }
             ]
         });
@@ -756,13 +888,79 @@ mod github_api_tests {
     }
 
     #[test]
+    fn test_platform_asset_scoring_across_os_and_formats() {
+        // macOS prefers .dmg over .tar.gz and never selects Linux .tar.gz
+        assert!(
+            select_platform_asset_score("ctdozlite-0.1.0-macos-arm64.dmg", "macos", "aarch64")
+                > select_platform_asset_score(
+                    "ctdozlite-0.1.0-macos-arm64.tar.gz",
+                    "macos",
+                    "aarch64"
+                )
+        );
+        assert!(
+            select_platform_asset_score("ctdozlite-0.1.0-macos-arm64.tar.gz", "macos", "aarch64")
+                > 0
+        );
+        assert_eq!(
+            select_platform_asset_score("ctdozlite-0.1.0-linux-x86_64.tar.gz", "macos", "aarch64"),
+            0
+        );
+
+        // Linux never selects macOS .tar.gz or Windows .exe
+        assert_eq!(
+            select_platform_asset_score("ctdozlite-0.1.0-macos-arm64.tar.gz", "linux", "x86_64"),
+            0
+        );
+        assert!(
+            select_platform_asset_score("ctdozlite-0.1.0-x86_64.AppImage", "linux", "x86_64")
+                > select_platform_asset_score("ctdozlite_0.1.0_amd64.deb", "linux", "x86_64")
+        );
+    }
+
+    #[test]
+    fn test_verify_asset_integrity_checks_magic_and_sha256() {
+        let pe_bytes = b"MZ\x90\x00portable-exe-payload";
+        let pe_hash = format!("{:x}", Sha256::digest(pe_bytes));
+        assert!(verify_asset_integrity(
+            "ctdozlite-0.1.0-portable-windows-x86_64.exe",
+            pe_bytes,
+            Some(&pe_hash)
+        )
+        .is_ok());
+        assert!(verify_asset_integrity(
+            "ctdozlite-0.1.0-portable-windows-x86_64.exe",
+            b"not-a-pe",
+            None
+        )
+        .is_err());
+        assert!(verify_asset_integrity(
+            "ctdozlite-0.1.0-macos-arm64.tar.gz",
+            &[0x1f, 0x8b, 0x08, 0x00],
+            None
+        )
+        .is_ok());
+        assert!(verify_asset_integrity(
+            "ctdozlite-0.1.0-macos-arm64.tar.gz",
+            b"plain-text",
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
     fn test_parse_sha256sums_for_asset() {
         let sums = "\
 abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789  ctdozlite-0.0.4-portable-windows-x86_64.exe\n\
-2222222222222222222222222222222222222222222222222222222222222222 *./ctdozlite-0.0.4-macos-arm64.dmg\n";
+2222222222222222222222222222222222222222222222222222222222222222 *./ctdozlite-0.0.4-macos-arm64.dmg\n\
+SHA256 (dist/ctdozlite-0.0.4-macos-arm64.tar.gz) = 3333333333333333333333333333333333333333333333333333333333333333\n";
         assert_eq!(
             parse_sha256sums_for_asset(sums, "ctdozlite-0.0.4-macos-arm64.dmg").as_deref(),
             Some("2222222222222222222222222222222222222222222222222222222222222222")
+        );
+        assert_eq!(
+            parse_sha256sums_for_asset(sums, "ctdozlite-0.0.4-macos-arm64.tar.gz").as_deref(),
+            Some("3333333333333333333333333333333333333333333333333333333333333333")
         );
     }
 }

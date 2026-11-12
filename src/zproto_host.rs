@@ -35,11 +35,11 @@ use wasmtime::{Caller, Engine, Extern, Func, Instance, Linker, Memory, Module, S
 // WASM location (same order as scripts/sync_v2_helper.js findWasm)
 // ---------------------------------------------------------------------------
 
-/// Locate `libzproto_wasm_bg.*.wasm` without bundling it in the repo:
-/// 1. `CTDOZLITE_ZPROTO_WASM` absolute path, 2. installed Zalo PC, 3. dev
-/// copy under `scripts/assets`. Returns `None` when not found (callers turn
-/// this into a clear error telling the user to install Zalo PC or set the
-/// env var).
+/// Locate `libzproto_wasm_bg.*.wasm` without bundling it in the repo.
+/// Search order: `CTDOZLITE_ZPROTO_WASM` absolute path, installed Zalo PC,
+/// own app bundle `Contents/Resources`, dev copy under `scripts/assets`.
+/// Returns `None` when not found (callers turn this into a clear error
+/// telling the user to install Zalo PC or set the env var).
 pub fn find_wasm_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CTDOZLITE_ZPROTO_WASM") {
         let p = PathBuf::from(p);
@@ -48,6 +48,16 @@ pub fn find_wasm_path() -> Option<PathBuf> {
         }
     }
     let mut roots: Vec<PathBuf> = Vec::new();
+    // Chính app bundle của mình: Contents/Resources/*.wasm (copy lúc cài đặt,
+    // không commit vào repo theo chính sách HistoryCodec).
+    if let Ok(exe) = std::env::current_exe() {
+        // .../ctdozlite.app/Contents/MacOS/ctdozlite → .../Contents/Resources
+        if let Some(macos) = exe.parent() {
+            if let Some(contents) = macos.parent() {
+                roots.push(contents.join("Resources"));
+            }
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         roots.push(PathBuf::from("/Applications/Zalo.app/Contents/Resources/app.asar.unpacked"));
@@ -129,6 +139,7 @@ enum FuncKind {
 /// Host-side JS value. Only the shapes the glue touches are modeled;
 /// everything exotic collapses to [`JsVal::Dummy`] (a shared plain object).
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // Bool/Dummy payloads giữ shape enum cho glue sau này.
 enum JsVal {
     #[default]
     Undefined,
@@ -347,11 +358,27 @@ fn add_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "wbg",
         "__wbg_set_65595bdd868b3009",
         |mut caller: Caller<'_, HostState>, arr: u32, src: u32, off: u32| {
-            // `a(e).set(a(t), off)` — views write through to WASM memory.
+            // `a(e).set(a(t), off)`: views write through to WASM memory;
+            // owned arrays splice into their bytes (JS `set` semantics).
             let m = mem_of(&mut caller);
             let src_bytes = u8_bytes(&caller, m, src);
-            if let JsVal::U8 { view: Some((ptr, _)), .. } = caller.data().get(arr).clone() {
-                write_bytes(&mut caller, m, ptr + off, &src_bytes);
+            match caller.data().get(arr).clone() {
+                JsVal::U8 { view: Some((ptr, _)), .. } => {
+                    write_bytes(&mut caller, m, ptr + off, &src_bytes);
+                }
+                JsVal::U8 { view: None, .. } => {
+                    if let Some(slot) = caller.data_mut().heap.get_mut(arr as usize) {
+                        if let Some(JsVal::U8 { bytes, .. }) = slot.as_mut() {
+                            let need = off as usize + src_bytes.len();
+                            if bytes.len() < need {
+                                bytes.resize(need, 0);
+                            }
+                            bytes[off as usize..off as usize + src_bytes.len()]
+                                .copy_from_slice(&src_bytes);
+                        }
+                    }
+                }
+                _ => {}
             }
         },
     )?;
@@ -387,9 +414,26 @@ fn add_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "wbg",
         "__wbg_new_a12002a7f91c75be",
         |mut caller: Caller<'_, HostState>, src: u32| -> u32 {
-            let m = mem_of(&mut caller);
-            let b = u8_bytes(&caller, m, src);
-            caller.data_mut().alloc(JsVal::U8 { bytes: b, view: None })
+            // `new Uint8Array(src)`: views stay views (JS shares the buffer —
+            // copying breaks `getUint8Memory().set(...)` write-through).
+            // Only owned sources are copied.
+            match caller.data().get(src).clone() {
+                JsVal::U8 { view: Some(v), .. } => {
+                    caller.data_mut().alloc(JsVal::U8 { bytes: Vec::new(), view: Some(v) })
+                }
+                // `new Uint8Array(arraybuffer)`: whole-memory view (JS shares
+                // the buffer — `getUint8Memory().set()` must write through).
+                JsVal::Dummy("arraybuffer") => {
+                    let m = mem_of(&mut caller);
+                    let view = (0u32, m.data_size(&caller) as u32);
+                    caller.data_mut().alloc(JsVal::U8 { bytes: Vec::new(), view: Some(view) })
+                }
+                _ => {
+                    let m = mem_of(&mut caller);
+                    let b = u8_bytes(&caller, m, src);
+                    caller.data_mut().alloc(JsVal::U8 { bytes: b, view: None })
+                }
+            }
         },
     )?;
     linker.func_wrap(
@@ -513,13 +557,7 @@ fn add_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "wbg",
         "__wbg_getRandomValues_bcb4912f16000dc4",
         |mut caller: Caller<'_, HostState>, _crypto: u32, arr: u32| -> Result<(), wasmtime::Error> {
-            let m = mem_of(&mut caller);
-            if let JsVal::U8 { view: Some((ptr, len)), .. } = caller.data().get(arr).clone() {
-                let mut buf = vec![0u8; len as usize];
-                fill_random(&mut buf).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
-                write_bytes(&mut caller, m, ptr, &buf);
-            }
-            Ok(())
+            fill_u8(&mut caller, arr).map_err(|e| wasmtime::Error::msg(e.to_string()))
         },
     )?;
     linker.func_wrap(
@@ -821,8 +859,6 @@ impl ZprotoHost {
                     Val::I32(b as i32), Val::I32(bl as i32),
                     Val::I32(d as i32), Val::I32(dl as i32),
                     Val::I32(e), Val::I32(el),
-                    // Optional 6th string arg: null → (0, 0).
-                    Val::I32(0), Val::I32(0),
                 ])
             })?;
             h.call_raw("zprotoSync2DecryptMetadata", &args)?;
@@ -990,8 +1026,7 @@ mod tests {
             Some(p) => match ZprotoHost::load_from(&p) {
                 Ok(h) => Some(h),
                 Err(e) => {
-                    eprintln!("SKIP: failed to load WASM: {e}");
-                    None
+                    panic!("failed to load WASM {}: {e:#}", p.display());
                 }
             },
         }
@@ -1014,6 +1049,16 @@ mod tests {
         assert_eq!(pubk.len(), 33, "pub must be 33 bytes");
         assert_eq!(pubk[0], 0x05, "pub must have 0x05 prefix");
         assert_eq!(privk.len(), 32, "priv must be 32 bytes");
+    }
+
+    #[test]
+    fn gen_keys_are_unique_per_call() {
+        // RNG shim phải cấp entropy thật mỗi lần gọi: key trùng nhau khiến
+        // điện thoại văng app khi bấm vào thông báo đồng bộ (ek == ik).
+        let Some(h) = try_load() else { return };
+        let (p1, _) = h.generate_keypair().expect("keypair 1");
+        let (p2, _) = h.generate_keypair().expect("keypair 2");
+        assert_ne!(p1, p2, "hai lần gen key liên tiếp phải khác nhau");
     }
 
     #[test]

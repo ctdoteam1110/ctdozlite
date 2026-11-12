@@ -23,6 +23,7 @@ pub(super) struct ThemePalette {
     pub(super) accent_online: Color32,
     pub(super) danger: Color32,
     pub(super) warning: Color32,
+    pub(super) primary_fg: Color32,
     pub(super) bubble_out_bg: Color32,
     pub(super) bubble_out_text: Color32,
     pub(super) bubble_out_meta: Color32,
@@ -32,63 +33,84 @@ pub(super) struct ThemePalette {
     pub(super) bubble_in_meta: Color32,
 }
 
+pub(crate) fn relative_luminance(c: Color32) -> f32 {
+    let srgb_to_linear = |v: u8| -> f32 {
+        let vf = v as f32 / 255.0;
+        if vf <= 0.04045 {
+            vf / 12.92
+        } else {
+            ((vf + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * srgb_to_linear(c.r()) + 0.7152 * srgb_to_linear(c.g()) + 0.0722 * srgb_to_linear(c.b())
+}
+
+pub(crate) fn contrast_ratio(c1: Color32, c2: Color32) -> f32 {
+    let l1 = relative_luminance(c1);
+    let l2 = relative_luminance(c2);
+    (l1.max(l2) + 0.05) / (l1.min(l2) + 0.05)
+}
+
 impl ThemePalette {
     pub(super) fn dark() -> Self {
-        // Official Atom One Dark (`one-dark-ui` + `one-dark-syntax`) color system
+        // Zalo PC dark tokens
         Self {
             is_dark: true,
-            bg_app: Color32::from_rgb(24, 26, 31), // #181A1F Activity Bar & Title Bar
-            bg_sidebar: Color32::from_rgb(33, 37, 43), // #21252B Tree-View / Sidebar / Header
-            bg_chat_canvas: Color32::from_rgb(40, 44, 52), // #282C34 Atom One Dark Editor Canvas
-            bg_elevated: Color32::from_rgb(44, 49, 58), // #2C313A Elevated Card / Modal / Popover
-            bg_hover: Color32::from_rgb(50, 56, 66), // #323842 List Hover Surface
-            bg_selected: Color32::from_rgb(58, 63, 75), // #3A3F4B Active Selection Row
-            bg_input: Color32::from_rgb(29, 31, 35), // #1D1F23 Input / Search Well
-            border: Color32::from_rgb(52, 57, 66), // #343942 Subtle Panel Divider
-            text_primary: Color32::from_rgb(215, 218, 224), // #D7DAE0 Bright Foreground
-            text_secondary: Color32::from_rgb(171, 178, 191), // #ABB2BF Atom @mono-1
-            text_muted: Color32::from_rgb(118, 126, 142), // #767E8E Atom @mono-3 (readable muted)
-            primary: Color32::from_rgb(82, 139, 255), // #528BFF Atom UI Accent Blue
-            primary_hover: Color32::from_rgb(97, 175, 239), // #61AFEF Atom @hue-2 Cyan-Blue
-            accent_online: Color32::from_rgb(152, 195, 121), // #98C379 Atom @hue-4 Green
-            danger: Color32::from_rgb(224, 108, 117), // #E06C75 Atom @hue-5 Coral Red
-            warning: Color32::from_rgb(229, 192, 123), // #E5C07B Atom @hue-62 Warm Gold
-            bubble_out_bg: Color32::from_rgb(37, 55, 77), // #25374D Zalo Dark Slate-Navy Outgoing Bubble
-            bubble_out_text: Color32::from_rgb(235, 240, 246), // #EBF0F6
-            bubble_out_meta: Color32::from_rgb(154, 171, 192), // #9AABC0
-            bubble_in_bg: Color32::from_rgb(50, 56, 66),  // #323842 Atom Elevated Incoming Bubble
-            bubble_in_border: Color32::from_rgb(62, 68, 81), // #3E4451 Atom Gutter Border
-            bubble_in_text: Color32::from_rgb(215, 218, 224), // #D7DAE0
-            bubble_in_meta: Color32::from_rgb(142, 150, 165), // #8E96A5
+            bg_app: Color32::from_rgb(34, 38, 43), // #22262B
+            bg_sidebar: Color32::from_rgb(34, 38, 43), // #22262B
+            bg_chat_canvas: Color32::from_rgb(29, 32, 37), // #1D2025
+            bg_elevated: Color32::from_rgb(40, 45, 51), // #282D33
+            bg_hover: Color32::from_rgb(46, 51, 58),
+            bg_selected: Color32::from_rgb(31, 52, 77), // #1F344D selected row
+            bg_input: Color32::from_rgb(40, 45, 51), // #282D33
+            border: Color32::from_rgb(55, 61, 69),
+            text_primary: Color32::from_rgb(230, 233, 238),
+            text_secondary: Color32::from_rgb(170, 178, 190),
+            text_muted: Color32::from_rgb(139, 150, 167), // #8B96A7
+            primary: Color32::from_rgb(51, 132, 255), // #3384FF
+            primary_hover: Color32::from_rgb(102, 166, 255), // #66A6FF
+            accent_online: Color32::from_rgb(55, 179, 97), // #37B361
+            danger: Color32::from_rgb(233, 73, 73), // #E94949
+            warning: Color32::from_rgb(229, 192, 123),
+            primary_fg: Color32::WHITE,
+            bubble_out_bg: Color32::from_rgb(31, 52, 77), // #1F344D
+            bubble_out_text: Color32::from_rgb(235, 240, 246),
+            bubble_out_meta: Color32::from_rgb(154, 171, 192),
+            bubble_in_bg: Color32::from_rgb(40, 45, 51), // #282D33
+            bubble_in_border: Color32::from_rgb(55, 61, 69),
+            bubble_in_text: Color32::from_rgb(230, 233, 238),
+            bubble_in_meta: Color32::from_rgb(139, 150, 167),
         }
     }
 
     pub(super) fn light() -> Self {
+        // Zalo PC light tokens
         Self {
             is_dark: false,
             bg_app: Color32::from_rgb(255, 255, 255), // #FFFFFF
-            bg_sidebar: Color32::from_rgb(255, 255, 255), // #FFFFFF
-            bg_chat_canvas: Color32::from_rgb(235, 240, 247), // Authentic Zalo PC cool blue-gray canvas
-            bg_elevated: Color32::from_rgb(255, 255, 255),    // #FFFFFF
-            bg_hover: Color32::from_rgb(241, 245, 249),       // #F1F5F9
-            bg_selected: Color32::from_rgb(229, 241, 255),    // #E5F1FF Zalo active row
-            bg_input: Color32::from_rgb(248, 250, 252),       // #F8FAFC
-            border: Color32::from_rgb(226, 232, 240),         // #E2E8F0
-            text_primary: Color32::from_rgb(15, 23, 42),      // #0F172A (16.1:1 contrast)
-            text_secondary: Color32::from_rgb(71, 85, 105),   // #475569 (7.2:1 contrast)
-            text_muted: Color32::from_rgb(100, 116, 139),     // #64748B (4.6:1 contrast)
-            primary: Color32::from_rgb(0, 104, 255),          // #0068FF Zalo Blue
-            primary_hover: Color32::from_rgb(37, 99, 235),    // #2563EB
-            accent_online: Color32::from_rgb(5, 150, 105),    // #059669 Emerald
-            danger: Color32::from_rgb(220, 38, 38),           // #DC2626
-            warning: Color32::from_rgb(217, 119, 6),          // #D97706
-            bubble_out_bg: Color32::from_rgb(229, 239, 255), // Zalo Desktop Light Outgoing (#E5EFFF)
-            bubble_out_text: Color32::from_rgb(15, 23, 42),  // Crisp dark text on light blue (14:1)
-            bubble_out_meta: Color32::from_rgb(71, 92, 122),
+            bg_sidebar: Color32::from_rgb(255, 255, 255),
+            bg_chat_canvas: Color32::from_rgb(255, 255, 255),
+            bg_elevated: Color32::from_rgb(255, 255, 255),
+            bg_hover: Color32::from_rgb(241, 242, 244), // #F1F2F4
+            bg_selected: Color32::from_rgb(229, 241, 255), // #E5F1FF
+            bg_input: Color32::from_rgb(255, 255, 255),
+            border: Color32::from_rgb(229, 231, 235), // #E5E7EB
+            text_primary: Color32::from_rgb(8, 27, 58), // #081B3A
+            text_secondary: Color32::from_rgb(90, 105, 129), // #5A6981
+            text_muted: Color32::from_rgb(99, 113, 136), // #637188 (~5.4:1 trên trắng)
+            primary: Color32::from_rgb(0, 104, 255), // #0068FF
+            primary_hover: Color32::from_rgb(0, 88, 220),
+            accent_online: Color32::from_rgb(55, 179, 97), // #37B361
+            danger: Color32::from_rgb(195, 24, 24), // #C31818
+            warning: Color32::from_rgb(217, 119, 6),
+            primary_fg: Color32::WHITE,
+            bubble_out_bg: Color32::from_rgb(229, 241, 255), // #E5F1FF
+            bubble_out_text: Color32::from_rgb(8, 27, 58),
+            bubble_out_meta: Color32::from_rgb(90, 105, 129),
             bubble_in_bg: Color32::WHITE,
-            bubble_in_border: Color32::from_rgb(216, 224, 236),
-            bubble_in_text: Color32::from_rgb(15, 23, 42),
-            bubble_in_meta: Color32::from_rgb(100, 116, 139),
+            bubble_in_border: Color32::from_rgb(229, 231, 235), // #E5E7EB
+            bubble_in_text: Color32::from_rgb(8, 27, 58),
+            bubble_in_meta: Color32::from_rgb(99, 113, 136),
         }
     }
 
@@ -110,7 +132,7 @@ impl ThemePalette {
                 .linear_multiply(if self.is_dark { 0.45 } else { 0.22 });
         visuals.selection.stroke = Stroke::new(1.5_f32, self.primary);
 
-        let r = Rounding::same(8.0);
+        let r = Rounding::same(6.0);
         visuals.widgets.noninteractive.bg_fill = self.bg_app;
         visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.border);
         visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, self.text_primary);
@@ -131,13 +153,16 @@ impl ThemePalette {
         visuals.widgets.active.bg_fill = self.primary;
         visuals.widgets.active.weak_bg_fill = self.primary;
         visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, self.primary);
-        visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, self.primary_fg);
         visuals.widgets.active.rounding = r;
 
-        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+        style.spacing.item_spacing = Vec2::new(8.0, 8.0);
         style.spacing.button_padding = Vec2::new(10.0, 6.0);
         style.spacing.scroll = egui::style::ScrollStyle::solid();
         style.spacing.scroll.bar_width = 6.0;
+        style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(13.5));
+        style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
         style.visuals = visuals;
         ctx.set_style(style);
     }
@@ -237,6 +262,82 @@ impl ThemePalette {
         let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
         std::fs::write(path, text)
     }
+
+    /// Apply custom color overrides (primary, accent, outbound/inbound bubble backgrounds) (#7, R2).
+    pub(super) fn apply_custom_colors(
+        &mut self,
+        primary_hex: Option<&str>,
+        accent_hex: Option<&str>,
+        bubble_out_hex: Option<&str>,
+        bubble_in_hex: Option<&str>,
+    ) {
+        if let Some(hex) = primary_hex {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
+                self.primary = c;
+                self.primary_hover = Color32::from_rgb(
+                    c.r().saturating_add(25),
+                    c.g().saturating_add(25),
+                    c.b().saturating_add(25),
+                );
+                self.primary_fg = if contrast_ratio(Color32::WHITE, c)
+                    >= contrast_ratio(Color32::from_rgb(15, 23, 42), c)
+                {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgb(15, 23, 42)
+                };
+            }
+        }
+        if let Some(hex) = accent_hex {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
+                self.accent_online = c;
+            }
+        }
+        if let Some(hex) = bubble_out_hex {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
+                self.bubble_out_bg = c;
+                let dark_text = Color32::from_rgb(15, 23, 42);
+                let light_text = Color32::from_rgb(235, 240, 246);
+                self.bubble_out_text =
+                    if contrast_ratio(dark_text, c) >= contrast_ratio(light_text, c) {
+                        dark_text
+                    } else {
+                        light_text
+                    };
+
+                let dark_meta = Color32::from_rgb(71, 92, 122);
+                let light_meta = Color32::from_rgb(154, 171, 192);
+                self.bubble_out_meta =
+                    if contrast_ratio(dark_meta, c) >= contrast_ratio(light_meta, c) {
+                        dark_meta
+                    } else {
+                        light_meta
+                    };
+            }
+        }
+        if let Some(hex) = bubble_in_hex {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
+                self.bubble_in_bg = c;
+                let dark_text = Color32::from_rgb(15, 23, 42);
+                let light_text = Color32::from_rgb(215, 218, 224);
+                self.bubble_in_text =
+                    if contrast_ratio(dark_text, c) >= contrast_ratio(light_text, c) {
+                        dark_text
+                    } else {
+                        light_text
+                    };
+
+                let dark_meta = Color32::from_rgb(100, 116, 139);
+                let light_meta = Color32::from_rgb(142, 150, 165);
+                self.bubble_in_meta =
+                    if contrast_ratio(dark_meta, c) >= contrast_ratio(light_meta, c) {
+                        dark_meta
+                    } else {
+                        light_meta
+                    };
+            }
+        }
+    }
 }
 
 pub(super) fn parse_hex_color(s: &str) -> Option<Color32> {
@@ -246,13 +347,24 @@ pub(super) fn parse_hex_color(s: &str) -> Option<Color32> {
         let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
         let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
         Some(Color32::from_rgb(r, g, b))
+    } else if hex.len() == 8 {
+        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+        let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
+        Some(Color32::from_rgba_unmultiplied(r, g, b, a))
     } else {
         None
     }
 }
 
 pub(super) fn format_hex_color(c: Color32) -> String {
-    format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    if a == 255 {
+        format!("#{:02X}{:02X}{:02X}", r, g, b)
+    } else {
+        format!("#{:02X}{:02X}{:02X}{:02X}", r, g, b, a)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -361,15 +473,15 @@ fn paint_circular_image(
     let (uv_min, uv_max) = if tw == th || tw == 0 || th == 0 {
         (Pos2::ZERO, Pos2::new(1.0, 1.0))
     } else if tw > th {
-        let crop = (tw - th) as f32 / (2.0 * tw as f32);
+        let crop = ((tw - th) as f32 / (2.0 * tw as f32)).clamp(0.0, 0.49);
         (Pos2::new(crop, 0.0), Pos2::new(1.0 - crop, 1.0))
     } else {
-        let crop = (th - tw) as f32 / (2.0 * th as f32);
+        let crop = ((th - tw) as f32 / (2.0 * th as f32)).clamp(0.0, 0.49);
         (Pos2::new(0.0, crop), Pos2::new(1.0, 1.0 - crop))
     };
 
     let mut mesh = egui::Mesh::with_texture(tex.id());
-    let n_pts = 32;
+    let n_pts = 48;
     mesh.vertices.push(egui::epaint::Vertex {
         pos: center,
         uv: Pos2::new((uv_min.x + uv_max.x) * 0.5, (uv_min.y + uv_max.y) * 0.5),
@@ -408,11 +520,17 @@ fn paint_single_circle_avatar(
     if let Some(url) = avatar_url.map(str::trim).filter(|u| {
         !u.is_empty()
             && !u.ends_with("/default")
+            && !u.contains("default_avatar")
+            && !u.contains("avatar_default")
             && (u.starts_with("http://") || u.starts_with("https://"))
     }) {
         let file_or_base = crate::chat::avatar_file_key(Some(url))
             .unwrap_or_else(|| url.split('?').next().unwrap_or(url).to_string());
-        let key = format!("ava_{}", crate::crypto::md5_hex(&file_or_base));
+        let hash = crate::crypto::md5_hex(&file_or_base);
+        // Issue #131: Use `avt_` key prefix so `worker.rs` decodes the full uncropped square
+        // avatar instead of applying the legacy `ava_` 160x160 center cutout crop (which zoomed
+        // 240x240 / 480x480 Zalo avatars by 1.5x–3x).
+        let key = format!("avt_{hash}");
         if let Some(tex) = textures.get(&key) {
             paint_circular_image(painter, center, radius, tex);
             painter.circle_stroke(
@@ -424,9 +542,18 @@ fn paint_single_circle_avatar(
         }
         if loading.insert(key.clone()) {
             if let Some(tx) = WORKER_TX.get() {
+                let legacy_cache = std::path::PathBuf::from("stickers_cache")
+                    .join(format!("ava_{hash}.png"));
+                let new_cache = std::path::PathBuf::from("stickers_cache")
+                    .join(format!("avt_{hash}.png"));
+                let fetch_url = if !new_cache.is_file() && legacy_cache.is_file() {
+                    format!("local://{}", legacy_cache.display())
+                } else {
+                    url.to_string()
+                };
                 let _ = tx.send(WorkerCmd::FetchStickerImage {
                     key,
-                    url: url.to_string(),
+                    url: fetch_url,
                 });
             }
         }
@@ -754,7 +881,8 @@ pub(super) fn draw_icon_feed(painter: &egui::Painter, center: Pos2, size: f32, c
 }
 
 pub(super) fn draw_icon_drawer(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    draw_lucide_icon(painter, center, lucide::PANEL_RIGHT, size, color);
+    // Icon ⓘ to rõ thay vì PANEL_RIGHT mờ khó thấy.
+    draw_lucide_icon(painter, center, lucide::INFO, size * 1.15, color);
 }
 
 pub(super) fn draw_icon_pin(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
@@ -878,7 +1006,9 @@ pub fn load_app_icon_with_badge(unread_count: usize) -> Option<egui::IconData> {
         for x in min_x..max_x {
             let fx = x as f32;
             let fy = y as f32;
-            let clamped_x = fx.clamp(cx - half_span, cx + half_span);
+            let lo_x = cx - half_span;
+            let hi_x = (cx + half_span).max(lo_x);
+            let clamped_x = fx.clamp(lo_x, hi_x);
             let dist = (fx - clamped_x).hypot(fy - cy);
             if dist <= badge_radius + border_w + 0.6 {
                 if dist <= badge_radius - 0.5 {
@@ -1032,6 +1162,7 @@ pub(super) fn render_toggle_switch(
 }
 
 static CJK_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ACTIVE_FONT_CHOICE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 pub(crate) fn is_cjk(c: char) -> bool {
     matches!(c as u32,
@@ -1047,14 +1178,27 @@ pub(super) fn ensure_cjk_font<'a>(ctx: &egui::Context, mut texts: impl Iterator<
         return;
     }
     CJK_LOADED.store(true, Ordering::Relaxed);
-    build_fonts(ctx, true);
+    let choice = ACTIVE_FONT_CHOICE
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_else(|_| "default".into());
+    build_fonts(ctx, &choice, true);
 }
 
+pub(super) fn setup_custom_fonts_with_choice(ctx: &egui::Context, font_choice: &str) {
+    if let Ok(mut active) = ACTIVE_FONT_CHOICE.lock() {
+        *active = font_choice.to_string();
+    }
+    let with_cjk = CJK_LOADED.load(std::sync::atomic::Ordering::Relaxed);
+    build_fonts(ctx, font_choice, with_cjk);
+}
+
+#[allow(dead_code)]
 pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
-    build_fonts(ctx, false);
+    setup_custom_fonts_with_choice(ctx, "default");
 }
 
-fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
+pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool) {
     let mut fonts = egui::FontDefinitions::default();
 
     // 1. Embed official Lucide Icon Font (vector glyphs for all UI icons)
@@ -1072,6 +1216,76 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
         egui::FontData::from_static(BUNDLED_SANS),
     );
 
+    // 3. Optional user-selected system or custom font family (Requirement R2)
+    let mut selected_font_loaded = false;
+    let choice_norm = font_choice.trim().to_lowercase();
+    match choice_norm.as_str() {
+        "segoe_ui" | "segoe" => {
+            let candidates = [
+                "C:\\Windows\\Fonts\\segoeui.ttf",
+                "/usr/share/fonts/truetype/segoeui.ttf",
+            ];
+            for path in candidates {
+                if let Ok(font_data) = std::fs::read(path) {
+                    fonts.font_data.insert(
+                        "selected_font".to_owned(),
+                        egui::FontData::from_owned(font_data),
+                    );
+                    selected_font_loaded = true;
+                    break;
+                }
+            }
+        }
+        "arial" => {
+            let candidates = [
+                "C:\\Windows\\Fonts\\arial.ttf",
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/Library/Fonts/Arial.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ];
+            for path in candidates {
+                if let Ok(font_data) = std::fs::read(path) {
+                    fonts.font_data.insert(
+                        "selected_font".to_owned(),
+                        egui::FontData::from_owned(font_data),
+                    );
+                    selected_font_loaded = true;
+                    break;
+                }
+            }
+        }
+        "tahoma" => {
+            let candidates = [
+                "C:\\Windows\\Fonts\\tahoma.ttf",
+                "/System/Library/Fonts/Supplemental/Tahoma.ttf",
+            ];
+            for path in candidates {
+                if let Ok(font_data) = std::fs::read(path) {
+                    fonts.font_data.insert(
+                        "selected_font".to_owned(),
+                        egui::FontData::from_owned(font_data),
+                    );
+                    selected_font_loaded = true;
+                    break;
+                }
+            }
+        }
+        "default" | "" => {
+            // Uses bundled_sans directly at priority index 0
+        }
+        _custom_path => {
+            if let Ok(font_data) = std::fs::read(font_choice.trim()) {
+                fonts.font_data.insert(
+                    "selected_font".to_owned(),
+                    egui::FontData::from_owned(font_data),
+                );
+                selected_font_loaded = true;
+            }
+        }
+    }
+
+    // Also load generic system vietnamese_font as supplementary candidate if available
     let font_candidates = [
         "C:\\Windows\\Fonts\\segoeui.ttf",
         "C:\\Windows\\Fonts\\arial.ttf",
@@ -1099,7 +1313,7 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
         }
     }
 
-    // 3. Optional CJK (Chinese / Japanese / Korean) system font fallback (#5, #6)
+    // 4. Optional CJK (Chinese / Japanese / Korean) system font fallback (#5, #6)
     let cjk_candidates = [
         "C:\\Windows\\Fonts\\msyh.ttc",
         "C:\\Windows\\Fonts\\simsun.ttc",
@@ -1121,14 +1335,21 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
         }
     }
 
-    // Fallback order: bundled sans guarantees Vietnamese coverage, CJK supplies Han/Kana/Hangul, Lucide supplies icon glyphs
+    // 5. Fallback priority order:
+    // If a custom or system font is selected, place it at index 0.
+    // Index 1 (or 0 for default) is bundled_sans, guaranteeing full Vietnamese diacritic coverage.
     let prop = fonts
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default();
-    prop.insert(0, "bundled_sans".to_owned());
-    if fonts.font_data.contains_key("vietnamese_font") {
-        prop.insert(1, "vietnamese_font".to_owned());
+    if selected_font_loaded {
+        prop.insert(0, "selected_font".to_owned());
+        prop.insert(1, "bundled_sans".to_owned());
+    } else {
+        prop.insert(0, "bundled_sans".to_owned());
+    }
+    if fonts.font_data.contains_key("vietnamese_font") && !selected_font_loaded {
+        prop.push("vietnamese_font".to_owned());
     }
     if fonts.font_data.contains_key("cjk_font") {
         prop.push("cjk_font".to_owned());
@@ -1149,4 +1370,59 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
     mono.push("lucide_font".to_owned());
 
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_and_format_hex_color() {
+        assert_eq!(
+            parse_hex_color("#0068FF"),
+            Some(Color32::from_rgb(0, 104, 255))
+        );
+        assert_eq!(
+            parse_hex_color("528BFF"),
+            Some(Color32::from_rgb(82, 139, 255))
+        );
+        assert_eq!(
+            parse_hex_color("#0068FF80"),
+            Some(Color32::from_rgba_unmultiplied(0, 104, 255, 128))
+        );
+        assert_eq!(parse_hex_color("invalid"), None);
+        assert_eq!(parse_hex_color("#123"), None);
+
+        let col = Color32::from_rgb(0, 104, 255);
+        assert_eq!(format_hex_color(col), "#0068FF");
+    }
+
+    #[test]
+    fn test_palette_apply_custom_colors() {
+        let mut pal = ThemePalette::light();
+        pal.apply_custom_colors(
+            Some("#059669"),
+            Some("#7C3AED"),
+            Some("#E11D48"),
+            Some("#FFFFFF"),
+        );
+        assert_eq!(pal.primary, Color32::from_rgb(5, 150, 105));
+        assert_eq!(pal.accent_online, Color32::from_rgb(124, 58, 237));
+        assert_eq!(pal.bubble_out_bg, Color32::from_rgb(225, 29, 72));
+        assert_eq!(pal.bubble_in_bg, Color32::WHITE);
+        assert_eq!(pal.bubble_in_text, Color32::from_rgb(15, 23, 42));
+    }
+
+    #[test]
+    fn test_palette_dark_mode_bubble_contrast() {
+        let mut pal = ThemePalette::dark();
+        pal.apply_custom_colors(
+            None,
+            None,
+            Some("#1E293B"),
+            None,
+        );
+        assert_eq!(pal.bubble_out_bg, Color32::from_rgb(30, 41, 59));
+        assert_eq!(pal.bubble_out_text, Color32::from_rgb(235, 240, 246));
+    }
 }

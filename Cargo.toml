@@ -1,6 +1,6 @@
 [package]
 name = "ctdozlite"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["TIPC1110 <tienichpc1110@gmail.com>"]
 description = "Lightweight, high-performance native Zalo PC client written in Rust (zero Node.js, zero Electron)"
@@ -8,6 +8,9 @@ homepage = "https://ctdozlite.ctdo.net/"
 repository = "https://github.com/ctdoteam1110/ctdozlite"
 license = "MIT OR Apache-2.0"
 default-run = "ctdozlite"
+
+[patch.crates-io]
+egui-winit = { path = "vendor/egui-winit" }
 
 [dependencies]
 aes = "0.8"
@@ -34,12 +37,17 @@ crossterm = "0.28"
 rusqlite = { version = "0.32", features = ["bundled"] }
 cpal = "0.15"
 opus = "0.3"
+rusty_mp3 = "1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 rsa = "0.9.10"
 lzma-rs = "0.3.0"
 zstd = "0.14.3"
 wasmtime = { version = "50.0.1", default-features = false, features = ["runtime", "cranelift", "std", "anyhow"] }
 getrandom = { version = "0.3", features = ["std"] }
+zip = "9.4.2"
+quick-xml = "0.42.0"
+pdf-extract = "0.12.1"
+rhai = "1"
 
 [lib]
 name = "zalo_rust"

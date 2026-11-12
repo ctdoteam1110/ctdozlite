@@ -2740,6 +2740,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            vanish: None,
         };
         let mut app = TuiApp {
             session: &mut session,

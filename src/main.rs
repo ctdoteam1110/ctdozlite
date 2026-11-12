@@ -222,13 +222,11 @@ async fn main() -> Result<()> {
         };
 
         let mut initial_threads = chat::load_threads_cache();
-        let db_to_load = if let Some(uin) = s.login.as_ref().map(|l| &l.uin).filter(|u| !u.is_empty()) {
-            store::db_path_for_account(uin)
-        } else {
-            "zalo_history.db".to_string()
-        };
+        // Hydrate từ đúng account DB (read-point/vanish/note lưu theo acc, #119).
+        let startup_uin = s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or("");
+        let startup_db = store::db_path_for_account(startup_uin);
         store::load_history_into_threads(
-            &db_to_load,
+            &startup_db,
             &mut initial_threads,
             store::MessageStore::PRELOAD_MSGS,
         );
@@ -357,7 +355,9 @@ async fn main() -> Result<()> {
 
     // Fetch initial threads and hydrate with local SQLite history
     let mut initial_threads = chat::load_threads_cache();
-    store::load_history_into_threads("zalo_history.db", &mut initial_threads, 200);
+    let tui_uin = s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or("");
+    let tui_db = store::db_path_for_account(tui_uin);
+    store::load_history_into_threads(&tui_db, &mut initial_threads, 200);
     if s.login.is_some() && server_ok {
         match chat::get_friends(&s).await {
             Ok(list) => {

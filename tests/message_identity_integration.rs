@@ -25,6 +25,7 @@ fn thread(messages: Vec<ChatMessage>) -> Thread {
         messages,
         presentation: Default::default(),
         unread: Default::default(),
+        vanish: None,
     }
 }
 

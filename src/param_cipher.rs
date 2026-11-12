@@ -24,6 +24,28 @@ fn split_even_odd(s: &str) -> (Vec<char>, Vec<char>) {
 
 /// `Math.random().toString(16).substr(2, n)` — 8 random hex chars would be 4 bytes;
 /// the bundle produces 6..12 hex chars.
+/// Zalo `generateRandomString(n)`: `n` ký tự base62 (`A-Za-z0-9`).
+/// Dùng cho Sync V2 `syncId` — server/phone validate format này.
+pub fn random_base62(len: usize) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1)
+        ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    const B62: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut out = String::with_capacity(len);
+    for _ in 0..len {
+        // xorshift64*
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        let r = seed.wrapping_mul(0x2545F4914F6CDD1D);
+        out.push(B62[(r >> 58) as usize % 62] as char);
+    }
+    out
+}
+
 pub fn random_hex(len: usize) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let mut seed = SystemTime::now()
@@ -79,9 +101,12 @@ impl ParamCipher {
         let (a_even, mut a_odd) = split_even_odd(&zcid);
         a_odd.reverse();
 
-        let key: String = n_even.iter().take(8).collect::<String>()
-            + &a_even.iter().take(12).collect::<String>()
-            + &a_odd.iter().take(12).collect::<String>();
+        let key: String = format!(
+            "{}{}{}",
+            n_even.iter().take(8).collect::<String>(),
+            a_even.iter().take(12).collect::<String>(),
+            a_odd.iter().take(12).collect::<String>()
+        );
 
         Ok(Self {
             zcid,

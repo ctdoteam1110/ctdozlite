@@ -401,6 +401,7 @@ mod tests {
             avatar: None,
             is_group: false,
             messages: vec![],
+            vanish: None,
             unread: Default::default(),
         }];
         merge_mute_metadata(
@@ -433,6 +434,7 @@ mod tests {
                 avatar: None,
                 is_group: false,
                 messages: vec![],
+                vanish: None,
                 unread: Default::default(),
             },
             Thread {
@@ -444,6 +446,7 @@ mod tests {
                 avatar: None,
                 is_group: true,
                 messages: vec![],
+                vanish: None,
                 unread: Default::default(),
             },
         ];
