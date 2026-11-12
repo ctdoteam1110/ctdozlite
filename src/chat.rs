@@ -2735,7 +2735,10 @@ pub async fn send_voice_message(
         ("/api/message/voice/upload", 2, m)
     };
     let params = s.encoded_params(&params_obj)?;
-    let url = format!("{file_host}{upload_ep}?{}&params={params}&type={target_type}", s.common_params());
+    let url = format!(
+        "{file_host}{upload_ep}?{}&params={params}&type={target_type}",
+        s.common_params()
+    );
     let up_raw = s
         .post_multipart(&url, "chunkContent", &file_name, mime, &voice_bytes)
         .await
@@ -2751,16 +2754,11 @@ pub async fn send_voice_message(
     if need_url && FILE_DONE_LISTENER_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
         let fid = send_resp
             .get("data")
-            .and_then(|d| {
-                pick_str(d, &["fileId"]).filter(|id| id != "-1")
-            })
+            .and_then(|d| pick_str(d, &["fileId"]).filter(|id| id != "-1"))
             .unwrap_or_default();
         if !fid.is_empty() {
             if let Some(url) = wait_for_file_done(&fid, FILE_DONE_TIMEOUT).await {
-                if let Some(obj) = send_resp
-                    .get_mut("data")
-                    .and_then(Value::as_object_mut)
-                {
+                if let Some(obj) = send_resp.get_mut("data").and_then(Value::as_object_mut) {
                     obj.insert("fileUrl".into(), Value::String(url));
                 }
             } else {
@@ -2792,9 +2790,9 @@ pub fn parse_voice_send_response(
         }
     }
     let data_node = send_resp.get("data").unwrap_or(send_resp);
-    let file_url = pick_str(data_node, &["fileUrl", "url", "normalUrl", "href"]).unwrap_or_default();
-    let msg_id = pick_str(data_node, &["msgId"])
-        .unwrap_or_else(|| format!("out_{client_id}"));
+    let file_url =
+        pick_str(data_node, &["fileUrl", "url", "normalUrl", "href"]).unwrap_or_default();
+    let msg_id = pick_str(data_node, &["msgId"]).unwrap_or_else(|| format!("out_{client_id}"));
     let mm = duration_secs / 60;
     let ss = duration_secs % 60;
     Ok(ChatMessage {
@@ -2807,7 +2805,11 @@ pub fn parse_voice_send_response(
         ts: client_id as i64,
         delivery: crate::message_model::DeliveryState::ServerAccepted,
         kind: crate::message_model::MessageKind::Voice,
-        link_url: if file_url.is_empty() { None } else { Some(file_url) },
+        link_url: if file_url.is_empty() {
+            None
+        } else {
+            Some(file_url)
+        },
         link_title: Some(format!("Tin nhắn thoại ({mm:02}:{ss:02})")),
         link_desc: None,
         link_src: Some("Thoại Zalo".into()),
@@ -2842,18 +2844,16 @@ pub fn translate_source_for_target(text: &str, target: &str) -> Option<&'static 
     for ch in text.chars() {
         match ch {
             // Dấu tiếng Việt (đ, ă, â, ê, ô, ơ, ư + nguyên âm dấu, cả HOA).
-            'đ' | 'Đ' | 'ă' | 'Ă' | 'â' | 'Â' | 'ê' | 'Ê' | 'ô' | 'Ô' | 'ơ' | 'Ơ'
-            | 'ư' | 'Ư' | 'á' | 'à' | 'ả' | 'ã' | 'ạ' | 'ắ' | 'ằ' | 'ẳ' | 'ẵ' | 'ặ'
-            | 'ấ' | 'ầ' | 'ẩ' | 'ẫ' | 'ậ' | 'é' | 'è' | 'ẻ' | 'ẽ' | 'ẹ' | 'ế' | 'ề'
-            | 'ể' | 'ễ' | 'ệ' | 'í' | 'ì' | 'ỉ' | 'ĩ' | 'ị' | 'ó' | 'ò' | 'ỏ' | 'õ'
-            | 'ọ' | 'ố' | 'ồ' | 'ổ' | 'ỗ' | 'ộ' | 'ớ' | 'ờ' | 'ở' | 'ỡ' | 'ợ'
-            | 'ú' | 'ù' | 'ủ' | 'ũ' | 'ụ' | 'ứ' | 'ừ' | 'ử' | 'ữ' | 'ự'
-            | 'ý' | 'ỳ' | 'ỷ' | 'ỹ' | 'ỵ' | 'Á' | 'À' | 'Ả' | 'Ã' | 'Ạ' | 'Ắ'
-            | 'Ằ' | 'Ẳ' | 'Ẵ' | 'Ặ' | 'Ấ' | 'Ầ' | 'Ẩ' | 'Ẫ' | 'Ậ' | 'É' | 'È'
-            | 'Ẻ' | 'Ẽ' | 'Ẹ' | 'Ế' | 'Ề' | 'Ể' | 'Ễ' | 'Ệ' | 'Í' | 'Ì' | 'Ỉ'
-            | 'Ĩ' | 'Ị' | 'Ó' | 'Ò' | 'Ỏ' | 'Õ' | 'Ọ' | 'Ố' | 'Ồ' | 'Ổ' | 'Ỗ'
-            | 'Ộ' | 'Ớ' | 'Ờ' | 'Ở' | 'Ỡ' | 'Ợ' | 'Ú' | 'Ù' | 'Ủ' | 'Ũ' | 'Ụ'
-            | 'Ứ' | 'Ừ' | 'Ử' | 'Ữ' | 'Ự' | 'Ý' | 'Ỳ' | 'Ỷ' | 'Ỹ' | 'Ỵ' => vi_mark += 1,
+            'đ' | 'Đ' | 'ă' | 'Ă' | 'â' | 'Â' | 'ê' | 'Ê' | 'ô' | 'Ô' | 'ơ' | 'Ơ' | 'ư' | 'Ư'
+            | 'á' | 'à' | 'ả' | 'ã' | 'ạ' | 'ắ' | 'ằ' | 'ẳ' | 'ẵ' | 'ặ' | 'ấ' | 'ầ' | 'ẩ' | 'ẫ'
+            | 'ậ' | 'é' | 'è' | 'ẻ' | 'ẽ' | 'ẹ' | 'ế' | 'ề' | 'ể' | 'ễ' | 'ệ' | 'í' | 'ì' | 'ỉ'
+            | 'ĩ' | 'ị' | 'ó' | 'ò' | 'ỏ' | 'õ' | 'ọ' | 'ố' | 'ồ' | 'ổ' | 'ỗ' | 'ộ' | 'ớ' | 'ờ'
+            | 'ở' | 'ỡ' | 'ợ' | 'ú' | 'ù' | 'ủ' | 'ũ' | 'ụ' | 'ứ' | 'ừ' | 'ử' | 'ữ' | 'ự' | 'ý'
+            | 'ỳ' | 'ỷ' | 'ỹ' | 'ỵ' | 'Á' | 'À' | 'Ả' | 'Ã' | 'Ạ' | 'Ắ' | 'Ằ' | 'Ẳ' | 'Ẵ' | 'Ặ'
+            | 'Ấ' | 'Ầ' | 'Ẩ' | 'Ẫ' | 'Ậ' | 'É' | 'È' | 'Ẻ' | 'Ẽ' | 'Ẹ' | 'Ế' | 'Ề' | 'Ể' | 'Ễ'
+            | 'Ệ' | 'Í' | 'Ì' | 'Ỉ' | 'Ĩ' | 'Ị' | 'Ó' | 'Ò' | 'Ỏ' | 'Õ' | 'Ọ' | 'Ố' | 'Ồ' | 'Ổ'
+            | 'Ỗ' | 'Ộ' | 'Ớ' | 'Ờ' | 'Ở' | 'Ỡ' | 'Ợ' | 'Ú' | 'Ù' | 'Ủ' | 'Ũ' | 'Ụ' | 'Ứ' | 'Ừ'
+            | 'Ử' | 'Ữ' | 'Ự' | 'Ý' | 'Ỳ' | 'Ỷ' | 'Ỹ' | 'Ỵ' => vi_mark += 1,
             'a'..='z' | 'A'..='Z' => latin += 1,
             '\u{3040}'..='\u{30ff}' => kana += 1,
             '\u{4e00}'..='\u{9fff}' => cjk += 1,
@@ -2873,19 +2873,39 @@ pub fn translate_source_for_target(text: &str, target: &str) -> Option<&'static 
     }
     // Ưu tiên script phi-Latin (rõ ràng nhất).
     if kana > 0 {
-        return if lang_is(target, "ja") { None } else { Some("ja") };
+        return if lang_is(target, "ja") {
+            None
+        } else {
+            Some("ja")
+        };
     }
     if hangul > 0 {
-        return if lang_is(target, "ko") { None } else { Some("ko") };
+        return if lang_is(target, "ko") {
+            None
+        } else {
+            Some("ko")
+        };
     }
     if cyrillic > cjk && cyrillic > latin {
-        return if lang_is(target, "ru") { None } else { Some("ru") };
+        return if lang_is(target, "ru") {
+            None
+        } else {
+            Some("ru")
+        };
     }
     if cjk > 0 {
-        return if lang_is(target, "zh") { None } else { Some("zh") };
+        return if lang_is(target, "zh") {
+            None
+        } else {
+            Some("zh")
+        };
     }
     if latin >= 3 {
-        return if lang_is(target, "en") { None } else { Some("en") };
+        return if lang_is(target, "en") {
+            None
+        } else {
+            Some("en")
+        };
     }
     None
 }
@@ -2893,7 +2913,6 @@ pub fn translate_source_for_target(text: &str, target: &str) -> Option<&'static 
 pub fn translate_request_key(thread_id: &str, msg_id: &str) -> String {
     format!("{thread_id}\u{1f}{msg_id}")
 }
-
 
 /// Lỗi dịch đã phân loại để GUI toast thân thiện.
 #[derive(Debug, PartialEq)]
@@ -2942,9 +2961,13 @@ pub fn parse_mymemory_response(resp: &Value, sent: &str) -> Result<String, Trans
             .unwrap_or("")
             .trim();
         if detail.is_empty() {
-            return Err(TranslateError::Rejected("Dịch thất bại (mã lỗi không rõ)".into()));
+            return Err(TranslateError::Rejected(
+                "Dịch thất bại (mã lỗi không rõ)".into(),
+            ));
         }
-        return Err(TranslateError::Rejected(format!("Dịch thất bại ({detail})")));
+        return Err(TranslateError::Rejected(format!(
+            "Dịch thất bại ({detail})"
+        )));
     }
     let out = resp
         .get("responseData")
@@ -2987,7 +3010,10 @@ pub async fn translate_via_mymemory(
     let short: String = text.chars().take(450).collect();
     let http_resp = http
         .get("https://api.mymemory.translated.net/get")
-        .query(&[("q", short.as_str()), ("langpair", &format!("{source}|{target}"))])
+        .query(&[
+            ("q", short.as_str()),
+            ("langpair", &format!("{source}|{target}")),
+        ])
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
@@ -3005,7 +3031,6 @@ pub async fn translate_via_mymemory(
         Ok(out)
     }
 }
-
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LinkMetadata {
@@ -3269,7 +3294,7 @@ pub async fn send_link_message(
 }
 
 /// Preserve the request client ID for reconciliation with a later server echo.
-pub(crate) async fn send_link_message_with_client_id(
+pub async fn send_link_message_with_client_id(
     s: &Session,
     to_id: &str,
     text: &str,
@@ -3377,11 +3402,22 @@ pub(crate) async fn send_link_message_with_client_id(
 
     match res {
         Ok(v) => Ok(v),
-        Err(_) => {
-            if is_group {
-                send_group_message_with_client_id(s, to_id, msg_str, now).await
+        Err(err) => {
+            crate::logger::log_error(
+                "chat::send_link_message",
+                &format!("sendlink failed ({err:?}), falling back to text message with URL"),
+            );
+            let fallback_text = if msg_str.contains(meta.url.as_str()) {
+                msg_str.to_string()
+            } else if msg_str.is_empty() {
+                meta.url.clone()
             } else {
-                send_message_with_client_id(s, to_id, msg_str, now).await
+                format!("{msg_str}\n{}", meta.url)
+            };
+            if is_group {
+                send_group_message_with_client_id(s, to_id, &fallback_text, now).await
+            } else {
+                send_message_with_client_id(s, to_id, &fallback_text, now).await
             }
         }
     }
@@ -4293,8 +4329,81 @@ pub async fn forward_message(
         .await
 }
 
+/// Filter thread candidates for forwarding by search keyword matching name or ID case-insensitively.
+pub fn filter_forward_candidates<'a>(threads: &'a [Thread], query: &str) -> Vec<&'a Thread> {
+    let q = query.trim().to_lowercase();
+    threads
+        .iter()
+        .filter(|t| {
+            if q.is_empty() {
+                true
+            } else {
+                t.name.to_lowercase().contains(&q) || t.id.to_lowercase().contains(&q)
+            }
+        })
+        .collect()
+}
+
+/// Resolve the forwarded payload text for a message.
+///
+/// For stickers, sticker ID takes precedence in dispatch.
+/// For media messages (image/photo, file, web content/links) where `link_url` is present,
+/// this ensures the media URL is preserved and forwarded rather than the placeholder
+/// label string (e.g. `"[Hình ảnh]"` or `"[Photo]"` or `"[Tập tin]"`).
+pub fn forward_content_for_message(msg: &ChatMessage) -> String {
+    let raw_text = if let Some(stripped) = msg.text.strip_prefix("[Đã thu hồi] ") {
+        stripped
+    } else {
+        &msg.text
+    };
+
+    if let Some(url) = msg.link_url.as_ref().filter(|u| !u.trim().is_empty()) {
+        let trimmed = raw_text.trim();
+        if trimmed.is_empty()
+            || trimmed == "[Hình ảnh]"
+            || trimmed == "[Photo]"
+            || trimmed == "[Tập tin]"
+            || trimmed == "[File]"
+            || trimmed == "[Nhãn dán]"
+            || trimmed == "[Chia sẻ]"
+            || trimmed == "[Video]"
+            || trimmed == "[Tin nhắn]"
+        {
+            url.clone()
+        } else if let Some(caption) = trimmed
+            .strip_prefix("[Hình ảnh] ")
+            .or_else(|| trimmed.strip_prefix("[Photo] "))
+        {
+            if caption.trim().is_empty() {
+                url.clone()
+            } else if caption.contains(url) {
+                caption.trim().to_string()
+            } else {
+                format!("{}\n{}", caption.trim(), url)
+            }
+        } else if let Some(caption) = trimmed
+            .strip_prefix("[Tập tin] ")
+            .or_else(|| trimmed.strip_prefix("[File] "))
+        {
+            if caption.trim().is_empty() {
+                url.clone()
+            } else if caption.contains(url) {
+                caption.trim().to_string()
+            } else {
+                format!("{}\n{}", caption.trim(), url)
+            }
+        } else if !trimmed.contains(url) {
+            format!("{trimmed}\n{url}")
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        raw_text.to_string()
+    }
+}
+
 /// Preserve the request client ID for reconciliation with a later server echo.
-pub(crate) async fn forward_message_with_client_id(
+pub async fn forward_message_with_client_id(
     s: &Session,
     target_id: &str,
     target_is_group: bool,
@@ -4323,6 +4432,36 @@ pub(crate) async fn forward_message_with_client_id(
     } else {
         &msg.text
     };
+
+    // Prioritize rich-link card forwarding before photo CDN downloads
+    let is_rich_link = (msg.kind == crate::message_model::MessageKind::Link
+        || msg.kind == crate::message_model::MessageKind::WebContent)
+        && msg.link_url.is_some()
+        && (msg.link_title.is_some() || msg.link_thumb.is_some() || msg.link_desc.is_some());
+
+    if is_rich_link {
+        let url = msg.link_url.as_deref().unwrap_or_default();
+        let meta = LinkMetadata {
+            url: url.to_string(),
+            title: msg.link_title.clone().unwrap_or_default(),
+            desc: msg.link_desc.clone().unwrap_or_default(),
+            thumb: msg.link_thumb.clone().unwrap_or_default(),
+            src: msg.link_src.clone().unwrap_or_default(),
+        };
+        let text = if clean_text.trim().is_empty()
+            || clean_text == "[Chia sẻ]"
+            || clean_text == "[Tin nhắn]"
+        {
+            url
+        } else {
+            clean_text.trim()
+        };
+        if let Ok(resp) =
+            send_link_message_with_client_id(s, target_id, text, &meta, target_is_group, now).await
+        {
+            return Ok(resp);
+        }
+    }
 
     // Forward photo if message contains a photo CDN URL
     if let Some(photo_url) = msg
@@ -4353,10 +4492,11 @@ pub(crate) async fn forward_message_with_client_id(
         }
     }
 
+    let forward_text = forward_content_for_message(msg);
     if target_is_group {
-        send_group_message_with_client_id(s, target_id, clean_text, now).await
+        send_group_message_with_client_id(s, target_id, &forward_text, now).await
     } else {
-        send_message_with_client_id(s, target_id, clean_text, now).await
+        send_message_with_client_id(s, target_id, &forward_text, now).await
     }
 }
 
@@ -5932,8 +6072,8 @@ pub fn is_zalo_photo_cdn_url(url: &str) -> bool {
     }
     // Direct image file extensions anywhere (kể cả jxl/heic/avif Zalo dùng, #118)
     if [
-        ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".ico", ".jfif", ".tiff",
-        ".jxl", ".heic", ".heif", ".avif", ".svg",
+        ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".ico", ".jfif", ".tiff", ".jxl",
+        ".heic", ".heif", ".avif", ".svg",
     ]
     .iter()
     .any(|ext| path_part.ends_with(ext))
@@ -6093,9 +6233,7 @@ fn extract_link_info(
                 .iter()
                 .filter_map(|k| o.get(*k).and_then(Value::as_str))
                 .map(str::trim)
-                .find(|h| {
-                    !h.is_empty() && (h.starts_with("http://") || h.starts_with("https://"))
-                })
+                .find(|h| !h.is_empty() && (h.starts_with("http://") || h.starts_with("https://")))
                 .map(str::to_string);
             let Some(url) = href else {
                 return (None, None, None, None, None);
@@ -6227,10 +6365,22 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     if is_voice_msg {
         link_src = Some("Thoại Zalo".to_string());
     }
-    let is_photo_msg = matches!(msg_type.as_str(), "chat.photo" | "photo" | "2")
-        || link_src.as_deref() == Some("Hình ảnh Zalo")
-        || link_url.as_deref().is_some_and(is_zalo_photo_cdn_url)
-        || link_thumb.as_deref().is_some_and(is_zalo_photo_cdn_url);
+    let is_link_card_msg = matches!(
+        msg_type.as_str(),
+        "chat.link" | "link" | "6" | "share.link" | "chat.recommended"
+    ) || (link_url.is_some()
+        && (link_title.is_some() || link_desc.is_some())
+        && link_src.as_deref() != Some("Hình ảnh Zalo")
+        && link_src.as_deref() != Some("Tập tin Zalo")
+        && !matches!(
+            msg_type.as_str(),
+            "chat.photo" | "photo" | "2" | "chat.file" | "file" | "19" | "share.file"
+        ));
+
+    let is_photo_msg = !is_link_card_msg
+        && (matches!(msg_type.as_str(), "chat.photo" | "photo" | "2")
+            || link_src.as_deref() == Some("Hình ảnh Zalo")
+            || link_url.as_deref().is_some_and(is_zalo_photo_cdn_url));
     let is_file_msg = !is_voice_msg
         && (matches!(
             msg_type.as_str(),
@@ -6546,7 +6696,26 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         }
     }
 
+    let msg_kind = if sticker_meta.is_some() {
+        crate::message_model::MessageKind::Sticker
+    } else if is_voice_msg {
+        crate::message_model::MessageKind::Voice
+    } else if is_file_msg {
+        crate::message_model::MessageKind::File
+    } else if is_link_card_msg {
+        crate::message_model::MessageKind::Link
+    } else if is_photo_msg {
+        crate::message_model::MessageKind::Photo
+    } else if link_url.is_some()
+        && (link_title.is_some() || link_thumb.is_some() || link_desc.is_some())
+    {
+        crate::message_model::MessageKind::Link
+    } else {
+        crate::message_model::MessageKind::Text
+    };
+
     Some(ChatMessage {
+        kind: msg_kind,
         id: msg_id,
         client_message_id: parsed_client_id,
         wire_ref,
@@ -7638,9 +7807,7 @@ pub fn parse_board_topics(resp: &Value) -> Vec<BoardTopic> {
         let mut msg_ids: Vec<String> = Vec::new();
         if let Some(params) = item.get("params") {
             let params = match params {
-                Value::String(txt) => {
-                    serde_json::from_str::<Value>(txt).unwrap_or(Value::Null)
-                }
+                Value::String(txt) => serde_json::from_str::<Value>(txt).unwrap_or(Value::Null),
                 other => other.clone(),
             };
             collect_msg_ids(&params, &mut msg_ids);
@@ -7790,8 +7957,6 @@ pub async fn list_board_topics(
 
     anyhow::bail!("{}", errors.join(" · "))
 }
-
-
 
 /// Pin or unpin a conversation (`updatePinnedConversationsV2` @ `compact-app-pc.js:14354215`, cmd `12122`).
 pub async fn update_pinned_conversation(
@@ -8444,7 +8609,10 @@ pub async fn wake_phone_sync_v2(s: &Session) -> Result<String> {
              Cài Zalo PC hoặc đặt CTDOZLITE_ZPROTO_WASM trỏ tới file WASM"
         )
     })?;
-    crate::logger::log_sync(&format!("V2 session mở: sync={}", &sync_id.chars().take(8).collect::<String>()));
+    crate::logger::log_sync(&format!(
+        "V2 session mở: sync={}",
+        &sync_id.chars().take(8).collect::<String>()
+    ));
     // KHÔNG gửi 592 ở đây: Zalo chỉ dùng 592 wake-up cho session ĐÃ tồn tại
     // (shared-worker.js `session.wakeup()`). Lệnh mở màn là 590.
     Ok(sync_id)
@@ -8513,12 +8681,18 @@ pub fn send_sync_v2_request_with_queries(
         "ver": 1,
         "ussidx": 0
     });
-    crate::logger::log_sync(&format!("590 payload: {}", sync_data.to_string().chars().take(600).collect::<String>()));
+    crate::logger::log_sync(&format!(
+        "590 payload: {}",
+        sync_data.to_string().chars().take(600).collect::<String>()
+    ));
     let sent_ws = crate::socket::send_sync_message_ws_request(&sync_data);
-    crate::logger::log_sync(&format!("590 gửi sau confirm: sync={} ws={}", &sync_id.chars().take(8).collect::<String>(), sent_ws));
+    crate::logger::log_sync(&format!(
+        "590 gửi sau confirm: sync={} ws={}",
+        &sync_id.chars().take(8).collect::<String>(),
+        sent_ws
+    ));
     Ok(sent_ws)
 }
-
 
 /// Cancel an active mobile message sync request (`cancelTransferMessage` @ `app.asar:14372356`, cmd `12700`, #68).
 pub async fn cancel_phone_sync(s: &Session, public_key: &str) -> Result<Value> {
@@ -10325,7 +10499,10 @@ mod send_identity_tests {
 
     #[test]
     fn guess_translate_source_detects_script() {
-        assert_eq!(guess_translate_source("Hello world, how are you"), Some("en"));
+        assert_eq!(
+            guess_translate_source("Hello world, how are you"),
+            Some("en")
+        );
         assert_eq!(guess_translate_source("你好世界"), Some("zh"));
         assert_eq!(guess_translate_source("こんにちは"), Some("ja"));
         assert_eq!(guess_translate_source("안녕하세요"), Some("ko"));
@@ -10340,7 +10517,10 @@ mod send_identity_tests {
         assert_eq!(guess_translate_source("12345"), None);
         assert_eq!(guess_translate_source(""), None);
         // Phân biệt "đã đúng target" vs "quá ngắn": tin Việt + target en vẫn dịch.
-        assert_eq!(translate_source_for_target("Xin chào bạn", "en"), Some("vi"));
+        assert_eq!(
+            translate_source_for_target("Xin chào bạn", "en"),
+            Some("vi")
+        );
         assert_eq!(translate_source_for_target("Xin chào bạn", "vi"), None);
         assert_eq!(translate_source_for_target("Hello world", "en"), None);
         assert_eq!(translate_source_for_target("Hello world", "vi"), Some("en"));
@@ -10351,20 +10531,39 @@ mod send_identity_tests {
         use serde_json::json;
         let ok = json!({"responseStatus": 200, "responseData": {"translatedText": "Xin chào"}});
         assert_eq!(parse_mymemory_response(&ok, "Hello").unwrap(), "Xin chào");
-        let ok_str = json!({"responseStatus": "200", "responseData": {"translatedText": "Xin chào"}});
-        assert_eq!(parse_mymemory_response(&ok_str, "Hello").unwrap(), "Xin chào");
+        let ok_str =
+            json!({"responseStatus": "200", "responseData": {"translatedText": "Xin chào"}});
+        assert_eq!(
+            parse_mymemory_response(&ok_str, "Hello").unwrap(),
+            "Xin chào"
+        );
         let quota = json!({"responseStatus": 200, "quotaFinished": true, "responseData": {"translatedText": "x"}});
-        assert_eq!(parse_mymemory_response(&quota, "Hello").unwrap_err(), TranslateError::Quota);
+        assert_eq!(
+            parse_mymemory_response(&quota, "Hello").unwrap_err(),
+            TranslateError::Quota
+        );
         for status in [json!(429), json!("429")] {
             let r = json!({"responseStatus": status, "responseData": {"translatedText": "x"}});
-            assert_eq!(parse_mymemory_response(&r, "Hello").unwrap_err(), TranslateError::Quota);
+            assert_eq!(
+                parse_mymemory_response(&r, "Hello").unwrap_err(),
+                TranslateError::Quota
+            );
         }
         let diag = json!({"responseStatus": 200, "responseData": {"translatedText": "PLEASE SELECT TWO DISTINCT LANGUAGES"}});
-        assert_eq!(parse_mymemory_response(&diag, "Hello").unwrap_err(), TranslateError::Empty);
+        assert_eq!(
+            parse_mymemory_response(&diag, "Hello").unwrap_err(),
+            TranslateError::Empty
+        );
         let echo = json!({"responseStatus": 200, "responseData": {"translatedText": "Hello"}});
-        assert_eq!(parse_mymemory_response(&echo, "Hello").unwrap_err(), TranslateError::Empty);
+        assert_eq!(
+            parse_mymemory_response(&echo, "Hello").unwrap_err(),
+            TranslateError::Empty
+        );
         let bad = json!({"responseStatus": 403, "responseDetails": "INVALID EMAIL", "responseData": {"translatedText": "INVALID EMAIL"}});
-        assert!(matches!(parse_mymemory_response(&bad, "Hello").unwrap_err(), TranslateError::Rejected(_)));
+        assert!(matches!(
+            parse_mymemory_response(&bad, "Hello").unwrap_err(),
+            TranslateError::Rejected(_)
+        ));
     }
 
     #[test]
@@ -10376,13 +10575,19 @@ mod send_identity_tests {
             "data": {"fileUrl": "https://fdl.zaloapp.com/voice.m4a", "msgId": "m-voice-1"}
         });
         let cm = parse_voice_send_response(&ok, 77, 65).unwrap();
-        assert_eq!(cm.link_url.as_deref(), Some("https://fdl.zaloapp.com/voice.m4a"));
+        assert_eq!(
+            cm.link_url.as_deref(),
+            Some("https://fdl.zaloapp.com/voice.m4a")
+        );
         assert_eq!(cm.id, "m-voice-1");
         assert_eq!(cm.link_title.as_deref(), Some("Tin nhắn thoại (01:05)"));
         // error_code tài liệu hoá → Err.
         for code in [-101, -111, -112, 201, 202] {
             let err = json!({"error_code": code, "error_message": "fail", "data": {}});
-            assert!(parse_voice_send_response(&err, 77, 65).is_err(), "code {code}");
+            assert!(
+                parse_voice_send_response(&err, 77, 65).is_err(),
+                "code {code}"
+            );
         }
     }
 
@@ -10478,7 +10683,10 @@ mod send_identity_tests {
         let cm2 = parse_chat_message(&msg_obj).unwrap();
         assert_eq!(cm2.text, "Ghi chú có cấu trúc");
         assert!(cm2.is_outgoing);
-        assert_eq!(cm2.delivery, crate::message_model::DeliveryState::ServerAccepted);
+        assert_eq!(
+            cm2.delivery,
+            crate::message_model::DeliveryState::ServerAccepted
+        );
     }
 
     #[test]
@@ -10497,7 +10705,10 @@ mod send_identity_tests {
             "ts": "1700000010000"
         });
         let cm_orig = parse_chat_message(&orig).unwrap();
-        assert_eq!(cm_orig.delivery, crate::message_model::DeliveryState::ServerAccepted);
+        assert_eq!(
+            cm_orig.delivery,
+            crate::message_model::DeliveryState::ServerAccepted
+        );
 
         // Recall event where globalMsgId is "0" on outer envelope and real target ID is in content.
         let undo1 = json!({
@@ -10553,5 +10764,28 @@ mod send_identity_tests {
         );
         assert_eq!(threads[0].messages[0].text, "[Đã thu hồi] Tin nhắn gốc");
         assert_eq!(threads[0].messages[0].ts, 1700000010000);
+    }
+
+    #[test]
+    fn test_parse_chat_message_recommended_card_with_image_href_classified_as_link() {
+        let msg = json!({
+            "msgId": "rec-msg-1",
+            "cliMsgId": "cli-rec-1",
+            "msgType": "chat.recommended",
+            "content": {
+                "href": "https://example.com/banner.jpg",
+                "title": "Khám phá công nghệ mới",
+                "desc": "Bài viết chi tiết về công nghệ AI"
+            },
+            "uidFrom": "user123",
+            "ts": "1700000030000"
+        });
+        let cm = parse_chat_message(&msg).expect("Failed to parse recommended message");
+        assert_eq!(cm.kind, crate::message_model::MessageKind::Link);
+        assert_eq!(
+            cm.link_url.as_deref(),
+            Some("https://example.com/banner.jpg")
+        );
+        assert_eq!(cm.link_title.as_deref(), Some("Khám phá công nghệ mới"));
     }
 }
