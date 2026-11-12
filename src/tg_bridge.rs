@@ -163,6 +163,109 @@ impl TgClient {
             .ok_or_else(|| anyhow::anyhow!("createForumTopic failed: {}", v.to_string().chars().take(200).collect::<String>()))
     }
 
+}
+
+
+/// Outbound Telegram job — queued to preserve order + survive rate-limits.
+/// Album grouping (PR2) batches adjacent photo jobs before flushing.
+#[derive(Debug, Clone)]
+pub enum TgJob {
+    Text {
+        chat: String,
+        thread: Option<i64>,
+        text: String,
+        reply_to: Option<i64>,
+    },
+    File {
+        chat: String,
+        thread: Option<i64>,
+        path: String,
+        caption: String,
+        is_photo: bool,
+    },
+}
+
+impl TgJob {
+    fn key(&self) -> String {
+        match self {
+            TgJob::Text { chat, thread, .. } => format!("{chat}:{}", thread.unwrap_or(0)),
+            TgJob::File { chat, thread, .. } => format!("{chat}:{}", thread.unwrap_or(0)),
+        }
+    }
+}
+
+/// Serial sender: 1 worker, FIFO per chat+thread, retry with backoff on 429/5xx.
+/// Returned TG msg ids in order (0 = failed after retries, logged not lost silently).
+pub async fn flush_queue(tg: &TgClient, jobs: Vec<TgJob>, dry_run: bool) -> Vec<i64> {
+    use std::collections::HashMap;
+    // Group preserving first-seen order.
+    let mut order: Vec<String> = Vec::new();
+    let mut by_key: HashMap<String, Vec<TgJob>> = HashMap::new();
+    for j in jobs {
+        let k = j.key();
+        if !by_key.contains_key(&k) {
+            order.push(k.clone());
+        }
+        by_key.entry(k).or_default().push(j);
+    }
+    let mut out = Vec::new();
+    for k in order {
+        let list = by_key.remove(&k).unwrap_or_default();
+        for job in list {
+            let r = send_job_with_retry(tg, &job, dry_run).await;
+            match r {
+                Ok(mid) => out.push(mid),
+                Err(e) => {
+                    eprintln!("[bridge] tg send FAIL {k}: {e}");
+                    out.push(0);
+                }
+            }
+        }
+    }
+    out
+}
+
+async fn send_job_with_retry(tg: &TgClient, job: &TgJob, dry_run: bool) -> Result<i64> {
+    if dry_run {
+        match job {
+            TgJob::Text { chat, thread, text, .. } => {
+                println!("[bridge dry] TG.send chat={chat} topic={thread:?} :: {}", text.chars().take(80).collect::<String>());
+            }
+            TgJob::File { chat, thread, path, caption, .. } => {
+                println!("[bridge dry] TG.sendFile chat={chat} topic={thread:?} {path} :: {caption}");
+            }
+        }
+        return Ok(-1);
+    }
+    let mut wait_ms = 1000u64;
+    for attempt in 0..5 {
+        let r = match job {
+            TgJob::Text { chat, thread, text, reply_to } => {
+                tg.send_text(chat, *thread, text, *reply_to).await
+            }
+            TgJob::File { chat, thread, path, caption, is_photo } => {
+                tg.send_file(chat, *thread, std::path::Path::new(path), caption, *is_photo)
+                    .await
+                    .map(|(mid, _)| mid)
+            }
+        };
+        match r {
+            Ok(mid) => return Ok(mid),
+            Err(e) => {
+                let s = e.to_string();
+                let retryable = s.contains("429") || s.contains("500") || s.contains("502") || s.contains("503") || s.contains("timeout");
+                if !retryable || attempt == 4 {
+                    return Err(e);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                wait_ms = (wait_ms * 2).min(16_000);
+            }
+        }
+    }
+    unreachable!()
+}
+
+impl TgClient {
     /// True if chat is a forum supergroup (topics available).
     pub async fn is_forum(&self, chat: &str) -> bool {
         let resp = match self.client.get(self.url("getChat")).query(&[("chat_id", chat)]).send().await {
@@ -466,6 +569,8 @@ async fn run_bridge_loop_inner(
                 .flat_map(|t| t.messages.iter().map(|m| m.id.clone()))
                 .collect();
             threads = th;
+            // Collect one batch, then flush once to preserve order (tgQueue).
+            let mut batch: Vec<(String, String, Vec<TgJob>)> = Vec::new();
             for t in threads.clone() {
                 let Some(target) = rev.get(&t.id) else { continue };
                 for m in t.messages.iter().filter(|m| {
@@ -477,9 +582,35 @@ async fn run_bridge_loop_inner(
                         continue;
                     }
                     if let Ok(mut store) = crate::store::MessageStore::open(&db_path) {
-                        match forward_zalo_to_tg(&tg, &mut store, &data_dir, quota_bytes, target, &t, m, media).await {
-                            Ok(mid) => println!("[bridge] Z->TG {} mid={mid}", m.id),
-                            Err(e) => eprintln!("[bridge] Z->TG {} FAIL: {e}", m.id),
+                        match forward_zalo_to_tg(&mut store, &data_dir, quota_bytes, target, &t, m, media).await {
+                            Ok(jobs) => {
+                                if !jobs.is_empty() {
+                                    batch.push((t.id.clone(), m.id.clone(), jobs));
+                                }
+                            }
+                            Err(e) => eprintln!("[bridge] Z->TG build {} FAIL: {e}", m.id),
+                        }
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let all: Vec<TgJob> = batch.iter().flat_map(|(_, _, js)| js.clone()).collect();
+                if dry_run {
+                    println!("[bridge dry] flush {} jobs (skipped)", all.len());
+                } else {
+                    let mids = flush_queue(&tg, all, false).await;
+                    // Record echo-guard mappings in send order.
+                    if let Ok(mut store) = crate::store::MessageStore::open(&db_path) {
+                        let mut k = 0usize;
+                        for (tid, mid0, jobs) in &batch {
+                            let (chat, _topic) = split_tg_target(rev.get(tid).map(String::as_str).unwrap_or(""));
+                            for _ in jobs {
+                                if k < mids.len() && mids[k] > 0 {
+                                    let _ = store.bridge_sent_put(&format!("{chat}:{}", mids[k]), mid0);
+                                    println!("[bridge] Z->TG {mid0} mid={}", mids[k]);
+                                }
+                                k += 1;
+                            }
                         }
                     }
                 }
@@ -594,8 +725,9 @@ async fn run_bridge_loop_inner(
 /// Forward one Zalo message to Telegram. Downloads attachments into the
 /// buffer dir (quota-checked), uploads, records mapping. Returns TG msg id.
 #[allow(clippy::too_many_arguments)]
+/// Build outbound job(s) for one Zalo message (no network send here —
+/// caller batches jobs and flushes once to preserve order + survive 429).
 pub async fn forward_zalo_to_tg(
-    tg: &TgClient,
     store: &mut crate::store::MessageStore,
     data_dir: &std::path::Path,
     quota_bytes: u64,
@@ -603,7 +735,7 @@ pub async fn forward_zalo_to_tg(
     thread: &crate::chat::Thread,
     msg: &crate::chat::ChatMessage,
     media: bool,
-) -> Result<i64> {
+) -> Result<Vec<TgJob>> {
     let (chat, topic) = split_tg_target(tg_target);
     let caption = format!("{} · {}", msg.sender, msg.time);
     // Attachment? PR1 is text-only: describe it, skip download.
@@ -616,22 +748,13 @@ pub async fn forward_zalo_to_tg(
         // Reply-chain: if this Zalo msg quotes another, map to its TG msg.
         // reply_to_* fields carry original sender/text; resolve via recent mappings is
         // best-effort here (full chain in PR3). Pass None for now.
-        let mid = tg.send_text(&chat, topic, &format!("{caption}\n{text}"), None).await?;
-        let _ = store.bridge_sent_put(&format!("{chat}:{mid}"), &msg.id);
-        let f = BridgeFile {
-            msg_id: format!("tgzalo-{}", msg.id),
-            thread_id: thread.id.clone(),
-            path: String::new(),
-            tg_file_id: String::new(),
-            zalo_url: String::new(),
-            bytes: 0,
-            offset: 0,
-            done: true,
-            last_access: crate::login::unix_now(),
-        };
-        store.bridge_file_put(&f)?;
-        let _ = mid;
-        return Ok(mid);
+        // echo-guard + reply-chain mapping filled in after flush (mid known then).
+        return Ok(vec![TgJob::Text {
+            chat,
+            thread: topic,
+            text: format!("{caption}\n{text}"),
+            reply_to: None,
+        }]);
     }
     let url = url.unwrap();
     // Download Zalo CDN → buffer (quota-checked).
@@ -659,20 +782,26 @@ pub async fn forward_zalo_to_tg(
         .and_then(|e| e.to_str())
         .map(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp"))
         .unwrap_or(false);
-    let label = if msg.text.trim().is_empty() { fname.clone() } else { msg.text.chars().take(120).collect() };
-    let (mid, fid) = tg.send_file(&chat, topic, &dest, &format!("{caption}\n{label}"), is_photo).await?;
+    let label: String = if msg.text.trim().is_empty() { fname.clone() } else { msg.text.chars().take(120).collect() };
+    let caption2 = format!("{caption}\n{label}");
     store.bridge_file_put(&BridgeFile {
         msg_id: format!("tgzalo-{}", msg.id),
         thread_id: thread.id.clone(),
         path: dest.to_string_lossy().to_string(),
-        tg_file_id: fid,
+        tg_file_id: String::new(),
         zalo_url: url,
         bytes: bytes.len() as u64,
         offset: bytes.len() as u64,
         done: true,
         last_access: crate::login::unix_now(),
     })?;
-    Ok(mid)
+    Ok(vec![TgJob::File {
+        chat,
+        thread: topic,
+        path: dest.to_string_lossy().to_string(),
+        caption: caption2,
+        is_photo,
+    }])
 }
 
 #[cfg(test)]
