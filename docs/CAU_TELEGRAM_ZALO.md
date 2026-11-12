@@ -14,7 +14,13 @@ zlite --tg-bridge \
 ```
 
 - `--tg-map`: cặp `tg_chat[/topic]:zalo_thread_id`, phân cách dấu phẩy.
-  Mỗi hội thoại Zalo = 1 forum topic Telegram (học từ `zalo-tg`).
+  Mỗi hội thoại Zalo = 1 forum topic Telegram trong 1 **supergroup**
+(General làm tổng đài, học từ `zalo-tg`).
+
+**Bắt buộc: supergroup + bật Topics** (Group Settings → Topics).
+Bot không tự bật được — `--tg-map` tới group thường sẽ báo lỗi rõ ràng
+thay vì im lặng mất tin. Pair chưa có `/topic` sẽ được auto-tạo topic
+theo tên thread Zalo (rate-limit: tạo dần + retry).
 - `--tg-owner`: chỉ user ID này mới điều khiển được bridge (mặc định 0 = ai cũng được, chỉ dùng test local).
 - `--dry-run`: log 2 chiều, không gửi gì.
 - `--bridge-quota-gb`: quota bộ đệm `data_dir/bridge/` (mặc định 10, min 1).
