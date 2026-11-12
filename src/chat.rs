@@ -4433,35 +4433,7 @@ pub async fn forward_message_with_client_id(
         &msg.text
     };
 
-    // Forward photo if message contains a photo CDN URL
-    if let Some(photo_url) = msg
-        .link_url
-        .as_deref()
-        .filter(|u| is_zalo_photo_cdn_url(u) && is_safe_external_image_url(u))
-    {
-        if let Ok(resp) = s.http.get(photo_url).send().await {
-            if let Ok(bytes) = resp.bytes().await {
-                if !bytes.is_empty() {
-                    let temp_path = std::env::temp_dir().join(format!("zalo_fwd_{now}.jpg"));
-                    if std::fs::write(&temp_path, &bytes).is_ok() {
-                        let caption = if clean_text == "[Hình ảnh]" {
-                            ""
-                        } else {
-                            clean_text
-                        };
-                        let res =
-                            send_attachment(s, target_id, target_is_group, &temp_path, caption)
-                                .await;
-                        let _ = std::fs::remove_file(&temp_path);
-                        if let Ok((resp_v, _)) = res {
-                            return Ok(resp_v);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+    // Prioritize rich-link card forwarding before photo CDN downloads
     let is_rich_link = (msg.kind == crate::message_model::MessageKind::Link
         || msg.kind == crate::message_model::MessageKind::WebContent)
         && msg.link_url.is_some()
@@ -4488,6 +4460,35 @@ pub async fn forward_message_with_client_id(
             send_link_message_with_client_id(s, target_id, text, &meta, target_is_group, now).await
         {
             return Ok(resp);
+        }
+    }
+
+    // Forward photo if message contains a photo CDN URL
+    if let Some(photo_url) = msg
+        .link_url
+        .as_deref()
+        .filter(|u| is_zalo_photo_cdn_url(u) && is_safe_external_image_url(u))
+    {
+        if let Ok(resp) = s.http.get(photo_url).send().await {
+            if let Ok(bytes) = resp.bytes().await {
+                if !bytes.is_empty() {
+                    let temp_path = std::env::temp_dir().join(format!("zalo_fwd_{now}.jpg"));
+                    if std::fs::write(&temp_path, &bytes).is_ok() {
+                        let caption = if clean_text == "[Hình ảnh]" {
+                            ""
+                        } else {
+                            clean_text
+                        };
+                        let res =
+                            send_attachment(s, target_id, target_is_group, &temp_path, caption)
+                                .await;
+                        let _ = std::fs::remove_file(&temp_path);
+                        if let Ok((resp_v, _)) = res {
+                            return Ok(resp_v);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -6364,15 +6365,17 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     if is_voice_msg {
         link_src = Some("Thoại Zalo".to_string());
     }
-    let is_link_card_msg = matches!(msg_type.as_str(), "chat.link" | "link" | "6" | "share.link")
-        || (link_url.is_some()
-            && (link_title.is_some() || link_desc.is_some())
-            && link_src.as_deref() != Some("Hình ảnh Zalo")
-            && link_src.as_deref() != Some("Tập tin Zalo")
-            && !matches!(
-                msg_type.as_str(),
-                "chat.photo" | "photo" | "2" | "chat.file" | "file" | "19" | "share.file"
-            ));
+    let is_link_card_msg = matches!(
+        msg_type.as_str(),
+        "chat.link" | "link" | "6" | "share.link" | "chat.recommended"
+    ) || (link_url.is_some()
+        && (link_title.is_some() || link_desc.is_some())
+        && link_src.as_deref() != Some("Hình ảnh Zalo")
+        && link_src.as_deref() != Some("Tập tin Zalo")
+        && !matches!(
+            msg_type.as_str(),
+            "chat.photo" | "photo" | "2" | "chat.file" | "file" | "19" | "share.file"
+        ));
 
     let is_photo_msg = !is_link_card_msg
         && (matches!(msg_type.as_str(), "chat.photo" | "photo" | "2")
@@ -10761,5 +10764,28 @@ mod send_identity_tests {
         );
         assert_eq!(threads[0].messages[0].text, "[Đã thu hồi] Tin nhắn gốc");
         assert_eq!(threads[0].messages[0].ts, 1700000010000);
+    }
+
+    #[test]
+    fn test_parse_chat_message_recommended_card_with_image_href_classified_as_link() {
+        let msg = json!({
+            "msgId": "rec-msg-1",
+            "cliMsgId": "cli-rec-1",
+            "msgType": "chat.recommended",
+            "content": {
+                "href": "https://example.com/banner.jpg",
+                "title": "Khám phá công nghệ mới",
+                "desc": "Bài viết chi tiết về công nghệ AI"
+            },
+            "uidFrom": "user123",
+            "ts": "1700000030000"
+        });
+        let cm = parse_chat_message(&msg).expect("Failed to parse recommended message");
+        assert_eq!(cm.kind, crate::message_model::MessageKind::Link);
+        assert_eq!(
+            cm.link_url.as_deref(),
+            Some("https://example.com/banner.jpg")
+        );
+        assert_eq!(cm.link_title.as_deref(), Some("Khám phá công nghệ mới"));
     }
 }

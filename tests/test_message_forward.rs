@@ -501,7 +501,7 @@ async fn test_outbound_forward_dispatch_direct_and_group() {
     let msg2 = ChatMessage {
         id: "orig_msg_2".into(),
         text: "[Hình ảnh]".into(),
-        link_url: Some("https://cdn.zalo.me/photos/screenshot.png".into()),
+        link_url: Some("https://photos.example.invalid/screenshot.png".into()),
         kind: MessageKind::Photo,
         ..Default::default()
     };
@@ -523,7 +523,7 @@ async fn test_outbound_forward_dispatch_direct_and_group() {
     let msg4 = ChatMessage {
         id: "orig_msg_4".into(),
         text: "[Tập tin] bao_cao_tai_chinh.xlsx".into(),
-        link_url: Some("https://files.zalo.me/bao_cao_tai_chinh.xlsx".into()),
+        link_url: Some("https://files.example.invalid/bao_cao_tai_chinh.xlsx".into()),
         kind: MessageKind::File,
         ..Default::default()
     };
@@ -573,7 +573,7 @@ async fn test_outbound_forward_dispatch_direct_and_group() {
                 );
                 assert_eq!(
                     json_body.get("message").and_then(|v| v.as_str()),
-                    Some("https://cdn.zalo.me/photos/screenshot.png")
+                    Some("https://photos.example.invalid/screenshot.png")
                 );
                 assert_eq!(
                     json_body.get("clientId").and_then(|v| v.as_u64()),
@@ -595,7 +595,7 @@ async fn test_outbound_forward_dispatch_direct_and_group() {
                 assert_eq!(json_body.get("grid").and_then(|v| v.as_str()), Some("200"));
                 assert_eq!(
                     json_body.get("message").and_then(|v| v.as_str()),
-                    Some("bao_cao_tai_chinh.xlsx\nhttps://files.zalo.me/bao_cao_tai_chinh.xlsx")
+                    Some("bao_cao_tai_chinh.xlsx\nhttps://files.example.invalid/bao_cao_tai_chinh.xlsx")
                 );
                 assert_eq!(
                     json_body.get("clientId").and_then(|v| v.as_u64()),
@@ -684,5 +684,104 @@ fn test_escape_key_dismissal_and_state_reset() {
         state.toast_notice.as_deref(),
         Some("Đã chuyển tiếp tin nhắn tới Nhóm Kỹ Thuật"),
         "Must generate user-visible success toast feedback"
+    );
+}
+
+#[tokio::test]
+async fn test_rich_link_forward_priority_over_photo_cdn() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let host = format!("http://{}", addr);
+
+    let server_handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 8192];
+        let mut read_bytes = 0usize;
+        let mut header_end = None;
+        let mut expected_total = None;
+
+        loop {
+            let n = stream.read(&mut buf[read_bytes..]).unwrap();
+            if n == 0 {
+                break;
+            }
+            read_bytes += n;
+
+            if header_end.is_none() {
+                if let Some(pos) = buf[..read_bytes].windows(4).position(|w| w == b"\r\n\r\n") {
+                    header_end = Some(pos);
+                    let header_str = String::from_utf8_lossy(&buf[..pos]);
+                    let mut clen = 0usize;
+                    for line in header_str.lines() {
+                        if let Some(val) = line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            clen = val.trim().parse::<usize>().unwrap_or(0);
+                            break;
+                        }
+                    }
+                    expected_total = Some(pos + 4 + clen);
+                }
+            }
+
+            if let Some(total) = expected_total {
+                if read_bytes >= total {
+                    break;
+                }
+            }
+        }
+        let req_str = String::from_utf8_lossy(&buf[..read_bytes]);
+        let first_line = req_str.lines().next().unwrap_or_default();
+        let path = first_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
+
+        let response = r#"{"error_code":0,"data":{"msgId":"link_fwd_123"}}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .unwrap();
+
+        path
+    });
+
+    let mut session = Session::new(false, false, false).unwrap();
+    session.login = Some(LoginInfo {
+        uin: "test_user".into(),
+        display_name: "Test User".into(),
+        avatar: "".into(),
+        zpw_enk: "".into(),
+        zpw_sek: "1111222233334444".into(),
+        send2me_id: "".into(),
+    });
+    session.imei = "test-imei".into();
+    session.secret_key = Some(b"1111222233334444".to_vec());
+    session.domains.chat = host.clone();
+    session.domains.group = host.clone();
+
+    let link_msg = ChatMessage {
+        id: "link_msg_1".into(),
+        text: "https://example.com/news".into(),
+        link_url: Some("https://example.com/news".into()),
+        link_title: Some("Tin tức nổi bật".into()),
+        link_desc: Some("Mô tả bài viết".into()),
+        link_thumb: Some("https://example.com/thumb.jpg".into()),
+        kind: MessageKind::Link,
+        ..Default::default()
+    };
+
+    forward_message_with_client_id(&session, "group_888", true, &link_msg, 1700000000001)
+        .await
+        .expect("Link forward failed");
+
+    let path = server_handle.join().expect("Mock server panicked");
+    assert!(
+        path.contains("/api/group/sendlink"),
+        "Expected sendlink endpoint, got: {}",
+        path
     );
 }
