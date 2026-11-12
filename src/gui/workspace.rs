@@ -2804,6 +2804,30 @@ impl ZaloGuiApp {
                                                 .color(pal.text_primary)
                                                 .strong(),
                                         );
+                                        // Privacy toggle: LLM đọc ảnh/file (mặc định TẮT).
+                                        let dbp = crate::store::db_path_for_account(&self.user_uin);
+                                        let mut cur = crate::store::MessageStore::open(&dbp)
+                                            .map(|st| crate::thread_script::privacy_allowed(&st, &ws_id))
+                                            .unwrap_or(false);
+                                        let tog = ui.checkbox(
+                                            &mut cur,
+                                            RichText::new("LLM đọc ảnh/file").size(10.5),
+                                        );
+                                        if tog.changed() {
+                                            if let Ok(mut st) = crate::store::MessageStore::open(&dbp) {
+                                                let _ = st.thread_kv_set(
+                                                    &ws_id,
+                                                    crate::thread_script::PRIVACY_KEY,
+                                                    if cur { "true" } else { "false" },
+                                                );
+                                                let _ = st.push_script_log(
+                                                    &ws_id,
+                                                    "privacy",
+                                                    "info",
+                                                    &format!("GUI set llm_read_attachments={cur}"),
+                                                );
+                                            }
+                                        }
                                         ui.with_layout(
                                             Layout::right_to_left(Align::Center),
                                             |ui| {

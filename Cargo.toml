@@ -7,7 +7,7 @@ description = "Lightweight, high-performance native Zalo PC client written in Ru
 homepage = "https://ctdozlite.ctdo.net/"
 repository = "https://github.com/ctdoteam1110/ctdozlite"
 license = "MIT OR Apache-2.0"
-default-run = "ctdozlite"
+default-run = "zlite"
 
 [dependencies]
 aes = "0.8"
@@ -51,7 +51,7 @@ name = "zalo_rust"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ctdozlite"
+name = "zlite"
 path = "src/main.rs"
 
 [[bin]]
