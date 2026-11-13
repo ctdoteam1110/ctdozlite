@@ -201,6 +201,9 @@ impl ZaloGuiApp {
         let mut close_menu = false;
         let mut do_logout = false;
         let mut do_wipe = false;
+        let mut switch_target: Option<String> = None;
+        let mut add_account = false;
+        let accounts = self.account_menu_accounts.clone();
         let area_resp = egui::Area::new(Id::new("left_rail_profile_popover"))
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(68.0, 44.0))
@@ -244,11 +247,129 @@ impl ZaloGuiApp {
                         ui.add_space(6.0);
                         ui.separator();
                         ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("Tài khoản đã đăng nhập")
+                                .size(10.5)
+                                .color(pal.text_muted),
+                        );
+                        ui.add_space(2.0);
+                        for acc in &accounts {
+                            let is_current = acc.uin == self.user_uin;
+                            let (row, resp) =
+                                ui.allocate_exact_size(Vec2::new(200.0, 38.0), Sense::click());
+                            if is_current {
+                                ui.painter()
+                                    .rect_filled(row, Rounding::same(8.0), pal.bg_selected);
+                            } else if resp.hovered() {
+                                ui.painter()
+                                    .rect_filled(row, Rounding::same(8.0), pal.bg_input);
+                            }
+                            let name = acc.display_name.as_str();
+                            let avatar = acc
+                                .avatar
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty());
+                            paint_user_avatar(
+                                ui.painter(),
+                                Pos2::new(row.left() + 19.0, row.center().y),
+                                13.0,
+                                name,
+                                false,
+                                avatar,
+                                &self.sticker_textures,
+                                &mut self.loading_stickers,
+                            );
+                            ui.painter().text(
+                                Pos2::new(row.left() + 40.0, row.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                truncate_chars(name, 17),
+                                FontId::proportional(12.5),
+                                pal.text_primary,
+                            );
+                            let unread = self.background_unread.get(&acc.uin).copied().unwrap_or(0);
+                            if is_current {
+                                ui.painter().text(
+                                    Pos2::new(row.right() - 10.0, row.center().y),
+                                    egui::Align2::RIGHT_CENTER,
+                                    lucide::CHECK,
+                                    FontId::proportional(13.0),
+                                    pal.accent_online,
+                                );
+                            } else if unread > 0 {
+                                let label = if unread > 99 {
+                                    "99+".to_string()
+                                } else {
+                                    unread.to_string()
+                                };
+                                let badge_w = if label.len() > 2 { 28.0 } else { 20.0 };
+                                let badge = Rect::from_center_size(
+                                    Pos2::new(row.right() - 8.0 - badge_w / 2.0, row.center().y),
+                                    Vec2::new(badge_w, 18.0),
+                                );
+                                ui.painter()
+                                    .rect_filled(badge, Rounding::same(9.0), pal.danger);
+                                ui.painter().text(
+                                    badge.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    label,
+                                    FontId::proportional(10.5),
+                                    Color32::WHITE,
+                                );
+                            }
+                            if !is_current
+                                && resp
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("Chuyển sang tài khoản này")
+                                    .clicked()
+                            {
+                                switch_target = Some(acc.uin.clone());
+                            }
+                        }
+                        {
+                            let (row, resp) =
+                                ui.allocate_exact_size(Vec2::new(200.0, 36.0), Sense::click());
+                            if resp.hovered() {
+                                ui.painter()
+                                    .rect_filled(row, Rounding::same(8.0), pal.bg_input);
+                            }
+                            let icon_center = Pos2::new(row.left() + 19.0, row.center().y);
+                            ui.painter().circle_filled(
+                                icon_center,
+                                13.0,
+                                pal.primary.linear_multiply(0.16),
+                            );
+                            ui.painter().text(
+                                icon_center,
+                                egui::Align2::CENTER_CENTER,
+                                lucide::PLUS,
+                                FontId::proportional(14.0),
+                                pal.primary_hover,
+                            );
+                            ui.painter().text(
+                                Pos2::new(row.left() + 40.0, row.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                "Thêm tài khoản",
+                                FontId::proportional(12.5),
+                                pal.primary_hover,
+                            );
+                            if resp
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .on_hover_text("Đăng nhập thêm tài khoản bằng mã QR hoặc số điện thoại")
+                                .clicked()
+                            {
+                                add_account = true;
+                            }
+                        }
+
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
                         if ui
                             .add_sized(
                                 [200.0, 28.0],
                                 egui::Button::new(
-                                    RichText::new(format!("{}  Quản lý & Đổi tài khoản", lucide::USER))
+                                    RichText::new(format!("{}  Quản lý tài khoản", lucide::USER))
                                         .size(12.2)
                                         .color(pal.text_primary),
                                 )
@@ -483,6 +604,14 @@ impl ZaloGuiApp {
         if do_wipe {
             // Destructive and irreversible, so it asks first.
             self.wipe_confirm_open = true;
+        }
+        if let Some(target_uin) = switch_target {
+            self.switch_to_saved_account(target_uin);
+            close_menu = true;
+        }
+        if add_account {
+            self.begin_add_account();
+            close_menu = true;
         }
         if close_menu {
             self.profile_menu_open = false;
@@ -2004,7 +2133,7 @@ impl ZaloGuiApp {
                                                             ui.add_space(8.0);
                                                             ui.vertical(|ui| {
                                                                 ui.label(RichText::new(&acc.display_name).size(13.2).color(pal.text_primary).strong());
-                                                                ui.label(RichText::new(format!("UIN: {}", acc.uin)).size(10.8).color(pal.text_muted));
+                                                                ui.label(RichText::new(acc.subtitle()).size(10.8).color(pal.text_muted));
                                                             });
                                                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                                                 if acc.is_current {
@@ -3865,30 +3994,7 @@ impl ZaloGuiApp {
         }
         if add_new_account {
             self.settings_modal_open = false;
-            // Flush pending vào DB acc cũ trước khi snapshot (không mất draft).
-            self.flush_group_note_pending();
-            if let Err(e) = crate::account_manager::save_current_account_snapshot(&self.user_uin) {
-                // Snapshot fail: giữ nguyên acc + return marker để user retry (#3522).
-                self.show_toast(format!("⚠️ Không lưu được phiên hiện tại: {e}"));
-                self.pending_add_account_uin = None;
-            } else {
-                // Giữ uin cũ để nút Hủy quay lại được; KHÔNG gửi Logout (xóa file) (#103).
-                if !self.user_uin.is_empty() {
-                    self.pending_add_account_uin = Some(self.user_uin.clone());
-                }
-                self.is_logged_in = false;
-                self.user_name.clear();
-                self.user_uin.clear();
-                self.threads.clear();
-                self.selected_thread_index = 0;
-                self.qr_texture = None;
-                self.login_status_msg.clear();
-                self.qr_status = "Đang xin mã QR mới…".into();
-                self.status_msg = "Đang xin mã QR đăng nhập tài khoản mới…".into();
-                if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::RequestQr);
-                }
-            }
+            self.begin_add_account();
         }
         if theme_switched {
             self.theme_dirty = true;
@@ -7466,11 +7572,7 @@ impl ZaloGuiApp {
                                         Vec2::splat(36.0),
                                         Sense::hover(),
                                     );
-                                    let disp_name = if acc.display_name.trim().is_empty() {
-                                        &acc.uin
-                                    } else {
-                                        &acc.display_name
-                                    };
+                                    let disp_name = &acc.display_name;
                                     let av_opt = acc
                                         .avatar
                                         .as_deref()
@@ -7495,7 +7597,7 @@ impl ZaloGuiApp {
                                                 .strong(),
                                         );
                                         ui.label(
-                                            RichText::new(format!("UID: {}", acc.uin))
+                                            RichText::new(acc.subtitle())
                                                 .size(11.0)
                                                 .color(pal.text_muted),
                                         );

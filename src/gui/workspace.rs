@@ -96,6 +96,9 @@ impl ZaloGuiApp {
                         .clicked()
                     {
                         self.profile_menu_open = !self.profile_menu_open;
+                        if self.profile_menu_open {
+                            self.refresh_account_menu_accounts();
+                        }
                     }
 
                     ui.add_space(18.0);
