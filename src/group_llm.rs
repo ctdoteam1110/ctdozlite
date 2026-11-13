@@ -85,6 +85,10 @@ pub fn build_group_context(
             ));
         }
     }
+    // M1 gate: attachment descriptors enter context only with per-thread consent.
+    // Audit happens at decision points (agent run_cycle, TUI /sum) where the
+    // store handle is &mut — this builder stays read-only by design.
+    let privacy_on = crate::thread_script::privacy_allowed(store, thread_id);
     if let Some(t) = thread {
         for m in &t.messages {
             let ts = crate::clock::normalize_ts_ms(m.ts);
@@ -97,7 +101,21 @@ pub fn build_group_context(
                     continue;
                 }
             }
-            with_ts.push((ts, m.id.clone(), m.sender.clone(), m.text.clone(), m.time.clone()));
+            let mut txt = m.text.clone();
+            if privacy_on {
+                if let Some(u) = m.link_url.as_deref().filter(|u| !u.is_empty()) {
+                    let title = m.link_title.as_deref().unwrap_or("tệp");
+                    let kind = match m.kind {
+                        crate::message_model::MessageKind::Photo => "ảnh",
+                        crate::message_model::MessageKind::Video => "video",
+                        crate::message_model::MessageKind::File => "file",
+                        crate::message_model::MessageKind::Link => "link",
+                        _ => "đính kèm",
+                    };
+                    txt.push_str(&format!("\n[{kind}: {title} {u}]"));
+                }
+            }
+            with_ts.push((ts, m.id.clone(), m.sender.clone(), txt, m.time.clone()));
         }
     }
     with_ts.sort_by_key(|(ts, _, _, _, _)| *ts);
@@ -171,7 +189,7 @@ mod tests {
     use crate::chat::ChatMessage;
     use crate::store::{StoredMessage, StoredThread};
 
-    fn sample_thread() -> Thread {
+    pub(crate) fn tests_sample_thread() -> Thread {
         Thread {
             id: "g1".to_string(),
             name: "Nhóm Kế Toán".to_string(),
@@ -199,6 +217,46 @@ mod tests {
             ],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn attachments_hidden_without_consent() {
+        use crate::message_model::MessageKind;
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let mut thread = tests_sample_thread();
+        thread.messages.push(ChatMessage {
+            id: "m9".into(),
+            sender: "An".into(),
+            text: "xem file này".into(),
+            time: "09:10".into(),
+            ts: 3000,
+            kind: MessageKind::File,
+            link_url: Some("https://evil.example/secret.pdf".into()),
+            link_title: Some("secret.pdf".into()),
+            ..Default::default()
+        });
+        let threads = vec![thread];
+        // default: no consent → URL must NOT leak into context
+        let ctx = build_group_context(&store, &threads, "g1");
+        let all: String = ctx
+            .recent_messages
+            .iter()
+            .map(|m| m.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all.contains("evil.example"), "attachment URL leaked without consent");
+        // with consent → descriptor present
+        store
+            .thread_kv_set("g1", crate::thread_script::PRIVACY_KEY, "true")
+            .unwrap();
+        let ctx2 = build_group_context(&store, &threads, "g1");
+        let all2: String = ctx2
+            .recent_messages
+            .iter()
+            .map(|m| m.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all2.contains("evil.example"), "attachment missing despite consent");
     }
 
     #[test]
@@ -236,7 +294,7 @@ mod tests {
         store.set_group_note("g1", "ghi chú nhóm", 123).unwrap();
         store.add_group_watch("g1", "báo cáo").unwrap();
 
-        let threads = vec![sample_thread()];
+        let threads = vec![tests_sample_thread()];
         let ctx = build_group_context(&store, &threads, "g1");
         assert_eq!(ctx.thread_id, "g1");
         assert_eq!(ctx.thread_name, "Nhóm Kế Toán");

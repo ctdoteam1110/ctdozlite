@@ -3425,6 +3425,64 @@ impl ZaloGuiApp {
                                                         export_autoreply_tpl = true;
                                                     }
                                                 });
+                                            ui.add_space(16.0);
+                                            ui.label(RichText::new("Trợ lý AI (LLM)").color(pal.text_primary).size(13.5).strong());
+                                            ui.add_space(6.0);
+                                            egui::Frame::none()
+                                                .fill(pal.bg_elevated)
+                                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                                .rounding(Rounding::same(8.0))
+                                                .inner_margin(Margin::symmetric(14.0, 12.0))
+                                                .show(ui, |ui| {
+                                                    if let Some((mref, url)) = crate::llm::opencode_model_info() {
+                                                        ui.label(RichText::new(format!("opencode đang dùng: {mref}")).color(pal.text_secondary).size(11.8));
+                                                        ui.label(RichText::new(format!("Endpoint: {url}")).color(pal.text_secondary).size(11.8));
+                                                        ui.add_space(4.0);
+                                                        if ui.button("Đồng bộ model từ opencode").clicked() {
+                                                            let (prov_model, base) = (mref.clone(), url.clone());
+                                                            // model ref "provider/id" → giữ FULL id (kể cả có / lồng nhau).
+                                                            let id = crate::llm::parse_opencode_model(&prov_model)
+                                                                .map(|(_, m)| m)
+                                                                .unwrap_or_default();
+                                                            self.settings.llm_base_url = base;
+                                                            if self.settings.llm_model.trim().is_empty() {
+                                                                self.settings.llm_model = id;
+                                                            }
+                                                            self.settings.save();
+                                                            self.show_toast("Đã đồng bộ endpoint từ opencode");
+                                                        }
+                                                        ui.add_space(8.0);
+                                                    }
+                                                    ui.label(RichText::new("Base URL (OpenAI-compatible)").color(pal.text_primary).size(12.2));
+                                                    ui.add(egui::TextEdit::singleline(&mut self.settings.llm_base_url).hint_text("https://.../v1 — trống = theo opencode.json").desired_width(f32::INFINITY));
+                                                    ui.add_space(4.0);
+                                                    ui.label(RichText::new("API key").color(pal.text_primary).size(12.2));
+                                                    ui.add(egui::TextEdit::singleline(&mut self.settings.llm_api_key).hint_text("sk-... (env CTDOZ_API_KEY ưu tiên hơn)").password(true).desired_width(f32::INFINITY));
+                                                    ui.add_space(4.0);
+                                                    ui.label(RichText::new("Model").color(pal.text_primary).size(12.2));
+                                                    ui.add(egui::TextEdit::singleline(&mut self.settings.llm_model).hint_text("agnes-2.0-flash — trống = theo opencode.json").desired_width(f32::INFINITY));
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal(|ui| {
+                                                        if ui.button("Lưu").clicked() {
+                                                            self.settings.save();
+                                                            self.show_toast("Đã lưu cấu hình LLM");
+                                                        }
+                                                        if ui.button("Kiểm tra kết nối").clicked() {
+                                                            let ep = crate::llm::UnifiedProvider::from_settings(
+                                                                &self.settings.llm_base_url.clone(),
+                                                                &self.settings.llm_api_key.clone(),
+                                                                &self.settings.llm_model.clone(),
+                                                            ).ep;
+                                                            self.llm_test_result = Some(format!("{} · {}", ep.source, ep.model));
+                                                            self.llm_test_pending = true;
+                                                        }
+                                                        if let Some(ref r) = self.llm_test_result {
+                                                            ui.label(RichText::new(format!("→ {r}")).color(pal.text_secondary).size(11.8));
+                                                        }
+                                                    });
+                                                    ui.add_space(4.0);
+                                                    ui.label(RichText::new("Env CTDOZ_BASE_URL / CTDOZ_API_KEY / CTDOZ_MODEL luôn thắng settings.").color(pal.text_muted).size(11.0));
+                                                });
                                         }
                                         SettingsTab::Update => {
                                             let cur_ver = env!("CARGO_PKG_VERSION");

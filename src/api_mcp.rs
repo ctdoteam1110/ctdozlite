@@ -103,6 +103,16 @@ pub async fn handle_mcp_request(
     req: &Value,
     db_path: &str,
 ) -> Option<Value> {
+    handle_mcp_request_bound(session, req, db_path, &None).await
+}
+
+/// Bound variant: `bound = Some(thread_id)` locks thread-scoped tools to one thread.
+pub async fn handle_mcp_request_bound(
+    session: &Arc<Mutex<Session>>,
+    req: &Value,
+    db_path: &str,
+    bound: &BoundThread,
+) -> Option<Value> {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
@@ -266,6 +276,18 @@ pub async fn handle_mcp_request(
                         }
                     },
                     {
+                        "name": "zalo_privacy",
+                        "description": "Xem hoặc bật/tắt quyền LLM đọc ảnh/file của 1 thread (mặc định TẮT)",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "action": { "type": "string", "description": "'status', 'on', hoặc 'off'" },
+                                "thread_id": { "type": "string", "description": "ID hội thoại" }
+                            },
+                            "required": ["action", "thread_id"]
+                        }
+                    },
+                    {
                         "name": "zalo_configure_autoreply",
                         "description": "Xem hoặc thêm quy tắc tự động trả lời tin nhắn theo từ khóa",
                         "inputSchema": {
@@ -285,7 +307,7 @@ pub async fn handle_mcp_request(
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            let (is_err, payload) = execute_tool_call(session, name, &args, db_path).await;
+            let (is_err, payload) = execute_tool_call(session, name, &args, db_path, bound).await;
             Some(json!({
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -309,11 +331,31 @@ pub async fn handle_mcp_request(
     }
 }
 
+/// Bound thread scope for a per-thread agent session (`--mcp --thread <id>`).
+/// `None` = global mode (legacy behaviour, all threads allowed).
+pub type BoundThread = Option<String>;
+
+/// Reject a tool call that targets a thread outside the bound scope.
+fn check_thread_bound(bound: &BoundThread, tool: &str, got: Option<&str>) -> Option<(bool, Value)> {
+    match (bound, got) {
+        (Some(want), Some(got)) if got != want => Some((
+            true,
+            json!({ "error": format!("wrong_thread: tool '{tool}' locked to thread '{want}'") }),
+        )),
+        (Some(want), None) => Some((
+            true,
+            json!({ "error": format!("wrong_thread: tool '{tool}' requires thread '{want}'") }),
+        )),
+        _ => None,
+    }
+}
+
 async fn execute_tool_call(
     session: &Arc<Mutex<Session>>,
     name: &str,
     args: &Value,
     db_path: &str,
+    bound: &BoundThread,
 ) -> (bool, Value) {
     match name {
         "zalo_status" => {
@@ -371,6 +413,9 @@ async fn execute_tool_call(
             (false, json!({ "threads": items }))
         }
         "zalo_get_messages" => {
+            if let Some(reject) = check_thread_bound(bound, "zalo_get_messages", args.get("thread_id").and_then(Value::as_str)) {
+                return reject;
+            }
             let Some(tid) = args.get("thread_id").and_then(Value::as_str) else {
                 return (true, json!({ "error": "Missing required argument: thread_id" }));
             };
@@ -385,6 +430,12 @@ async fn execute_tool_call(
             }
         }
         "zalo_search_messages" => {
+            if bound.is_some() {
+                return (
+                    true,
+                    json!({ "error": "wrong_thread: global search disabled in bound mode (run unbound --mcp)" }),
+                );
+            }
             let Some(q) = args.get("query").and_then(Value::as_str) else {
                 return (true, json!({ "error": "Missing required argument: query" }));
             };
@@ -399,6 +450,9 @@ async fn execute_tool_call(
             }
         }
         "zalo_send_message" => {
+            if let Some(reject) = check_thread_bound(bound, "zalo_send_message", args.get("to_id").and_then(Value::as_str)) {
+                return reject;
+            }
             let Some(to_id) = args.get("to_id").and_then(Value::as_str) else {
                 return (true, json!({ "error": "Missing required argument: to_id" }));
             };
@@ -418,6 +472,9 @@ async fn execute_tool_call(
             }
         }
         "zalo_schedule_message" => {
+            if let Some(reject) = check_thread_bound(bound, "zalo_schedule_message", args.get("to_id").and_then(Value::as_str)) {
+                return reject;
+            }
             let Some(to_id) = args.get("to_id").and_then(Value::as_str) else {
                 return (true, json!({ "error": "Missing required argument: to_id" }));
             };
@@ -453,7 +510,44 @@ async fn execute_tool_call(
                 Err(e) => (true, json!({ "error": e.to_string() })),
             }
         }
+        "zalo_privacy" => {
+            let Some(tid) = args.get("thread_id").and_then(Value::as_str) else {
+                return (true, json!({ "error": "Missing required argument: thread_id" }));
+            };
+            if let Some(reject) = check_thread_bound(bound, "zalo_privacy", Some(tid)) {
+                return reject;
+            }
+            let action = args.get("action").and_then(Value::as_str).unwrap_or("status");
+            match crate::store::MessageStore::open(db_path) {
+                Ok(mut st) => match action {
+                    "on" | "off" => {
+                        let val = if action == "on" { "true" } else { "false" };
+                        match st.thread_kv_set(tid, crate::thread_script::PRIVACY_KEY, val) {
+                            Ok(()) => {
+                                let _ = st.push_script_log(tid, "privacy", "info", &format!("MCP set llm_read_attachments={val}"));
+                                (false, json!({ "thread_id": tid, "llm_read_attachments": action == "on" }))
+                            }
+                            Err(e) => (true, json!({ "error": e.to_string() })),
+                        }
+                    }
+                    _ => {
+                        let on = crate::thread_script::privacy_allowed(&st, tid);
+                        (false, json!({ "thread_id": tid, "llm_read_attachments": on }))
+                    }
+                },
+                Err(e) => (true, json!({ "error": e.to_string() })),
+            }
+        }
         "zalo_configure_autoreply" => {
+            // Bound sessions must not see or touch global autoreply rules:
+            // rules match across ALL threads by keyword, so even `list`
+            // leaks another thread's automation surface.
+            if bound.is_some() {
+                return (
+                    true,
+                    json!({ "error": "wrong_thread: autoreply is global-only (run unbound --mcp)" }),
+                );
+            }
             let action = args
                 .get("action")
                 .and_then(Value::as_str)
@@ -511,9 +605,21 @@ async fn execute_tool_call(
 
 /// Run the MCP JSON-RPC 2.0 server over `stdin`/`stdout` (`ctdozlite --mcp`).
 pub async fn run_mcp_stdio_server(session: Arc<Mutex<Session>>, db_path: &str) -> Result<()> {
+    run_mcp_stdio_server_bound(session, db_path, None).await
+}
+
+/// Bound variant: `--mcp --thread <id>` locks thread-scoped tools to one thread.
+pub async fn run_mcp_stdio_server_bound(
+    session: Arc<Mutex<Session>>,
+    db_path: &str,
+    bound: BoundThread,
+) -> Result<()> {
     use std::io::{BufRead, Write};
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
+    if let Some(ref tid) = bound {
+        eprintln!("🔒 MCP bound to thread: {tid}");
+    }
 
     for line_res in stdin.lock().lines() {
         let line = line_res?;
@@ -522,7 +628,7 @@ pub async fn run_mcp_stdio_server(session: Arc<Mutex<Session>>, db_path: &str) -
             continue;
         }
         let resp = match serde_json::from_str::<Value>(trimmed) {
-            Ok(req) => handle_mcp_request(&session, &req, db_path).await,
+            Ok(req) => handle_mcp_request_bound(&session, &req, db_path, &bound).await,
             Err(e) => Some(json!({
                 "jsonrpc": "2.0",
                 "id": null,
@@ -564,7 +670,7 @@ pub async fn handle_rest_request(
 
     match (method, path) {
         ("GET", "/api/v1/status") | ("GET", "/health") => {
-            let (_, val) = execute_tool_call(session, "zalo_status", &json!({}), db_path).await;
+            let (_, val) = execute_tool_call(session, "zalo_status", &json!({}), db_path, &None).await;
             (200, val)
         }
         ("GET", "/api/v1/threads") => {
@@ -577,6 +683,7 @@ pub async fn handle_rest_request(
                 "zalo_list_threads",
                 &json!({ "limit": limit }),
                 db_path,
+                &None,
             )
             .await;
             (200, val)
@@ -595,6 +702,7 @@ pub async fn handle_rest_request(
                 "zalo_get_messages",
                 &json!({ "thread_id": tid, "limit": limit }),
                 db_path,
+                &None,
             )
             .await;
             (if err { 400 } else { 200 }, val)
@@ -610,6 +718,7 @@ pub async fn handle_rest_request(
                 "zalo_search_messages",
                 &json!({ "query": q, "limit": limit }),
                 db_path,
+                &None,
             )
             .await;
             (if err { 400 } else { 200 }, val)
@@ -617,7 +726,7 @@ pub async fn handle_rest_request(
         ("POST", "/api/v1/messages/send") => {
             let payload: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
             let (err, val) =
-                execute_tool_call(session, "zalo_send_message", &payload, db_path).await;
+                execute_tool_call(session, "zalo_send_message", &payload, db_path, &None).await;
             (if err { 400 } else { 200 }, val)
         }
         ("POST", "/api/v1/messages/schedule") => {
@@ -629,7 +738,7 @@ pub async fn handle_rest_request(
                 }
             }
             let (err, val) =
-                execute_tool_call(session, "zalo_schedule_message", &normalized, db_path).await;
+                execute_tool_call(session, "zalo_schedule_message", &normalized, db_path, &None).await;
             (if err { 400 } else { 200 }, val)
         }
         ("GET", "/api/v1/scheduled") => {
@@ -663,7 +772,7 @@ pub async fn handle_rest_request(
                 }
             } else {
                 let (err, val) =
-                    execute_tool_call(session, "zalo_configure_autoreply", &payload, db_path).await;
+                    execute_tool_call(session, "zalo_configure_autoreply", &payload, db_path, &None).await;
                 (if err { 400 } else { 200 }, val)
             }
         }
@@ -860,6 +969,21 @@ mod tests {
         // r2 has scope `all` and prefix `/ping`
         let hit = match_autoreply_rule(&rules, "/ping server", true).unwrap();
         assert_eq!(hit.id, "r2");
+    }
+
+    #[tokio::test]
+    async fn bound_thread_gate_rejects_foreign_thread() {
+        // check_thread_bound: matching / missing / foreign
+        assert!(check_thread_bound(&Some("t1".into()), "zalo_get_messages", Some("t1")).is_none());
+        assert!(check_thread_bound(&None, "zalo_get_messages", Some("tX")).is_none());
+        let rej = check_thread_bound(&Some("t1".into()), "zalo_send_message", Some("t2"))
+            .expect("foreign thread must be rejected");
+        assert!(rej.0);
+        assert!(rej.1["error"].as_str().unwrap().contains("wrong_thread"));
+        // search/autoreply-mutations rejected wholesale in bound mode even without a tid
+        let rej2 = check_thread_bound(&Some("t1".into()), "zalo_search_messages", None)
+            .expect("missing tid must be rejected");
+        assert!(rej2.1["error"].as_str().unwrap().contains("wrong_thread"));
     }
 
     #[tokio::test]
