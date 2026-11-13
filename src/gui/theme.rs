@@ -542,10 +542,9 @@ fn paint_single_circle_avatar(
         }
         if loading.insert(key.clone()) {
             if let Some(tx) = WORKER_TX.get() {
-                let legacy_cache = std::path::PathBuf::from("stickers_cache")
-                    .join(format!("ava_{hash}.png"));
-                let new_cache = std::path::PathBuf::from("stickers_cache")
-                    .join(format!("avt_{hash}.png"));
+                let cache_dir = crate::account_manager::media_cache_dir();
+                let legacy_cache = cache_dir.join(format!("ava_{hash}.png"));
+                let new_cache = cache_dir.join(format!("avt_{hash}.png"));
                 let fetch_url = if !new_cache.is_file() && legacy_cache.is_file() {
                     format!("local://{}", legacy_cache.display())
                 } else {

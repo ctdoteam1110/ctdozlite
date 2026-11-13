@@ -687,12 +687,12 @@ pub(super) fn finalize_clipboard_rgba_image(
     if width == 0 || height == 0 {
         return None;
     }
-    let _ = std::fs::create_dir_all("stickers_cache");
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = std::path::PathBuf::from(format!("stickers_cache/clipboard_{now_ms}.png"));
+    let path = crate::account_manager::ensure_media_cache_dir()
+        .join(format!("clipboard_{now_ms}.png"));
     rgba.save(&path).ok()?;
 
     let thumb = if width > 240 || height > 240 {
