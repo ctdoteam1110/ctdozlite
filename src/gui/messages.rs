@@ -3022,6 +3022,7 @@ fn render_photo_album_grid(
                     emoji_textures,
                     true,
                     sender_label,
+                    false,
                 ) {
                     action = Some(BubbleAction::AlbumMember {
                         idx: member_idx,
