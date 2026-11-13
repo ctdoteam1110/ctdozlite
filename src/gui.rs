@@ -21,6 +21,7 @@ use crate::logger::{self, FindingLevel, LogEntry, ScanFinding};
 use crate::qr::QrLogin;
 use crate::session::Session;
 
+mod attachments;
 pub(crate) mod messages;
 mod modals;
 mod reactions_dialog;
@@ -127,6 +128,8 @@ pub enum GuiEvent {
         thread_id: String,
         msg: ChatMessage,
     },
+    /// Files resolved by a picker, paste or drop, ready to join the composer queue.
+    AttachmentsPrepared(attachments::PreparedBatch),
     StickerImageReady {
         key: String,
         image: egui::ColorImage,
@@ -863,7 +866,9 @@ pub struct ZaloGuiApp {
     composer_mention_selected: usize,
     dismissed_mention_suggest_for: String,
     composer_focus_pending: bool,
-    pending_clipboard_image: Option<(std::path::PathBuf, u32, u32, TextureHandle)>,
+    /// Composer attachment queue (paste, drop, pickers, screenshots), capped at
+    /// [`attachments::MAX_PENDING_ATTACHMENTS`].
+    pending_attachments: Vec<attachments::PendingAttachment>,
     unread_counts: HashMap<String, usize>,
     reaction_unread_counts: HashMap<String, usize>,
     link_metadata_cache: HashMap<String, crate::chat::LinkMetadata>,
@@ -1213,7 +1218,7 @@ impl ZaloGuiApp {
             composer_mention_selected: 0,
             dismissed_mention_suggest_for: String::new(),
             composer_focus_pending: false,
-            pending_clipboard_image: None,
+            pending_attachments: Vec::new(),
             unread_counts: HashMap::new(),
             reaction_unread_counts: HashMap::new(),
             link_metadata_cache: HashMap::new(),
@@ -2690,17 +2695,11 @@ impl ZaloGuiApp {
                     height,
                     image,
                 } => {
-                    let tex = ctx.load_texture(
-                        format!("clip_preview_{}", crate::login::unix_now()),
-                        image,
-                        TextureOptions::LINEAR,
-                    );
-                    self.pending_clipboard_image = Some((path, width, height, tex));
-                    self.composer_focus_pending = true;
-                    self.show_toast(format!(
-                        "Đã chụp ảnh màn hình ({width}×{height} px) — nhấn Enter để gửi"
-                    ));
+                    self.queue_decoded_image(ctx, path, width, height, image);
                     self.status_msg = format!("Đã chụp ảnh màn hình ({width}×{height} px)");
+                }
+                GuiEvent::AttachmentsPrepared(batch) => {
+                    self.queue_attachments(ctx, batch.items, batch.truncated);
                 }
                 GuiEvent::TypingEventsReceived(evs) => {
                     for ev in evs {
@@ -4434,6 +4433,99 @@ impl ZaloGuiApp {
         let text = msg.into();
         self.status_msg = text.clone();
         self.toast_notice = Some((text, std::time::Instant::now()));
+    }
+
+    /// Append files to the composer queue, skipping duplicates and anything past the cap,
+    /// then toast a summary. `truncated` counts files already dropped upstream.
+    fn queue_attachments(
+        &mut self,
+        ctx: &egui::Context,
+        items: Vec<attachments::PreparedAttachment>,
+        truncated: usize,
+    ) {
+        let mut queued_paths: Vec<std::path::PathBuf> =
+            self.pending_attachments.iter().map(|a| a.path.clone()).collect();
+        let mut rejected = truncated;
+        let mut added = 0usize;
+        for item in items {
+            let (n_added, n_rejected) = attachments::merge_into_queue(
+                &mut queued_paths,
+                vec![item.path.clone()],
+                attachments::MAX_PENDING_ATTACHMENTS,
+            );
+            rejected += n_rejected;
+            if n_added == 0 {
+                continue;
+            }
+            added += 1;
+            let (dims, thumb) = match item.preview {
+                Some((w, h, col)) => {
+                    let tex = ctx.load_texture(
+                        format!("attach_preview_{}", item.path.display()),
+                        col,
+                        TextureOptions::LINEAR,
+                    );
+                    (Some((w, h)), Some(tex))
+                }
+                None => (None, None),
+            };
+            self.pending_attachments.push(attachments::PendingAttachment {
+                path: item.path,
+                dims,
+                thumb,
+            });
+        }
+        if added > 0 {
+            self.composer_focus_pending = true;
+        }
+        let total = self.pending_attachments.len();
+        let msg = match (added, rejected) {
+            (0, 0) => "Không có tập tin mới để đính kèm".to_string(),
+            (a, 0) => format!("Đã thêm {a} tệp ({total} đang chờ) — nhấn Enter để gửi"),
+            (a, r) => format!(
+                "Đã thêm {a} tệp, bỏ qua {r} tệp vì vượt giới hạn {} tệp",
+                attachments::MAX_PENDING_ATTACHMENTS
+            ),
+        };
+        self.show_toast(msg);
+    }
+
+    /// Queue whatever the clipboard holds: copied files first (decoded on the worker),
+    /// otherwise a raw bitmap. Returns `false` when there is nothing attachable.
+    fn paste_clipboard_attachments(&mut self, ctx: &egui::Context) -> bool {
+        let files = attachments::read_clipboard_file_list();
+        if !files.is_empty() {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::PrepareAttachments { paths: files });
+            }
+            return true;
+        }
+        match read_clipboard_image_to_png() {
+            Some((path, w, h, image)) => {
+                self.queue_decoded_image(ctx, path, w, h, image);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Queue an image already decoded on the UI thread (raw clipboard bitmap, screenshot).
+    fn queue_decoded_image(
+        &mut self,
+        ctx: &egui::Context,
+        path: std::path::PathBuf,
+        width: u32,
+        height: u32,
+        image: egui::ColorImage,
+    ) {
+        self.queue_attachments(
+            ctx,
+            vec![attachments::PreparedAttachment {
+                path,
+                preview: Some((width, height, image)),
+            }],
+            0,
+        );
     }
 }
 

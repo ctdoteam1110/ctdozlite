@@ -5893,7 +5893,8 @@ impl ZaloGuiApp {
 
                     // 1d. In-Conversation Message Search Bar (`self.in_chat_search_open`)
                     if self.in_chat_search_open {
-                        if ui.input(|i| i.key_pressed(Key::Escape)) {
+                        // Consume Escape so it does not also clear the attachment queue below.
+                        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
                             self.in_chat_search_open = false;
                             self.in_chat_search_query.clear();
                         }
@@ -6175,10 +6176,10 @@ impl ZaloGuiApp {
                             + (if self.editing_message.is_some() { 52.0 } else { 0.0 })
                             + (if self.voice_recorder.is_some() { 46.0 } else { 0.0 })
                             + (if has_typing_banner { 36.0 } else { 0.0 })
-                            + (if self.pending_clipboard_image.is_some() {
-                                68.0
-                            } else {
+                            + (if self.pending_attachments.is_empty() {
                                 0.0
+                            } else {
+                                92.0
                             })
                             + (if has_sched_banner { 36.0 } else { 0.0 })
                     };
@@ -6403,16 +6404,35 @@ impl ZaloGuiApp {
                                                     m.is_outgoing && !is_system_notice_message(m)
                                                 })
                                                 .map(|(i, _)| i);
+                                            let visible_msgs: Vec<&crate::chat::ChatMessage> = visible_indices
+                                                .iter()
+                                                .map(|&i| &thread.messages[i])
+                                                .collect();
+                                            let album_runs = album_run_lengths(&visible_msgs);
+
                                             let vanish_now_ms =
                                                 crate::login::unix_now().saturating_mul(1000);
                                             for (pos, &idx) in visible_indices.iter().enumerate() {
+                                                // Later photos of an album are drawn inside the first one's grid.
+                                                let run_len = album_runs[pos];
+                                                if run_len == 0 {
+                                                    continue;
+                                                }
+                                                let album: Vec<(usize, &crate::chat::ChatMessage)> = if run_len >= 2 {
+                                                    visible_indices[pos..pos + run_len]
+                                                        .iter()
+                                                        .map(|&i| (i, &thread.messages[i]))
+                                                        .collect()
+                                                } else {
+                                                    Vec::new()
+                                                };
                                                 let msg = &thread.messages[idx];
                                                 let prev_msg = pos
                                                     .checked_sub(1)
                                                     .and_then(|p| visible_indices.get(p))
                                                     .map(|&pi| &thread.messages[pi]);
                                                 let next_msg = visible_indices
-                                                    .get(pos + 1)
+                                                    .get(pos + run_len)
                                                     .map(|&ni| &thread.messages[ni]);
 
                                                 if should_show_time_divider(prev_msg, msg) {
@@ -6436,8 +6456,9 @@ impl ZaloGuiApp {
                                                     let next_same_sender = next_msg
                                                         .map(|nm| same_message_cluster(msg, nm))
                                                         .unwrap_or(false);
-                                                    let is_latest_outgoing =
-                                                        last_outgoing_idx == Some(idx);
+                                                    // An album row is "latest" when any of its photos is.
+                                                    let is_latest_outgoing = last_outgoing_idx
+                                                        .is_some_and(|l| visible_indices[pos..pos + run_len].contains(&l));
 
                                                     let s_id = if is_group {
                                                         crate::chat::sidebar_sender_id(msg).or_else(|| {
@@ -6480,6 +6501,7 @@ impl ZaloGuiApp {
                                                         &mut self.loading_stickers,
                                                         &self.emoji_textures,
                                                         idx,
+                                                        &album,
                                                         thread.vanish.as_ref().and_then(|v| {
                                                             let ts_ms = crate::clock::normalize_ts_ms(msg.ts);
                                                             v.remaining_ms(ts_ms, vanish_now_ms)
@@ -6583,6 +6605,11 @@ impl ZaloGuiApp {
                         self.show_toast("Đang kiểm tra tin nhắn cũ từ máy chủ Zalo…");
                     }
                     if let Some((idx, action)) = pending_action {
+                        // A tile inside an album row targets its own photo.
+                        let (idx, action) = match action {
+                            BubbleAction::AlbumMember { idx, action } => (idx, *action),
+                            other => (idx, other),
+                        };
                         let target = self
                             .threads
                             .get(self.selected_thread_index)
@@ -6590,6 +6617,8 @@ impl ZaloGuiApp {
                             .cloned();
                         if let Some(m) = target {
                             match action {
+                                // Unwrapped above; albums never nest.
+                                BubbleAction::AlbumMember { .. } => {}
                                 BubbleAction::Reply => {
                                     self.replying_to = Some(m);
                                     self.composer_focus_pending = true;
@@ -7147,86 +7176,117 @@ impl ZaloGuiApp {
                             }
                         }
                     }
-                    // 3c. Clipboard Image Preview Banner (`Ctrl+V` / `Shift+Insert` screenshot or image file paste)
-                    if is_clipboard_paste_triggered(ctx) {
-                        if let Some((path, w, h, col_img)) = read_clipboard_image_to_png() {
-                            // Consume any text Paste event on this frame so the composer doesn't paste a file path
-                            ctx.input_mut(|i| {
-                                i.events.retain(|e| !matches!(e, egui::Event::Paste(_)));
-                            });
-                            let tex = ctx.load_texture(
-                                format!("clip_preview_{}", crate::login::unix_now()),
-                                col_img,
-                                TextureOptions::LINEAR,
-                            );
-                            self.pending_clipboard_image = Some((path, w, h, tex));
-                            self.composer_focus_pending = true;
-                            self.show_toast(format!(
-                                "Đã dán ảnh ({w}×{h} px) từ Clipboard — nhấn Enter để gửi"
-                            ));
-                        }
+                    // 3c. Pending attachment strip (`Ctrl+V` / `Shift+Insert`, drag-and-drop, pickers)
+                    if is_clipboard_paste_triggered(ctx) && self.paste_clipboard_attachments(ctx) {
+                        // Swallow the text Paste event so the composer does not also receive a file path.
+                        ctx.input_mut(|i| {
+                            i.events.retain(|e| !matches!(e, egui::Event::Paste(_)));
+                        });
                     }
-                    if self.pending_clipboard_image.is_some() {
-                        let mut clear_clip = false;
-                        if ui.input(|i| i.key_pressed(Key::Escape)) {
-                            clear_clip = true;
-                        }
-                        if let Some((ref path, w, h, ref tex)) = self.pending_clipboard_image {
-                            egui::Frame::none()
-                                .fill(pal.bg_elevated)
-                                .inner_margin(Margin::symmetric(14.0, 6.0))
-                                .stroke(Stroke::new(
-                                    1.0_f32,
-                                    pal.primary.linear_multiply(0.55),
-                                ))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.add(
-                                            egui::Image::new(tex)
-                                                .fit_to_exact_size(Vec2::new(48.0, 48.0))
-                                                .rounding(Rounding::same(6.0)),
-                                        );
-                                        ui.add_space(6.0);
-                                        ui.vertical(|ui| {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{} Ảnh chụp từ bộ nhớ tạm (Ctrl+V)",
-                                                    lucide::IMAGE
-                                                ))
-                                                .size(12.2)
-                                                .color(pal.primary)
-                                                .strong(),
-                                            );
-                                            let fname = path
-                                                .file_name()
-                                                .and_then(|n| n.to_str())
-                                                .unwrap_or("clipboard.png");
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{fname} · {w}×{h} px — Nhập chú thích bên dưới rồi nhấn Enter để gửi"
-                                                ))
-                                                .size(11.3)
-                                                .color(pal.text_secondary),
-                                            );
-                                        });
-                                        ui.with_layout(
-                                            Layout::right_to_left(Align::Center),
-                                            |ui| {
-                                                if ui
-                                                    .small_button(format!("{} Hủy", lucide::X))
-                                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                                    .on_hover_text("Hủy ảnh dán (Esc)")
-                                                    .clicked()
-                                                {
-                                                    clear_clip = true;
-                                                }
-                                            },
-                                        );
+                    if !self.pending_attachments.is_empty() && ui.input(|i| i.key_pressed(Key::Escape)) {
+                        self.pending_attachments.clear();
+                    }
+                    if !self.pending_attachments.is_empty() {
+                        let mut remove_idx: Option<usize> = None;
+                        let mut clear_all = false;
+                        egui::Frame::none()
+                            .fill(pal.bg_elevated)
+                            .inner_margin(Margin::symmetric(14.0, 6.0))
+                            .stroke(Stroke::new(1.0_f32, pal.primary.linear_multiply(0.55)))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} {} / {} tệp đính kèm — nhập chú thích rồi nhấn Enter để gửi",
+                                            lucide::PAPERCLIP,
+                                            self.pending_attachments.len(),
+                                            super::attachments::MAX_PENDING_ATTACHMENTS
+                                        ))
+                                        .size(12.0)
+                                        .color(pal.primary)
+                                        .strong(),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui
+                                            .small_button(format!("{} Hủy tất cả", lucide::X))
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .on_hover_text("Bỏ toàn bộ tệp đang chờ (Esc)")
+                                            .clicked()
+                                        {
+                                            clear_all = true;
+                                        }
                                     });
                                 });
-                        }
-                        if clear_clip {
-                            self.pending_clipboard_image = None;
+                                ui.add_space(4.0);
+                                egui::ScrollArea::horizontal()
+                                    .id_salt("pending_attachments_strip")
+                                    .max_height(56.0)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            for (idx, att) in self.pending_attachments.iter().enumerate() {
+                                                let (tile, tile_resp) = ui.allocate_exact_size(
+                                                    Vec2::new(52.0, 52.0),
+                                                    Sense::click(),
+                                                );
+                                                let fname = att
+                                                    .path
+                                                    .file_name()
+                                                    .map(|n| n.to_string_lossy().into_owned())
+                                                    .unwrap_or_default();
+                                                match &att.thumb {
+                                                    Some(tex) => {
+                                                        egui::Image::new(tex)
+                                                            .fit_to_exact_size(tile.size())
+                                                            .rounding(Rounding::same(6.0))
+                                                            .paint_at(ui, tile);
+                                                    }
+                                                    None => {
+                                                        ui.painter().rect_filled(tile, Rounding::same(6.0), pal.bg_hover);
+                                                        draw_lucide_icon(
+                                                            ui.painter(),
+                                                            tile.center() - Vec2::new(0.0, 7.0),
+                                                            lucide::FILE_TEXT,
+                                                            18.0,
+                                                            pal.text_secondary,
+                                                        );
+                                                        let ext = att
+                                                            .path
+                                                            .extension()
+                                                            .map(|e| e.to_string_lossy().to_uppercase())
+                                                            .unwrap_or_default();
+                                                        ui.painter().text(
+                                                            tile.center() + Vec2::new(0.0, 13.0),
+                                                            egui::Align2::CENTER_CENTER,
+                                                            truncate_chars(&ext, 5),
+                                                            egui::FontId::proportional(10.0),
+                                                            pal.text_secondary,
+                                                        );
+                                                    }
+                                                }
+                                                if tile_resp.hovered() {
+                                                    let badge = tile.right_top() + Vec2::new(-8.0, 8.0);
+                                                    ui.painter().circle_filled(badge, 7.0, pal.bg_sidebar);
+                                                    draw_lucide_icon(ui.painter(), badge, lucide::X, 10.0, pal.text_primary);
+                                                }
+                                                let hover_text = match att.dims {
+                                                    Some((w, h)) => format!("{fname} · {w}×{h} px — bấm để bỏ"),
+                                                    None => format!("{fname} — bấm để bỏ"),
+                                                };
+                                                if tile_resp
+                                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                                    .on_hover_text(hover_text)
+                                                    .clicked()
+                                                {
+                                                    remove_idx = Some(idx);
+                                                }
+                                            }
+                                        });
+                                    });
+                            });
+                        if clear_all {
+                            self.pending_attachments.clear();
+                        } else if let Some(idx) = remove_idx {
+                            self.pending_attachments.remove(idx);
                         }
                     }
 
@@ -7300,16 +7360,9 @@ impl ZaloGuiApp {
                                     .filter_map(|df| df.path.clone())
                                     .collect()
                             });
-                            for dpath in dropped {
+                            if !dropped.is_empty() {
                                 if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                        to_id: thread_id.clone(),
-                                        is_group,
-                                        images_only: false,
-                                        caption: String::new(),
-                                        preset_path: Some(dpath),
-                                        original_hd: self.send_hd_original,
-                                    });
+                                    let _ = tx.send(WorkerCmd::PrepareAttachments { paths: dropped });
                                 }
                             }
 
@@ -7412,19 +7465,12 @@ impl ZaloGuiApp {
                                 );
                                 if img_resp
                                     .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Gửi hình ảnh")
+                                    .on_hover_text("Gửi hình ảnh (chọn được nhiều ảnh)")
                                     .clicked()
                                 {
-                                    let cap = self.input_message.trim().to_string();
-                                    self.input_message.clear();
                                     if let Some(tx) = WORKER_TX.get() {
-                                        let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                            to_id: thread_id.clone(),
-                                            is_group,
-                                            images_only: true,
-                                            caption: cap,
-                                            preset_path: None,
-                                            original_hd: self.send_hd_original,
+                                        let _ = tx.send(WorkerCmd::PickAttachments {
+                                            mode: super::attachments::PickMode::Images,
                                         });
                                     }
                                 }
@@ -7511,22 +7557,39 @@ impl ZaloGuiApp {
                                         pal.text_secondary
                                     },
                                 );
-                                if att_resp
+                                let attach_menu_id = ui.make_persistent_id("composer_attach_menu");
+                                let att_resp = att_resp
                                     .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Đính kèm File / Video")
-                                    .clicked()
-                                {
-                                    let cap = self.input_message.trim().to_string();
-                                    self.input_message.clear();
+                                    .on_hover_text("Đính kèm File / Thư mục");
+                                if att_resp.clicked() {
+                                    ui.memory_mut(|m| m.toggle_popup(attach_menu_id));
+                                }
+                                let mut pick_mode: Option<super::attachments::PickMode> = None;
+                                egui::popup::popup_above_or_below_widget(
+                                    ui,
+                                    attach_menu_id,
+                                    &att_resp,
+                                    egui::AboveOrBelow::Above,
+                                    egui::PopupCloseBehavior::CloseOnClick,
+                                    |ui| {
+                                        ui.set_min_width(170.0);
+                                        if ui
+                                            .button(format!("{}  Chọn File", lucide::FILE_TEXT))
+                                            .clicked()
+                                        {
+                                            pick_mode = Some(super::attachments::PickMode::Files);
+                                        }
+                                        if ui
+                                            .button(format!("{}  Chọn Thư mục", lucide::FOLDER_OPEN))
+                                            .clicked()
+                                        {
+                                            pick_mode = Some(super::attachments::PickMode::Folder);
+                                        }
+                                    },
+                                );
+                                if let Some(mode) = pick_mode {
                                     if let Some(tx) = WORKER_TX.get() {
-                                        let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                            to_id: thread_id.clone(),
-                                            is_group,
-                                            images_only: false,
-                                            caption: cap,
-                                            preset_path: None,
-                                            original_hd: self.send_hd_original,
-                                        });
+                                        let _ = tx.send(WorkerCmd::PickAttachments { mode });
                                     }
                                 }
 
@@ -7774,7 +7837,7 @@ impl ZaloGuiApp {
                                                         .input_message
                                                         .trim()
                                                         .is_empty()
-                                                        || self.pending_clipboard_image.is_some();
+                                                        || !self.pending_attachments.is_empty();
                                                     let (send_rect, send_resp) = ui
                                                         .allocate_exact_size(
                                                             Vec2::new(send_btn_w, 32.0),
@@ -7894,32 +7957,15 @@ impl ZaloGuiApp {
                                     response.context_menu(|ui| {
                                         if ui
                                             .button(format!(
-                                                "{} Dán hình ảnh từ Clipboard (Ctrl+V)",
+                                                "{} Dán ảnh / tệp từ Clipboard (Ctrl+V)",
                                                 lucide::IMAGE
                                             ))
                                             .clicked()
                                         {
                                             ui.close_menu();
-                                            if let Some((path, w, h, col_img)) =
-                                                read_clipboard_image_to_png()
-                                            {
-                                                let tex = ctx.load_texture(
-                                                    format!(
-                                                        "clip_preview_{}",
-                                                        crate::login::unix_now()
-                                                    ),
-                                                    col_img,
-                                                    TextureOptions::LINEAR,
-                                                );
-                                                self.pending_clipboard_image =
-                                                    Some((path, w, h, tex));
-                                                self.composer_focus_pending = true;
-                                                self.show_toast(format!(
-                                                    "Đã dán ảnh ({w}×{h} px) từ Clipboard — nhấn Enter để gửi"
-                                                ));
-                                            } else {
+                                            if !self.paste_clipboard_attachments(ctx) {
                                                 self.show_toast(
-                                                    "Không tìm thấy hình ảnh nào trong Clipboard",
+                                                    "Không tìm thấy hình ảnh hoặc tệp nào trong Clipboard",
                                                 );
                                             }
                                         }
@@ -7999,7 +8045,7 @@ impl ZaloGuiApp {
                                         }
                                     }
                                     let can_send = !self.input_message.trim().is_empty()
-                                        || self.pending_clipboard_image.is_some();
+                                        || !self.pending_attachments.is_empty();
 
                                     if let Some(chosen) = send_selected_sticker {
                                         self.input_message.clear();
@@ -8016,26 +8062,26 @@ impl ZaloGuiApp {
                                             });
                                         }
                                     } else if (send_clicked || enter_pressed)
-                                        && self.pending_clipboard_image.is_some()
+                                        && !self.pending_attachments.is_empty()
                                     {
-                                        if let Some((clip_path, _, _, _)) =
-                                            self.pending_clipboard_image.take()
-                                        {
-                                            let cap = self.input_message.trim().to_string();
-                                            self.input_message.clear();
-                                            self.dismissed_sticker_suggest_for.clear();
-                                            self.composer_sticker_selected = None;
-                                            response.request_focus();
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                                    to_id: thread_id.clone(),
-                                                    is_group,
-                                                    images_only: true,
-                                                    caption: cap,
-                                                    preset_path: Some(clip_path),
-                                                    original_hd: self.send_hd_original,
-                                                });
-                                            }
+                                        let paths: Vec<std::path::PathBuf> = self
+                                            .pending_attachments
+                                            .drain(..)
+                                            .map(|a| a.path)
+                                            .collect();
+                                        let cap = self.input_message.trim().to_string();
+                                        self.input_message.clear();
+                                        self.dismissed_sticker_suggest_for.clear();
+                                        self.composer_sticker_selected = None;
+                                        response.request_focus();
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let _ = tx.send(WorkerCmd::SendAttachments {
+                                                to_id: thread_id.clone(),
+                                                is_group,
+                                                paths,
+                                                caption: cap,
+                                                original_hd: self.send_hd_original,
+                                            });
                                         }
                                     } else if (send_clicked || enter_pressed) && can_send {
                                         let text = self.input_message.trim().to_string();

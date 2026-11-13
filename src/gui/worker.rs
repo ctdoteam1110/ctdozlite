@@ -88,12 +88,23 @@ pub enum WorkerCmd {
         sticker_type: u32,
         is_group: bool,
     },
-    PickAndSendAttachment {
+    /// Open a native picker and queue the chosen files in the composer.
+    PickAttachments {
+        mode: super::attachments::PickMode,
+    },
+    /// Decode previews for already-known paths (clipboard file list, drag-and-drop).
+    PrepareAttachments {
+        paths: Vec<std::path::PathBuf>,
+    },
+    /// Upload and send queued files one after another. Still photos are moved together to
+    /// the first photo's position (see `attachments::album_send_order`) so they form one
+    /// album; everything else keeps its order. `caption` goes on the first photo, or, when
+    /// the queue has no photo, is sent as a text message after the files.
+    SendAttachments {
         to_id: String,
         is_group: bool,
-        images_only: bool,
+        paths: Vec<std::path::PathBuf>,
         caption: String,
-        preset_path: Option<std::path::PathBuf>,
         original_hd: bool,
     },
     TriggerScreenshot,
@@ -3473,65 +3484,141 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 ctx_clone.request_repaint();
                             });
                         }
-                        WorkerCmd::PickAndSendAttachment {
+                        WorkerCmd::PickAttachments { mode } => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let Some(paths) = super::attachments::pick_attachments(mode) else {
+                                    return;
+                                };
+                                let batch = super::attachments::prepare_batch(paths);
+                                let _ = gui_tx_clone.send(GuiEvent::AttachmentsPrepared(batch));
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::PrepareAttachments { paths } => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let batch = super::attachments::prepare_batch(paths);
+                                let _ = gui_tx_clone.send(GuiEvent::AttachmentsPrepared(batch));
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::SendAttachments {
                             to_id,
                             is_group,
-                            images_only,
+                            paths,
                             caption,
-                            preset_path,
                             original_hd,
                         } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
-                                let picked_path = if let Some(p) = preset_path {
-                                    Some(p)
-                                } else {
-                                    tokio::task::spawn_blocking(move || {
-                                        pick_native_file_dialog(images_only)
-                                    })
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                };
-
-                                let Some(path) = picked_path else {
-                                    return;
-                                };
-                                let fname = path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("tập tin")
+                                let paths = super::attachments::album_send_order(paths);
+                                let total = paths.len();
+                                // Two or more still photos go out as one album; GIFs, videos
+                                // and files are sent standalone (same split as Zalo Web).
+                                let album_slots = super::attachments::plan_album_slots(&paths);
+                                // Only photo sends carry a description; for a queue without
+                                // photos the caption goes out as its own text message.
+                                let caption_idx = paths
+                                    .iter()
+                                    .position(|p| super::attachments::is_image_path(p));
+                                let album_id = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis())
+                                    .unwrap_or(0)
                                     .to_string();
-                                let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                    "⏳ Đang tải lên và gửi '{fname}'…"
-                                )));
-                                ctx_clone.request_repaint();
+                                // Sequential on purpose: concurrent uploads reorder the
+                                // resulting messages in the conversation.
+                                for (idx, path) in paths.into_iter().enumerate() {
+                                    let fname = path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("tập tin")
+                                        .to_string();
+                                    let progress = if total > 1 {
+                                        format!(" ({}/{total})", idx + 1)
+                                    } else {
+                                        String::new()
+                                    };
+                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                        "⏳ Đang tải lên và gửi '{fname}'{progress}…"
+                                    )));
+                                    ctx_clone.request_repaint();
 
-                                let s = session_clone.lock().await.clone();
-                                match crate::chat::send_attachment_ext(
-                                    &s, &to_id, is_group, &path, &caption, original_hd,
-                                )
-                                .await
-                                {
-                                    Ok((_resp, cm)) => {
-                                        let _ = gui_tx_clone.send(GuiEvent::AttachmentSent {
-                                            thread_id: to_id,
-                                            msg: cm,
-                                        });
+                                    let item_caption =
+                                        if Some(idx) == caption_idx { caption.as_str() } else { "" };
+                                    let s = session_clone.lock().await.clone();
+                                    let layout = album_slots[idx].map(|(slot, of)| {
+                                        crate::chat::MediaGroupLayout::new(album_id.clone(), slot, of)
+                                    });
+                                    match crate::chat::send_attachment_in_layout(
+                                        &s,
+                                        &to_id,
+                                        is_group,
+                                        &path,
+                                        item_caption,
+                                        original_hd,
+                                        layout.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok((_resp, cm)) => {
+                                            let _ = gui_tx_clone.send(GuiEvent::AttachmentSent {
+                                                thread_id: to_id.clone(),
+                                                msg: cm,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let err_s = e.to_string();
+                                            crate::logger::log_error("gui::send_attachment", &err_s);
+                                            let _ = gui_tx_clone.send(GuiEvent::SendFailed {
+                                                thread_id: to_id.clone(),
+                                                text: item_caption.to_string(),
+                                                error: format!("Lỗi gửi '{fname}': {err_s}"),
+                                            });
+                                        }
                                     }
-                                    Err(e) => {
-                                        let err_s = e.to_string();
-                                        crate::logger::log_error("gui::send_attachment", &err_s);
-                                        let _ = gui_tx_clone.send(GuiEvent::SendFailed {
-                                            thread_id: to_id,
-                                            text: caption,
-                                            error: format!("Lỗi gửi '{fname}': {err_s}"),
-                                        });
-                                    }
+                                    ctx_clone.request_repaint();
                                 }
-                                ctx_clone.request_repaint();
+                                if caption_idx.is_none() && !caption.trim().is_empty() {
+                                    let s = session_clone.lock().await.clone();
+                                    let client_id = crate::chat::next_client_message_id();
+                                    let res = if is_group {
+                                        crate::chat::send_group_message_with_client_id(
+                                            &s, &to_id, &caption, client_id,
+                                        )
+                                        .await
+                                    } else {
+                                        crate::chat::send_message_with_client_id(
+                                            &s, &to_id, &caption, client_id,
+                                        )
+                                        .await
+                                    };
+                                    match res {
+                                        Ok(resp) => {
+                                            let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                                client_message_id: client_id.to_string(),
+                                                thread_id: to_id,
+                                                text: caption,
+                                                msg_id: extract_msg_id(&resp),
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let err_s = e.to_string();
+                                            crate::logger::log_error("gui::send_caption", &err_s);
+                                            let _ = gui_tx_clone.send(GuiEvent::SendFailed {
+                                                thread_id: to_id,
+                                                text: caption,
+                                                error: err_s,
+                                            });
+                                        }
+                                    }
+                                    ctx_clone.request_repaint();
+                                }
                             });
                         }
                         WorkerCmd::TriggerScreenshot => {

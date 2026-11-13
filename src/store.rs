@@ -1720,6 +1720,7 @@ impl MessageStore {
                 let mut link_desc = None;
                 let mut link_thumb = None;
                 let mut link_src = None;
+                let mut media_group: Option<crate::chat::MediaGroupLayout> = None;
                 if !sm.raw_json.is_empty() {
                     // Expiry tombstone (`{"vanished":true}`): authoritative —
                     // keep the tombstone text, restore NO metadata, and never
@@ -1850,6 +1851,9 @@ impl MessageStore {
                             .get("link_src")
                             .and_then(|v| v.as_str())
                             .map(str::to_string);
+                        media_group = val
+                            .get("media_group")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok());
                     }
                 }
                 let cm = ChatMessage {
@@ -1884,6 +1888,7 @@ impl MessageStore {
                     link_desc,
                     link_thumb,
                     link_src,
+                    media_group,
 
                     ..Default::default()
                 };
@@ -2007,6 +2012,9 @@ impl From<&ChatMessage> for StoredMessage {
         }
         if let Some(lsrc) = &m.link_src {
             meta.insert("link_src".into(), serde_json::json!(lsrc));
+        }
+        if let Some(group) = &m.media_group {
+            meta.insert("media_group".into(), serde_json::json!(group));
         }
         let raw_json = if meta.is_empty() {
             String::new()
