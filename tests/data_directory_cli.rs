@@ -39,7 +39,7 @@ impl Drop for Fixture {
 fn explicit_storage_is_stable_and_invalid_directory_fails_before_network() {
     let fixture = Fixture::new();
     let data = fixture.0.join("explicit-data");
-    let result = Command::new(env!("CARGO_BIN_EXE_ctdozlite"))
+    let result = Command::new(env!("CARGO_BIN_EXE_zlite"))
         .args([
             "--data-dir",
             data.to_str().unwrap(),
@@ -59,7 +59,7 @@ fn explicit_storage_is_stable_and_invalid_directory_fails_before_network() {
         data.to_str().unwrap()
     );
     std::fs::write(data.join("keep.fixture"), b"retained fixture").unwrap();
-    let result = Command::new(env!("CARGO_BIN_EXE_ctdozlite"))
+    let result = Command::new(env!("CARGO_BIN_EXE_zlite"))
         .args([
             "--data-dir",
             data.to_str().unwrap(),
@@ -74,7 +74,7 @@ fn explicit_storage_is_stable_and_invalid_directory_fails_before_network() {
         std::fs::read(data.join("keep.fixture")).unwrap(),
         b"retained fixture"
     );
-    let bad = Command::new(env!("CARGO_BIN_EXE_ctdozlite"))
+    let bad = Command::new(env!("CARGO_BIN_EXE_zlite"))
         .args([
             "--data-dir",
             data.join("keep.fixture").to_str().unwrap(),
@@ -101,7 +101,7 @@ fn finder_bundle_with_root_cwd_selects_private_application_support() {
     let bundle = fixture.0.join("Fixture.app/Contents/MacOS");
     std::fs::create_dir_all(&bundle).unwrap();
     let executable = bundle.join("ctdozlite");
-    std::fs::copy(env!("CARGO_BIN_EXE_ctdozlite"), &executable).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_zlite"), &executable).unwrap();
     let home = fixture.0.join("home");
     std::fs::create_dir(&home).unwrap();
     let expected = home.join("Library/Application Support/ctdozlite");
@@ -141,11 +141,11 @@ fn finder_bundle_with_root_cwd_selects_private_application_support() {
 #[test]
 fn legacy_cli_keeps_cwd_and_version_does_not_prepare_storage() {
     eprintln!(
-        "CARGO_BIN_EXE_ctdozlite={}",
-        env!("CARGO_BIN_EXE_ctdozlite")
+        "CARGO_BIN_EXE_zlite={}",
+        env!("CARGO_BIN_EXE_zlite")
     );
     let fixture = Fixture::new();
-    let result = Command::new(env!("CARGO_BIN_EXE_ctdozlite"))
+    let result = Command::new(env!("CARGO_BIN_EXE_zlite"))
         .args(["--print-data-dir", "--logout"])
         .current_dir(&fixture.0)
         .output()
@@ -156,7 +156,7 @@ fn legacy_cli_keeps_cwd_and_version_does_not_prepare_storage() {
         fixture.0.to_str().unwrap()
     );
     let data = fixture.0.join("not-created");
-    let result = Command::new(env!("CARGO_BIN_EXE_ctdozlite"))
+    let result = Command::new(env!("CARGO_BIN_EXE_zlite"))
         .args(["--version", "--data-dir", data.to_str().unwrap()])
         .env_remove("HOME")
         .current_dir(&fixture.0)
@@ -182,7 +182,7 @@ fn malformed_storage_options_fail_before_startup() {
         vec!["--data-dir", "-d"],
         vec!["--data-dir", "-v"],
     ] {
-        let result = Command::new(env!("CARGO_BIN_EXE_ctdozlite"))
+        let result = Command::new(env!("CARGO_BIN_EXE_zlite"))
             .args(&args)
             .arg("--logout")
             .env_remove("HOME")
@@ -202,7 +202,7 @@ fn bundled_version_does_not_create_application_support_or_require_home() {
     let bundle = fixture.0.join("Fixture.app/Contents/MacOS");
     std::fs::create_dir_all(&bundle).unwrap();
     let executable = bundle.join("ctdozlite");
-    std::fs::copy(env!("CARGO_BIN_EXE_ctdozlite"), &executable).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_zlite"), &executable).unwrap();
     let home = fixture.0.join("home-not-created");
     let result = Command::new(&executable)
         .arg("--version")
@@ -225,7 +225,7 @@ fn bundled_version_does_not_create_application_support_or_require_home() {
 fn relative_storage_is_private_and_unrelated_cwd_state_is_untouched() {
     let fixture = Fixture::new();
     std::fs::write(fixture.0.join("session.json"), b"existing fixture").unwrap();
-    let result = Command::new(env!("CARGO_BIN_EXE_ctdozlite"))
+    let result = Command::new(env!("CARGO_BIN_EXE_zlite"))
         .args(["--data-dir=relative-data", "--print-data-dir", "--logout"])
         .env_remove("HOME")
         .current_dir(&fixture.0)

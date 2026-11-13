@@ -2804,6 +2804,46 @@ impl ZaloGuiApp {
                                                 .color(pal.text_primary)
                                                 .strong(),
                                         );
+                                        // Privacy toggle: LLM đọc ảnh/file (mặc định TẮT).
+                                        // Ghi DB trước, chỉ lật UI khi thành công —
+                                        // fail mà vẫn hiện BẬT là mở toang quyền đọc.
+                                        let dbp = crate::store::db_path_for_account(&self.user_uin);
+                                        let stored = crate::store::MessageStore::open(&dbp)
+                                            .map(|st| crate::thread_script::privacy_allowed(&st, &ws_id))
+                                            .unwrap_or(false);
+                                        let mut cur = stored;
+                                        let tog = ui.checkbox(
+                                            &mut cur,
+                                            RichText::new("LLM đọc ảnh/file").size(10.5),
+                                        );
+                                        if tog.changed() {
+                                            // Revert UI ngay nếu không persist được —
+                                            // checkbox đã lật `cur` nhưng DB vẫn là `stored`.
+                                            let mut ok = false;
+                                            if let Ok(mut st) = crate::store::MessageStore::open(&dbp) {
+                                                let val = if cur { "true" } else { "false" };
+                                                match st.thread_kv_set(&ws_id, crate::thread_script::PRIVACY_KEY, val) {
+                                                    Ok(()) => {
+                                                        let _ = st.push_script_log(
+                                                            &ws_id,
+                                                            "privacy",
+                                                            "info",
+                                                            &format!("GUI set llm_read_attachments={cur}"),
+                                                        );
+                                                        ok = true;
+                                                    }
+                                                    Err(e) => {
+                                                        self.show_toast(format!("Lỗi lưu quyền riêng tư: {e}"));
+                                                    }
+                                                }
+                                            } else {
+                                                self.show_toast("Lỗi mở DB — quyền giữ nguyên");
+                                            }
+                                            if !ok {
+                                                // Ép frame sau đọc lại từ DB (stored), không giữ giá trị lật lỗi.
+                                                self.show_toast("Không đổi được quyền — giữ nguyên");
+                                            }
+                                        }
                                         ui.with_layout(
                                             Layout::right_to_left(Align::Center),
                                             |ui| {

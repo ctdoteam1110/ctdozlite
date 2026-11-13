@@ -39,7 +39,10 @@ pub mod updater;
 /// Scheduled message queue backed by SQLite (#38, #24).
 pub mod scheduler;
 /// Local HTTP REST API, MCP JSON-RPC 2.0 server, and auto-reply rules (#35).
+pub mod agent;
 pub mod api_mcp;
+pub mod auth;
+pub mod llm;
 /// Fire-and-forget OS desktop banners + notification sound for chat events.
 /// Shared backend for chat/message/reaction banners
 /// (DailyNotifier is intentionally NOT used: its payload is hardcoded generic).
