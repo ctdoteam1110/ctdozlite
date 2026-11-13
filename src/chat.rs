@@ -2425,11 +2425,14 @@ pub async fn send_attachment_ext(
         } else {
             file_path.display().to_string()
         };
-        // Pre-populate `stickers_cache/thumb_<md5>.png` with the local image bytes so the GUI
+        // Pre-populate `<media cache>/thumb_<md5>.png` with the local image bytes so the GUI
         // renders the sent photo immediately without an extra network round-trip.
-        let _ = std::fs::create_dir_all("stickers_cache");
         let cache_key = format!("thumb_{}", crate::crypto::md5_hex(&final_thumb));
-        let _ = std::fs::write(format!("stickers_cache/{cache_key}.png"), &file_bytes);
+        // Best effort: a failed cache write only costs one thumbnail re-download.
+        let _ = std::fs::write(
+            crate::account_manager::ensure_media_cache_dir().join(format!("{cache_key}.png")),
+            &file_bytes,
+        );
 
         let msg_id = send_resp
             .get("data")
@@ -3513,10 +3516,9 @@ pub struct StickerItem {
 /// Fetch the complete Zalo Sticker Store catalog (`getStickerCatsV2` -> `getAllCate` in `compact-app-pc.js:14288962`).
 ///
 /// Returns ~390 official Zalo sticker packs sorted by newest/featured first and caches them to
-/// `stickers_cache/store_packs.json`.
+/// `store_packs.json` in the active account's media cache.
 pub async fn fetch_sticker_store_packs(s: &Session) -> Result<Vec<StickerPackInfo>> {
-    let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    let cache_dir = crate::account_manager::ensure_media_cache_dir();
     let cache_path = cache_dir.join("store_packs.json");
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<StickerPackInfo>>(&raw_cache) {
@@ -3642,8 +3644,7 @@ pub async fn fetch_sticker_pack_items(
             .collect());
     }
 
-    let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    let cache_dir = crate::account_manager::ensure_media_cache_dir();
     let cache_path = cache_dir.join(format!("pack_{cate_id}.json"));
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<StickerItem>>(&raw_cache) {
@@ -3825,8 +3826,7 @@ pub fn canonical_vn_sticker_queries(keyword: &str) -> Vec<String> {
 /// Includes both normalized accented/raw forms and ASCII-folded forms so typing accented or
 /// unaccented Vietnamese triggers suggestions reliably.
 pub async fn fetch_sticker_suggest_keywords(s: &Session) -> Result<Vec<String>> {
-    let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    let cache_dir = crate::account_manager::ensure_media_cache_dir();
     let cache_path = cache_dir.join("suggest_keywords_v2.json");
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<String>>(&raw_cache) {
@@ -4030,8 +4030,7 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
     if kw.is_empty() {
         return Ok(Vec::new());
     }
-    let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    let cache_dir = crate::account_manager::ensure_media_cache_dir();
     let cache_path = cache_dir.join(format!("suggest_v2_{}.json", crate::crypto::md5_hex(&kw)));
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<StickerItem>>(&raw_cache) {

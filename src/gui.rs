@@ -326,6 +326,8 @@ pub enum GuiEvent {
     },
     LoggedOut,
     HistoryReachedStart(String),
+    /// An account that is signed in but not shown received new messages.
+    BackgroundAccountActivity(crate::background_accounts::BackgroundActivity),
     AccountSwitched {
         uin: String,
         name: String,
@@ -778,6 +780,11 @@ pub struct ZaloGuiApp {
     /// UIN tài khoản đang dùng trước khi bấm "Thêm tài khoản mới" (#103):
     /// login screen hiện nút quay lại, Hủy → SwitchAccount về uin này.
     pub(crate) pending_add_account_uin: Option<String>,
+    /// New incoming messages per inactive account, shown as badges in the account menu.
+    pub(crate) background_unread: HashMap<String, usize>,
+    /// Saved accounts listed in the account menu; refreshed when the menu opens so the
+    /// directory scan stays off the per-frame path.
+    pub(crate) account_menu_accounts: Vec<crate::account_manager::AccountProfile>,
 
     // Login screen state
     login_tab: LoginTab,
@@ -1090,6 +1097,9 @@ impl ZaloGuiApp {
             })
             .unwrap_or_default();
 
+        // Media written from the first frame on must land in this account's cache.
+        crate::account_manager::set_active_uin(&user_uin);
+
         // main() already read threads_cache.json and hydrated it from SQLite; reading, merging,
         // hydrating and rewriting the cache again here doubled startup I/O.
         let mut threads = initial_threads;
@@ -1139,6 +1149,8 @@ impl ZaloGuiApp {
             user_uin,
             user_avatar,
             pending_add_account_uin: None,
+            background_unread: HashMap::new(),
+            account_menu_accounts: Vec::new(),
             login_tab: LoginTab::QrCode,
             phone_input: String::new(),
             password_input: String::new(),
@@ -1748,6 +1760,8 @@ impl ZaloGuiApp {
                     self.pending_add_account_uin = None;
                     self.user_name = name;
                     self.user_uin = uin;
+                    crate::account_manager::set_active_uin(&self.user_uin);
+                    self.background_unread.remove(&self.user_uin);
                     if avatar.is_some() {
                         self.user_avatar = avatar;
                     }
@@ -2189,10 +2203,15 @@ impl ZaloGuiApp {
                     self.group_summary_pending = None;
                     self.group_jump_pending = None;
                 }
+                GuiEvent::BackgroundAccountActivity(activity) => {
+                    self.handle_background_account_activity(activity);
+                }
                 GuiEvent::LoggedOut => {
                     self.is_logged_in = false;
                     self.user_name.clear();
                     self.user_uin.clear();
+                    crate::account_manager::set_active_uin("");
+                    self.background_unread.clear();
                     self.threads.clear();
                     if let Ok(mut watch) = VANISH_THREADS.lock() {
                         watch.clear();
@@ -2230,6 +2249,13 @@ impl ZaloGuiApp {
                     self.is_logged_in = true;
                     self.pending_add_account_uin = None;
                     self.user_uin = uin;
+                    crate::account_manager::set_active_uin(&self.user_uin);
+                    self.background_unread.remove(&self.user_uin);
+                    // Counts were keyed by the previous account's threads. Rebuild them
+                    // from the read-points so messages stored while this account was in
+                    // the background still show as unread.
+                    self.reaction_unread_counts.clear();
+                    self.unread_counts = unread_counts_from_read_points(&threads);
                     self.user_name = name.clone();
                     self.user_avatar = avatar;
                     self.threads = threads;
@@ -4194,17 +4220,26 @@ impl ZaloGuiApp {
                         ui.image((tex.id(), Vec2::new(64.0, 64.0)));
                         ui.add_space(10.0);
                     }
+                    let adding_account = self.pending_add_account_uin.is_some();
                     ui.label(
-                        RichText::new("Đăng nhập Zalo")
-                            .color(pal.primary)
-                            .size(26.0)
-                            .strong(),
+                        RichText::new(if adding_account {
+                            "Thêm tài khoản Zalo"
+                        } else {
+                            "Đăng nhập Zalo"
+                        })
+                        .color(pal.primary)
+                        .size(26.0)
+                        .strong(),
                     );
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new("Khởi chạy nhẹ, bảo mật và đồng bộ tin nhắn thời gian thực")
-                            .color(pal.text_secondary)
-                            .size(13.5),
+                        RichText::new(if adding_account {
+                            "Đăng nhập thêm một tài khoản — tài khoản hiện tại vẫn được giữ nguyên"
+                        } else {
+                            "Khởi chạy nhẹ, bảo mật và đồng bộ tin nhắn thời gian thực"
+                        })
+                        .color(pal.text_secondary)
+                        .size(13.5),
                     );
                     ui.add_space(18.0);
 
@@ -4396,11 +4431,11 @@ impl ZaloGuiApp {
                             });
                         });
 
-                    // Nút quay lại khi đang thêm tài khoản mới mà đổi ý (#103).
-                    if let Some(prev_uin) = self.pending_add_account_uin.clone() {
+                    // Leaving the add-account flow restores the previous account (#103).
+                    if adding_account {
                         ui.add_space(12.0);
                         let back = egui::Button::new(
-                            RichText::new("← Hủy, quay lại tài khoản trước")
+                            RichText::new(format!("{}  Thoát thêm tài khoản", lucide::X))
                                 .size(13.0)
                                 .color(pal.primary),
                         )
@@ -4411,15 +4446,10 @@ impl ZaloGuiApp {
                         if ui
                             .add(back)
                             .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text("Quay lại giao diện chính với tài khoản đang dùng")
                             .clicked()
                         {
-                            self.pending_add_account_uin = None;
-                            self.status_msg = "Đã hủy thêm tài khoản".into();
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::SwitchAccount {
-                                    target_uin: prev_uin,
-                                });
-                            }
+                            self.exit_add_account();
                         }
                     }
 
@@ -4430,6 +4460,106 @@ impl ZaloGuiApp {
             });
     }
 
+    /// Raise OS banners and the menu badge for messages received by an inactive account.
+    fn handle_background_account_activity(
+        &mut self,
+        activity: crate::background_accounts::BackgroundActivity,
+    ) {
+        // The listener of an account that just became active may still flush one event.
+        if activity.uin == self.user_uin {
+            return;
+        }
+        // Mute state is evaluated by the listener from that account's own thread list;
+        // `settings.muted_threads` describes the active account and must not apply here.
+        let banners: Vec<(String, String)> = activity
+            .banners
+            .iter()
+            .map(|b| {
+                (
+                    format!("{} → {}", b.title, activity.account_name),
+                    b.body.clone(),
+                )
+            })
+            .collect();
+        if banners.is_empty() {
+            return;
+        }
+        *self
+            .background_unread
+            .entry(activity.uin.clone())
+            .or_insert(0) += activity.incoming.max(1);
+        if self.settings.enable_notifications {
+            if self.settings.play_notification_sound {
+                crate::media::play_notification_chime();
+            }
+            crate::os_notify::notify_chat_batch(&banners);
+        }
+    }
+
+    /// Reload the saved accounts shown in the account menu.
+    pub(crate) fn refresh_account_menu_accounts(&mut self) {
+        self.account_menu_accounts = crate::account_manager::list_saved_accounts(&self.user_uin);
+    }
+
+    /// Switch the UI to another saved account without scanning a QR code again.
+    pub(crate) fn switch_to_saved_account(&mut self, target_uin: String) {
+        // Pending notes belong to the current account's database; flush before the switch.
+        self.flush_group_note_pending();
+        self.status_msg = "Đang chuyển tài khoản…".into();
+        if let Some(tx) = WORKER_TX.get() {
+            let _ = tx.send(WorkerCmd::SwitchAccount { target_uin });
+        }
+    }
+
+    /// Open the login screen to sign in one more account while keeping the current one.
+    pub(crate) fn begin_add_account(&mut self) {
+        self.flush_group_note_pending();
+        if let Err(e) = crate::account_manager::save_current_account_snapshot(&self.user_uin) {
+            // Without a snapshot the current account could not be restored afterwards.
+            self.show_toast(format!("⚠️ Không lưu được phiên hiện tại: {e}"));
+            self.pending_add_account_uin = None;
+            return;
+        }
+        // Remember the current account so "Thoát thêm tài khoản" can return to it. No
+        // Logout is sent (#103): `RequestQr` signs the worker session out in memory only,
+        // and the saved snapshot keeps the account listening in the background.
+        if !self.user_uin.is_empty() {
+            self.pending_add_account_uin = Some(self.user_uin.clone());
+        }
+        self.is_logged_in = false;
+        self.user_name.clear();
+        self.user_uin.clear();
+        self.threads.clear();
+        self.selected_thread_index = 0;
+        self.qr_texture = None;
+        self.login_tab = LoginTab::QrCode;
+        self.login_in_progress = false;
+        self.login_status_msg.clear();
+        self.phone_input.clear();
+        self.password_input.clear();
+        self.qr_status = "Đang xin mã QR mới…".into();
+        self.status_msg = "Đang xin mã QR đăng nhập tài khoản mới…".into();
+        if let Some(tx) = WORKER_TX.get() {
+            let _ = tx.send(WorkerCmd::RequestQr);
+        }
+    }
+
+    /// Leave the add-account login screen and return to the account used before.
+    fn exit_add_account(&mut self) {
+        let Some(prev_uin) = self.pending_add_account_uin.take() else {
+            return;
+        };
+        self.login_in_progress = false;
+        self.login_status_msg.clear();
+        self.password_input.clear();
+        self.status_msg = "Đã thoát thêm tài khoản".into();
+        if let Some(tx) = WORKER_TX.get() {
+            let _ = tx.send(WorkerCmd::SwitchAccount {
+                target_uin: prev_uin,
+            });
+        }
+    }
+
     fn show_toast(&mut self, msg: impl Into<String>) {
         let text = msg.into();
         self.status_msg = text.clone();
@@ -4437,9 +4567,72 @@ impl ZaloGuiApp {
     }
 }
 
+/// Count incoming messages newer than each thread's read-point.
+///
+/// Threads without a read-point, and message ids that cannot be ordered against it,
+/// count as read: a freshly loaded history must not light up as unread (#1445).
+fn unread_counts_from_read_points(threads: &[Thread]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for thread in threads {
+        let Some(seen) = thread.unread.last_seen_id.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let unread = thread
+            .messages
+            .iter()
+            .filter(|m| {
+                !m.is_outgoing
+                    && crate::unread::compare_ids(&m.id, seen)
+                        == Some(std::cmp::Ordering::Greater)
+            })
+            .count();
+        if unread > 0 {
+            counts.insert(thread.id.clone(), unread);
+        }
+    }
+    counts
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_newer_semver, phone_sync_completion_message};
+
+    fn unread_fixture(seen: Option<&str>, ids: &[(&str, bool)]) -> crate::chat::Thread {
+        let mut thread = crate::chat::Thread {
+            presentation: Default::default(),
+            unread: Default::default(),
+            id: "thread-1".into(),
+            name: "Thread 1".into(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            is_group: false,
+            messages: Vec::new(),
+            vanish: None,
+        };
+        thread.unread.last_seen_id = seen.map(str::to_string);
+        for (id, outgoing) in ids {
+            thread.messages.push(crate::chat::ChatMessage {
+                id: (*id).to_string(),
+                is_outgoing: *outgoing,
+                ..Default::default()
+            });
+        }
+        thread
+    }
+
+    #[test]
+    fn unread_rebuild_counts_incoming_messages_after_read_point() {
+        let thread = unread_fixture(Some("100"), &[("99", false), ("101", false), ("102", true), ("103", false)]);
+        let counts = super::unread_counts_from_read_points(&[thread]);
+        assert_eq!(counts.get("thread-1"), Some(&2));
+    }
+
+    #[test]
+    fn unread_rebuild_skips_threads_without_read_point() {
+        let thread = unread_fixture(None, &[("101", false)]);
+        assert!(super::unread_counts_from_read_points(&[thread]).is_empty());
+    }
 
     #[test]
     fn sent_message_reconciles_when_server_push_arrives_first() {

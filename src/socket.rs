@@ -413,12 +413,31 @@ fn pull_next_frame(
 ///
 /// Reconnects forever with capped backoff. Dropping the returned receiver stops the task.
 pub fn spawn(sess: Session) -> mpsc::UnboundedReceiver<WsEvent> {
+    spawn_with_role(sess, SocketRole::Active)
+}
+
+/// Like [`spawn`], for an account that is signed in but not shown in the UI.
+///
+/// The socket only receives: it never becomes the target of [`send_ws_frame`], so
+/// outbound frames of the active account cannot leak onto another account's connection.
+pub fn spawn_passive(sess: Session) -> mpsc::UnboundedReceiver<WsEvent> {
+    spawn_with_role(sess, SocketRole::Passive)
+}
+
+/// Whether a socket carries the UI's outbound frames or only listens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketRole {
+    Active,
+    Passive,
+}
+
+fn spawn_with_role(sess: Session, role: SocketRole) -> mpsc::UnboundedReceiver<WsEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut backoff = 2u64;
         let mut endpoint_idx = 0usize;
         loop {
-            match run_once(&sess, &tx, endpoint_idx).await {
+            match run_once(&sess, &tx, endpoint_idx, role).await {
                 Ok(reason) => trace(format!("closed: {reason}")),
                 Err(e) => trace(format!("error: {e:#}")),
             }
@@ -427,7 +446,10 @@ pub fn spawn(sess: Session) -> mpsc::UnboundedReceiver<WsEvent> {
             }
             // `3002 NOT_FOUND_WORKER` means this shard does not host the session; rotate.
             endpoint_idx = endpoint_idx.wrapping_add(1);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            tokio::select! {
+                _ = tx.closed() => break,
+                _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+            }
             backoff = (backoff * 2).min(30);
         }
     });
@@ -438,6 +460,7 @@ async fn run_once(
     sess: &Session,
     tx: &mpsc::UnboundedSender<WsEvent>,
     endpoint_idx: usize,
+    role: SocketRole,
 ) -> Result<String> {
     let url = build_url(sess, endpoint_idx);
     trace(format!("connect {url}"));
@@ -476,12 +499,25 @@ async fn run_once(
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // consume the immediate first tick
 
+    // A passive socket keeps its sender private: `_out_tx` stays alive so `out_rx`
+    // simply never yields, and the global outbound slot keeps pointing at the active socket.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    if let Ok(mut g) = WS_OUTBOUND_TX.lock() {
-        *g = Some(out_tx);
-    }
+    let _out_tx = match role {
+        SocketRole::Active => {
+            if let Ok(mut g) = WS_OUTBOUND_TX.lock() {
+                *g = Some(out_tx);
+            }
+            None
+        }
+        SocketRole::Passive => Some(out_tx),
+    };
     loop {
         tokio::select! {
+            // The owner dropped the receiver (account switched or removed): close the
+            // connection instead of keeping a second session alive for that account.
+            _ = tx.closed() => {
+                return Ok("receiver dropped".into());
+            }
             _ = ping.tick() => {
                 if authed {
                     let body = json!({ "eventId": now_ms() });
@@ -613,7 +649,9 @@ async fn run_once(
                 if cmd == CMD_SYNC_REQUEST || cmd == CMD_SYNC_MOBILE_WAKE_UP {
                     crate::logger::log_sync(&format!("WS về cmd={cmd}: {}", payload.to_string().chars().take(400).collect::<String>()));
                 }
-                let _ = tx.send(WsEvent { cmd, sub_cmd, version, payload });
+                if tx.send(WsEvent { cmd, sub_cmd, version, payload }).is_err() {
+                    return Ok("receiver dropped".into());
+                }
             }
         }
     }

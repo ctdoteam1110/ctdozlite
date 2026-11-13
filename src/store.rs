@@ -208,7 +208,20 @@ impl MessageStore {
         } else {
             Connection::open(path)?
         };
+        Self::configure_connection(&conn);
         Ok(Self { conn })
+    }
+
+    /// Apply the per-connection settings from `docs/standards/database-and-migrations.md`.
+    ///
+    /// WAL lets the UI read while the worker commits a large history batch; in
+    /// rollback-journal mode those reads waited out the full busy timeout and froze
+    /// the window for seconds at a time during a first sync.
+    fn configure_connection(conn: &Connection) {
+        // Best effort: switching the journal needs a lock another writer may hold, and
+        // the mode is persistent, so a later open applies it. `:memory:` stays "memory".
+        let _ = conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
     }
 
      /// Open SQLite database at `path` and initialize table schemas and indices if absent.
@@ -218,6 +231,7 @@ impl MessageStore {
         } else {
             Connection::open(path)?
         };
+        Self::configure_connection(&conn);
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
@@ -2090,15 +2104,39 @@ pub fn merge_stored_read_point(unread: &mut crate::unread::UnreadState, stored: 
 
 /// Persist threads and their messages to SQLite store, returning the count of newly inserted messages.
 pub fn persist_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
+    persist_threads_in_transaction(store, threads, true)
+}
+
+/// Persist received messages without touching per-thread user state.
+///
+/// Used by listeners of inactive accounts, whose thread list is a stale snapshot: the
+/// stored vanish settings and read-point are kept, only names, `last_ts` and messages
+/// are merged. Returns the count of newly inserted messages.
+///
+/// # Errors
+/// Returns an error when the transaction or any row write fails.
+pub fn persist_received_messages(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
+    persist_threads_in_transaction(store, threads, false)
+}
+
+fn persist_threads_in_transaction(
+    store: &mut MessageStore,
+    threads: &[Thread],
+    with_user_state: bool,
+) -> Result<usize> {
     // One transaction for the whole snapshot: in autocommit every row was its own fsync.
     store.conn.execute_batch("BEGIN")?;
-    let res = persist_threads_inner(store, threads);
+    let res = persist_threads_inner(store, threads, with_user_state);
     store
         .conn
         .execute_batch(if res.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
     res
 }
-fn persist_threads_inner(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
+fn persist_threads_inner(
+    store: &mut MessageStore,
+    threads: &[Thread],
+    with_user_state: bool,
+) -> Result<usize> {
     let mut new_count = 0;
     for t in threads {
         let last_ts = t.messages.iter().map(|m| m.ts).max().unwrap_or(0);
@@ -2109,11 +2147,16 @@ fn persist_threads_inner(store: &mut MessageStore, threads: &[Thread]) -> Result
             last_ts,
             vanish_duration_sec: t.vanish.as_ref().map(|v| v.duration_sec).unwrap_or(0),
             vanish_started_at_sec: t.vanish.as_ref().map(|v| v.started_at_sec).unwrap_or(0),
-            last_read_msg_id: t.unread.last_seen_id.clone().unwrap_or_default(),
+            // An empty read-point keeps the stored one (see the upsert's CASE).
+            last_read_msg_id: if with_user_state {
+                t.unread.last_seen_id.clone().unwrap_or_default()
+            } else {
+                String::new()
+            },
         };
         // RAM snapshot carries the user's vanish intent (incl. explicit disable),
         // unlike history-sync pages which must preserve stored vanish (#376).
-        store.upsert_thread_inner(&st, true, t.presentation.contact_name)?;
+        store.upsert_thread_inner(&st, with_user_state, t.presentation.contact_name)?;
         for m in t.messages.iter().filter(|m| m.text != "sendBubbleMessage") {
             let mut sm = StoredMessage::from(m);
             sm.thread_id = t.id.clone();
@@ -3781,5 +3824,45 @@ mod tests {
         assert_eq!(map.get("u1").map(|x| x.0.as_str()), Some("Biệt danh 1"));
         assert_eq!(map.get("u2").map(|x| x.0.as_str()), Some("123"));
         assert_eq!(map.get("u3").map(|x| x.0.as_str()), Some("Tên Gốc 3"));
+    }
+
+    #[test]
+    fn reader_is_not_blocked_while_another_connection_holds_a_write_transaction() {
+        // A file is required: the lock under test only exists between connections.
+        let dir = std::env::temp_dir().join(format!(
+            "ctdozlite-wal-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        let path = path.to_str().unwrap();
+
+        let writer = MessageStore::open(path).unwrap();
+        writer.conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        writer
+            .conn
+            .execute(
+                "INSERT INTO threads (thread_id, name, is_group, last_ts) VALUES ('thread-1', 'T', 0, 1)",
+                [],
+            )
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let reader = MessageStore::open(path).unwrap();
+        assert_eq!(reader.count_messages("thread-1").unwrap(), 0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "reader waited {:?} behind the writer",
+            started.elapsed()
+        );
+
+        writer.conn.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
