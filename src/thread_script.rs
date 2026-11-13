@@ -124,6 +124,17 @@ pub fn interval_due(last_run_sec: i64, every_min: u64, now_sec: i64) -> bool {
 }
 
 /// Key KV lưu mốc chạy gần nhất của 1 script interval.
+/// Privacy gate: thread cho phép LLM đọc attachments (ảnh/file/link) hay không.
+/// Mặc định TẮT. Bật qua TUI `/privacy on`, GUI toggle, MCP `zalo_privacy`.
+pub const PRIVACY_KEY: &str = "__llm_read_attachments";
+
+pub fn privacy_allowed(store: &crate::store::MessageStore, thread_id: &str) -> bool {
+    store
+        .thread_kv_get(thread_id, PRIVACY_KEY)
+        .map(|v| v.trim() == "true" || v.trim() == "1")
+        .unwrap_or(false)
+}
+
 pub fn last_run_key(script_id: i64) -> String {
     format!("__script_last_run_{script_id}")
 }

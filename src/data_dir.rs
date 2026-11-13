@@ -77,14 +77,11 @@ pub fn resolve(
             true,
         ));
     }
-    let bundled = executable
-        .parent()
-        .filter(|p| p.file_name().is_some_and(|n| n == "MacOS"))
-        .and_then(Path::parent)
-        .filter(|p| p.file_name().is_some_and(|n| n == "Contents"))
-        .and_then(Path::parent)
-        .is_some_and(|p| p.extension().is_some_and(|e| e == "app"));
-    let (base, is_private) = if macos && bundled {
+    // macOS: GUI (.app) và CLI (cargo/test) dùng chung Application Support để
+    // TUI/agent/MCP thấy cùng session + SQLite với GUI. `--data-dir` explicit
+    // vẫn thắng. Non-macOS giữ CWD như cũ.
+    let _ = executable;
+    let (base, is_private) = if macos {
         let home = home.context("Cần HOME để xác định Application Support")?;
         if !home.is_absolute() && !home.to_str().is_some_and(|s| s.starts_with('/')) {
             bail!("HOME phải là đường dẫn tuyệt đối");
@@ -231,8 +228,11 @@ mod tests {
             )
         );
         assert_eq!(
-            resolve(&[], cwd, Path::new("/bin/ctdozlite"), None, true).unwrap(),
-            (cwd.to_path_buf(), false)
+            resolve(&[], cwd, Path::new("/bin/ctdozlite"), Some(Path::new("/Users/fixture")), true).unwrap(),
+            (
+                PathBuf::from("/Users/fixture/Library/Application Support/ctdozlite"),
+                true
+            )
         );
         assert_eq!(
             resolve(&[], cwd, exe, None, false).unwrap(),
@@ -265,11 +265,14 @@ mod tests {
                 &["--profile".into(), "acc_2".into()],
                 cwd,
                 Path::new("/bin/ctdozlite"),
-                None,
+                Some(Path::new("/Users/fixture")),
                 true
             )
             .unwrap(),
-            (cwd.join("profiles").join("acc_2"), true)
+            (
+                PathBuf::from("/Users/fixture/Library/Application Support/ctdozlite/profiles/acc_2"),
+                true
+            )
         );
     }
 
@@ -305,17 +308,30 @@ mod tests {
             (PathBuf::from("/fixture-data"), true)
         );
         assert!(resolve(&[], cwd, exe, Some(Path::new("relative-home")), true).is_err());
+        // macOS CLI (không bundle) cũng về Application Support chung với GUI.
         assert_eq!(
             resolve(
                 &[],
                 cwd,
                 Path::new("/Fixture.app/Contents/MacOS-extra/ctdozlite"),
-                None,
+                Some(Path::new("/Users/fixture")),
                 true
             )
             .unwrap(),
-            (cwd.to_path_buf(), false)
+            (
+                PathBuf::from("/Users/fixture/Library/Application Support/ctdozlite"),
+                true
+            )
         );
+        // Thiếu HOME vẫn lỗi (không đoán được Application Support).
+        assert!(resolve(
+            &[],
+            cwd,
+            Path::new("/Fixture.app/Contents/MacOS-extra/ctdozlite"),
+            None,
+            true
+        )
+        .is_err());
     }
 
     #[test]
