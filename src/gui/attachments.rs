@@ -452,7 +452,16 @@ fn pick_files_with_helpers(
     if multi {
         kdialog_args.extend(["--multiple", "--separate-output"]);
     }
-    run("kdialog", &kdialog_args).unwrap_or_default()
+    match run("kdialog", &kdialog_args) {
+        Some(picked) => picked,
+        None => {
+            crate::logger::log_error(
+                "gui::file_dialog",
+                "Không mở được hộp thoại chọn tệp: thiếu zenity và kdialog. Hãy cài đặt một trong hai gói (ví dụ: sudo apt install zenity).",
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// zenity directory dialog, falling back to kdialog; `None` on cancel.
@@ -485,9 +494,13 @@ fn run_dialog_command(prog: &str, args: &[&str]) -> Option<Vec<PathBuf>> {
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            crate::logger::log_error("gui::file_dialog", &format!("{prog}: {e} (permission denied)"));
+            None
+        }
         Err(e) => {
             crate::logger::log_error("gui::file_dialog", &format!("{prog}: {e}"));
-            Some(Vec::new())
+            None
         }
     }
 }
