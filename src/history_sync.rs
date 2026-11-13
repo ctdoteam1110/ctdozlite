@@ -107,6 +107,20 @@ pub fn set_last_mobile_sync_status(status: Option<String>) {
     }
 }
 
+static LAST_PHONE_SYNC_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn set_last_phone_sync_error(error: Option<String>) {
+    if let Ok(mut g) = LAST_PHONE_SYNC_ERROR.lock() {
+        *g = error;
+    }
+}
+
+/// Why the phone (Sync V2) step of the last `sync_phone_messages` run could not start,
+/// e.g. no Zalo PC WASM on this machine. `None` when it started or was not attempted.
+pub fn last_phone_sync_error() -> Option<String> {
+    LAST_PHONE_SYNC_ERROR.lock().ok().and_then(|g| g.clone())
+}
+
 /// Read the latest status returned by the user's phone during `sync_phone_messages`.
 pub fn last_mobile_sync_status() -> Option<String> {
     LAST_MOBILE_SYNC_STATUS.lock().ok().and_then(|g| g.clone())
@@ -223,6 +237,7 @@ where
 
     if send_phone_prompt {
         set_last_mobile_sync_status(None);
+        set_last_phone_sync_error(None);
 
         // Phase 1 — Sync V2 đúng Zalo PC (`shared-worker.js` SyncSession.start):
         // 590 là message mạng ĐẦU TIÊN (mở session, phone hiện màn xác nhận).
@@ -242,23 +257,30 @@ where
                     Some(sync_id)
                 }
                 Ok(false) => {
-                    on_progress(0.15, "⚠️ Không gửi được cmd 590 (mất kết nối WebSocket)".to_string());
+                    let msg = "Không gửi được cmd 590 (mất kết nối WebSocket)".to_string();
+                    on_progress(0.15, format!("⚠️ {msg}"));
+                    set_last_phone_sync_error(Some(msg));
                     None
                 }
                 Err(e) => {
                     on_progress(0.15, format!("⚠️ Sync V2: {e}"));
+                    set_last_phone_sync_error(Some(e.to_string()));
                     None
                 }
             },
             Err(e) => {
                 crate::logger::log_sync(&format!("V2 mở session FAIL: {e}"));
                 on_progress(0.15, format!("⚠️ Sync V2: {e}"));
+                set_last_phone_sync_error(Some(e.to_string()));
                 None
             }
         };
 
         // Chờ user xác nhận trên phone (tối đa 90s). Không gửi lại gì cả.
-        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        // No session was opened when 590 failed, so no confirmation can arrive:
+        // skip straight to the server/Cloud phases instead of idling for 90s.
+        let confirm_window = if v2_sync_id.is_some() { Duration::from_secs(90) } else { Duration::ZERO };
+        let deadline = std::time::Instant::now() + confirm_window;
         let mut confirmed = false;
         let mut rejected = false;
         while std::time::Instant::now() < deadline {

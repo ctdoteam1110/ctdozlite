@@ -364,11 +364,14 @@ pub enum GuiEvent {
     ScriptLogsUpdated { thread_id: String },
 }
 
+/// Summary shown when phone sync ends. `phone_error` explains why the phone step
+/// could not start (e.g. Zalo PC missing) while the Cloud/group phases still ran.
 fn phone_sync_completion_message(
     added: usize,
     active_threads: usize,
     cancelled: bool,
     error: Option<&str>,
+    phone_error: Option<&str>,
 ) -> String {
     if let Some(err) = error {
         return format!("⚠️ Đồng bộ thất bại: {err}");
@@ -378,9 +381,11 @@ fn phone_sync_completion_message(
     } else {
         "Đã hoàn tất"
     };
-    format!(
-        "{prefix} yêu cầu: {added} tin mới từ Cloud/Nhóm ({active_threads} hội thoại). Lịch sử điện thoại chưa được tải vào ứng dụng."
-    )
+    let phone_note = match phone_error {
+        Some(err) => format!("Không đồng bộ được từ điện thoại: {err}"),
+        None => "Lịch sử điện thoại chưa được tải vào ứng dụng.".to_string(),
+    };
+    format!("{prefix} yêu cầu: {added} tin mới từ Cloud/Nhóm ({active_threads} hội thoại). {phone_note}")
 }
 
 #[derive(Debug, Clone)]
@@ -3420,11 +3425,13 @@ impl ZaloGuiApp {
                         self.settings.save();
                         self.persist_threads_async();
                     }
+                    let phone_error = crate::history_sync::last_phone_sync_error();
                     let msg = phone_sync_completion_message(
                         added,
                         active_threads,
                         cancelled,
                         error.as_deref(),
+                        phone_error.as_deref(),
                     );
                     self.phone_sync_status = msg.clone();
                     self.status_msg = msg.clone();
@@ -4521,16 +4528,24 @@ mod tests {
 
     #[test]
     fn phone_sync_completion_does_not_claim_phone_messages_were_imported() {
-        let none = phone_sync_completion_message(0, 0, false, None);
+        let none = phone_sync_completion_message(0, 0, false, None, None);
         assert!(none.contains("Lịch sử điện thoại chưa được tải vào ứng dụng"));
         assert!(none.contains("0 tin mới từ Cloud/Nhóm"));
 
-        let cloud = phone_sync_completion_message(12, 3, false, None);
+        let cloud = phone_sync_completion_message(12, 3, false, None, None);
         assert!(cloud.contains("12 tin mới từ Cloud/Nhóm (3 hội thoại)"));
         assert!(cloud.contains("Lịch sử điện thoại chưa được tải vào ứng dụng"));
 
-        let failed = phone_sync_completion_message(0, 0, false, Some("network"));
+        let failed = phone_sync_completion_message(0, 0, false, Some("network"), None);
         assert!(failed.contains("Đồng bộ thất bại: network"));
+    }
+
+    #[test]
+    fn phone_sync_completion_keeps_phone_step_error_visible() {
+        let msg = phone_sync_completion_message(5, 2, false, None, Some("Không tìm thấy Zalo PC trên máy này"));
+        assert!(msg.contains("5 tin mới từ Cloud/Nhóm (2 hội thoại)"));
+        assert!(msg.contains("Không đồng bộ được từ điện thoại: Không tìm thấy Zalo PC trên máy này"));
+        assert!(!msg.contains("Lịch sử điện thoại chưa được tải"));
     }
 
     #[test]

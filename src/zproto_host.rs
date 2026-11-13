@@ -5,7 +5,9 @@
 //! runtime). This host re-implements the glue's semantics in Rust:
 //!
 //! - [`find_wasm_path`]: same locate order as `scripts/sync_v2_helper.js`
-//!   (`CTDOZLITE_ZPROTO_WASM` override → installed Zalo PC → `scripts/assets`).
+//!   (`CTDOZLITE_ZPROTO_WASM` override → installed Zalo PC → `scripts/assets`);
+//!   [`ZprotoHost::load`] then falls back to the copy packed inside Zalo PC's
+//!   `app.asar` (Windows 26.11+ no longer unpacks it).
 //!   The WASM blob is NEVER committed to the repo.
 //! - wasm-bindgen object heap: slots 0..=3 are reserved (`undefined`, `null`,
 //!   `true`, `false`); the rest hold host [`JsVal`]s. `c()` allocates,
@@ -118,6 +120,158 @@ fn glob_wasm(dir: &Path, depth: u32) -> Option<PathBuf> {
     for sub in subdirs {
         if let Some(hit) = glob_wasm(&sub, depth - 1) {
             return Some(hit);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// WASM inside Zalo PC's app.asar
+// ---------------------------------------------------------------------------
+
+/// Largest WASM accepted from an asar entry; the real module is ~0.3 MB.
+const MAX_ASAR_WASM_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Largest asar header JSON accepted (Zalo PC 26.11's is ~0.8 MB).
+const MAX_ASAR_HEADER_BYTES: u32 = 64 * 1024 * 1024;
+
+/// `app.asar` archives of installed Zalo PC builds, newest version folder first.
+/// Zalo PC 26.11+ on Windows packs `pc-dist/libs/libzproto_wasm_bg.*.wasm` inside
+/// `resources/app.asar` (not `app.asar.unpacked`), so [`find_wasm_path`] cannot see it.
+fn zalo_asar_candidates() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        let mut installs: Vec<PathBuf> = Vec::new();
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            installs.push(PathBuf::from(local).join("Programs/Zalo"));
+        }
+        if let Ok(prog) = std::env::var("ProgramFiles") {
+            installs.push(PathBuf::from(prog).join("Zalo"));
+        }
+        for install in installs {
+            let mut versions: Vec<PathBuf> = std::fs::read_dir(&install)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("Zalo-"))
+                })
+                .collect();
+            // "Zalo-26.11.11" style names; compare numerically so 26.10 < 26.9 cannot happen.
+            versions.sort_by_key(|p| std::cmp::Reverse(zalo_version_key(p)));
+            for v in versions {
+                out.push(v.join("resources/app.asar"));
+            }
+            out.push(install.join("resources/app.asar"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        out.push(PathBuf::from("/Applications/Zalo.app/Contents/Resources/app.asar"));
+        if let Ok(home) = std::env::var("HOME") {
+            out.push(PathBuf::from(home).join("Applications/Zalo.app/Contents/Resources/app.asar"));
+        }
+    }
+    out.retain(|p| p.is_file());
+    out
+}
+
+/// Numeric version parts of a `Zalo-<a>.<b>.<c>` folder name, for newest-first ordering.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn zalo_version_key(path: &Path) -> Vec<u64> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("Zalo-"))
+        .map(|v| v.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect())
+        .unwrap_or_default()
+}
+
+/// One file entry of an asar index: byte range relative to the data section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AsarEntry {
+    path: String,
+    offset: u64,
+    size: u64,
+}
+
+/// Parse the asar header and return `(data_section_start, libzproto entry)`.
+///
+/// Layout: `u32 4 | u32 header_pickle_size | u32 | u32 json_len | json`, with file data
+/// starting at `8 + header_pickle_size`. Entries flagged `unpacked` live on disk instead.
+fn read_asar_index(archive: &mut impl std::io::Read) -> Result<(u64, Option<AsarEntry>)> {
+    let mut head = [0u8; 16];
+    archive.read_exact(&mut head)?;
+    let word = |i: usize| u32::from_le_bytes([head[i], head[i + 1], head[i + 2], head[i + 3]]);
+    let (pickle_size, json_len) = (word(4), word(12));
+    anyhow::ensure!(json_len > 0 && json_len <= MAX_ASAR_HEADER_BYTES, "asar header size {json_len} out of range");
+    anyhow::ensure!(u64::from(json_len) + 8 <= u64::from(pickle_size), "asar header sizes inconsistent");
+    let mut json = vec![0u8; json_len as usize];
+    archive.read_exact(&mut json)?;
+    let index: serde_json::Value = serde_json::from_slice(&json)?;
+    Ok((8 + u64::from(pickle_size), find_asar_wasm_entry(&index)))
+}
+
+/// Depth-first search of an asar index for the packed `libzproto_wasm_bg.*.wasm`.
+fn find_asar_wasm_entry(index: &serde_json::Value) -> Option<AsarEntry> {
+    fn walk(node: &serde_json::Value, prefix: &str) -> Option<AsarEntry> {
+        let files = node.get("files")?.as_object()?;
+        for (name, child) in files {
+            let path = format!("{prefix}/{name}");
+            if child.get("files").is_some() {
+                if let Some(hit) = walk(child, &path) {
+                    return Some(hit);
+                }
+                continue;
+            }
+            let is_target = name.starts_with("libzproto_wasm_bg.") && name.ends_with(".wasm");
+            let packed = !child.get("unpacked").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            if !is_target || !packed {
+                continue;
+            }
+            let offset = match child.get("offset")? {
+                serde_json::Value::String(s) => s.parse().ok()?,
+                v => v.as_u64()?,
+            };
+            let size = child.get("size")?.as_u64()?;
+            return Some(AsarEntry { path, offset, size });
+        }
+        None
+    }
+    walk(index, "")
+}
+
+/// Read the packed libzproto WASM out of one `app.asar`. `Ok(None)` when it has none.
+fn read_wasm_from_asar(archive_path: &Path) -> Result<Option<(String, Vec<u8>)>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(archive_path)?;
+    let (data_start, entry) = read_asar_index(&mut file)?;
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        entry.size > 8 && entry.size <= MAX_ASAR_WASM_BYTES,
+        "asar entry {} has implausible size {}",
+        entry.path,
+        entry.size
+    );
+    file.seek(SeekFrom::Start(data_start + entry.offset))?;
+    let mut bytes = vec![0u8; entry.size as usize];
+    file.read_exact(&mut bytes)?;
+    anyhow::ensure!(bytes.starts_with(b"\0asm"), "asar entry {} is not a WASM module", entry.path);
+    Ok(Some((entry.path, bytes)))
+}
+
+/// First libzproto WASM packed in an installed Zalo PC `app.asar`, with its origin label.
+fn find_wasm_in_zalo_asar() -> Option<(String, Vec<u8>)> {
+    for archive in zalo_asar_candidates() {
+        match read_wasm_from_asar(&archive) {
+            Ok(Some((entry, bytes))) => return Some((format!("{}:{entry}", archive.display()), bytes)),
+            Ok(None) => {}
+            Err(e) => crate::logger::log_sync(&format!("app.asar {}: {e}", archive.display())),
         }
     }
     None
@@ -645,18 +799,42 @@ impl std::fmt::Debug for ZprotoHost {
 }
 
 impl ZprotoHost {
+    /// Load the WASM from disk ([`find_wasm_path`]) or, failing that, from inside an
+    /// installed Zalo PC's `app.asar`.
+    ///
+    /// # Errors
+    /// Returns a user-facing error when no Zalo PC / WASM is available, or when the
+    /// module cannot be instantiated.
     pub fn load() -> Result<Self> {
-        let path = find_wasm_path().ok_or_else(|| {
-            anyhow!("Không tìm thấy libzproto_wasm_bg.*.wasm. Cài Zalo PC hoặc đặt CTDOZLITE_ZPROTO_WASM trỏ tới file WASM.")
-        })?;
-        Self::load_from(&path)
+        if let Some(path) = find_wasm_path() {
+            return Self::load_from(&path);
+        }
+        if let Some((origin, bytes)) = find_wasm_in_zalo_asar() {
+            crate::logger::log_sync(&format!("libzproto WASM từ {origin}"));
+            return Self::load_from_bytes(&bytes);
+        }
+        Err(anyhow!(
+            "Không tìm thấy Zalo PC trên máy này (cần file libzproto_wasm_bg.*.wasm của Zalo PC). \
+             Cài Zalo PC hoặc đặt CTDOZLITE_ZPROTO_WASM trỏ tới file WASM."
+        ))
     }
 
+    /// Load the WASM module from a file path.
+    ///
+    /// # Errors
+    /// Returns an error when the file cannot be read or instantiated.
     pub fn load_from(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)?;
+        Self::load_from_bytes(&std::fs::read(path)?)
+    }
+
+    /// Instantiate the WASM module from raw bytes.
+    ///
+    /// # Errors
+    /// Returns an error when the bytes are not a compatible libzproto module.
+    pub fn load_from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut linker = Linker::<HostState>::new(&ENGINE);
         add_imports(&mut linker)?;
-        let module = Module::new(&ENGINE, &bytes)?;
+        let module = Module::new(&ENGINE, bytes)?;
         let mut store = Store::new(&ENGINE, HostState::new());
         let instance = linker.instantiate(&mut store, &module)?;
         let memory = instance
@@ -1019,10 +1197,16 @@ mod tests {
 
     fn try_load() -> Option<ZprotoHost> {
         match find_wasm_path() {
-            None => {
-                eprintln!("SKIP: no libzproto WASM found (install Zalo PC or set CTDOZLITE_ZPROTO_WASM)");
-                None
-            }
+            None => match find_wasm_in_zalo_asar() {
+                Some((origin, bytes)) => match ZprotoHost::load_from_bytes(&bytes) {
+                    Ok(h) => Some(h),
+                    Err(e) => panic!("failed to load WASM from {origin}: {e:#}"),
+                },
+                None => {
+                    eprintln!("SKIP: no libzproto WASM found (install Zalo PC or set CTDOZLITE_ZPROTO_WASM)");
+                    None
+                }
+            },
             Some(p) => match ZprotoHost::load_from(&p) {
                 Ok(h) => Some(h),
                 Err(e) => {
@@ -1034,12 +1218,123 @@ mod tests {
 
     #[test]
     fn wasm_missing_gives_clear_error() {
-        if find_wasm_path().is_some() {
+        if find_wasm_path().is_some() || find_wasm_in_zalo_asar().is_some() {
             eprintln!("WASM present; missing-path branch not exercised");
             return;
         }
         let err = ZprotoHost::load().unwrap_err().to_string();
         assert!(err.contains("libzproto_wasm_bg"), "clear WASM error: {err}");
+        assert!(err.contains("Zalo PC"), "error names the requirement: {err}");
+    }
+
+    /// Write a minimal asar archive holding `files` (`(path, bytes, unpacked)`) and return it.
+    fn write_fake_asar(name: &str, files: &[(&str, &[u8], bool)]) -> PathBuf {
+        let mut root = serde_json::json!({ "files": {} });
+        let mut data: Vec<u8> = Vec::new();
+        for (path, bytes, unpacked) in files {
+            let mut node = &mut root;
+            let parts: Vec<&str> = path.split('/').collect();
+            for dir in &parts[..parts.len() - 1] {
+                node = node["files"]
+                    .as_object_mut()
+                    .unwrap()
+                    .entry(dir.to_string())
+                    .or_insert_with(|| serde_json::json!({ "files": {} }));
+            }
+            let entry = if *unpacked {
+                serde_json::json!({ "size": bytes.len(), "unpacked": true })
+            } else {
+                serde_json::json!({ "size": bytes.len(), "offset": data.len().to_string() })
+            };
+            node["files"][parts[parts.len() - 1]] = entry;
+            if !*unpacked {
+                data.extend_from_slice(bytes);
+            }
+        }
+        let json = serde_json::to_vec(&root).unwrap();
+        let aligned = (json.len() + 3) & !3;
+        let mut out = Vec::new();
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&((8 + aligned) as u32).to_le_bytes());
+        out.extend_from_slice(&((4 + aligned) as u32).to_le_bytes());
+        out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        out.extend_from_slice(&json);
+        out.resize(16 + aligned, 0);
+        out.extend_from_slice(&data);
+        let path = std::env::temp_dir().join(format!("ctdoz_{name}_{}.asar", std::process::id()));
+        std::fs::write(&path, out).unwrap();
+        path
+    }
+
+    #[test]
+    fn asar_reader_extracts_packed_libzproto_wasm() {
+        let wasm: &[u8] = b"\0asm\x01\x00\x00\x00fake-module";
+        let archive = write_fake_asar(
+            "packed",
+            &[
+                ("pc-dist/index.js", b"console.log(1)", false),
+                ("pc-dist/libs/libzproto_backup_wasm_bg.111.wasm", b"\0asm-backup", false),
+                ("pc-dist/libs/libzproto_wasm_bg.5ea0.wasm", wasm, false),
+            ],
+        );
+        let got = read_wasm_from_asar(&archive);
+        let _ = std::fs::remove_file(&archive);
+        let (entry, bytes) = got.expect("readable").expect("entry found");
+        assert_eq!(entry, "/pc-dist/libs/libzproto_wasm_bg.5ea0.wasm");
+        assert_eq!(bytes, wasm);
+    }
+
+    #[test]
+    fn asar_reader_skips_unpacked_and_missing_entries() {
+        let unpacked = write_fake_asar("unpacked", &[("libs/libzproto_wasm_bg.1.wasm", b"\0asm1234", true)]);
+        let none = write_fake_asar("none", &[("libs/other.wasm", b"\0asm1234", false)]);
+        let (a, b) = (read_wasm_from_asar(&unpacked), read_wasm_from_asar(&none));
+        let _ = std::fs::remove_file(&unpacked);
+        let _ = std::fs::remove_file(&none);
+        assert!(a.expect("readable").is_none());
+        assert!(b.expect("readable").is_none());
+    }
+
+    #[test]
+    fn asar_reader_rejects_non_wasm_and_garbage() {
+        let bogus = write_fake_asar("bogus", &[("libs/libzproto_wasm_bg.1.wasm", b"not a wasm module", false)]);
+        let res = read_wasm_from_asar(&bogus);
+        let _ = std::fs::remove_file(&bogus);
+        assert!(res.unwrap_err().to_string().contains("not a WASM"));
+
+        let garbage = std::env::temp_dir().join(format!("ctdoz_garbage_{}.asar", std::process::id()));
+        std::fs::write(&garbage, [0xffu8; 32]).unwrap();
+        let res = read_wasm_from_asar(&garbage);
+        let _ = std::fs::remove_file(&garbage);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn zalo_version_folders_sort_numerically() {
+        let mut dirs = [
+            PathBuf::from("Zalo-26.9.3"),
+            PathBuf::from("Zalo-26.11.11"),
+            PathBuf::from("Zalo-26.10.2"),
+        ];
+        dirs.sort_by_key(|p| std::cmp::Reverse(zalo_version_key(p)));
+        assert_eq!(dirs[0], PathBuf::from("Zalo-26.11.11"));
+        assert_eq!(dirs[2], PathBuf::from("Zalo-26.9.3"));
+    }
+
+    /// Opt-in check against a real Zalo PC archive: set `CTDOZLITE_TEST_ASAR` to its path.
+    #[test]
+    fn real_zalo_asar_wasm_instantiates() {
+        let Ok(path) = std::env::var("CTDOZLITE_TEST_ASAR") else {
+            eprintln!("SKIP: CTDOZLITE_TEST_ASAR not set");
+            return;
+        };
+        let (entry, bytes) = read_wasm_from_asar(Path::new(&path))
+            .expect("asar readable")
+            .expect("libzproto entry present");
+        let host = ZprotoHost::load_from_bytes(&bytes).expect("module instantiates");
+        let (pk, sk) = host.generate_keypair().expect("keypair");
+        eprintln!("{entry}: pk={} sk={}", pk.len(), sk.len());
+        assert!(!pk.is_empty() && !sk.is_empty());
     }
 
     #[test]
