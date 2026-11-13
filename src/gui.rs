@@ -297,6 +297,8 @@ pub enum GuiEvent {
         active_threads: usize,
         cancelled: bool,
         error: Option<String>,
+        /// Why the phone (Sync V2) step could not start, captured by the worker for this run.
+        phone_error: Option<String>,
     },
     /// Result of pinning/unpinning a single chat message through the group-board API.
     MessagePinResult {
@@ -3385,6 +3387,7 @@ impl ZaloGuiApp {
                     active_threads,
                     cancelled,
                     error,
+                    phone_error,
                 } => {
                     self.phone_sync_progress = 0.0;
                     if !threads.is_empty() {
@@ -3425,7 +3428,6 @@ impl ZaloGuiApp {
                         self.settings.save();
                         self.persist_threads_async();
                     }
-                    let phone_error = crate::history_sync::last_phone_sync_error();
                     let msg = phone_sync_completion_message(
                         added,
                         active_threads,
