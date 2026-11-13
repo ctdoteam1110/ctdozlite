@@ -5132,10 +5132,7 @@ mod attachment_card_tests {
         }
     }
 
-        let tall = cover_uv(100.0, 400.0);
-        assert!((tall.min.y - 0.375).abs() < 1e-6 && (tall.max.y - 0.625).abs() < 1e-6);
-    }
-
+    #[test]
     fn classifies_video_voice_and_office_docs() {
         let video = ChatMessage {
             text: "[Video] clip.mp4".into(),
