@@ -361,8 +361,9 @@ async fn main() -> Result<()> {
         return res;
     }
 
-    // 1. Initial server info check for TUI mode
-    if let Ok(resp) = login::get_server_info(&s).await {
+    // 1. Initial server info check for TUI mode (skipped offline).
+    if !offline_mode {
+        if let Ok(resp) = login::get_server_info(&s).await {
         if let Some(d) = resp.get("data") {
             s.apply_server_info(d);
         }
@@ -371,6 +372,7 @@ async fn main() -> Result<()> {
                 "✓ getServerInfo: chat {} • convers {}",
                 s.domains.chat, s.domains.conversation
             );
+        }
         }
     }
 
