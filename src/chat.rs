@@ -8438,12 +8438,9 @@ pub async fn wake_phone_sync_v2(s: &Session) -> Result<String> {
     let sync_id = crate::param_cipher::random_base62(32);
     // Sync V2 BẮT BUỘC có keypair thật từ WASM libzproto (host bằng wasmtime,
     // không cần Node.js). Fail rõ ở đây thay vì gửi request rác.
-    crate::history_sync::generate_sync_v2_keys().map_err(|e| {
-        anyhow::anyhow!(
-            "Không sinh được khóa Sync V2: {e}. \
-             Cài Zalo PC hoặc đặt CTDOZLITE_ZPROTO_WASM trỏ tới file WASM"
-        )
-    })?;
+    // The loader's error already says how to fix a missing Zalo PC / WASM.
+    crate::history_sync::generate_sync_v2_keys()
+        .map_err(|e| anyhow::anyhow!("Không sinh được khóa Sync V2: {e}"))?;
     crate::logger::log_sync(&format!("V2 session mở: sync={}", &sync_id.chars().take(8).collect::<String>()));
     // KHÔNG gửi 592 ở đây: Zalo chỉ dùng 592 wake-up cho session ĐÃ tồn tại
     // (shared-worker.js `session.wakeup()`). Lệnh mở màn là 590.
