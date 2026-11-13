@@ -33,6 +33,7 @@ downloaded_backup.bin
 real_backup.db.crypt
 real_decompressed_db.bin
 sync_rsa_priv.pem
+sync_identity.json
 
 # Phone dumps, private UI screenshots & screen captures
 phone_*.png
