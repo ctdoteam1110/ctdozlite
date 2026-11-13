@@ -381,6 +381,112 @@ impl Domains {
     }
 }
 
+/// The signed-in user's own profile as far as a response exposes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OwnProfile {
+    pub uid: Option<String>,
+    pub name: String,
+    pub avatar: String,
+    /// Display form (see [`display_phone`]); empty when the response has no phone.
+    pub phone: String,
+}
+
+const OWN_PROFILE_ID_KEYS: [&str; 4] = ["userId", "uid", "id", "fid"];
+const OWN_PROFILE_NAME_KEYS: [&str; 6] = [
+    "displayName",
+    "zaloName",
+    "zalo_name",
+    "display_name",
+    "username",
+    "name",
+];
+const OWN_PROFILE_AVATAR_KEYS: [&str; 4] = ["avatar", "avt", "avatarUrl", "fullAvt"];
+const OWN_PROFILE_PHONE_KEYS: [&str; 4] = ["phoneNumber", "phone_number", "phone", "phoneNum"];
+
+fn first_text(obj: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .filter_map(|k| obj.get(*k))
+        .find_map(|v| match v {
+            Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Objects that may hold the own profile, most specific first.
+///
+/// The response shape of `me-v2` is not pinned down: the profile has been seen under
+/// `data.profile`, and other clients also accept `data.info` and a bare `data`. The
+/// decrypted body can additionally be a nested `{error_code, data}` envelope.
+fn own_profile_candidates(dec: &Value) -> Vec<&Value> {
+    let mut out = Vec::new();
+    let bases = [dec.pointer("/data/data"), dec.get("data"), Some(dec)];
+    for base in bases.into_iter().flatten() {
+        for key in ["profile", "info", "user"] {
+            if let Some(v) = base.get(key).filter(|v| v.is_object()) {
+                out.push(v);
+            }
+        }
+    }
+    for base in bases.into_iter().flatten() {
+        if base.is_object() {
+            out.push(base);
+        }
+    }
+    out
+}
+
+/// Extract the own profile from a decrypted `me-v2` style response.
+///
+/// Returns an empty profile when no candidate object carries a name, avatar or id.
+pub(crate) fn parse_own_profile(dec: &Value) -> OwnProfile {
+    for obj in own_profile_candidates(dec) {
+        let uid = first_text(obj, &OWN_PROFILE_ID_KEYS);
+        let name = first_text(obj, &OWN_PROFILE_NAME_KEYS);
+        let avatar = first_text(obj, &OWN_PROFILE_AVATAR_KEYS);
+        if uid.is_empty() && name.is_empty() && avatar.is_empty() {
+            continue;
+        }
+        return OwnProfile {
+            uid: (!uid.is_empty() && uid != "0").then_some(uid),
+            name,
+            avatar,
+            phone: display_phone(&first_text(obj, &OWN_PROFILE_PHONE_KEYS)),
+        };
+    }
+    OwnProfile::default()
+}
+
+/// Comma-separated field names of the first profile candidate, for diagnostics.
+fn own_profile_field_names(dec: &Value) -> String {
+    own_profile_candidates(dec)
+        .first()
+        .and_then(|v| v.as_object())
+        .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
+        .unwrap_or_else(|| "<none>".to_string())
+}
+
+/// Phone number as Vietnamese users write it: `+84 912 345 678` / `84912345678` become
+/// `0912345678`. Numbers of other countries keep their digits (and a leading `+`).
+pub fn display_phone(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let digits: String = trimmed.chars().filter(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return String::new();
+    }
+    if let Some(national) = digits.strip_prefix("84") {
+        if (9..=10).contains(&national.len()) && !national.starts_with('0') {
+            return format!("0{national}");
+        }
+    }
+    if trimmed.starts_with('+') {
+        format!("+{digits}")
+    } else {
+        digits
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LoginInfo {
     pub uin: String,
@@ -392,6 +498,10 @@ pub struct LoginInfo {
     pub send2me_id: String,
     #[serde(default)]
     pub avatar: String,
+    /// Phone number of the account when known (password login or own profile); only
+    /// used to label the account locally. Absent in files from older builds.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phone: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -841,7 +951,11 @@ impl Session {
         }
     }
 
-    /// Fetch the authenticated user's own numeric `userId` and `displayName` from `/api/social/profile/me-v2`.
+    /// Fetch the authenticated user's own id, name, avatar and phone number.
+    ///
+    /// Reads `/api/social/profile/me-v2` and, when it lacks the name or avatar, falls
+    /// back to `getprofiles` on the own uid. Found fields are stored in `self.login`.
+    /// Returns the uid and name, or `None` when signed out or no uid is known.
     pub async fn sync_profile_me(&mut self) -> Option<(String, String)> {
         if self.login.is_none() || self.effective_zpw_sek().is_none() {
             return None;
@@ -856,42 +970,54 @@ impl Session {
             self.domains.profile,
             self.common_params()
         );
-        let resp = self.get(&url).await.ok()?;
-        let dec = self.maybe_decrypt(resp, self.session_key_bytes()).await;
-        let profile = dec
-            .get("data")
-            .and_then(|d| d.get("profile"))
-            .or_else(|| dec.get("profile"))?;
-        let uid = profile
-            .get("userId")
-            .or_else(|| profile.get("uid"))
-            .and_then(|v| match v {
-                Value::String(s) if !s.is_empty() => Some(s.clone()),
-                Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            })?;
-        let name = profile
-            .get("displayName")
-            .or_else(|| profile.get("zaloName"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let avatar = profile
-            .get("avatar")
-            .or_else(|| profile.get("avt"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if let Some(ref mut li) = self.login {
-            li.uin = uid.clone();
-            if !name.is_empty() {
-                li.display_name = name.clone();
+        let mut own = OwnProfile::default();
+        if let Ok(resp) = self.get(&url).await {
+            let dec = self.maybe_decrypt(resp, self.session_key_bytes()).await;
+            if self.verbose {
+                // Field names only: the values are personal data.
+                eprintln!("  me-v2 profile fields: {}", own_profile_field_names(&dec));
             }
-            if !avatar.is_empty() {
-                li.avatar = avatar;
+            own = parse_own_profile(&dec);
+        }
+
+        let known_uin = self
+            .login
+            .as_ref()
+            .map(|l| l.uin.clone())
+            .unwrap_or_default();
+        let uid = own.uid.clone().unwrap_or_else(|| known_uin.clone());
+        if uid.is_empty() {
+            return None;
+        }
+        // `me-v2` does not always carry the name or avatar. `getprofiles` on the own uid
+        // is the same fallback the feed uses for its profile header.
+        if own.name.is_empty() || own.avatar.is_empty() {
+            if let Ok(social) = self.get_friend_social_profile(&uid).await {
+                if own.name.is_empty() {
+                    own.name = if social.display_name.trim().is_empty() {
+                        social.zalo_name.trim().to_string()
+                    } else {
+                        social.display_name.trim().to_string()
+                    };
+                }
+                if own.avatar.is_empty() {
+                    own.avatar = social.avatar_url.trim().to_string();
+                }
             }
         }
-        Some((uid, name))
+        if let Some(ref mut li) = self.login {
+            li.uin = uid.clone();
+            if !own.name.is_empty() {
+                li.display_name = own.name.clone();
+            }
+            if !own.avatar.is_empty() {
+                li.avatar = own.avatar.clone();
+            }
+            if !own.phone.is_empty() {
+                li.phone = own.phone.clone();
+            }
+        }
+        Some((uid, own.name))
     }
 
     /// Clear all session credentials, tokens, keys, and cookies.
@@ -2018,5 +2144,70 @@ mod tests {
             profile_cookies.contains("zpw_sek=sek_from_qr_jar"),
             "expected zpw_sek propagated to tt-profile-wpa.chat.zalo.me, got: {profile_cookies}"
         );
+    }
+
+    #[test]
+    fn own_profile_is_read_from_data_profile() {
+        let dec = serde_json::json!({ "error_code": 0, "data": { "profile": {
+            "userId": "user-1", "displayName": "An", "avatar": "https://cdn.example/a.jpg",
+            "phoneNumber": "84900000001"
+        } } });
+        assert_eq!(
+            parse_own_profile(&dec),
+            OwnProfile {
+                uid: Some("user-1".into()),
+                name: "An".into(),
+                avatar: "https://cdn.example/a.jpg".into(),
+                phone: "0900000001".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn own_profile_is_read_from_bare_data_and_alternate_field_names() {
+        let dec = serde_json::json!({ "error_code": 0, "data": {
+            "uid": 1001, "zaloName": "Binh", "avt": "https://cdn.example/b.jpg"
+        } });
+        let profile = parse_own_profile(&dec);
+        assert_eq!(profile.uid.as_deref(), Some("1001"));
+        assert_eq!(profile.name, "Binh");
+        assert_eq!(profile.avatar, "https://cdn.example/b.jpg");
+        assert!(profile.phone.is_empty());
+    }
+
+    #[test]
+    fn own_profile_is_read_from_nested_envelope_and_info_object() {
+        let dec = serde_json::json!({ "data": { "error_code": 0, "data": { "info": {
+            "display_name": "Chi"
+        } } } });
+        let profile = parse_own_profile(&dec);
+        assert_eq!(profile.uid, None);
+        assert_eq!(profile.name, "Chi");
+    }
+
+    #[test]
+    fn own_profile_is_empty_when_response_has_no_profile_fields() {
+        let dec = serde_json::json!({ "error_code": 600, "error_message": "expired" });
+        assert_eq!(parse_own_profile(&dec), OwnProfile::default());
+    }
+
+    #[test]
+    fn display_phone_converts_vietnamese_country_code_to_leading_zero() {
+        assert_eq!(display_phone("84900000001"), "0900000001");
+        assert_eq!(display_phone("+84 900 000 001"), "0900000001");
+        assert_eq!(display_phone("0900000001"), "0900000001");
+        assert_eq!(display_phone("+1 202 555 0100"), "+12025550100");
+        assert_eq!(display_phone("  "), "");
+    }
+
+    #[test]
+    fn login_info_without_phone_field_still_loads() {
+        let info: LoginInfo = serde_json::from_value(serde_json::json!({
+            "uin": "user-1", "zpw_enk": "", "zpw_sek": "", "display_name": "An",
+            "send2me_id": ""
+        }))
+        .unwrap();
+        assert!(info.phone.is_empty());
+        assert!(!serde_json::to_string(&info).unwrap().contains("phone"));
     }
 }
