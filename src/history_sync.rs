@@ -235,18 +235,47 @@ where
             0.10,
             "📲 Đang gửi yêu cầu đồng bộ tới Zalo trên điện thoại (hãy mở Zalo trên điện thoại và bấm 'Đồng bộ ngay')…".to_string(),
         );
+        let partitions = chat::resolve_thread_partitions(s, threads).await;
+        crate::logger::log_sync(&format!("Tìm được {} partitions cho sync", partitions.len()));
+
         let v2_sync_id = match chat::wake_phone_sync_v2(s).await {
-            Ok(sync_id) => match chat::send_sync_v2_request(s, &sync_id) {
-                Ok(true) => {
-                    crate::logger::log_sync(&format!("590 mở session: sync={}", &sync_id.chars().take(8).collect::<String>()));
-                    Some(sync_id)
-                }
-                Ok(false) => {
-                    on_progress(0.15, "⚠️ Không gửi được cmd 590 (mất kết nối WebSocket)".to_string());
-                    None
+            Ok(sync_id) => match chat::build_sync_v2_payload(s, &sync_id, &partitions) {
+                Ok(sync_data) => {
+                    // 1. Gửi HTTP request-sync (cmd 12888) lên file server để kích hoạt push notification tới phone
+                    let s_clone = s.clone();
+                    let sync_data_clone = sync_data.clone();
+                    let _sid_clone = sync_id.clone();
+                    tokio::spawn(async move {
+                        let req_id = format!("req_12888_{}", crate::login::unix_now());
+                        if let Err(e) =
+                            chat::request_phone_sync_v2_http(&s_clone, &req_id, &sync_data_clone)
+                                .await
+                        {
+                            crate::logger::log_sync(&format!("HTTP request-sync 12888 err: {e}"));
+                        } else {
+                            crate::logger::log_sync("HTTP request-sync 12888 đã gửi thành công");
+                        }
+                    });
+
+                    // 2. Gửi WS cmd 590 & cmd 592
+                    let sent_ws = crate::socket::send_sync_message_ws_request(&sync_data);
+                    let sent_wake = crate::socket::send_mobile_wakeup(&sync_id);
+                    crate::logger::log_sync(&format!(
+                        "590/592 mở session: sync={} ws_590={sent_ws} ws_592={sent_wake}",
+                        &sync_id.chars().take(8).collect::<String>()
+                    ));
+                    if sent_ws || sent_wake {
+                        Some(sync_id)
+                    } else {
+                        on_progress(
+                            0.15,
+                            "⚠️ Không gửi được cmd 590 (mất kết nối WebSocket)".to_string(),
+                        );
+                        Some(sync_id) // Vẫn giữ sync_id vì HTTP 12888 đã gửi
+                    }
                 }
                 Err(e) => {
-                    on_progress(0.15, format!("⚠️ Sync V2: {e}"));
+                    on_progress(0.15, format!("⚠️ Lỗi tạo gói Sync V2: {e}"));
                     None
                 }
             },
@@ -256,6 +285,15 @@ where
                 None
             }
         };
+
+        // Fallback sang V1 pull_mobile_msg nếu V2 không khởi tạo được khóa
+        if v2_sync_id.is_none() {
+            let s_legacy = s.clone();
+            let pub_key_clone = pub_key.clone();
+            tokio::spawn(async move {
+                let _ = chat::request_phone_sync(&s_legacy, &pub_key_clone).await;
+            });
+        }
 
         // Chờ user xác nhận trên phone (tối đa 90s). Không gửi lại gì cả.
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
@@ -980,6 +1018,18 @@ pub fn remove_sync_v2_session(sync_id: &str) {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct ParsedProtoAttach {
+    pub attach_type: Option<String>,
+    pub params: Option<String>,
+    pub title: Option<String>,
+    pub href: Option<String>,
+    pub thumb: Option<String>,
+    pub description: Option<String>,
+    pub cat_id: Option<i32>,
+    pub id: Option<i32>,
+}
+
 #[derive(Debug, Default)]
 pub struct ParsedProtoMsg {
     pub sender_id: String,
@@ -989,6 +1039,7 @@ pub struct ParsedProtoMsg {
     pub timestamp: u64,
     pub global_id: String,
     pub content: String,
+    pub attaches: Vec<ParsedProtoAttach>,
 }
 
 #[derive(Debug, Default)]
@@ -1011,6 +1062,82 @@ fn parse_vli(buf: &[u8], mut offset: usize) -> Option<(u64, usize)> {
         if shift >= 64 { return None; }
     }
     None
+}
+
+fn parse_proto_attach(buf: &[u8]) -> Option<ParsedProtoAttach> {
+    let mut att = ParsedProtoAttach::default();
+    let mut offset = 0;
+    while offset < buf.len() {
+        let (tag, next) = parse_vli(buf, offset)?;
+        offset = next;
+        let field_num = tag >> 3;
+        let wire_type = tag & 0x07;
+        match wire_type {
+            0 => {
+                let (val, next) = parse_vli(buf, offset)?;
+                offset = next;
+                match field_num {
+                    9 => att.cat_id = Some(val as i32),
+                    10 => att.id = Some(val as i32),
+                    _ => {}
+                }
+            }
+            2 => {
+                let (len, next) = parse_vli(buf, offset)?;
+                offset = next;
+                let len = len as usize;
+                if offset + len > buf.len() { return None; }
+                let s = String::from_utf8_lossy(&buf[offset..offset + len]).into_owned();
+                offset += len;
+                match field_num {
+                    1 => att.attach_type = Some(s),
+                    4 => att.params = Some(s),
+                    5 => att.title = Some(s),
+                    6 => att.href = Some(s),
+                    7 => att.thumb = Some(s),
+                    8 => att.description = Some(s),
+                    _ => {}
+                }
+            }
+            1 => offset += 8,
+            5 => offset += 4,
+            _ => return None,
+        }
+    }
+    Some(att)
+}
+
+fn parse_proto_metadata(buf: &[u8]) -> Option<Vec<ParsedProtoAttach>> {
+    let mut attaches = Vec::new();
+    let mut offset = 0;
+    while offset < buf.len() {
+        let (tag, next) = parse_vli(buf, offset)?;
+        offset = next;
+        let field_num = tag >> 3;
+        let wire_type = tag & 0x07;
+        match wire_type {
+            0 => {
+                let (_, next) = parse_vli(buf, offset)?;
+                offset = next;
+            }
+            2 => {
+                let (len, next) = parse_vli(buf, offset)?;
+                offset = next;
+                let len = len as usize;
+                if offset + len > buf.len() { return None; }
+                if field_num == 1 {
+                    if let Some(att) = parse_proto_attach(&buf[offset..offset + len]) {
+                        attaches.push(att);
+                    }
+                }
+                offset += len;
+            }
+            1 => offset += 8,
+            5 => offset += 4,
+            _ => return None,
+        }
+    }
+    Some(attaches)
 }
 
 fn parse_message(buf: &[u8]) -> Option<ParsedProtoMsg> {
@@ -1044,6 +1171,11 @@ fn parse_message(buf: &[u8]) -> Option<ParsedProtoMsg> {
                     1 => msg.sender_id = String::from_utf8_lossy(bytes).into_owned(),
                     6 => msg.global_id = String::from_utf8_lossy(bytes).into_owned(),
                     7 => msg.content = String::from_utf8_lossy(bytes).into_owned(),
+                    8 => {
+                        if let Some(atts) = parse_proto_metadata(bytes) {
+                            msg.attaches.extend(atts);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1225,16 +1357,89 @@ pub(crate) async fn import_sync_v2_messages_inner(
                 m.client_id.to_string()
             };
 
+            // Map numeric msg_type from protobuf into Zalo string msg_type:
+            // 1: text, 2/11: photo, 3: voice, 4/5/13: sticker, 18: video, 19: file, 20/31: undo
+            let msg_type_str = match m.msg_type {
+                1 => "chat.text",
+                2 | 11 => "chat.photo",
+                3 => "chat.voice",
+                4 | 5 | 13 => "chat.sticker",
+                18 => "chat.video.msg",
+                19 => "chat.file",
+                20 | 31 => "chat.undo",
+                _ => "chat.text",
+            };
+
+            let mut text = m.content;
+            let mut raw_meta = serde_json::Map::new();
+
+            if let Some(att) = m.attaches.into_iter().next() {
+                if let Some(href) = att.href.filter(|h| !h.is_empty()) {
+                    raw_meta.insert("link_url".into(), serde_json::json!(href));
+                }
+                if let Some(title) = att.title.filter(|t| !t.is_empty()) {
+                    raw_meta.insert("link_title".into(), serde_json::json!(title));
+                }
+                if let Some(thumb) = att.thumb.filter(|t| !t.is_empty()) {
+                    raw_meta.insert("link_thumb".into(), serde_json::json!(thumb));
+                }
+                if let Some(desc) = att.description.filter(|d| !d.is_empty()) {
+                    raw_meta.insert("link_desc".into(), serde_json::json!(desc));
+                }
+                if let Some(sid) = att.id {
+                    raw_meta.insert("stickerId".into(), serde_json::json!(sid));
+                    if let Some(cid) = att.cat_id {
+                        raw_meta.insert("cateId".into(), serde_json::json!(cid));
+                    }
+                }
+            }
+
+            let is_video = m.msg_type == 18
+                || raw_meta
+                    .get("link_url")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|u| {
+                        let l = u.to_ascii_lowercase();
+                        l.contains("video-") || l.contains(".dlmd.me") || l.ends_with(".mp4")
+                    });
+
+            if is_video {
+                raw_meta.insert("link_src".into(), serde_json::json!("Video Zalo"));
+                raw_meta.insert("link_title".into(), serde_json::json!("Video"));
+                text = "[Video]".into();
+            } else if m.msg_type == 2 || m.msg_type == 11 {
+                raw_meta.insert("link_src".into(), serde_json::json!("Hình ảnh Zalo"));
+                if text.is_empty() || (text.len() > 20 && !text.contains(' ')) {
+                    text = "[Hình ảnh]".into();
+                }
+            } else if m.msg_type == 19 {
+                raw_meta.insert("link_src".into(), serde_json::json!("Tập tin Zalo"));
+                let title = raw_meta
+                    .get("link_title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&text);
+                text = format!("[Tập tin] {title}");
+            } else if m.msg_type == 3 {
+                raw_meta.insert("link_src".into(), serde_json::json!("Thoại Zalo"));
+                text = "[Tin nhắn thoại]".into();
+            }
+
+            let raw_json = if raw_meta.is_empty() {
+                String::new()
+            } else {
+                serde_json::Value::Object(raw_meta).to_string()
+            };
+
             let sm = crate::store::StoredMessage {
                 msg_id,
                 thread_id: thread_id.clone(),
                 sender_id: if is_outgoing { uin.clone() } else { thread_id.clone() },
                 sender_name,
-                text: m.content,
-                msg_type: "webchat".into(),
+                text,
+                msg_type: msg_type_str.into(),
                 ts: m.timestamp as i64,
                 is_outgoing,
-                raw_json: String::new(),
+                raw_json,
             };
 
             if store.upsert_message(&sm).unwrap_or(false) {

@@ -907,22 +907,34 @@ impl ZaloGuiApp {
         pal: &ThemePalette,
     ) {
         // Trigger background store catalog load once when drawer opens
-        if self.sticker_store_packs.is_empty() && !self.sticker_store_loading {
+        if !self.sticker_store_attempted
+            && self.sticker_store_packs.is_empty()
+            && !self.sticker_store_loading
+        {
             self.sticker_store_loading = true;
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::FetchStickerStore);
             }
         }
 
+        let open_t = self.anim_bool(
+            ui.ctx(),
+            Id::new("sticker_picker_open_anim"),
+            self.sticker_picker_open,
+            0.16,
+        );
+        let max_picker_h = (ui.ctx().screen_rect().height() * 0.38).clamp(160.0, 248.0);
+        let animated_h = (max_picker_h * open_t).max(1.0);
+
         egui::Frame::none()
             .fill(pal.bg_sidebar)
             .stroke(Stroke::new(1.0_f32, pal.border))
             .inner_margin(Margin::symmetric(14.0, 8.0))
             .show(ui, |ui| {
-                ui.set_height(248.0);
+                ui.set_height(animated_h);
 
                 // 1. Top Pack & Store Navigation Bar
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let store_count_lbl = if !self.sticker_store_packs.is_empty() {
                         format!("{} Kho Nhãn Dán ({})", lucide::STORE, self.sticker_store_packs.len())
                     } else {
@@ -940,7 +952,7 @@ impl ZaloGuiApp {
                             RichText::new(title)
                                 .size(12.2)
                                 .color(if active {
-                                    Color32::WHITE
+                                    pal.primary_fg
                                 } else {
                                     pal.text_primary
                                 })
@@ -961,15 +973,13 @@ impl ZaloGuiApp {
                         }
                     }
 
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .small_button(format!("{} Đóng", lucide::X))
-                            .on_hover_cursor(CursorIcon::PointingHand)
-                            .clicked()
-                        {
-                            self.sticker_picker_open = false;
-                        }
-                    });
+                    if ui
+                        .small_button(format!("{} Đóng", lucide::X))
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        self.sticker_picker_open = false;
+                    }
                 });
 
                 ui.add_space(3.0);
@@ -988,7 +998,7 @@ impl ZaloGuiApp {
                                     RichText::new(&pname)
                                         .size(11.8)
                                         .color(if active {
-                                            Color32::WHITE
+                                            pal.primary_fg
                                         } else {
                                             pal.text_secondary
                                         })
@@ -1011,6 +1021,7 @@ impl ZaloGuiApp {
                                 {
                                     self.sticker_tab = tab;
                                     if !self.sticker_pack_items.contains_key(&cid)
+                                        && !self.failed_sticker_packs.contains(&cid)
                                         && self.loading_sticker_packs.insert(cid)
                                     {
                                         if let Some(tx) = WORKER_TX.get() {
@@ -1030,7 +1041,8 @@ impl ZaloGuiApp {
                 // 2. Tab Body
                 match self.sticker_tab {
                     StickerTab::Store => {
-                        ui.horizontal(|ui| {
+                        let filter_w = (ui.available_width() - 140.0).clamp(130.0, 340.0);
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(
                                 RichText::new("Lọc bộ nhãn:")
                                     .size(12.0)
@@ -1038,8 +1050,8 @@ impl ZaloGuiApp {
                             );
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.sticker_store_filter)
-                                    .hint_text("Tìm trong 390+ bộ nhãn Zalo (VD: Zapy, Mèo, Gấu, Tết, Cò Lõ…)")
-                                    .desired_width(340.0),
+                                    .hint_text("Tìm trong 390+ bộ nhãn Zalo (VD: Zapy, Mèo, Gấu, Tết…)")
+                                    .desired_width(filter_w),
                             );
                             if !self.sticker_store_filter.is_empty()
                                 && ui.small_button("Xóa").clicked()
@@ -1052,6 +1064,7 @@ impl ZaloGuiApp {
                                 .clicked()
                             {
                                 self.sticker_store_loading = true;
+                                self.sticker_store_attempted = true;
                                 if let Some(tx) = WORKER_TX.get() {
                                     let _ = tx.send(WorkerCmd::FetchStickerStore);
                                 }
@@ -1064,6 +1077,28 @@ impl ZaloGuiApp {
                                 ui.add_space(36.0);
                                 ui.spinner();
                                 ui.label("Đang tải danh mục Kho Nhãn Dán Zalo…");
+                            });
+                            return;
+                        }
+                        if self.sticker_store_packs.is_empty() {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(28.0);
+                                ui.label(
+                                    RichText::new("Không tải được danh mục Kho Nhãn Dán Zalo.")
+                                        .size(12.5)
+                                        .color(pal.text_muted),
+                                );
+                                ui.add_space(8.0);
+                                if ui
+                                    .button(format!("{} Thử tải lại kho", lucide::REFRESH))
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    self.sticker_store_loading = true;
+                                    if let Some(tx) = WORKER_TX.get() {
+                                        let _ = tx.send(WorkerCmd::FetchStickerStore);
+                                    }
+                                }
                             });
                             return;
                         }
@@ -1086,16 +1121,11 @@ impl ZaloGuiApp {
                                     ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                                     for pack in &packs_snapshot {
                                         let icon_key = format!("pack_ic_{}", pack.id);
-                                        if !pack.icon_url.is_empty()
-                                            && !self.sticker_textures.contains_key(&icon_key)
-                                            && self.loading_stickers.insert(icon_key.clone())
-                                        {
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                                    key: icon_key.clone(),
-                                                    url: pack.icon_url.clone(),
-                                                });
-                                            }
+                                        if !pack.icon_url.is_empty() {
+                                            self.request_sticker_image(
+                                                icon_key.clone(),
+                                                pack.icon_url.clone(),
+                                            );
                                         }
 
                                         let (card_rect, card_resp) = ui.allocate_exact_size(
@@ -1192,6 +1222,7 @@ impl ZaloGuiApp {
                             }
                             self.sticker_tab = StickerTab::Pack(cid);
                             if !self.sticker_pack_items.contains_key(&cid)
+                                && !self.failed_sticker_packs.contains(&cid)
                                 && self.loading_sticker_packs.insert(cid)
                             {
                                 if let Some(tx) = WORKER_TX.get() {
@@ -1205,10 +1236,11 @@ impl ZaloGuiApp {
                     }
                     StickerTab::Search => {
                         let mut trigger_kw: Option<String> = None;
-                        ui.horizontal(|ui| {
+                        let search_w = (ui.available_width() - 90.0).clamp(130.0, 250.0);
+                        ui.horizontal_wrapped(|ui| {
                             let te = egui::TextEdit::singleline(&mut self.sticker_search_query)
                                 .hint_text("Gõ để tự động tìm nhãn dán (xin chào, cảm ơn, khóc, nhớ, cố lên, mệt quá…)")
-                                .desired_width(250.0);
+                                .desired_width(search_w);
                             let resp = ui.add(te);
                             if resp.changed() {
                                 self.last_sticker_search_edit_at = std::time::Instant::now();
@@ -1316,11 +1348,42 @@ impl ZaloGuiApp {
                     StickerTab::Pack(cid) => {
                         if let Some(items) = self.sticker_pack_items.get(&cid).cloned() {
                             self.render_sticker_items_grid(ui, &items, thread_id, is_group, pal);
-                        } else {
+                        } else if self.loading_sticker_packs.contains(&cid) {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(36.0);
                                 ui.spinner();
                                 ui.label("Đang tải bộ nhãn dán từ máy chủ Zalo…");
+                            });
+                        } else {
+                            let pack_name = self
+                                .pinned_sticker_packs
+                                .iter()
+                                .find(|(id, _)| *id == cid)
+                                .map(|(_, n)| n.clone())
+                                .unwrap_or_else(|| format!("Bộ #{cid}"));
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(28.0);
+                                ui.label(
+                                    RichText::new("Không tải được bộ nhãn dán này.")
+                                        .size(12.5)
+                                        .color(pal.text_muted),
+                                );
+                                ui.add_space(8.0);
+                                if ui
+                                    .button(format!("{} Thử tải lại", lucide::REFRESH))
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    self.failed_sticker_packs.remove(&cid);
+                                    if self.loading_sticker_packs.insert(cid) {
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let _ = tx.send(WorkerCmd::FetchStickerPack {
+                                                cate_id: cid,
+                                                name: pack_name,
+                                            });
+                                        }
+                                    }
+                                }
                             });
                         }
                     }
@@ -1355,16 +1418,7 @@ impl ZaloGuiApp {
                             )
                         };
 
-                        if !self.sticker_textures.contains_key(&key)
-                            && self.loading_stickers.insert(key.clone())
-                        {
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                    key: key.clone(),
-                                    url,
-                                });
-                            }
-                        }
+                        self.request_sticker_image(key.clone(), url);
 
                         let (cell_rect, cell_resp) =
                             ui.allocate_exact_size(Vec2::new(68.0, 68.0), Sense::click());
@@ -1644,16 +1698,7 @@ impl ZaloGuiApp {
                                                 )
                                             };
 
-                                            if !self.sticker_textures.contains_key(&key)
-                                                && self.loading_stickers.insert(key.clone())
-                                            {
-                                                if let Some(tx) = WORKER_TX.get() {
-                                                    let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                                        key: key.clone(),
-                                                        url,
-                                                    });
-                                                }
-                                            }
+                                            self.request_sticker_image(key.clone(), url);
 
                                             let (cell_rect, cell_resp) = ui.allocate_exact_size(
                                                 Vec2::new(62.0, 62.0),

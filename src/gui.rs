@@ -40,6 +40,593 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
     crate::chat::merge_sent_message(thread, message);
 }
 
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WinRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl WinRect {
+    #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+    fn width(self) -> i32 {
+        self.right.saturating_sub(self.left)
+    }
+
+    #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+    fn height(self) -> i32 {
+        self.bottom.saturating_sub(self.top)
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug)]
+struct WinResizeDrag {
+    dir: egui::ResizeDirection,
+    start_cursor_x: i32,
+    start_cursor_y: i32,
+    start_rect: WinRect,
+    last_rect: WinRect,
+}
+
+/// Computes the target Win32 window rectangle during an 8-direction border drag,
+/// clamping width and height to `(min_w, min_h)` without flipping opposite edges.
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn compute_resized_rect(
+    start: WinRect,
+    dir: egui::ResizeDirection,
+    dx: i32,
+    dy: i32,
+    min_w: i32,
+    min_h: i32,
+) -> WinRect {
+    let min_w = min_w.max(1);
+    let min_h = min_h.max(1);
+    let mut r = start;
+
+    match dir {
+        egui::ResizeDirection::West
+        | egui::ResizeDirection::NorthWest
+        | egui::ResizeDirection::SouthWest => {
+            let max_left = r.right.saturating_sub(min_w);
+            r.left = start.left.saturating_add(dx).min(max_left);
+        }
+        egui::ResizeDirection::East
+        | egui::ResizeDirection::NorthEast
+        | egui::ResizeDirection::SouthEast => {
+            let min_right = r.left.saturating_add(min_w);
+            r.right = start.right.saturating_add(dx).max(min_right);
+        }
+        egui::ResizeDirection::North | egui::ResizeDirection::South => {}
+    }
+
+    match dir {
+        egui::ResizeDirection::North
+        | egui::ResizeDirection::NorthWest
+        | egui::ResizeDirection::NorthEast => {
+            let max_top = r.bottom.saturating_sub(min_h);
+            r.top = start.top.saturating_add(dy).min(max_top);
+        }
+        egui::ResizeDirection::South
+        | egui::ResizeDirection::SouthWest
+        | egui::ResizeDirection::SouthEast => {
+            let min_bottom = r.top.saturating_add(min_h);
+            r.bottom = start.bottom.saturating_add(dy).max(min_bottom);
+        }
+        egui::ResizeDirection::West | egui::ResizeDirection::East => {}
+    }
+
+    r
+}
+
+#[cfg(target_os = "windows")]
+mod win32_frameless {
+    use super::WinRect;
+    use std::sync::{Mutex, OnceLock};
+
+    const GWL_STYLE: i32 = -16;
+    const GWL_EXSTYLE: i32 = -20;
+    const GWLP_WNDPROC: i32 = -4;
+
+    const WM_STYLECHANGING: u32 = 0x007C;
+    const WM_NCDESTROY: u32 = 0x0082;
+
+    // winit 0.30 keeps WS_CAPTION | WS_THICKFRAME and WS_EX_WINDOWEDGE even for undecorated
+    // windows. Intel/hybrid WGL drivers use AdjustWindowRectEx on those bits and shift rendering,
+    // leaving an unrendered black border on the top/left edges.
+    const WS_BORDER: u32 = 0x0080_0000;
+    const WS_DLGFRAME: u32 = 0x0040_0000;
+    const WS_CAPTION: u32 = WS_BORDER | WS_DLGFRAME;
+    const WS_THICKFRAME: u32 = 0x0004_0000;
+    const STRIP_STYLE_MASK: u32 = WS_CAPTION | WS_THICKFRAME;
+
+    const WS_EX_DLGMODALFRAME: u32 = 0x0000_0001;
+    const WS_EX_WINDOWEDGE: u32 = 0x0000_0100;
+    const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
+    const STRIP_EX_STYLE_MASK: u32 = WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE;
+
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    const SWP_FRAMECHANGED: u32 = 0x0020;
+
+    const GW_OWNER: u32 = 4;
+    const MONITOR_DEFAULTTONEAREST: u32 = 2;
+    const SPI_GETWORKAREA: u32 = 0x0030;
+
+    static ORIG_WNDPROCS: OnceLock<Mutex<Vec<(usize, usize)>>> = OnceLock::new();
+
+    #[repr(C)]
+    struct StyleStruct {
+        style_old: u32,
+        style_new: u32,
+    }
+
+    #[repr(C)]
+    struct RawPoint {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    struct MonitorInfo {
+        cb_size: u32,
+        rc_monitor: WinRect,
+        rc_work: WinRect,
+        dw_flags: u32,
+    }
+
+    struct EnumSearchState {
+        visible_match: usize,
+        any_match: usize,
+    }
+
+    struct EnumTitleState<'a> {
+        target_title: &'a str,
+        matched: usize,
+    }
+
+    #[link(name = "opengl32")]
+    extern "system" {
+        fn wglGetCurrentDC() -> usize;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThreadId() -> u32;
+    }
+
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: usize,
+            dw_attribute: u32,
+            pv_attribute: *const u32,
+            cb_attribute: u32,
+        ) -> i32;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn WindowFromDC(hdc: usize) -> usize;
+        fn GetActiveWindow() -> usize;
+        fn EnumThreadWindows(
+            dw_thread_id: u32,
+            lpfn: unsafe extern "system" fn(usize, isize) -> i32,
+            l_param: isize,
+        ) -> i32;
+        fn GetWindow(hwnd: usize, u_cmd: u32) -> usize;
+        fn GetWindowTextW(hwnd: usize, lp_string: *mut u16, n_max_count: i32) -> i32;
+        fn IsWindow(hwnd: usize) -> i32;
+        fn IsWindowVisible(hwnd: usize) -> i32;
+        fn GetWindowLongW(hwnd: usize, n_index: i32) -> i32;
+        fn SetWindowLongW(hwnd: usize, n_index: i32, dw_new_long: i32) -> i32;
+        #[cfg(target_pointer_width = "64")]
+        fn SetWindowLongPtrW(hwnd: usize, n_index: i32, dw_new_long: isize) -> isize;
+        fn CallWindowProcW(
+            lp_prev_wnd_func: usize,
+            hwnd: usize,
+            msg: u32,
+            w_param: usize,
+            l_param: isize,
+        ) -> isize;
+        fn SetWindowPos(
+            hwnd: usize,
+            hwnd_insert_after: usize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            u_flags: u32,
+        ) -> i32;
+        fn GetWindowRect(hwnd: usize, lp_rect: *mut WinRect) -> i32;
+        fn GetCursorPos(lp_point: *mut RawPoint) -> i32;
+        fn MonitorFromWindow(hwnd: usize, dw_flags: u32) -> usize;
+        fn GetMonitorInfoW(h_monitor: usize, lpmi: *mut MonitorInfo) -> i32;
+        fn SystemParametersInfoW(
+            ui_action: u32,
+            ui_param: u32,
+            pv_param: *mut WinRect,
+            f_win_ini: u32,
+        ) -> i32;
+    }
+
+    #[inline]
+    fn strip_style_bits(style: u32) -> u32 {
+        style & !STRIP_STYLE_MASK
+    }
+
+    #[inline]
+    fn strip_ex_style_bits(ex_style: u32) -> u32 {
+        ex_style & !STRIP_EX_STYLE_MASK
+    }
+
+    unsafe fn set_window_long_ptr(hwnd: usize, index: i32, new_val: isize) -> isize {
+        #[cfg(target_pointer_width = "64")]
+        // SAFETY: Caller passes a valid Win32 `HWND` and pointer-sized index/value on 64-bit Windows.
+        unsafe {
+            SetWindowLongPtrW(hwnd, index, new_val)
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        // SAFETY: On 32-bit Windows `SetWindowLongW` accepts pointer-width values.
+        unsafe {
+            SetWindowLongW(hwnd, index, new_val as i32) as isize
+        }
+    }
+
+    fn wndproc_map() -> &'static Mutex<Vec<(usize, usize)>> {
+        ORIG_WNDPROCS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    fn lookup_orig_wndproc(hwnd: usize) -> usize {
+        let guard = wndproc_map().lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .iter()
+            .find(|&&(h, _)| h == hwnd)
+            .map_or(0, |&(_, proc_ptr)| proc_ptr)
+    }
+
+    fn store_orig_wndproc(hwnd: usize, orig: usize) {
+        let mut guard = wndproc_map().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.iter_mut().find(|entry| entry.0 == hwnd) {
+            entry.1 = orig;
+        } else {
+            guard.push((hwnd, orig));
+        }
+    }
+
+    fn remove_orig_wndproc(hwnd: usize) -> usize {
+        let mut guard = wndproc_map().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(idx) = guard.iter().position(|&(h, _)| h == hwnd) {
+            guard.swap_remove(idx).1
+        } else {
+            0
+        }
+    }
+
+    /// Intercepts `WM_STYLECHANGING` synchronously before Win32 commits `SetWindowLongW` changes,
+    /// preventing `winit` (`set_visible`, maximize/restore, DPI updates) from re-enabling borders.
+    unsafe extern "system" fn frameless_subclass_wndproc(
+        hwnd: usize,
+        msg: u32,
+        w_param: usize,
+        l_param: isize,
+    ) -> isize {
+        if msg == WM_STYLECHANGING && l_param != 0 {
+            // Win32 places `GWL_STYLE` (-16) / `GWL_EXSTYLE` (-20) in the low 32 bits of `w_param`.
+            let style_kind = w_param as i32;
+            // SAFETY: For `WM_STYLECHANGING` with non-null `l_param`, Win32 guarantees `l_param`
+            // points to a live mutable `STYLESTRUCT` for the duration of the message.
+            let style_struct = unsafe { &mut *(l_param as *mut StyleStruct) };
+            if style_kind == GWL_STYLE {
+                style_struct.style_new = strip_style_bits(style_struct.style_new);
+            } else if style_kind == GWL_EXSTYLE {
+                style_struct.style_new = strip_ex_style_bits(style_struct.style_new);
+            }
+        }
+
+        let orig = if msg == WM_NCDESTROY {
+            let removed = remove_orig_wndproc(hwnd);
+            if removed != 0 {
+                // SAFETY: Restoring original `WndProc` on `WM_NCDESTROY` detaches subclass cleanly.
+                let _ = unsafe { set_window_long_ptr(hwnd, GWLP_WNDPROC, removed as isize) };
+            }
+            removed
+        } else {
+            lookup_orig_wndproc(hwnd)
+        };
+
+        if orig != 0 {
+            // SAFETY: `orig` is the valid previous `WndProc` saved when this subclass was installed.
+            unsafe { CallWindowProcW(orig, hwnd, msg, w_param, l_param) }
+        } else {
+            0
+        }
+    }
+
+    unsafe extern "system" fn enum_thread_window_cb(hwnd: usize, l_param: isize) -> i32 {
+        // SAFETY: `l_param` points to stack-allocated `EnumSearchState` owned by `find_window_hwnd`.
+        let state = unsafe { &mut *(l_param as *mut EnumSearchState) };
+        // SAFETY: Win32 passes a valid thread `HWND` into `EnumThreadWindows` callback.
+        let is_top_level = unsafe { GetWindow(hwnd, GW_OWNER) } == 0;
+        if !is_top_level {
+            return 1;
+        }
+        let Some(rect) = get_window_rect(hwnd) else {
+            return 1;
+        };
+        // Skip winit/IME helper windows and the 380x156 corner popup so only the main window matches.
+        if rect.width() < 400 || rect.height() < 300 {
+            return 1;
+        }
+        // SAFETY: `hwnd` was enumerated by Win32 and verified non-null above.
+        if unsafe { IsWindowVisible(hwnd) } != 0 {
+            state.visible_match = hwnd;
+            return 0;
+        }
+        if state.any_match == 0 {
+            state.any_match = hwnd;
+        }
+        1
+    }
+
+    unsafe extern "system" fn enum_title_window_cb(hwnd: usize, l_param: isize) -> i32 {
+        // SAFETY: `l_param` points to stack-allocated `EnumTitleState` owned by caller.
+        let state = unsafe { &mut *(l_param as *mut EnumTitleState<'_>) };
+        let mut buf = [0u16; 128];
+        // SAFETY: `hwnd` comes from `EnumThreadWindows` and `buf` is a 128-unit stack buffer.
+        let len = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        if len > 0 {
+            let title = String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]);
+            if title == state.target_title {
+                state.matched = hwnd;
+                return 0;
+            }
+        }
+        1
+    }
+
+    fn find_thread_window_by_title(title: &str) -> usize {
+        let mut state = EnumTitleState {
+            target_title: title,
+            matched: 0,
+        };
+        // SAFETY: `state` outlives the synchronous `EnumThreadWindows` call on this thread.
+        unsafe {
+            let tid = GetCurrentThreadId();
+            let _ = EnumThreadWindows(
+                tid,
+                enum_title_window_cb,
+                (&mut state as *mut EnumTitleState<'_>) as isize,
+            );
+        }
+        state.matched
+    }
+
+    pub(super) fn is_valid_window(hwnd: usize) -> bool {
+        if hwnd == 0 {
+            return false;
+        }
+        // SAFETY: `IsWindow` safely validates arbitrary handle integers without dereferencing.
+        unsafe { IsWindow(hwnd) != 0 }
+    }
+
+    pub(super) fn find_window_hwnd() -> usize {
+        // SAFETY: `wglGetCurrentDC` and `WindowFromDC` operate on thread-local GL state.
+        let dc_hwnd = unsafe {
+            let hdc = wglGetCurrentDC();
+            if hdc == 0 {
+                0
+            } else {
+                WindowFromDC(hdc)
+            }
+        };
+        if dc_hwnd != 0
+            && get_window_rect(dc_hwnd).is_some_and(|r| r.width() >= 400 && r.height() >= 300)
+        {
+            return dc_hwnd;
+        }
+
+        // Prefer exact main window title lookup before falling back to active/size heuristics.
+        let by_title = find_thread_window_by_title("ctdozlite");
+        if by_title != 0 {
+            return by_title;
+        }
+
+        // SAFETY: `GetActiveWindow` returns the calling thread's active window or zero.
+        let active = unsafe { GetActiveWindow() };
+        if active != 0 {
+            // SAFETY: `active` is non-zero and owned by the calling thread.
+            let is_top_level = unsafe { GetWindow(active, GW_OWNER) } == 0;
+            if is_top_level
+                && get_window_rect(active).is_some_and(|r| r.width() >= 400 && r.height() >= 300)
+            {
+                return active;
+            }
+        }
+
+        let mut state = EnumSearchState {
+            visible_match: 0,
+            any_match: 0,
+        };
+        // SAFETY: `state` outlives the synchronous `EnumThreadWindows` call on this thread.
+        unsafe {
+            let tid = GetCurrentThreadId();
+            let _ = EnumThreadWindows(
+                tid,
+                enum_thread_window_cb,
+                (&mut state as *mut EnumSearchState) as isize,
+            );
+        }
+        if state.visible_match != 0 {
+            state.visible_match
+        } else {
+            state.any_match
+        }
+    }
+
+    /// Strips any pre-existing caption/thickframe bits and issues `SWP_FRAMECHANGED` so Win32 and
+    /// WGL immediately reset the drawable origin to `(0, 0)`.
+    pub(super) fn sync_frameless_style(hwnd: usize) -> bool {
+        if !is_valid_window(hwnd) {
+            return false;
+        }
+        // SAFETY: `hwnd` was just verified by `IsWindow` on the GUI thread.
+        unsafe {
+            let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            if (style & STRIP_STYLE_MASK) == 0 && (ex_style & STRIP_EX_STYLE_MASK) == 0 {
+                return false;
+            }
+            let new_style = strip_style_bits(style) as i32;
+            let new_ex_style = strip_ex_style_bits(ex_style) as i32;
+            let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style);
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex_style);
+            let _ = SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+            true
+        }
+    }
+
+    /// Attaches the `WM_STYLECHANGING` filter once per `HWND` and strips initial border bits.
+    /// Returns `(newly_subclassed, style_changed)`.
+    pub(super) fn install_frameless_subclass(hwnd: usize) -> (bool, bool) {
+        if !is_valid_window(hwnd) {
+            return (false, false);
+        }
+        let mut newly_subclassed = false;
+        if lookup_orig_wndproc(hwnd) == 0 {
+            let sub_ptr = frameless_subclass_wndproc as *const () as usize;
+            // SAFETY: `hwnd` is a valid Win32 window created on this GUI thread.
+            let prev =
+                unsafe { set_window_long_ptr(hwnd, GWLP_WNDPROC, sub_ptr as isize) } as usize;
+            if prev != 0 && prev != sub_ptr {
+                store_orig_wndproc(hwnd, prev);
+                newly_subclassed = true;
+            }
+        }
+        let style_changed = sync_frameless_style(hwnd);
+        (newly_subclassed, style_changed)
+    }
+
+    /// Protects secondary frameless viewports (such as the corner notification popup) identified by
+    /// their exact title on the GUI thread, returning `true` when style/subclass was just applied.
+    pub(super) fn sync_frameless_window_by_title(title: &str, rounded_corners: bool) -> bool {
+        let matched = find_thread_window_by_title(title);
+        if matched == 0 {
+            return false;
+        }
+        let (newly_subclassed, style_changed) = install_frameless_subclass(matched);
+        if rounded_corners && (newly_subclassed || style_changed) {
+            // Enable hardware-clipped rounded corners on Windows 11; Windows 10 ignores safely.
+            const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+            const DWMWCP_ROUND: u32 = 2;
+            let pref = DWMWCP_ROUND;
+            // SAFETY: `matched` is a valid HWND and `pref` is a stack 4-byte DWORD.
+            let _ = unsafe {
+                DwmSetWindowAttribute(
+                    matched,
+                    DWMWA_WINDOW_CORNER_PREFERENCE,
+                    &pref,
+                    std::mem::size_of::<u32>() as u32,
+                )
+            };
+        }
+        newly_subclassed || style_changed
+    }
+
+    pub(super) fn get_window_rect(hwnd: usize) -> Option<WinRect> {
+        if !is_valid_window(hwnd) {
+            return None;
+        }
+        let mut raw = WinRect::default();
+        // SAFETY: `hwnd` is a valid Win32 window and `raw` is a properly aligned output struct.
+        let ok = unsafe { GetWindowRect(hwnd, &mut raw) != 0 };
+        ok.then_some(raw)
+    }
+
+    pub(super) fn set_window_rect(hwnd: usize, rect: WinRect, frame_changed: bool) {
+        if !is_valid_window(hwnd) {
+            return;
+        }
+        let mut flags = SWP_NOZORDER | SWP_NOACTIVATE;
+        if frame_changed {
+            flags |= SWP_FRAMECHANGED;
+        }
+        // SAFETY: `hwnd` was verified by `IsWindow` and width/height are clamped positive.
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                0,
+                rect.left,
+                rect.top,
+                rect.width().max(1),
+                rect.height().max(1),
+                flags,
+            );
+        }
+    }
+
+    pub(super) fn get_cursor_pos() -> Option<(i32, i32)> {
+        let mut pt = RawPoint { x: 0, y: 0 };
+        // SAFETY: `pt` is a stack-allocated Win32 `POINT` initialized to zero.
+        let ok = unsafe { GetCursorPos(&mut pt) != 0 };
+        ok.then_some((pt.x, pt.y))
+    }
+
+    pub(super) fn get_monitor_work_area(hwnd: usize) -> Option<WinRect> {
+        if !is_valid_window(hwnd) {
+            return None;
+        }
+        // SAFETY: `MonitorFromWindow` accepts valid `HWND` and `MonitorInfo` sets `cb_size` first.
+        unsafe {
+            let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if mon == 0 {
+                return None;
+            }
+            let mut info = MonitorInfo {
+                cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+                rc_monitor: WinRect::default(),
+                rc_work: WinRect::default(),
+                dw_flags: 0,
+            };
+            if GetMonitorInfoW(mon, &mut info) == 0 {
+                return None;
+            }
+            (info.rc_work.width() > 0 && info.rc_work.height() > 0).then_some(info.rc_work)
+        }
+    }
+
+    pub(super) fn active_window_work_area() -> Option<WinRect> {
+        // SAFETY: `GetActiveWindow` returns the thread's active `HWND` or zero.
+        let active = unsafe { GetActiveWindow() };
+        if let Some(work) = get_monitor_work_area(active) {
+            return Some(work);
+        }
+        let hwnd = find_window_hwnd();
+        if let Some(work) = get_monitor_work_area(hwnd) {
+            return Some(work);
+        }
+        let mut primary_work = WinRect::default();
+        // SAFETY: `primary_work` is a stack-allocated `RECT` passed to `SPI_GETWORKAREA`.
+        let ok = unsafe {
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut primary_work as *mut WinRect, 0) != 0
+        };
+        (ok && primary_work.width() > 0 && primary_work.height() > 0).then_some(primary_work)
+    }
+}
+
 /// Display name for a reaction sender inside a thread: group member name when
 /// resolved, the sender id as-is when numeric/unknown, thread name otherwise.
 fn resolve_reactor_name(thread: &Thread, sender_id: &str) -> String {
@@ -360,8 +947,41 @@ pub enum GuiEvent {
     ReminderListUpdated,
     /// Script per-thread chạy xong → toast output (worker tick / on_message / chạy thử).
     ScriptToast { thread_id: String, message: String },
+    /// Kết quả rời nhóm gửi từ worker thread
+    GroupLeft {
+        group_id: String,
+        success: bool,
+        error: Option<String>,
+    },
     /// Log script của thread đang mở thay đổi → drawer Scripts refresh.
     ScriptLogsUpdated { thread_id: String },
+    /// Người dùng đóng hộp thoại chọn tệp mà không chọn tệp nào -> khôi phục caption đang gõ.
+    AttachmentPickerCancelled { thread_id: String, caption: String },
+    /// Kết quả tóm tắt nhóm chạy off-UI-thread (`INV-3`).
+    GroupSummaryReady { message: String },
+    /// Danh sách script của thread đã nạp từ SQLite off-UI-thread (`INV-3`).
+    ThreadScriptsLoaded {
+        thread_id: String,
+        scripts: Vec<crate::thread_script::ThreadScript>,
+        logs: Vec<crate::thread_script::ScriptLog>,
+    },
+    /// Kết quả lưu / xoá / bật-tắt script trong SQLite off-UI-thread (`INV-3`).
+    ThreadScriptSaved {
+        thread_id: String,
+        close_editor: bool,
+        ok: bool,
+        toast: Option<String>,
+        logs: Option<Vec<crate::thread_script::ScriptLog>>,
+    },
+    /// Kết quả chạy thử script Rhai off-UI-thread (`INV-3`).
+    ThreadScriptRunResult {
+        thread_id: String,
+        output: String,
+        outbox: Vec<crate::thread_script::OutboxMsg>,
+        toasts: Vec<String>,
+        is_group: bool,
+        logs: Vec<crate::thread_script::ScriptLog>,
+    },
 }
 
 fn phone_sync_completion_message(
@@ -449,6 +1069,19 @@ struct ImageViewerModal {
     time: String,
     zoom: f32,
     pan: Vec2,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VideoPlayerModal {
+    pub url: String,
+    pub title: String,
+    pub sender: String,
+    pub time: String,
+    pub thumb_key: Option<String>,
+    pub is_downloaded: bool,
+    pub is_downloading: bool,
+    pub play_on_download: bool,
+    pub cached_path: Option<std::path::PathBuf>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FeedModalTab {
@@ -561,6 +1194,10 @@ struct AppSettings {
     pub(crate) use_avatar_as_wallpaper: bool,
     pub(crate) font_family: String,
     pub(crate) font_scale: f32,
+    #[serde(default = "settings_default_true")]
+    pub(crate) animations_enabled: bool,
+    #[serde(default = "settings_default_animation_speed")]
+    pub(crate) animation_speed: f32,
     pub(crate) custom_primary_color: Option<String>,
     pub(crate) custom_accent_color: Option<String>,
     pub(crate) custom_bubble_out_bg: Option<String>,
@@ -648,6 +1285,8 @@ impl Default for AppSettings {
             use_avatar_as_wallpaper: false,
             font_family: "default".into(),
             font_scale: 1.0,
+            animations_enabled: true,
+            animation_speed: 1.0,
             custom_primary_color: None,
             custom_accent_color: None,
             custom_bubble_out_bg: None,
@@ -694,6 +1333,14 @@ impl AppSettings {
             1.0
         } else {
             self.font_scale.clamp(0.5, 3.0)
+        }
+    }
+
+    pub(crate) fn normalized_animation_speed(&self) -> f32 {
+        if !self.animation_speed.is_finite() || self.animation_speed <= 0.0 {
+            1.0
+        } else {
+            self.animation_speed.clamp(0.5, 2.0)
         }
     }
 
@@ -769,6 +1416,7 @@ pub struct ZaloGuiApp {
     // Theme state
     dark_mode: bool,
     theme_dirty: bool,
+    cached_palette: ThemePalette,
 
     // Session state
     is_logged_in: bool,
@@ -812,9 +1460,9 @@ pub struct ZaloGuiApp {
     filter_starred_only: bool,
     pub(crate) send_hd_original: bool,
     pub(crate) typing_map: HashMap<String, (String, std::time::Instant)>,
-    pub(crate) last_typing_ping_at: std::time::Instant,
     active_call: Option<ActiveCallOverlay>,
     image_viewer: Option<ImageViewerModal>,
+    pub(crate) video_player: Option<VideoPlayerModal>,
 
     info_drawer_open: bool,
     profile_menu_open: bool,
@@ -840,13 +1488,17 @@ pub struct ZaloGuiApp {
     sticker_tab: StickerTab,
     sticker_textures: HashMap<String, TextureHandle>,
     loading_stickers: HashSet<String>,
+    /// Tracks sticker/avatar/thumb URLs that failed to download: `(attempts, last_failed_at)`.
+    failed_stickers: HashMap<String, (u8, std::time::Instant)>,
     emoji_textures: HashMap<String, TextureHandle>,
     app_logo_texture: Option<TextureHandle>,
     sticker_store_packs: Vec<crate::chat::StickerPackInfo>,
     sticker_store_loading: bool,
+    sticker_store_attempted: bool,
     sticker_store_filter: String,
     sticker_pack_items: HashMap<u64, Vec<crate::chat::StickerItem>>,
     loading_sticker_packs: HashSet<u64>,
+    failed_sticker_packs: HashSet<u64>,
     pinned_sticker_packs: Vec<(u64, String)>,
     sticker_search_query: String,
     sticker_search_results: Vec<crate::chat::StickerItem>,
@@ -908,12 +1560,18 @@ pub struct ZaloGuiApp {
     /// Scripts per-thread: tab drawer (0 = list, 1 = editor), script đang sửa, draft code.
     script_tab: usize,
     script_list_cache: HashMap<String, Vec<crate::thread_script::ThreadScript>>,
+    script_logs_cache: HashMap<String, Vec<crate::thread_script::ScriptLog>>,
+    script_loading_threads: HashSet<String>,
     script_editing_id: Option<i64>,
     script_name_draft: String,
     script_trigger_draft: String,
     script_arg_draft: String,
     script_code_draft: String,
     script_output: String,
+    /// Pending confirmation before permanently deleting a thread (`(idx, tid, name, is_group, last_msg_id)`).
+    pending_delete_thread: Option<(usize, String, String, bool, String)>,
+    /// Pending confirmation before leaving a group (`(idx, group_id, group_name)`).
+    pub(crate) pending_leave_group: Option<(usize, String, String)>,
     /// Xem trước tài liệu (session-only): msg_id → text đã trích.
     doc_previews: HashMap<String, String>,
     /// msg_id đang tải xem trước (tránh gửi trùng mỗi frame).
@@ -1011,6 +1669,14 @@ pub struct ZaloGuiApp {
     ime_just_committed: bool,
     history_reached_start: HashSet<String>,
     force_scroll_to_bottom: bool,
+    #[cfg(target_os = "windows")]
+    win_hwnd: usize,
+    #[cfg(target_os = "windows")]
+    win_maximized: bool,
+    #[cfg(target_os = "windows")]
+    win_restore_rect: Option<WinRect>,
+    #[cfg(target_os = "windows")]
+    win_resize_drag: Option<WinResizeDrag>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1059,7 +1725,7 @@ impl ZaloGuiApp {
             loaded_settings.block_delivered,
             loaded_settings.block_seen,
         );
-        let dark_mode = loaded_settings.theme_mode != "light";
+        let dark_mode = resolve_dark_mode(&loaded_settings.theme_mode, &cc.egui_ctx);
         let mut initial_palette = ThemePalette::load_with_custom_override(dark_mode);
         initial_palette.apply_custom_colors(
             loaded_settings.custom_primary_color.as_deref(),
@@ -1067,7 +1733,11 @@ impl ZaloGuiApp {
             loaded_settings.custom_bubble_out_bg.as_deref(),
             loaded_settings.custom_bubble_in_bg.as_deref(),
         );
-        initial_palette.apply_to_ctx(&cc.egui_ctx);
+        initial_palette.apply_to_ctx_with_anim(
+            &cc.egui_ctx,
+            loaded_settings.animations_enabled,
+            loaded_settings.normalized_animation_speed(),
+        );
 
         let (tx, rx) = channel();
 
@@ -1134,6 +1804,7 @@ impl ZaloGuiApp {
         let app = Self {
             dark_mode,
             theme_dirty: false,
+            cached_palette: initial_palette,
             is_logged_in,
             user_name,
             user_uin,
@@ -1161,9 +1832,9 @@ impl ZaloGuiApp {
             filter_starred_only: false,
             send_hd_original: true,
             typing_map: HashMap::new(),
-            last_typing_ping_at: std::time::Instant::now(),
             active_call: None,
             image_viewer: None,
+            video_player: None,
             status_msg: "Trực tuyến · Sẵn sàng".into(),
             info_drawer_open: loaded_settings.info_drawer_open,
             profile_menu_open: false,
@@ -1184,16 +1855,19 @@ impl ZaloGuiApp {
             sticker_tab: StickerTab::Popular,
             sticker_textures: HashMap::new(),
             loading_stickers: HashSet::new(),
+            failed_stickers: HashMap::new(),
             emoji_textures: load_default_emoji_textures(&cc.egui_ctx),
             app_logo_texture: load_app_logo_texture(&cc.egui_ctx),
             sticker_store_packs: Vec::new(),
             sticker_store_loading: false,
+            sticker_store_attempted: false,
             sticker_store_filter: String::new(),
             sticker_pack_items: FEATURED_PACK_TABS
                 .iter()
                 .filter_map(|&(cid, _)| builtin_pack_stickers(cid).map(|items| (cid, items)))
                 .collect(),
             loading_sticker_packs: HashSet::new(),
+            failed_sticker_packs: HashSet::new(),
             pinned_sticker_packs: FEATURED_PACK_TABS
                 .iter()
                 .map(|&(cid, title)| (cid, title.to_string()))
@@ -1241,12 +1915,16 @@ impl ZaloGuiApp {
             group_jump_pending: None,
             script_tab: 0,
             script_list_cache: HashMap::new(),
+            script_logs_cache: HashMap::new(),
+            script_loading_threads: HashSet::new(),
             script_editing_id: None,
             script_name_draft: String::new(),
             script_trigger_draft: "manual".to_string(),
             script_arg_draft: String::new(),
             script_code_draft: String::new(),
             script_output: String::new(),
+            pending_delete_thread: None,
+            pending_leave_group: None,
             doc_previews: HashMap::new(),
             doc_preview_loading: HashSet::new(),
             doc_preview_errors: HashMap::new(),
@@ -1327,6 +2005,18 @@ impl ZaloGuiApp {
             ime_just_committed: false,
             history_reached_start: HashSet::new(),
             force_scroll_to_bottom: false,
+            #[cfg(target_os = "windows")]
+            win_hwnd: {
+                let hwnd = win32_frameless::find_window_hwnd();
+                let _ = win32_frameless::install_frameless_subclass(hwnd);
+                hwnd
+            },
+            #[cfg(target_os = "windows")]
+            win_maximized: false,
+            #[cfg(target_os = "windows")]
+            win_restore_rect: None,
+            #[cfg(target_os = "windows")]
+            win_resize_drag: None,
         };
         let mut app = app;
         let _ = app.reload_custom_sticker_packs();
@@ -1360,8 +2050,73 @@ impl ZaloGuiApp {
         }
         app
     }
+}
 
-    fn palette(&self) -> ThemePalette {
+/// Maximum retries after an initial sticker/image download failure (1 initial + 2 retries = 3 attempts).
+const MAX_STICKER_FETCH_ATTEMPTS: u8 = 3;
+/// Cooldown window before retrying a failed sticker/image download.
+const STICKER_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Returns `true` when `key` has not exceeded retry limits and its cooldown elapsed.
+pub(crate) fn can_attempt_sticker_fetch(
+    failures: &HashMap<String, (u8, std::time::Instant)>,
+    key: &str,
+    now: std::time::Instant,
+) -> bool {
+    match failures.get(key) {
+        None => true,
+        Some(&(attempts, last_fail)) => {
+            attempts < MAX_STICKER_FETCH_ATTEMPTS
+                && now.saturating_duration_since(last_fail) >= STICKER_RETRY_COOLDOWN
+        }
+    }
+}
+
+/// Records a sticker/image fetch failure with timestamp and capped attempt count.
+pub(crate) fn record_sticker_fetch_failure(
+    failures: &mut HashMap<String, (u8, std::time::Instant)>,
+    key: &str,
+    now: std::time::Instant,
+) {
+    let entry = failures.entry(key.to_string()).or_insert((0, now));
+    entry.0 = entry.0.saturating_add(1);
+    entry.1 = now;
+}
+
+/// Queues a worker download for a sticker/avatar/thumbnail without borrowing the full `ZaloGuiApp`.
+pub(crate) fn queue_sticker_fetch(
+    sticker_textures: &HashMap<String, TextureHandle>,
+    loading_stickers: &mut HashSet<String>,
+    failed_stickers: &HashMap<String, (u8, std::time::Instant)>,
+    key: String,
+    url: String,
+) {
+    if url.is_empty()
+        || sticker_textures.contains_key(&key)
+        || loading_stickers.contains(&key)
+        || !can_attempt_sticker_fetch(failed_stickers, &key, std::time::Instant::now())
+    {
+        return;
+    }
+    loading_stickers.insert(key.clone());
+    if let Some(tx) = WORKER_TX.get() {
+        let _ = tx.send(WorkerCmd::FetchStickerImage { key, url });
+    }
+}
+
+impl ZaloGuiApp {
+    /// Queues a worker download for a sticker/avatar/thumbnail once retry backoff allows it.
+    pub(super) fn request_sticker_image(&mut self, key: String, url: String) {
+        queue_sticker_fetch(
+            &self.sticker_textures,
+            &mut self.loading_stickers,
+            &self.failed_stickers,
+            key,
+            url,
+        );
+    }
+
+    pub(super) fn refresh_cached_palette(&mut self) {
         let mut pal = ThemePalette::load_with_custom_override(self.dark_mode);
         pal.apply_custom_colors(
             self.settings.custom_primary_color.as_deref(),
@@ -1369,7 +2124,33 @@ impl ZaloGuiApp {
             self.settings.custom_bubble_out_bg.as_deref(),
             self.settings.custom_bubble_in_bg.as_deref(),
         );
-        pal
+        self.cached_palette = pal;
+    }
+
+    fn palette(&self) -> ThemePalette {
+        self.cached_palette
+    }
+
+    pub(super) fn anim_value(&self, ctx: &egui::Context, id: egui::Id, target: f32, base_secs: f32) -> f32 {
+        crate::gui::theme::animate_value_scaled(
+            ctx,
+            id,
+            target,
+            base_secs,
+            self.settings.animations_enabled,
+            self.settings.normalized_animation_speed(),
+        )
+    }
+
+    pub(super) fn anim_bool(&self, ctx: &egui::Context, id: egui::Id, value: bool, base_secs: f32) -> f32 {
+        crate::gui::theme::animate_bool_scaled(
+            ctx,
+            id,
+            value,
+            base_secs,
+            self.settings.animations_enabled,
+            self.settings.normalized_animation_speed(),
+        )
     }
 
     pub(super) fn reload_custom_sticker_packs(&mut self) -> usize {
@@ -1459,9 +2240,11 @@ impl ZaloGuiApp {
         }
         let db = crate::store::db_path_for_account(&self.user_uin);
         let now = crate::login::unix_now() as i64;
-        if let Ok(mut st) = crate::store::MessageStore::open(&db) {
-            let _ = st.set_draft(&old_tid, &text, &reply_ref, now);
-        }
+        std::thread::spawn(move || {
+            if let Ok(mut st) = crate::store::MessageStore::open(&db) {
+                let _ = st.set_draft(&old_tid, &text, &reply_ref, now);
+            }
+        });
     }
 
     /// Nạp nháp của thread mới vào composer + reply banner (WaveA1).
@@ -1503,6 +2286,9 @@ impl ZaloGuiApp {
         if old_tid == new_tid {
             self.selected_thread_index = new_index;
             return;
+        }
+        if let Some(em) = self.editing_message.take() {
+            self.input_message = em.draft;
         }
         self.save_current_draft();
         self.selected_thread_index = new_index;
@@ -1898,24 +2684,13 @@ impl ZaloGuiApp {
                                                             "thumb_{}",
                                                             crate::crypto::md5_hex(url)
                                                         );
-                                                        if !self
-                                                            .sticker_textures
-                                                            .contains_key(&tex_key)
-                                                            && !self
-                                                                .loading_stickers
-                                                                .contains(&tex_key)
-                                                        {
-                                                            self.loading_stickers
-                                                                .insert(tex_key.clone());
-                                                            if let Some(tx) = WORKER_TX.get() {
-                                                                let _ = tx.send(
-                                                                    WorkerCmd::FetchStickerImage {
-                                                                        key: tex_key,
-                                                                        url: url.clone(),
-                                                                    },
-                                                                );
-                                                            }
-                                                        }
+                                                        queue_sticker_fetch(
+                                                            &self.sticker_textures,
+                                                            &mut self.loading_stickers,
+                                                            &self.failed_stickers,
+                                                            tex_key,
+                                                            url.clone(),
+                                                        );
                                                     }
                                                     let unread_for_thread = self
                                                         .unread_counts
@@ -2753,21 +3528,33 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::StickerImageReady { key, image } => {
                     self.loading_stickers.remove(&key);
+                    self.failed_stickers.remove(&key);
                     let tex = ctx.load_texture(&key, image, TextureOptions::LINEAR);
                     self.sticker_textures.insert(key, tex);
                 }
                 GuiEvent::StickerImageFailed { key } => {
+                    self.loading_stickers.remove(&key);
                     if key.starts_with("call_remote_video") {
                         self.sticker_textures.remove(&key);
                         ctx.request_repaint();
+                    } else {
+                        record_sticker_fetch_failure(
+                            &mut self.failed_stickers,
+                            &key,
+                            std::time::Instant::now(),
+                        );
                     }
-                    self.loading_stickers.remove(&key);
                 }
                 GuiEvent::StickerStoreLoaded(packs) => {
                     self.sticker_store_loading = false;
+                    self.sticker_store_attempted = true;
                     let count = packs.len();
                     self.sticker_store_packs = packs;
-                    self.status_msg = format!("Đã tải Kho Nhãn Dán Zalo ({count} bộ nhãn)");
+                    if count > 0 {
+                        self.status_msg = format!("Đã tải Kho Nhãn Dán Zalo ({count} bộ nhãn)");
+                    } else {
+                        self.status_msg = "Chưa tải được Kho Nhãn Dán Zalo (thử bấm Tải lại kho)".into();
+                    }
                 }
                 GuiEvent::StickerPackItemsLoaded {
                     cate_id,
@@ -2776,15 +3563,21 @@ impl ZaloGuiApp {
                 } => {
                     self.loading_sticker_packs.remove(&cate_id);
                     let count = items.len();
-                    if !self
-                        .pinned_sticker_packs
-                        .iter()
-                        .any(|(id, _)| *id == cate_id)
-                    {
-                        self.pinned_sticker_packs.insert(0, (cate_id, name.clone()));
+                    if items.is_empty() {
+                        self.failed_sticker_packs.insert(cate_id);
+                        self.status_msg = format!("Chưa tải được bộ nhãn \"{name}\"");
+                    } else {
+                        self.failed_sticker_packs.remove(&cate_id);
+                        if !self
+                            .pinned_sticker_packs
+                            .iter()
+                            .any(|(id, _)| *id == cate_id)
+                        {
+                            self.pinned_sticker_packs.insert(0, (cate_id, name.clone()));
+                        }
+                        self.sticker_pack_items.insert(cate_id, items);
+                        self.status_msg = format!("Đã mở bộ nhãn \"{name}\" ({count} nhãn dán)");
                     }
-                    self.sticker_pack_items.insert(cate_id, items);
-                    self.status_msg = format!("Đã mở bộ nhãn \"{name}\" ({count} nhãn dán)");
                 }
                 GuiEvent::StickerSearchResults { keyword, items } => {
                     self.sticker_search_loading = false;
@@ -2806,16 +3599,7 @@ impl ZaloGuiApp {
                     self.loading_link_previews.remove(&meta.url);
                     if !meta.thumb.is_empty() {
                         let key = format!("thumb_{}", crate::crypto::md5_hex(&meta.thumb));
-                        if !self.sticker_textures.contains_key(&key)
-                            && self.loading_stickers.insert(key.clone())
-                        {
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                    key,
-                                    url: meta.thumb.clone(),
-                                });
-                            }
-                        }
+                        self.request_sticker_image(key, meta.thumb.clone());
                     }
                     let mut updated_any = false;
                     for t in &mut self.threads {
@@ -2909,16 +3693,7 @@ impl ZaloGuiApp {
                                             ava_url.split('?').next().unwrap_or(ava_url).to_string()
                                         });
                                 let key = format!("avt_{}", crate::crypto::md5_hex(&file_or_base));
-                                if !self.sticker_textures.contains_key(&key)
-                                    && self.loading_stickers.insert(key.clone())
-                                {
-                                    if let Some(tx) = WORKER_TX.get() {
-                                        let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                            key,
-                                            url: ava_url.clone(),
-                                        });
-                                    }
-                                }
+                                self.request_sticker_image(key, ava_url.clone());
                             }
                         }
                     }
@@ -3057,6 +3832,13 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::ScriptToast { message, .. } => {
                     self.show_toast(message);
+                }
+                GuiEvent::GroupLeft { group_id: _, success, error } => {
+                    if success {
+                        self.show_toast("Đã rời nhóm thành công");
+                    } else if let Some(err) = error {
+                        self.show_toast(format!("Rời nhóm thất bại: {err}"));
+                    }
                 }
                 GuiEvent::ScriptLogsUpdated { .. } => {
                     // Drawer Scripts đọc log trực tiếp từ DB khi render nên chỉ cần repaint.
@@ -3266,7 +4048,6 @@ impl ZaloGuiApp {
                     self.show_toast(format!("✅ Đã cập nhật lên v{ver} — Đang khởi động lại…"));
                     self.allow_quit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    std::process::exit(0);
                 }
                 GuiEvent::SocialProfileLoaded(res) => {
                     self.feed_loading_profile = false;
@@ -3554,6 +4335,77 @@ impl ZaloGuiApp {
                     self.doc_preview_loading.remove(&msg_id);
                     self.doc_preview_errors.insert(msg_id, err);
                 }
+                GuiEvent::AttachmentPickerCancelled { thread_id, caption } => {
+                    if !caption.is_empty() {
+                        let active_tid = self
+                            .threads
+                            .get(self.selected_thread_index)
+                            .map(|t| t.id.as_str())
+                            .unwrap_or("");
+                        if active_tid == thread_id && self.input_message.trim().is_empty() {
+                            self.input_message = caption;
+                            self.composer_focus_pending = true;
+                        } else {
+                            self.draft_map.entry(thread_id.clone()).or_insert(caption);
+                            self.draft_threads.insert(thread_id);
+                        }
+                    }
+                }
+                GuiEvent::GroupSummaryReady { message } => {
+                    self.show_toast(message);
+                }
+                GuiEvent::ThreadScriptsLoaded {
+                    thread_id,
+                    scripts,
+                    logs,
+                } => {
+                    self.script_loading_threads.remove(&thread_id);
+                    self.script_list_cache.insert(thread_id.clone(), scripts);
+                    self.script_logs_cache.insert(thread_id, logs);
+                }
+                GuiEvent::ThreadScriptSaved {
+                    thread_id,
+                    close_editor,
+                    ok,
+                    toast,
+                    logs,
+                } => {
+                    self.script_loading_threads.remove(&thread_id);
+                    self.script_list_cache.remove(&thread_id);
+                    if let Some(updated_logs) = logs {
+                        self.script_logs_cache.insert(thread_id, updated_logs);
+                    }
+                    if ok && close_editor {
+                        self.script_tab = 0;
+                        self.script_editing_id = None;
+                    }
+                    if let Some(msg) = toast {
+                        self.show_toast(msg);
+                    }
+                }
+                GuiEvent::ThreadScriptRunResult {
+                    thread_id,
+                    output,
+                    outbox,
+                    toasts,
+                    is_group,
+                    logs,
+                } => {
+                    for o in &outbox {
+                        if let Some(wtx) = WORKER_TX.get() {
+                            let _ = wtx.send(WorkerCmd::SendMessage {
+                                to_id: o.thread_id.clone(),
+                                text: o.text.clone(),
+                                is_group,
+                            });
+                        }
+                    }
+                    for t in toasts {
+                        self.show_toast(t);
+                    }
+                    self.script_output = output;
+                    self.script_logs_cache.insert(thread_id, logs);
+                }
             }
         }
     }
@@ -3592,6 +4444,8 @@ fn reveal_in_file_manager(path: &str) {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ensure_windows_frameless_subclass(ctx);
+
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
             || ctx.input(|i| i.viewport().close_requested())
         {
@@ -3599,7 +4453,7 @@ impl eframe::App for ZaloGuiApp {
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::EndCall);
             }
-            std::process::exit(0);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if ctx.input(|i| {
             (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::P)
@@ -3607,8 +4461,30 @@ impl eframe::App for ZaloGuiApp {
             self.settings_modal_open = true;
             self.settings_tab = SettingsTab::Privacy;
         }
+        if self.settings.theme_mode == "system" {
+            let os_dark = resolve_dark_mode("system", ctx);
+            if os_dark != self.dark_mode {
+                self.dark_mode = os_dark;
+                self.theme_dirty = true;
+            }
+        }
+        let expected_egui_theme = if self.dark_mode {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        };
+        if ctx.theme() != expected_egui_theme
+            || ctx.style().visuals.dark_mode != self.dark_mode
+        {
+            self.theme_dirty = true;
+        }
         if self.theme_dirty {
-            self.palette().apply_to_ctx(ctx);
+            self.refresh_cached_palette();
+            self.cached_palette.apply_to_ctx_with_anim(
+                ctx,
+                self.settings.animations_enabled,
+                self.settings.normalized_animation_speed(),
+            );
             self.theme_dirty = false;
         }
 
@@ -3738,7 +4614,7 @@ impl eframe::App for ZaloGuiApp {
 
         let pal = self.palette();
 
-        Self::handle_frameless_resize(ctx);
+        self.handle_frameless_resize(ctx);
         self.render_custom_title_bar(ctx, &pal);
         // Dev Inspector Panel
         if self.dev_mode && self.dev_panel_open {
@@ -3746,8 +4622,8 @@ impl eframe::App for ZaloGuiApp {
                 .resizable(true)
                 .default_height(250.0)
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong("Dev Inspector & Protocol Scanner");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong("Trình kiểm tra Dev & Giao thức");
                         ui.separator();
                         ui.selectable_value(
                             &mut self.dev_tab,
@@ -3764,17 +4640,15 @@ impl eframe::App for ZaloGuiApp {
                             DevTab::CryptoState,
                             "Trạng thái Crypto & Keys",
                         );
-
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button("Làm mới quét").clicked() {
-                                self.scanner_findings = logger::scan_logs();
-                            }
-                            if ui.button("Xóa log").clicked() {
-                                logger::clear_entries();
-                                self.selected_log = None;
-                                self.scanner_findings.clear();
-                            }
-                        });
+                        ui.separator();
+                        if ui.button("Làm mới quét").clicked() {
+                            self.scanner_findings = logger::scan_logs();
+                        }
+                        if ui.button("Xóa log").clicked() {
+                            logger::clear_entries();
+                            self.selected_log = None;
+                            self.scanner_findings.clear();
+                        }
                     });
                     ui.separator();
 
@@ -3800,7 +4674,7 @@ impl eframe::App for ZaloGuiApp {
         // Auto-notification modal for new GitHub Releases (works on both Login & Chat screens)
         self.render_update_notification_modal(ctx, &pal);
 
-        if !ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+        if !self.is_window_maximized(ctx) {
             let screen = ctx.screen_rect();
             ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
@@ -3815,6 +4689,7 @@ impl eframe::App for ZaloGuiApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = self.settings.save();
         std::process::exit(0);
     }
 }
@@ -3824,14 +4699,190 @@ impl eframe::App for ZaloGuiApp {
 // ---------------------------------------------------------------------------
 
 impl ZaloGuiApp {
-    fn handle_frameless_resize(ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+    fn resize_cursor_for(dir: egui::ResizeDirection) -> CursorIcon {
+        match dir {
+            egui::ResizeDirection::NorthWest | egui::ResizeDirection::SouthEast => {
+                CursorIcon::ResizeNwSe
+            }
+            egui::ResizeDirection::NorthEast | egui::ResizeDirection::SouthWest => {
+                CursorIcon::ResizeNeSw
+            }
+            egui::ResizeDirection::West | egui::ResizeDirection::East => {
+                CursorIcon::ResizeHorizontal
+            }
+            egui::ResizeDirection::North | egui::ResizeDirection::South => {
+                CursorIcon::ResizeVertical
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn resolve_windows_hwnd(&mut self) -> usize {
+        if !win32_frameless::is_valid_window(self.win_hwnd) {
+            self.win_hwnd = win32_frameless::find_window_hwnd();
+        }
+        self.win_hwnd
+    }
+
+    fn ensure_windows_frameless_subclass(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        {
+            let hwnd = self.resolve_windows_hwnd();
+            if hwnd != 0 {
+                let (newly_subclassed, style_changed) =
+                    win32_frameless::install_frameless_subclass(hwnd);
+                if newly_subclassed || style_changed {
+                    ctx.request_repaint();
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = ctx;
+    }
+
+    fn is_window_maximized(&self, ctx: &egui::Context) -> bool {
+        #[cfg(target_os = "windows")]
+        if self.win_maximized {
+            return true;
+        }
+        ctx.input(|i| i.viewport().maximized.unwrap_or(false))
+    }
+
+    fn toggle_maximize(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        {
+            let hwnd = self.resolve_windows_hwnd();
+            if hwnd != 0 {
+                if !self.win_maximized {
+                    self.win_restore_rect = win32_frameless::get_window_rect(hwnd);
+                    if let Some(work) = win32_frameless::get_monitor_work_area(hwnd) {
+                        win32_frameless::set_window_rect(hwnd, work, true);
+                        self.win_maximized = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                } else {
+                    let target = self.win_restore_rect.take().unwrap_or_else(|| {
+                        let ppp = ctx.pixels_per_point().max(1.0);
+                        let w = (1000.0 * ppp).round() as i32;
+                        let h = (640.0 * ppp).round() as i32;
+                        if let Some(work) = win32_frameless::get_monitor_work_area(hwnd) {
+                            let left = work.left + (work.width() - w).max(0) / 2;
+                            let top = work.top + (work.height() - h).max(0) / 2;
+                            WinRect {
+                                left,
+                                top,
+                                right: left + w,
+                                bottom: top + h,
+                            }
+                        } else {
+                            WinRect {
+                                left: 80,
+                                top: 80,
+                                right: 80 + w,
+                                bottom: 80 + h,
+                            }
+                        }
+                    });
+                    win32_frameless::set_window_rect(hwnd, target, true);
+                    self.win_maximized = false;
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        }
+        let is_max = self.is_window_maximized(ctx);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+    }
+
+    fn restore_before_drag_if_maximized(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        if self.win_maximized {
+            let hwnd = self.resolve_windows_hwnd();
+            if hwnd != 0 {
+                let ppp = ctx.pixels_per_point().max(1.0);
+                let fallback_w = (1000.0 * ppp).round() as i32;
+                let fallback_h = (640.0 * ppp).round() as i32;
+                let min_w = (480.0 * ppp).round() as i32;
+                let min_h = (360.0 * ppp).round() as i32;
+                let prev = self.win_restore_rect.take();
+                let rw = prev.map_or(fallback_w, |r| r.width()).max(min_w);
+                let rh = prev.map_or(fallback_h, |r| r.height()).max(min_h);
+                if let (Some((cx, cy)), Some(work)) = (
+                    win32_frameless::get_cursor_pos(),
+                    win32_frameless::get_monitor_work_area(hwnd),
+                ) {
+                    let frac =
+                        ((cx - work.left) as f32 / work.width().max(1) as f32).clamp(0.05, 0.95);
+                    let left = cx - (rw as f32 * frac).round() as i32;
+                    let top = (cy - (16.0 * ppp).round() as i32).max(work.top);
+                    win32_frameless::set_window_rect(
+                        hwnd,
+                        WinRect {
+                            left,
+                            top,
+                            right: left + rw,
+                            bottom: top + rh,
+                        },
+                        true,
+                    );
+                }
+                self.win_maximized = false;
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = ctx;
+    }
+
+    fn handle_frameless_resize(&mut self, ctx: &egui::Context) {
+        if self.is_window_maximized(ctx) {
+            #[cfg(target_os = "windows")]
+            {
+                self.win_resize_drag = None;
+            }
             return;
         }
+
+        #[cfg(target_os = "windows")]
+        if let Some(mut drag) = self.win_resize_drag {
+            if ctx.input(|i| i.pointer.primary_down()) {
+                ctx.set_cursor_icon(Self::resize_cursor_for(drag.dir));
+                let hwnd = self.resolve_windows_hwnd();
+                if hwnd != 0 {
+                    if let Some((cx, cy)) = win32_frameless::get_cursor_pos() {
+                        let ppp = ctx.pixels_per_point().max(1.0);
+                        let min_w = (480.0 * ppp).round() as i32;
+                        let min_h = (360.0 * ppp).round() as i32;
+                        let target = compute_resized_rect(
+                            drag.start_rect,
+                            drag.dir,
+                            cx.saturating_sub(drag.start_cursor_x),
+                            cy.saturating_sub(drag.start_cursor_y),
+                            min_w,
+                            min_h,
+                        );
+                        if target != drag.last_rect {
+                            win32_frameless::set_window_rect(hwnd, target, false);
+                            drag.last_rect = target;
+                            self.win_resize_drag = Some(drag);
+                        }
+                    }
+                }
+                ctx.request_repaint();
+                return;
+            }
+            self.win_resize_drag = None;
+        }
+
         let screen = ctx.screen_rect();
         let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else {
             return;
         };
+        // Keep the top-right window control buttons (Close / Max / Min / Theme) clickable
+        // even right up to the top-right corner of the frameless window.
+        if pos.y < screen.top() + 34.0 && pos.x >= screen.right() - 180.0 {
+            return;
+        }
         let border = 5.0_f32;
         let corner = 9.0_f32;
         let left = (pos.x - screen.left()).abs() <= border;
@@ -3844,36 +4895,60 @@ impl ZaloGuiApp {
         let top_c = (pos.y - screen.top()).abs() <= corner;
         let bottom_c = (screen.bottom() - pos.y).abs() <= corner;
 
-        let dir_and_cursor = if top_c && left_c && (top || left) {
-            Some((egui::ResizeDirection::NorthWest, CursorIcon::ResizeNwSe))
+        let dir = if top_c && left_c && (top || left) {
+            Some(egui::ResizeDirection::NorthWest)
         } else if top_c && right_c && (top || right) {
-            Some((egui::ResizeDirection::NorthEast, CursorIcon::ResizeNeSw))
+            Some(egui::ResizeDirection::NorthEast)
         } else if bottom_c && left_c && (bottom || left) {
-            Some((egui::ResizeDirection::SouthWest, CursorIcon::ResizeNeSw))
+            Some(egui::ResizeDirection::SouthWest)
         } else if bottom_c && right_c && (bottom || right) {
-            Some((egui::ResizeDirection::SouthEast, CursorIcon::ResizeNwSe))
+            Some(egui::ResizeDirection::SouthEast)
         } else if left {
-            Some((egui::ResizeDirection::West, CursorIcon::ResizeHorizontal))
+            Some(egui::ResizeDirection::West)
         } else if right {
-            Some((egui::ResizeDirection::East, CursorIcon::ResizeHorizontal))
+            Some(egui::ResizeDirection::East)
         } else if top {
-            Some((egui::ResizeDirection::North, CursorIcon::ResizeVertical))
+            Some(egui::ResizeDirection::North)
         } else if bottom {
-            Some((egui::ResizeDirection::South, CursorIcon::ResizeVertical))
+            Some(egui::ResizeDirection::South)
         } else {
             None
         };
 
-        if let Some((dir, cursor)) = dir_and_cursor {
-            ctx.set_cursor_icon(cursor);
+        if let Some(dir) = dir {
+            ctx.set_cursor_icon(Self::resize_cursor_for(dir));
             if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
+                #[cfg(target_os = "windows")]
+                {
+                    let hwnd = self.resolve_windows_hwnd();
+                    if let (Some((cx, cy)), Some(rect)) = (
+                        win32_frameless::get_cursor_pos(),
+                        win32_frameless::get_window_rect(hwnd),
+                    ) {
+                        self.win_resize_drag = Some(WinResizeDrag {
+                            dir,
+                            start_cursor_x: cx,
+                            start_cursor_y: cy,
+                            start_rect: rect,
+                            last_rect: rect,
+                        });
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
             }
         }
     }
 
     fn render_custom_title_bar(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
-        let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let is_maximized = self.is_window_maximized(ctx);
+        let mut toggle_max_requested = false;
+        let mut drag_started = false;
+        #[cfg(target_os = "windows")]
+        let resizing_now = self.win_resize_drag.is_some();
+        #[cfg(not(target_os = "windows"))]
+        let resizing_now = false;
         let total_unread: usize = self.unread_counts.values().sum();
         if self.last_synced_icon_unread != Some(total_unread) {
             self.last_synced_icon_unread = Some(total_unread);
@@ -3923,38 +4998,47 @@ impl ZaloGuiApp {
                             .strong(),
                     );
 
-                    // Subtle "Native v<version>" pill badge
-                    egui::Frame::none()
-                        .fill(pal.primary.linear_multiply(0.14))
-                        .rounding(Rounding::same(4.0))
-                        .inner_margin(Margin::symmetric(5.0, 1.5))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(format!("Native v{}", env!("CARGO_PKG_VERSION")))
-                                    .color(pal.primary)
-                                    .size(10.5)
-                                    .strong(),
-                            );
-                        });
+                    let compact_title_bar = bar_rect.width() < 560.0;
+                    // Subtle "Native v<version>" pill badge (hidden below 560px to preserve controls)
+                    if !compact_title_bar {
+                        egui::Frame::none()
+                            .fill(pal.primary.linear_multiply(0.14))
+                            .rounding(Rounding::same(4.0))
+                            .inner_margin(Margin::symmetric(5.0, 1.5))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(format!("Native v{}", env!("CARGO_PKG_VERSION")))
+                                        .color(pal.primary)
+                                        .size(10.5)
+                                        .strong(),
+                                );
+                            });
+                    }
 
                     if total_unread > 0 {
                         ui.add_space(4.0);
+                        let unread_lbl = if bar_rect.width() < 440.0 {
+                            total_unread.to_string()
+                        } else {
+                            format!("{total_unread} tin mới")
+                        };
                         egui::Frame::none()
                             .fill(pal.danger)
                             .rounding(Rounding::same(8.0))
                             .inner_margin(Margin::symmetric(6.0, 1.5))
                             .show(ui, |ui| {
                                 ui.label(
-                                    RichText::new(format!("{total_unread} tin mới"))
+                                    RichText::new(unread_lbl)
                                         .color(Color32::WHITE)
                                         .size(10.5)
                                         .strong(),
                                 );
                             });
-                    } else if self.is_logged_in && !self.user_name.is_empty() {
+                    } else if !compact_title_bar && self.is_logged_in && !self.user_name.is_empty()
+                    {
                         ui.add_space(6.0);
                         ui.label(
-                            RichText::new(format!("·  {}", self.user_name))
+                            RichText::new(format!("·  {}", truncate_chars(&self.user_name, 18)))
                                 .color(pal.text_muted)
                                 .size(12.0),
                         );
@@ -3990,13 +5074,12 @@ impl ZaloGuiApp {
                             Stroke::new(1.4_f32, close_fg),
                         );
                         let close_resp = close_resp.on_hover_text("Đóng ứng dụng (Ctrl+Q)");
-                        if close_resp.clicked() || close_resp.secondary_clicked() {
+                        if close_resp.clicked() {
                             self.allow_quit = true;
                             if let Some(tx) = WORKER_TX.get() {
                                 let _ = tx.send(WorkerCmd::EndCall);
                             }
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            std::process::exit(0);
                         }
 
                         // Maximize / Restore Button (46x32)
@@ -4047,7 +5130,7 @@ impl ZaloGuiApp {
                             })
                             .clicked()
                         {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
+                            toggle_max_requested = true;
                         }
 
                         // Minimize Button (46x32)
@@ -4100,32 +5183,38 @@ impl ZaloGuiApp {
                             .clicked()
                         {
                             self.dark_mode = !self.dark_mode;
+                            self.settings.theme_mode = if self.dark_mode {
+                                "dark".to_string()
+                            } else {
+                                "light".to_string()
+                            };
+                            let _ = self.settings.save();
                             self.theme_dirty = true;
                         }
 
                         buttons_left_x = th_rect.left();
 
                         if let Some(ref upd) = self.update_info {
-                            if upd.has_update {
+                            if upd.has_update && !compact_title_bar {
                                 ui.add_space(6.0);
                                 let badge_txt = if self.update_downloading {
                                     let (dl, tot) = self.update_progress.unwrap_or((0, 0));
                                     if tot > 0 {
                                         let pct = ((dl as f64 / tot as f64) * 100.0).clamp(0.0, 100.0);
-                                        format!("⏳ Đang cập nhật {pct:.0}%")
+                                        format!("{} Đang cập nhật {pct:.0}%", lucide::REFRESH)
                                     } else {
-                                        "⏳ Đang tải cập nhật…".to_string()
+                                        format!("{} Đang tải cập nhật…", lucide::REFRESH)
                                     }
                                 } else {
-                                    format!("🚀 Cập nhật mới v{}", upd.latest_version)
+                                    format!("{} Cập nhật mới v{}", lucide::SPARKLES, upd.latest_version)
                                 };
                                 let upd_pill = egui::Button::new(
                                     RichText::new(badge_txt)
                                         .size(11.2)
-                                        .color(Color32::WHITE)
+                                        .color(pal.primary_fg)
                                         .strong(),
                                 )
-                                .fill(pal.accent_online)
+                                .fill(pal.primary)
                                 .rounding(Rounding::same(5.0));
                                 let r = ui
                                     .add(upd_pill)
@@ -4174,12 +5263,19 @@ impl ZaloGuiApp {
                     Id::new("custom_title_bar_drag"),
                     Sense::click_and_drag(),
                 );
-                if drag_resp.double_clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
-                } else if drag_resp.drag_started_by(egui::PointerButton::Primary) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                if !resizing_now && drag_resp.double_clicked() {
+                    toggle_max_requested = true;
+                } else if !resizing_now && drag_resp.drag_started_by(egui::PointerButton::Primary) {
+                    drag_started = true;
                 }
             });
+
+        if toggle_max_requested {
+            self.toggle_maximize(ctx);
+        } else if drag_started {
+            self.restore_before_drag_if_maximized(ctx);
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
     }
 
     fn render_login_screen(&mut self, ui: &mut egui::Ui, pal: &ThemePalette) {
@@ -4196,9 +5292,8 @@ impl ZaloGuiApp {
                     }
                     ui.label(
                         RichText::new("Đăng nhập Zalo")
-                            .color(pal.primary)
-                            .size(26.0)
-                            .strong(),
+                            .font(FontId::new(24.0, crate::gui::theme::font_family_semibold()))
+                            .color(pal.primary),
                     );
                     ui.add_space(4.0);
                     ui.label(
@@ -4208,55 +5303,87 @@ impl ZaloGuiApp {
                     );
                     ui.add_space(18.0);
 
+                    let card_w = (ui.available_width() - 32.0).clamp(240.0, 360.0);
+                    let qr_box_side = (card_w - 8.0).min(268.0);
+                    let qr_img_side = (qr_box_side - 28.0).max(160.0);
+                    let pad_x = if card_w < 300.0 { 16.0 } else { 28.0 };
+
                     egui::Frame::none()
                         .fill(pal.bg_elevated)
                         .rounding(Rounding::same(16.0))
                         .stroke(Stroke::new(1.0_f32, pal.border))
-                        .inner_margin(Margin::symmetric(28.0, 24.0))
+                        .inner_margin(Margin::symmetric(pad_x, 24.0))
                         .show(ui, |ui| {
-                            ui.set_width(360.0);
+                            ui.set_width(card_w);
                             ui.vertical_centered(|ui| {
-                                // Segmented Tab Switcher
+                                // Segmented Tab Switcher with smooth animated sliding pill
                                 egui::Frame::none()
-                                    .fill(pal.bg_input)
-                                    .rounding(Rounding::same(10.0))
+                                    .fill(pal.bg_input_track)
+                                    .rounding(Rounding::same(11.0))
                                     .inner_margin(Margin::same(4.0))
                                     .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            let tab_w = (ui.available_width() - 8.0) / 2.0;
-                                            for (tab, title) in [
-                                                (LoginTab::QrCode, "Quét mã QR"),
-                                                (LoginTab::Password, "Số điện thoại"),
-                                            ] {
-                                                let active = self.login_tab == tab;
-                                                let btn = egui::Button::new(
-                                                    RichText::new(title)
-                                                        .size(13.0)
-                                                        .color(if active {
-                                                            Color32::WHITE
-                                                        } else {
-                                                            pal.text_secondary
-                                                        })
-                                                        .strong(),
-                                                )
-                                                .fill(if active {
-                                                    pal.primary
-                                                } else {
-                                                    Color32::TRANSPARENT
-                                                })
-                                                .stroke(Stroke::NONE)
-                                                .rounding(Rounding::same(7.0))
-                                                .min_size(Vec2::new(tab_w, 32.0));
+                                        let slide_t = self.anim_bool(
+                                            ui.ctx(),
+                                            Id::new("login_tab_slide"),
+                                            self.login_tab == LoginTab::Password,
+                                            0.16,
+                                        );
+                                        let track_w = ui.available_width();
+                                        let tab_w = ((track_w - 4.0) / 2.0).max(80.0);
+                                        let (track_rect, _) = ui.allocate_exact_size(
+                                            Vec2::new(track_w, 34.0),
+                                            Sense::hover(),
+                                        );
+                                        let left_rect = Rect::from_min_size(
+                                            track_rect.min,
+                                            Vec2::new(tab_w, 34.0),
+                                        );
+                                        let right_rect = Rect::from_min_size(
+                                            Pos2::new(track_rect.right() - tab_w, track_rect.top()),
+                                            Vec2::new(tab_w, 34.0),
+                                        );
+                                        let pill_x = egui::lerp(left_rect.left()..=right_rect.left(), slide_t);
+                                        let pill_rect = Rect::from_min_size(
+                                            Pos2::new(pill_x, track_rect.top()),
+                                            Vec2::new(tab_w, 34.0),
+                                        );
+                                        ui.painter().rect_filled(
+                                            pill_rect,
+                                            Rounding::same(8.0),
+                                            pal.primary,
+                                        );
 
-                                                if ui
-                                                    .add(btn)
-                                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                                    .clicked()
-                                                {
-                                                    self.login_tab = tab;
-                                                }
+                                        for (rect, tab, title) in [
+                                            (left_rect, LoginTab::QrCode, "Quét mã QR"),
+                                            (right_rect, LoginTab::Password, "Số điện thoại"),
+                                        ] {
+                                            let resp = ui.interact(
+                                                rect,
+                                                Id::new(("login_tab_btn", title)),
+                                                Sense::click(),
+                                            );
+                                            let active = self.login_tab == tab;
+                                            let label_col = if active {
+                                                pal.primary_fg
+                                            } else if resp.hovered() {
+                                                pal.text_primary
+                                            } else {
+                                                pal.text_secondary
+                                            };
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                title,
+                                                FontId::new(13.0, crate::gui::theme::font_family_semibold()),
+                                                label_col,
+                                            );
+                                            if resp
+                                                .on_hover_cursor(CursorIcon::PointingHand)
+                                                .clicked()
+                                            {
+                                                self.login_tab = tab;
                                             }
-                                        });
+                                        }
                                     });
 
                                 ui.add_space(18.0);
@@ -4270,11 +5397,11 @@ impl ZaloGuiApp {
                                                 .stroke(Stroke::new(1.0_f32, pal.border))
                                                 .inner_margin(Margin::same(14.0))
                                                 .show(ui, |ui| {
-                                                    ui.image((tex.id(), Vec2::new(240.0, 240.0)));
+                                                    ui.image((tex.id(), Vec2::splat(qr_img_side)));
                                                 });
                                         } else {
                                             let (rect, _) = ui.allocate_exact_size(
-                                                Vec2::new(268.0, 268.0),
+                                                Vec2::splat(qr_box_side),
                                                 Sense::hover(),
                                             );
                                             ui.painter().rect_filled(
@@ -4307,12 +5434,12 @@ impl ZaloGuiApp {
                                         let refresh_btn = egui::Button::new(
                                             RichText::new("Tạo / Làm mới mã QR")
                                                 .size(13.5)
-                                                .color(Color32::WHITE)
+                                                .color(pal.primary_fg)
                                                 .strong(),
                                         )
                                         .fill(pal.primary)
                                         .rounding(Rounding::same(8.0))
-                                        .min_size(Vec2::new(200.0, 36.0));
+                                        .min_size(Vec2::new(card_w.min(220.0), 36.0));
 
                                         if ui
                                             .add(refresh_btn)
@@ -4327,70 +5454,82 @@ impl ZaloGuiApp {
                                         }
                                     }
                                     LoginTab::Password => {
+                                        let phone_id = Id::new("login_phone_input");
+                                        let pass_id = Id::new("login_password_input");
+                                        let phone_focused = ui.memory(|m| m.has_focus(phone_id));
+                                        let pass_focused = ui.memory(|m| m.has_focus(pass_id));
+
                                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                                             ui.label(
                                                 RichText::new("Số điện thoại")
-                                                    .size(13.0)
-                                                    .color(pal.text_secondary)
-                                                    .strong(),
+                                                    .font(FontId::new(13.0, crate::gui::theme::font_family_semibold()))
+                                                    .color(pal.text_secondary),
                                             );
                                             ui.add_space(4.0);
-                                            ui.add_sized(
-                                                [ui.available_width(), 34.0],
-                                                egui::TextEdit::singleline(&mut self.phone_input)
-                                                    .hint_text("Ví dụ: 0912345678"),
-                                            );
+                                            crate::gui::theme::styled_input_frame(pal, phone_focused).show(ui, |ui| {
+                                                ui.add_sized(
+                                                    [ui.available_width(), 22.0],
+                                                    egui::TextEdit::singleline(&mut self.phone_input)
+                                                        .id(phone_id)
+                                                        .frame(false)
+                                                        .hint_text("Ví dụ: 0912345678"),
+                                                );
+                                            });
                                             ui.add_space(12.0);
 
                                             ui.label(
                                                 RichText::new("Mật khẩu")
-                                                    .size(13.0)
-                                                    .color(pal.text_secondary)
-                                                    .strong(),
+                                                    .font(FontId::new(13.0, crate::gui::theme::font_family_semibold()))
+                                                    .color(pal.text_secondary),
                                             );
                                             ui.add_space(4.0);
-                                            ui.add_sized(
-                                                [ui.available_width(), 34.0],
-                                                egui::TextEdit::singleline(&mut self.password_input)
-                                                    .password(true)
-                                                    .hint_text("Nhập mật khẩu Zalo"),
-                                            );
+                                            crate::gui::theme::styled_input_frame(pal, pass_focused).show(ui, |ui| {
+                                                ui.add_sized(
+                                                    [ui.available_width(), 22.0],
+                                                    egui::TextEdit::singleline(&mut self.password_input)
+                                                        .id(pass_id)
+                                                        .frame(false)
+                                                        .password(true)
+                                                        .hint_text("Nhập mật khẩu Zalo"),
+                                                );
+                                            });
                                             ui.add_space(16.0);
 
                                             if !self.login_status_msg.is_empty() {
                                                 ui.label(
                                                     RichText::new(&self.login_status_msg)
-                                                        .color(pal.danger)
+                                                        .color(pal.danger_text)
                                                         .size(12.5),
                                                 );
                                                 ui.add_space(8.0);
                                             }
-
-                                            let btn = egui::Button::new(
-                                                RichText::new("Đăng nhập")
-                                                    .color(Color32::WHITE)
-                                                    .size(14.0)
-                                                    .strong(),
-                                            )
-                                            .fill(pal.primary)
-                                            .rounding(Rounding::same(8.0))
-                                            .min_size(Vec2::new(ui.available_width(), 38.0));
-
-                                            if ui
-                                                .add_enabled(!self.login_in_progress, btn)
-                                                .on_hover_cursor(CursorIcon::PointingHand)
-                                                .clicked()
-                                            {
-                                                self.login_in_progress = true;
-                                                self.login_status_msg = "Đang kết nối…".into();
-                                                if let Some(tx) = WORKER_TX.get() {
-                                                    let _ = tx.send(WorkerCmd::LoginPassword {
-                                                        phone: self.phone_input.clone(),
-                                                        pass: self.password_input.clone(),
-                                                    });
-                                                }
-                                            }
                                         });
+
+                                        // Render primary submit button in centered layout so its label never shifts left.
+                                        let btn = egui::Button::new(
+                                            RichText::new("Đăng nhập")
+                                                .color(pal.primary_fg)
+                                                .size(14.0)
+                                                .strong(),
+                                        )
+                                        .fill(pal.primary)
+                                        .rounding(Rounding::same(8.0))
+                                        .min_size(Vec2::new(ui.available_width(), 38.0));
+
+                                        if ui
+                                            .add_enabled(!self.login_in_progress, btn)
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .clicked()
+                                        {
+                                            self.login_in_progress = true;
+                                            self.login_status_msg = "Đang kết nối…".into();
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                let _ = tx.send(WorkerCmd::LoginPassword {
+                                                    phone: self.phone_input.clone(),
+                                                    pass: self.password_input.clone(),
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                             });
@@ -4407,7 +5546,7 @@ impl ZaloGuiApp {
                         .fill(Color32::TRANSPARENT)
                         .stroke(Stroke::new(1.0_f32, pal.primary.linear_multiply(0.5)))
                         .rounding(Rounding::same(8.0))
-                        .min_size(Vec2::new(280.0, 34.0));
+                        .min_size(Vec2::new(card_w.min(280.0), 34.0));
                         if ui
                             .add(back)
                             .on_hover_cursor(CursorIcon::PointingHand)
@@ -4434,6 +5573,75 @@ impl ZaloGuiApp {
         let text = msg.into();
         self.status_msg = text.clone();
         self.toast_notice = Some((text, std::time::Instant::now()));
+    }
+}
+
+fn settings_default_animation_speed() -> f32 {
+    1.0
+}
+
+pub(super) fn resolve_dark_mode(theme_mode: &str, ctx: &egui::Context) -> bool {
+    match theme_mode {
+        "light" => false,
+        "system" => {
+            if let Some(sys) = ctx.input(|i| i.raw.system_theme) {
+                sys == egui::Theme::Dark
+            } else {
+                #[cfg(target_os = "windows")]
+                {
+                    detect_windows_os_dark_mode().unwrap_or(true)
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    true
+                }
+            }
+        }
+        _ => true,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn detect_windows_os_dark_mode() -> Option<bool> {
+    // Query HKCU\...\Personalize\AppsUseLightTheme without extra crate deps (0 = dark, 1 = light).
+    type Hkey = isize;
+    const HKEY_CURRENT_USER: Hkey = -0x7FFF_FFFF_isize; // 0x80000001
+    const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            hkey: Hkey,
+            lpSubKey: *const u16,
+            lpValue: *const u16,
+            dwFlags: u32,
+            pdwType: *mut u32,
+            pvData: *mut core::ffi::c_void,
+            pcbData: *mut u32,
+        ) -> i32;
+    }
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let subkey = to_wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let val_name = to_wide("AppsUseLightTheme");
+    let mut val: u32 = 1;
+    let mut size: u32 = std::mem::size_of::<u32>() as u32;
+    // SAFETY: Stack pointers (`val`, `size`) and null-terminated UTF-16 buffers stay valid across synchronous Win32 API call.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            val_name.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&mut val as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    if rc == 0 {
+        Some(val == 0)
+    } else {
+        None
     }
 }
 
@@ -4538,6 +5746,8 @@ mod tests {
         let default_settings = super::AppSettings::default();
         assert_eq!(default_settings.font_family, "default");
         assert_eq!(default_settings.font_scale, 1.0);
+        assert!(default_settings.animations_enabled);
+        assert_eq!(default_settings.animation_speed, 1.0);
         assert_eq!(default_settings.custom_primary_color, None);
         assert_eq!(default_settings.custom_accent_color, None);
         assert_eq!(default_settings.custom_bubble_out_bg, None);
@@ -4546,6 +5756,8 @@ mod tests {
         let mut custom = default_settings.clone();
         custom.font_family = "segoe_ui".into();
         custom.font_scale = 1.15;
+        custom.animations_enabled = false;
+        custom.animation_speed = 1.5;
         custom.custom_primary_color = Some("#0068FF".into());
         custom.custom_accent_color = Some("#059669".into());
         custom.custom_bubble_out_bg = Some("#25374D".into());
@@ -4555,9 +5767,129 @@ mod tests {
         let loaded: super::AppSettings = serde_json::from_str(&json).expect("deserialize settings");
         assert_eq!(loaded.font_family, "segoe_ui");
         assert_eq!(loaded.font_scale, 1.15);
+        assert!(!loaded.animations_enabled);
+        assert_eq!(loaded.animation_speed, 1.5);
         assert_eq!(loaded.custom_primary_color.as_deref(), Some("#0068FF"));
         assert_eq!(loaded.custom_accent_color.as_deref(), Some("#059669"));
         assert_eq!(loaded.custom_bubble_out_bg.as_deref(), Some("#25374D"));
         assert_eq!(loaded.custom_bubble_in_bg.as_deref(), Some("#323842"));
+    }
+
+    #[test]
+    fn compute_resized_rect_handles_edges_and_clamps_minimums() {
+        let base = super::WinRect {
+            left: 100,
+            top: 100,
+            right: 1100,
+            bottom: 800,
+        };
+        assert_eq!(base.width(), 1000);
+        assert_eq!(base.height(), 700);
+
+        let expanded = super::compute_resized_rect(
+            base,
+            eframe::egui::ResizeDirection::NorthWest,
+            -40,
+            -20,
+            480,
+            360,
+        );
+        assert_eq!(
+            expanded,
+            super::WinRect {
+                left: 60,
+                top: 80,
+                right: 1100,
+                bottom: 800,
+            }
+        );
+
+        let clamped_nw = super::compute_resized_rect(
+            base,
+            eframe::egui::ResizeDirection::NorthWest,
+            900,
+            600,
+            480,
+            360,
+        );
+        assert_eq!(clamped_nw.width(), 480);
+        assert_eq!(clamped_nw.height(), 360);
+        assert_eq!(clamped_nw.right, 1100);
+        assert_eq!(clamped_nw.bottom, 800);
+
+        let clamped_se = super::compute_resized_rect(
+            base,
+            eframe::egui::ResizeDirection::SouthEast,
+            -900,
+            -600,
+            480,
+            360,
+        );
+        assert_eq!(clamped_se.width(), 480);
+        assert_eq!(clamped_se.height(), 360);
+        assert_eq!(clamped_se.left, 100);
+        assert_eq!(clamped_se.top, 100);
+    }
+
+    #[test]
+    fn sticker_fetch_retry_respects_cooldown_and_max_attempts() {
+        let mut failures = std::collections::HashMap::new();
+        let t0 = std::time::Instant::now();
+        assert!(super::can_attempt_sticker_fetch(&failures, "stk_1", t0));
+
+        // 1st failure -> blocked during 30s cooldown, allowed after 30s.
+        super::record_sticker_fetch_failure(&mut failures, "stk_1", t0);
+        assert!(!super::can_attempt_sticker_fetch(
+            &failures,
+            "stk_1",
+            t0 + std::time::Duration::from_secs(10)
+        ));
+        let t1 = t0 + std::time::Duration::from_secs(30);
+        assert!(super::can_attempt_sticker_fetch(&failures, "stk_1", t1));
+
+        // 2nd failure -> allowed once more after cooldown.
+        super::record_sticker_fetch_failure(&mut failures, "stk_1", t1);
+        let t2 = t1 + std::time::Duration::from_secs(30);
+        assert!(super::can_attempt_sticker_fetch(&failures, "stk_1", t2));
+
+        // 3rd failure reaches MAX_STICKER_FETCH_ATTEMPTS -> permanently stops auto-retry.
+        super::record_sticker_fetch_failure(&mut failures, "stk_1", t2);
+        assert!(!super::can_attempt_sticker_fetch(
+            &failures,
+            "stk_1",
+            t2 + std::time::Duration::from_secs(3600)
+        ));
+    }
+
+    #[test]
+    fn truncate_chars_vietnamese_utf8_safety() {
+        let s = "Nguyễn Thị Hồng Nhung — Tiếng Việt có dấu";
+        let cut = super::truncate_chars(s, 16);
+        assert_eq!(cut.chars().count(), 17);
+        assert!(cut.ends_with('…'));
+        assert!(cut.starts_with("Nguyễn Thị Hồng"));
+        assert_eq!(super::truncate_chars("Ngắn", 16).as_ref(), "Ngắn");
+    }
+
+    #[test]
+    fn app_settings_animations_serde_defaults_and_clamping() {
+        let legacy: super::AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.animations_enabled);
+        assert!((legacy.animation_speed - 1.0).abs() < f32::EPSILON);
+        assert!((legacy.normalized_animation_speed() - 1.0).abs() < f32::EPSILON);
+
+        let mut custom = super::AppSettings {
+            animations_enabled: false,
+            animation_speed: 3.5,
+            ..Default::default()
+        };
+        assert!((custom.normalized_animation_speed() - 2.0).abs() < f32::EPSILON);
+        custom.animation_speed = 0.1;
+        assert!((custom.normalized_animation_speed() - 0.5).abs() < f32::EPSILON);
+
+        let roundtrip: super::AppSettings =
+            serde_json::from_str(&serde_json::to_string(&custom).unwrap()).unwrap();
+        assert!(!roundtrip.animations_enabled);
+        assert!((roundtrip.animation_speed - 0.1).abs() < 1e-4);
     }
 }

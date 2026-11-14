@@ -190,6 +190,7 @@ pub struct TuiApp<'a> {
     reply_target: Option<ChatMessage>,
     overlay: Overlay,
     log_scroll: usize,
+    help_scroll: usize,
     sticker: StickerState,
     prompt: Option<PromptState>,
     confirm: Option<ConfirmAction>,
@@ -232,6 +233,7 @@ impl<'a> TuiApp<'a> {
             reply_target: None,
             overlay: Overlay::None,
             log_scroll: 0,
+            help_scroll: 0,
             sticker: StickerState::default(),
             prompt: None,
             confirm: None,
@@ -1084,12 +1086,23 @@ impl<'a> TuiApp<'a> {
 
         match self.overlay {
             Overlay::Help => {
-                if code == KeyCode::Esc
-                    || code == KeyCode::F(1)
-                    || code == KeyCode::Char('?')
-                    || code == KeyCode::Char('q')
-                {
-                    self.overlay = Overlay::None;
+                match code {
+                    KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') | KeyCode::Char('q') => {
+                        self.overlay = Overlay::None;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.help_scroll = self.help_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.help_scroll = self.help_scroll.saturating_add(1);
+                    }
+                    KeyCode::PageUp => {
+                        self.help_scroll = self.help_scroll.saturating_sub(8);
+                    }
+                    KeyCode::PageDown => {
+                        self.help_scroll = self.help_scroll.saturating_add(8);
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -1129,9 +1142,9 @@ impl<'a> TuiApp<'a> {
                     self.search.pop();
                     self.rebuild_filter();
                 }
-                KeyCode::Up | KeyCode::Char('k') => self.move_thread(-1),
-                KeyCode::Down | KeyCode::Char('j') => self.move_thread(1),
-                KeyCode::Char(c) => {
+                KeyCode::Up => self.move_thread(-1),
+                KeyCode::Down => self.move_thread(1),
+                KeyCode::Char(c) if !c.is_control() && !mods.contains(KeyModifiers::CONTROL) => {
                     self.search.push(c);
                     self.rebuild_filter();
                 }
@@ -1143,10 +1156,12 @@ impl<'a> TuiApp<'a> {
         match code {
             KeyCode::F(1) => {
                 self.overlay = Overlay::Help;
+                self.help_scroll = 0;
                 return;
             }
             KeyCode::Char('?') if self.focus != Focus::Input => {
                 self.overlay = Overlay::Help;
+                self.help_scroll = 0;
                 return;
             }
             KeyCode::F(2) => {
@@ -1586,12 +1601,13 @@ async fn run_loop(
 fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
     let size = f.area();
 
+    let footer_h = if app.search_mode || size.width < 100 { 5 } else { 4 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(4),
+            Constraint::Length(footer_h),
         ])
         .split(size);
 
@@ -1669,11 +1685,20 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
     f.render_widget(header, chunks[0]);
 
     // 2. Body: thread list | chat area
+    let body_constraints = if size.width < 96 {
+        [
+            Constraint::Length((size.width / 3).clamp(26, 36)),
+            Constraint::Min(40),
+        ]
+    } else {
+        [Constraint::Percentage(32), Constraint::Percentage(68)]
+    };
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+        .constraints(body_constraints)
         .split(chunks[1]);
     app.threads_width = body_chunks[0].width;
+    let list_inner_w = body_chunks[0].width.saturating_sub(2) as usize;
 
     let selected_pos = app.list_state.selected();
     let thread_items: Vec<ListItem> = app
@@ -1698,17 +1723,36 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
             } else {
                 Style::default().fg(Color::White)
             };
+            let max_preview = list_inner_w.saturating_sub(7).max(10);
             let preview_text = if t.preview.is_empty() {
                 "- chưa có tin nhắn -".to_string()
+            } else if t.preview.chars().count() > max_preview {
+                let p = t
+                    .preview
+                    .chars()
+                    .take(max_preview.saturating_sub(1))
+                    .collect::<String>();
+                format!("{p}…")
             } else {
-                let p = t.preview.chars().take(22).collect::<String>();
-                format!("{p}...")
+                t.preview.clone()
+            };
+            let max_name = list_inner_w.saturating_sub(18).max(8);
+            let disp_name = if t.name.chars().count() > max_name {
+                format!(
+                    "{}…",
+                    t.name
+                        .chars()
+                        .take(max_name.saturating_sub(1))
+                        .collect::<String>()
+                )
+            } else {
+                t.name.clone()
             };
             let mut line1 = vec![
                 Span::raw(cursor),
                 Span::styled(tag, Style::default().fg(Color::DarkGray)),
-                Span::styled(t.name.clone(), name_style),
-                Span::raw("  "),
+                Span::styled(disp_name, name_style),
+                Span::raw(" "),
                 Span::styled(t.time.clone(), Style::default().fg(Color::DarkGray)),
             ];
             if let Some(n) = app.unread.get(&t.id).copied().filter(|n| *n > 0) {
@@ -1904,7 +1948,15 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         Style::default().fg(Color::DarkGray)
     };
     let cursor = if app.focus == Focus::Input { "_" } else { "" };
-    let input_widget = Paragraph::new(format!(" {}{cursor}", app.input_text)).block(
+    let input_avail = (chat_chunks[3].width as usize).saturating_sub(4).max(8);
+    let total_chars = app.input_text.chars().count();
+    let visible_input = if total_chars > input_avail {
+        let skip = total_chars.saturating_sub(input_avail.saturating_sub(1));
+        format!("…{}", app.input_text.chars().skip(skip).collect::<String>())
+    } else {
+        app.input_text.clone()
+    };
+    let input_widget = Paragraph::new(format!(" {visible_input}{cursor}")).block(
         Block::default()
             .title(input_title)
             .borders(Borders::ALL)
@@ -1916,45 +1968,49 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
     // 3. Footer
     let (hint1, hint2) = match app.focus {
         Focus::Threads => (
-            "[Up/Down j/k] chọn | [PgUp/PgDn] nhảy 10 | [Enter] xem tin | [Tab] đổi vùng | [/] tìm | [f] lọc",
-            "[r] làm mới | [h] lịch sử nhóm | [u] xoá chưa đọc | [F2] nhãn dán | [F3] tệp | [x] đăng xuất | [F1] trợ giúp | [q] thoát",
+            "[↑↓ j/k] chọn | [PgUp/Dn] 10 | [Enter] mở | [Tab] đổi vùng | [/] tìm | [f] lọc",
+            "[r] mới | [h] nhóm | [u] đọc | [F2] sticker | [F3] tệp | [x] thoát TK | [F1/?] | [q]",
         ),
         Focus::Messages => (
-            "[Up/Down j/k] chọn tin | [PgUp/PgDn] cuộn | [Home/End] đầu/cuối | [Enter] soạn | [Tab] đổi vùng",
-            "[1-6] cảm xúc | [y] trả lời | [d] xoá | [o] mở link | [F2] nhãn dán | [F3] tệp | [F1] trợ giúp | [q] thoát",
+            "[↑↓ j/k] chọn tin | [PgUp/Dn] cuộn | [Home/End] | [Enter] soạn | [Tab] đổi vùng",
+            "[1-6] cảm xúc | [y] trả lời | [d] xoá | [o] link | [F2] sticker | [F3] tệp | [F1] | [q]",
         ),
         Focus::Input => (
-            "[Enter] gửi | [Ctrl+U] xoá hết | [Ctrl+X] huỷ trả lời | [Esc] lùi | [Tab] đổi vùng",
+            "[Enter] gửi | [Ctrl+U] xoá | [Ctrl+X] huỷ TL | [Esc] lùi | [Tab] đổi vùng",
             "[F2] nhãn dán | [F3] tệp đính kèm | [F1] trợ giúp | [Ctrl+C] thoát",
         ),
     };
-    let footer_text = if app.search_mode {
-        format!("Tìm kiếm: {}_   (Enter: xong | Esc: xoá)", app.search)
-    } else {
-        String::new()
-    };
-    let footer = Paragraph::new(vec![
-        Line::from(Span::styled(hint1, Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled(
-            footer_text,
+    let mut footer_lines = Vec::new();
+    if app.search_mode {
+        footer_lines.push(Line::from(Span::styled(
+            format!("Tìm kiếm: {}_   (Enter: xong | Esc: xoá)", app.search),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(hint2, Style::default().fg(Color::DarkGray))),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
-            .title(" Phím tắt "),
-    )
-    .alignment(Alignment::Center);
+        )));
+    }
+    footer_lines.push(Line::from(Span::styled(
+        hint1,
+        Style::default().fg(Color::DarkGray),
+    )));
+    footer_lines.push(Line::from(Span::styled(
+        hint2,
+        Style::default().fg(Color::DarkGray),
+    )));
+    let footer = Paragraph::new(footer_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .title(" Phím tắt "),
+        )
+        .wrap(Wrap { trim: true })
+        .alignment(Alignment::Center);
     f.render_widget(footer, chunks[2]);
 
     // 4. Overlays
     match app.overlay {
-        Overlay::Help => render_help(f, size),
+        Overlay::Help => render_help(f, size, app.help_scroll),
         Overlay::Log => render_log_modal(f, size, app.log_scroll),
         Overlay::Sticker => render_sticker_overlay(f, size, app),
         Overlay::None => {}
@@ -2264,8 +2320,12 @@ fn help_line(keys: &str, desc: &str) -> Line<'static> {
     ])
 }
 
-fn render_help(f: &mut Frame, area: Rect) {
-    let modal_area = centered_rect(80, 80, area);
+fn render_help(f: &mut Frame, area: Rect, scroll: usize) {
+    let modal_area = centered_rect(
+        if area.width < 92 { 92 } else { 80 },
+        if area.height < 28 { 92 } else { 80 },
+        area,
+    );
     f.render_widget(Clear, modal_area);
 
     let mut content: Vec<Line<'static>> = Vec::new();
@@ -2343,12 +2403,16 @@ fn render_help(f: &mut Frame, area: Rect) {
     )));
 
     let block = Block::default()
-        .title(" Trợ giúp (Esc/F1 để đóng) ")
+        .title(" Trợ giúp (↑↓/j/k cuộn, Esc/F1 đóng) ")
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Cyan));
+    let inner_h = modal_area.height.saturating_sub(2) as usize;
+    let max_scroll = content.len().saturating_sub(inner_h);
+    let clamped_scroll = scroll.min(max_scroll);
     let paragraph = Paragraph::new(content)
         .block(block)
+        .scroll((clamped_scroll.min(u16::MAX as usize) as u16, 0))
         .wrap(Wrap { trim: true });
     f.render_widget(paragraph, modal_area);
 }
@@ -2487,8 +2551,18 @@ fn render_sticker_overlay(f: &mut Frame, area: Rect, app: &TuiApp<'_>) {
     f.render_stateful_widget(items_list, chunks[1], &mut items_state);
 }
 
+fn centered_box(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width).max(20.min(area.width));
+    let h = height.min(area.height).max(5.min(area.height));
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect::new(x, y, w, h)
+}
+
 fn render_confirm(f: &mut Frame, area: Rect, action: &ConfirmAction) {
-    let modal_area = centered_rect(60, 26, area);
+    let w = ((area.width as usize * 76) / 100).max(54) as u16;
+    let h = ((area.height as usize * 36) / 100).max(9) as u16;
+    let modal_area = centered_box(w, h, area);
     f.render_widget(Clear, modal_area);
 
     let content = vec![
@@ -2509,27 +2583,39 @@ fn render_confirm(f: &mut Frame, area: Rect, action: &ConfirmAction) {
             Style::default().fg(Color::Cyan),
         )),
     ];
-    let paragraph = Paragraph::new(content).block(
-        Block::default()
-            .title(" Xác nhận ")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
-            .border_style(Style::default().fg(Color::Yellow)),
-    );
+    let paragraph = Paragraph::new(content)
+        .block(
+            Block::default()
+                .title(" Xác nhận ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: true });
     f.render_widget(paragraph, modal_area);
 }
 
 fn render_prompt(f: &mut Frame, area: Rect, prompt: &PromptState) {
-    let modal_area = centered_rect(70, 24, area);
+    let w = ((area.width as usize * 80) / 100).max(54) as u16;
+    let h = ((area.height as usize * 32) / 100).max(8) as u16;
+    let modal_area = centered_box(w, h, area);
     f.render_widget(Clear, modal_area);
 
     let title = match prompt.kind {
         PromptKind::Attachment => " Gửi tệp đính kèm: nhập đường dẫn tệp ",
     };
+    let inner_w = modal_area.width.saturating_sub(5) as usize;
+    let char_len = prompt.text.chars().count();
+    let visible_text = if inner_w > 4 && char_len > inner_w {
+        let skip = char_len.saturating_sub(inner_w.saturating_sub(1));
+        format!("…{}", prompt.text.chars().skip(skip).collect::<String>())
+    } else {
+        prompt.text.clone()
+    };
     let content = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            format!("  {}_", prompt.text),
+            format!("  {visible_text}_"),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -2540,13 +2626,15 @@ fn render_prompt(f: &mut Frame, area: Rect, prompt: &PromptState) {
             Style::default().fg(Color::DarkGray),
         )),
     ];
-    let paragraph = Paragraph::new(content).block(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
+    let paragraph = Paragraph::new(content)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: true });
     f.render_widget(paragraph, modal_area);
 }
 
@@ -2767,6 +2855,7 @@ mod tests {
             reply_target: None,
             overlay: Overlay::None,
             log_scroll: 0,
+            help_scroll: 0,
             sticker: StickerState::default(),
             prompt: None,
             confirm: None,
@@ -2811,6 +2900,7 @@ mod tests {
             reply_target: None,
             overlay: Overlay::None,
             log_scroll: 0,
+            help_scroll: 0,
             sticker: StickerState::default(),
             prompt: None,
             confirm: Some(ConfirmAction {
@@ -2844,5 +2934,79 @@ mod tests {
             screen.contains("Xoá lịch sử tin nhắn cục bộ"),
             "confirmation question missing from the frame"
         );
+    }
+
+    #[test]
+    fn search_mode_accepts_j_k_and_80x24_confirm_fits() {
+        let mut session = crate::session::Session::new(false, false, false).unwrap();
+        let (tx, rx) = channel();
+        let make_thread = |id: &str, name: &str| Thread {
+            presentation: Default::default(),
+            unread: Default::default(),
+            id: id.into(),
+            name: name.into(),
+            preview: String::new(),
+            time: "12:00".into(),
+            avatar: None,
+            is_group: false,
+            messages: Vec::new(),
+            vanish: None,
+        };
+        let mut app = TuiApp {
+            session: &mut session,
+            threads: vec![make_thread("1", "An"), make_thread("2", "Khanh"), make_thread("3", "Jisoo")],
+            list_state: ListState::default(),
+            selected_thread: 0,
+            input_text: String::new(),
+            focus: Focus::Threads,
+            status: "test".into(),
+            should_quit: false,
+            store: None,
+            poll_state: chat::PollState::default(),
+            filtered: vec![0, 1, 2],
+            filter: FilterTab::All,
+            search: String::new(),
+            search_mode: true,
+            unread: HashMap::new(),
+            selected_msg: None,
+            msg_scroll: 0,
+            follow_tail: true,
+            msg_ranges: Vec::new(),
+            chat_view_h: 10,
+            threads_width: 0,
+            reply_target: None,
+            overlay: Overlay::None,
+            log_scroll: 0,
+            help_scroll: 0,
+            sticker: StickerState::default(),
+            prompt: None,
+            confirm: None,
+            poll_inflight: false,
+            bg_rx: rx,
+            bg_tx: tx,
+        };
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.search, "jk");
+        app.search.clear();
+        app.search_mode = false;
+        app.confirm = Some(ConfirmAction {
+            question: "Xoá tin nhắn này?".into(),
+            detail: "Không thể hoàn tác.".into(),
+            kind: ConfirmKind::DeleteMessage,
+            thread_id: String::new(),
+            msg_id: String::new(),
+        });
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui_draw(f, &mut app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("[y/Enter]"), "confirm footer clipped at 80x24");
     }
 }

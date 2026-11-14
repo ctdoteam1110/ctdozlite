@@ -39,6 +39,7 @@ pub(super) fn render_sticker_widget(
     msg: &ChatMessage,
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
+    failed_stickers: &HashMap<String, (u8, std::time::Instant)>,
 ) -> bool {
     let Some((sid, cid)) = is_sticker_message(msg) else {
         return false;
@@ -51,14 +52,7 @@ pub(super) fn render_sticker_widget(
         format!("https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={sid}&size=130")
     };
 
-    if !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
-        if let Some(tx) = WORKER_TX.get() {
-            let _ = tx.send(WorkerCmd::FetchStickerImage {
-                key: key.clone(),
-                url,
-            });
-        }
-    }
+    crate::gui::queue_sticker_fetch(sticker_textures, loading_stickers, failed_stickers, key.clone(), url);
 
     if let Some(tex) = sticker_textures.get(&key) {
         ui.image((tex.id(), Vec2::new(116.0, 116.0)));
@@ -307,9 +301,21 @@ pub(super) fn open_external_url_with_monitor(
     if trimmed.is_empty() {
         return Err("Liên kết trống".into());
     }
+
+    let is_local_file = trimmed.starts_with("file://")
+        || std::path::Path::new(trimmed).exists()
+        || (trimmed.len() >= 3
+            && trimmed.as_bytes()[1] == b':'
+            && (trimmed.as_bytes()[2] == b'\\' || trimmed.as_bytes()[2] == b'/'))
+        || trimmed.starts_with(r"\\")
+        || (cfg!(unix) && trimmed.starts_with('/'));
+
     // Chuẩn hoá link không scheme (www.x, x.com/abc) thay vì bỏ qua im lặng.
     let owned;
-    let target = if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+    let target = if is_local_file {
+        owned = trimmed.strip_prefix("file://").unwrap_or(trimmed).to_string();
+        &owned
+    } else if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
         trimmed
     } else if trimmed.contains('.') && !trimmed.contains(' ') && !trimmed.contains("://") {
         owned = format!("https://{trimmed}");
@@ -1148,7 +1154,7 @@ pub(super) fn render_system_notice_pill(ui: &mut egui::Ui, msg: &ChatMessage, pa
             .size()
             .x
         });
-        let pill_w = (text_w + 28.0).min(avail_w - 40.0);
+        let pill_w = (text_w + 28.0).min((avail_w - 24.0).max(40.0));
         let left_pad = ((avail_w - pill_w) * 0.5).max(0.0);
         if left_pad > 0.0 {
             ui.add_space(left_pad);
@@ -1159,10 +1165,14 @@ pub(super) fn render_system_notice_pill(ui: &mut egui::Ui, msg: &ChatMessage, pa
             .rounding(Rounding::same(12.0))
             .inner_margin(Margin::symmetric(12.0, 4.0))
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new(format!("{} {text}", lucide::SPARKLES))
-                        .size(12.0)
-                        .color(pal.text_secondary),
+                ui.set_max_width(pill_w);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{} {text}", lucide::SPARKLES))
+                            .size(12.0)
+                            .color(pal.text_secondary),
+                    )
+                    .wrap(),
                 );
             });
     });
@@ -1303,11 +1313,19 @@ fn parse_ordered_item(line: &str) -> Option<(String, usize, String)> {
     }
 }
 
-/// LỰA CHỌN `*đậm*` kiểu Zalo: `*x*` → ĐẬM khi `zalo_bold` bật; `**x**` luôn đậm;
-/// `_x_` luôn nghiêng. Trả về true khi đã tiêu thụ `*...*` tại đầu `rest`.
-/// Không phá URL/mention: caller chỉ gọi khi đã loại trừ link/mention, và yêu cầu
-/// nội dung trong `*...*` không chứa whitespace biên + không phải `**`.
-fn consume_zalo_bold(job: &mut egui::text::LayoutJob, rest: &str, base_size: f32, base_color: Color32, pal: &ThemePalette) -> Option<usize> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InlineMdRun {
+    Plain(String),
+    Bold(String),
+    Underline(String),
+    Strike(String),
+    Italic(String),
+    Code(String),
+    Mention(String),
+    Link { label: String, url: String },
+}
+
+fn try_consume_zalo_bold_span(rest: &str) -> Option<(usize, &str)> {
     if !rest.starts_with('*') || rest.starts_with("**") {
         return None;
     }
@@ -1317,43 +1335,89 @@ fn consume_zalo_bold(job: &mut egui::text::LayoutJob, rest: &str, base_size: f32
         return None;
     }
     let inner = &after[..end];
-    if inner.starts_with(char::is_whitespace) || inner.ends_with(char::is_whitespace) || inner.contains('\n') || inner.contains("http") || inner.contains('@') {
+    if inner.starts_with(char::is_whitespace)
+        || inner.ends_with(char::is_whitespace)
+        || inner.contains('\n')
+        || inner.contains("http")
+        || inner.contains('@')
+    {
         return None;
     }
-    job.append(
-        inner,
-        0.0,
-        egui::TextFormat {
-            font_id: FontId::proportional(base_size + 0.4),
-            color: if pal.is_dark { Color32::WHITE } else { pal.text_primary },
-            ..Default::default()
-        },
-    );
-    let _ = base_color;
-    Some(1 + end + 1)
+    Some((1 + end + 1, inner))
 }
 
-#[allow(dead_code)]
-fn render_markdown_inline_rich(
-    ui: &mut egui::Ui,
-    text: &str,
-    base_size: f32,
-    base_color: Color32,
-    pal: &ThemePalette,
-) {
-    render_markdown_inline_rich_opts(ui, text, base_size, base_color, pal, true)
+fn push_plain_run(runs: &mut Vec<InlineMdRun>, s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    if let Some(InlineMdRun::Plain(last)) = runs.last_mut() {
+        last.push_str(s);
+    } else {
+        runs.push(InlineMdRun::Plain(s.to_string()));
+    }
 }
 
-fn render_markdown_inline_rich_opts(
-    ui: &mut egui::Ui,
-    text: &str,
-    base_size: f32,
-    base_color: Color32,
-    pal: &ThemePalette,
-    zalo_bold: bool,
-) {
-    let mut job = egui::text::LayoutJob::default();
-    let mut first_link: Option<String> = None;
+fn find_next_single_star(s: &str) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(rel) = s[offset..].find('*') {
+        let idx = offset + rel;
+        if s.get(idx..idx + 2) != Some("**") {
+            return Some(idx);
+        }
+        offset = idx + 2;
+    }
+    None
+}
+
+fn find_next_italic_underscore(s: &str) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(rel) = s[offset..].find('_') {
+        let idx = offset + rel;
+        let is_double = s.get(idx..idx + 2) == Some("__");
+        let prev_alnum = s[..idx].chars().next_back().is_some_and(char::is_alphanumeric);
+        if !is_double && !prev_alnum {
+            return Some(idx);
+        }
+        offset = idx + if is_double { 2 } else { 1 };
+    }
+    None
+}
+
+fn find_next_mention(s: &str) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(rel) = s[offset..].find('@') {
+        let idx = offset + rel;
+        let prev_ident = s[..idx]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '.' || c == '_');
+        if !prev_ident {
+            return Some(idx);
+        }
+        offset = idx + 1;
+    }
+    None
+}
+
+fn find_next_bare_url(s: &str) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for scheme in ["https://", "http://"] {
+        let mut offset = 0;
+        while let Some(rel) = s[offset..].find(scheme) {
+            let idx = offset + rel;
+            let prev_alnum = s[..idx].chars().next_back().is_some_and(char::is_alphanumeric);
+            if !prev_alnum {
+                best = Some(best.map_or(idx, |b| b.min(idx)));
+                break;
+            }
+            offset = idx + scheme.len();
+        }
+    }
+    best
+}
+
+pub(crate) fn parse_inline_md_runs(text: &str, zalo_bold: bool) -> Vec<InlineMdRun> {
+    let mut runs: Vec<InlineMdRun> = Vec::new();
     let mut rest = text;
 
     while !rest.is_empty() {
@@ -1361,7 +1425,10 @@ fn render_markdown_inline_rich_opts(
         let next_under = rest.find("__");
         let next_strike = rest.find("~~");
         let next_code = rest.find('`');
-        let next_italic = rest.find('*').filter(|&i| rest.get(i..i + 2) != Some("**"));
+        let next_star = find_next_single_star(rest);
+        let next_underscore = find_next_italic_underscore(rest);
+        let next_mention = find_next_mention(rest);
+        let next_bare_url = find_next_bare_url(rest);
         let next_link = rest.find('[').and_then(|lb| {
             let after_lb = &rest[lb + 1..];
             let rb = after_lb.find("](")?;
@@ -1375,35 +1442,22 @@ fn render_markdown_inline_rich_opts(
             next_under,
             next_strike,
             next_code,
-            next_italic,
+            next_star,
+            next_underscore,
+            next_mention,
+            next_bare_url,
             next_link.map(|(lb, _, _)| lb),
         ]
         .into_iter()
         .flatten()
         .min();
         let Some(pos) = min_pos else {
-            job.append(
-                rest,
-                0.0,
-                egui::TextFormat {
-                    font_id: FontId::proportional(base_size),
-                    color: base_color,
-                    ..Default::default()
-                },
-            );
+            push_plain_run(&mut runs, rest);
             break;
         };
 
         if pos > 0 {
-            job.append(
-                &rest[..pos],
-                0.0,
-                egui::TextFormat {
-                    font_id: FontId::proportional(base_size),
-                    color: base_color,
-                    ..Default::default()
-                },
-            );
+            push_plain_run(&mut runs, &rest[..pos]);
             rest = &rest[pos..];
             continue;
         }
@@ -1411,25 +1465,32 @@ fn render_markdown_inline_rich_opts(
         if let Some((0, rb_idx, rp_idx)) = next_link {
             let label = &rest[1..rb_idx];
             let url = &rest[rb_idx + 2..rp_idx];
-            if first_link.is_none() && (url.starts_with("http://") || url.starts_with("https://")) {
-                first_link = Some(url.to_string());
-            }
-            job.append(
-                label.trim_matches('*').trim_matches('`'),
-                0.0,
-                egui::TextFormat {
-                    font_id: FontId::proportional(base_size),
-                    color: pal.primary_hover,
-                    underline: Stroke::new(1.0_f32, pal.primary_hover),
-                    ..Default::default()
-                },
-            );
+            runs.push(InlineMdRun::Link {
+                label: label.trim_matches('*').trim_matches('`').to_string(),
+                url: url.to_string(),
+            });
             rest = &rest[rp_idx + 1..];
             continue;
         }
 
+        if next_bare_url == Some(0) {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let raw_token = &rest[..end];
+            let clean_url = raw_token.trim_end_matches(|c: char| {
+                matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '>')
+            });
+            if clean_url.len() > 8 {
+                runs.push(InlineMdRun::Link {
+                    label: clean_url.to_string(),
+                    url: clean_url.to_string(),
+                });
+                rest = &rest[clean_url.len()..];
+                continue;
+            }
+        }
+
         // Render @All and @Name mentions as styled chips/links in Zalo Blue
-        if rest.starts_with('@') {
+        if rest.starts_with('@') && next_mention == Some(0) {
             let after = &rest[1..];
             let is_all = after.starts_with("All")
                 || after.starts_with("all")
@@ -1439,8 +1500,7 @@ fn render_markdown_inline_rich_opts(
                 || after.starts_with("Tat ca")
                 || after.starts_with("tat ca");
             if is_all {
-                let all_len = if after.starts_with("Tất cả") || after.starts_with("tất cả")
-                {
+                let all_len = if after.starts_with("Tất cả") || after.starts_with("tất cả") {
                     "Tất cả".len()
                 } else if after.starts_with("Tat ca") || after.starts_with("tat ca") {
                     6
@@ -1452,33 +1512,7 @@ fn render_markdown_inline_rich_opts(
                     || next_char.unwrap().is_whitespace()
                     || matches!(next_char.unwrap(), '.' | ',' | '!' | '?' | ':' | ';')
                 {
-                    let mention_text = &rest[..1 + all_len];
-                    job.append(
-                        mention_text,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: FontId::proportional(base_size),
-                            color: if pal.is_dark {
-                                Color32::from_rgb(97, 175, 239)
-                            } else {
-                                Color32::from_rgb(0, 104, 255)
-                            },
-                            background: if pal.is_dark {
-                                Color32::from_rgba_unmultiplied(97, 175, 239, 45)
-                            } else {
-                                Color32::from_rgba_unmultiplied(0, 104, 255, 30)
-                            },
-                            underline: Stroke::new(
-                                1.0_f32,
-                                if pal.is_dark {
-                                    Color32::from_rgba_unmultiplied(97, 175, 239, 120)
-                                } else {
-                                    Color32::from_rgba_unmultiplied(0, 104, 255, 100)
-                                },
-                            ),
-                            ..Default::default()
-                        },
-                    );
+                    runs.push(InlineMdRun::Mention(rest[..1 + all_len].to_string()));
                     rest = &after[all_len..];
                     continue;
                 }
@@ -1523,36 +1557,10 @@ fn render_markdown_inline_rich_opts(
             }
             let candidate_name = after[..end_idx].trim_end();
             if !candidate_name.is_empty()
-                && candidate_name.chars().next().unwrap().is_alphanumeric()
+                && candidate_name.chars().next().is_some_and(char::is_alphanumeric)
             {
                 let mention_len = 1 + candidate_name.len();
-                let mention_str = &rest[..mention_len];
-                job.append(
-                    mention_str,
-                    0.0,
-                    egui::TextFormat {
-                        font_id: FontId::proportional(base_size),
-                        color: if pal.is_dark {
-                            Color32::from_rgb(97, 175, 239)
-                        } else {
-                            Color32::from_rgb(0, 104, 255)
-                        },
-                        background: if pal.is_dark {
-                            Color32::from_rgba_unmultiplied(97, 175, 239, 40)
-                        } else {
-                            Color32::from_rgba_unmultiplied(0, 104, 255, 25)
-                        },
-                        underline: Stroke::new(
-                            1.0_f32,
-                            if pal.is_dark {
-                                Color32::from_rgba_unmultiplied(97, 175, 239, 110)
-                            } else {
-                                Color32::from_rgba_unmultiplied(0, 104, 255, 90)
-                            },
-                        ),
-                        ..Default::default()
-                    },
-                );
+                runs.push(InlineMdRun::Mention(rest[..mention_len].to_string()));
                 rest = &rest[mention_len..];
                 continue;
             }
@@ -1561,19 +1569,7 @@ fn render_markdown_inline_rich_opts(
         if rest.starts_with("**") {
             let after = &rest[2..];
             if let Some(end_b) = after.find("**") {
-                job.append(
-                    &after[..end_b],
-                    0.0,
-                    egui::TextFormat {
-                        font_id: FontId::proportional(base_size + 0.4),
-                        color: if pal.is_dark {
-                            Color32::WHITE
-                        } else {
-                            pal.text_primary
-                        },
-                        ..Default::default()
-                    },
-                );
+                runs.push(InlineMdRun::Bold(after[..end_b].to_string()));
                 rest = &after[end_b + 2..];
                 continue;
             }
@@ -1582,16 +1578,7 @@ fn render_markdown_inline_rich_opts(
         if rest.starts_with("__") {
             let after = &rest[2..];
             if let Some(end_u) = after.find("__") {
-                job.append(
-                    &after[..end_u],
-                    0.0,
-                    egui::TextFormat {
-                        font_id: FontId::proportional(base_size),
-                        color: base_color,
-                        underline: Stroke::new(1.0_f32, base_color),
-                        ..Default::default()
-                    },
-                );
+                runs.push(InlineMdRun::Underline(after[..end_u].to_string()));
                 rest = &after[end_u + 2..];
                 continue;
             }
@@ -1600,63 +1587,38 @@ fn render_markdown_inline_rich_opts(
         if rest.starts_with("~~") {
             let after = &rest[2..];
             if let Some(end_s) = after.find("~~") {
-                job.append(
-                    &after[..end_s],
-                    0.0,
-                    egui::TextFormat {
-                        font_id: FontId::proportional(base_size),
-                        color: base_color.linear_multiply(0.75),
-                        strikethrough: Stroke::new(1.0_f32, base_color),
-                        ..Default::default()
-                    },
-                );
+                runs.push(InlineMdRun::Strike(after[..end_s].to_string()));
                 rest = &after[end_s + 2..];
                 continue;
             }
         }
         if rest.starts_with('*') && !rest.starts_with("**") {
-            // Zalo: `*đậm*` (1 sao = đậm) khi bật toggle; `_x_` vẫn là nghiêng chuẩn.
-            // URL/mention đã được xử lý ở nhánh link/mention phía trên nên tới đây
-            // `*` ở đầu token là an toàn để thử parse đậm.
             if zalo_bold {
-                if let Some(consumed) = consume_zalo_bold(&mut job, rest, base_size, base_color, pal) {
+                if let Some((consumed, inner)) = try_consume_zalo_bold_span(rest) {
+                    runs.push(InlineMdRun::Bold(inner.to_string()));
                     rest = &rest[consumed..];
                     continue;
                 }
             }
-            // Fallback: nghiêng kiểu markdown chuẩn; kỳ vọng `_x_` được xử lý ở dưới.
             let after = &rest[1..];
             if let Some(end_i) = after.find('*') {
                 if end_i > 0 && !zalo_bold {
-                    job.append(
-                        &after[..end_i],
-                        0.0,
-                        egui::TextFormat {
-                            font_id: FontId::proportional(base_size),
-                            color: base_color,
-                            italics: true,
-                            ..Default::default()
-                        },
-                    );
+                    runs.push(InlineMdRun::Italic(after[..end_i].to_string()));
                     rest = &after[end_i + 1..];
                     continue;
                 }
             }
         }
-        if rest.starts_with('_') && !rest.starts_with("__") {
+        if rest.starts_with('_') && !rest.starts_with("__") && next_underscore == Some(0) {
             let after = &rest[1..];
             if let Some(end_i) = after.find('_') {
-                if end_i > 0 {
-                    job.append(
-                        &after[..end_i],
-                        0.0,
-                        egui::TextFormat {
-                            font_id: FontId::proportional(base_size),
-                            color: base_color,
-                            italics: true,
-                            ..Default::default()
-                        },
-                    );
+                let inner = &after[..end_i];
+                if end_i > 0
+                    && !inner.starts_with(char::is_whitespace)
+                    && !inner.ends_with(char::is_whitespace)
+                    && after.get(end_i..end_i + 2) != Some("__")
+                {
+                    runs.push(InlineMdRun::Italic(inner.to_string()));
                     rest = &after[end_i + 1..];
                     continue;
                 }
@@ -1666,16 +1628,7 @@ fn render_markdown_inline_rich_opts(
         if rest.starts_with('`') {
             let after = &rest[1..];
             if let Some(end_c) = after.find('`') {
-                job.append(
-                    &after[..end_c],
-                    0.0,
-                    egui::TextFormat {
-                        font_id: FontId::monospace((base_size - 0.8).max(11.0)),
-                        color: pal.primary_hover,
-                        background: pal.bg_input,
-                        ..Default::default()
-                    },
-                );
+                runs.push(InlineMdRun::Code(after[..end_c].to_string()));
                 rest = &after[end_c + 1..];
                 continue;
             }
@@ -1684,33 +1637,198 @@ fn render_markdown_inline_rich_opts(
         let mut chars = rest.chars();
         if let Some(ch) = chars.next() {
             let mut buf = [0u8; 4];
-            job.append(
-                ch.encode_utf8(&mut buf),
-                0.0,
-                egui::TextFormat {
-                    font_id: FontId::proportional(base_size),
-                    color: base_color,
-                    ..Default::default()
-                },
-            );
+            push_plain_run(&mut runs, ch.encode_utf8(&mut buf));
             rest = chars.as_str();
         } else {
             break;
         }
     }
 
-    if let Some(url) = first_link {
-        let resp = ui.add(egui::Label::new(job).wrap().sense(Sense::click()));
-        if resp
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text(&url)
-            .clicked()
-        {
-            let _ = open_external_url(&url);
-        }
-    } else {
-        ui.add(egui::Label::new(job).wrap());
+    runs
+}
+
+fn append_md_run_to_job(
+    job: &mut egui::text::LayoutJob,
+    run: &InlineMdRun,
+    base_size: f32,
+    base_color: Color32,
+    pal: &ThemePalette,
+) {
+    match run {
+        InlineMdRun::Plain(s) => job.append(
+            s,
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::proportional(base_size),
+                color: base_color,
+                ..Default::default()
+            },
+        ),
+        InlineMdRun::Bold(s) => job.append(
+            s,
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::proportional(base_size + 0.4),
+                color: if pal.is_dark {
+                    Color32::WHITE
+                } else {
+                    pal.text_primary
+                },
+                ..Default::default()
+            },
+        ),
+        InlineMdRun::Underline(s) => job.append(
+            s,
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::proportional(base_size),
+                color: base_color,
+                underline: Stroke::new(1.0_f32, base_color),
+                ..Default::default()
+            },
+        ),
+        InlineMdRun::Strike(s) => job.append(
+            s,
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::proportional(base_size),
+                color: base_color.linear_multiply(0.75),
+                strikethrough: Stroke::new(1.0_f32, base_color),
+                ..Default::default()
+            },
+        ),
+        InlineMdRun::Italic(s) => job.append(
+            s,
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::proportional(base_size),
+                color: base_color,
+                italics: true,
+                ..Default::default()
+            },
+        ),
+        InlineMdRun::Code(s) => job.append(
+            s,
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::monospace((base_size - 0.8).max(11.0)),
+                color: pal.link_text,
+                background: pal.code_bg,
+                ..Default::default()
+            },
+        ),
+        InlineMdRun::Mention(s) => job.append(
+            s,
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::proportional(base_size),
+                color: pal.link_text,
+                background: pal.primary.linear_multiply(0.14),
+                underline: Stroke::new(1.0_f32, pal.link_text.linear_multiply(0.6)),
+                ..Default::default()
+            },
+        ),
+        InlineMdRun::Link { label, .. } => job.append(
+            label,
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::proportional(base_size),
+                color: pal.link_text,
+                underline: Stroke::new(1.0_f32, pal.link_text),
+                ..Default::default()
+            },
+        ),
     }
+}
+
+#[allow(dead_code)]
+fn render_markdown_inline_rich(
+    ui: &mut egui::Ui,
+    text: &str,
+    base_size: f32,
+    base_color: Color32,
+    pal: &ThemePalette,
+) {
+    render_markdown_inline_rich_opts(ui, text, base_size, base_color, pal, true)
+}
+
+fn render_markdown_inline_rich_opts(
+    ui: &mut egui::Ui,
+    text: &str,
+    base_size: f32,
+    base_color: Color32,
+    pal: &ThemePalette,
+    zalo_bold: bool,
+) {
+    let runs = parse_inline_md_runs(text, zalo_bold);
+    let links: Vec<&str> = runs
+        .iter()
+        .filter_map(|r| match r {
+            InlineMdRun::Link { url, .. }
+                if url.starts_with("http://") || url.starts_with("https://") =>
+            {
+                Some(url.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+
+    if links.len() <= 1 {
+        let mut job = egui::text::LayoutJob::default();
+        for run in &runs {
+            append_md_run_to_job(&mut job, run, base_size, base_color, pal);
+        }
+        if let Some(&url) = links.first() {
+            let resp = ui.add(egui::Label::new(job).wrap().sense(Sense::click()));
+            if resp
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(url)
+                .clicked()
+            {
+                let _ = open_external_url(url);
+            }
+        } else {
+            ui.add(egui::Label::new(job).wrap());
+        }
+        return;
+    }
+
+    // Multiple clickable links on the same line: flush preceding styled runs and give each link its own click target.
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let mut chunk = egui::text::LayoutJob::default();
+        for run in &runs {
+            if let InlineMdRun::Link { label, url } = run {
+                if !chunk.is_empty() {
+                    ui.add(egui::Label::new(std::mem::take(&mut chunk)).wrap());
+                }
+                let mut link_job = egui::text::LayoutJob::default();
+                append_md_run_to_job(
+                    &mut link_job,
+                    &InlineMdRun::Link {
+                        label: label.clone(),
+                        url: url.clone(),
+                    },
+                    base_size,
+                    base_color,
+                    pal,
+                );
+                let resp = ui.add(egui::Label::new(link_job).wrap().sense(Sense::click()));
+                if resp
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text(url.as_str())
+                    .clicked()
+                {
+                    let _ = open_external_url(url);
+                }
+            } else {
+                append_md_run_to_job(&mut chunk, run, base_size, base_color, pal);
+            }
+        }
+        if !chunk.is_empty() {
+            ui.add(egui::Label::new(chunk).wrap());
+        }
+    });
 }
 
 #[allow(dead_code)]
@@ -1797,24 +1915,34 @@ fn render_code_block(ui: &mut egui::Ui, lang: &str, body: &str, pal: &ThemePalet
 }
 
 fn render_md_table(ui: &mut egui::Ui, headers: &[String], rows: &[Vec<String>], text_col: Color32, pal: &ThemePalette, zalo_bold: bool) {
+    let table_id = ui.next_auto_id().with(("md_table", headers.len(), rows.len()));
     egui::Frame::none()
         .fill(pal.bg_input)
         .stroke(Stroke::new(1.0_f32, pal.border))
         .rounding(Rounding::same(6.0))
         .inner_margin(Margin::symmetric(8.0, 6.0))
         .show(ui, |ui| {
-            egui::Grid::new(format!("md_table_{}", headers.len())).striped(true).spacing([10.0, 4.0]).show(ui, |ui| {
-                for h in headers {
-                    ui.label(RichText::new(h).size(13.5).color(text_col).strong());
-                }
-                ui.end_row();
-                for row in rows {
-                    for cell in row {
-                        render_markdown_inline_rich_opts(ui, cell, 13.5, text_col, pal, zalo_bold);
-                    }
-                    ui.end_row();
-                }
-            });
+            egui::ScrollArea::horizontal()
+                .id_salt(table_id.with("scroll"))
+                .show(ui, |ui| {
+                    egui::Grid::new(table_id)
+                        .striped(true)
+                        .spacing([10.0, 4.0])
+                        .show(ui, |ui| {
+                            for h in headers {
+                                ui.label(RichText::new(h).size(13.5).color(text_col).strong());
+                            }
+                            ui.end_row();
+                            for row in rows {
+                                for cell in row {
+                                    render_markdown_inline_rich_opts(
+                                        ui, cell, 13.5, text_col, pal, zalo_bold,
+                                    );
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
         });
 }
 
@@ -1858,6 +1986,7 @@ pub(super) fn render_message_body(
     max_text_width: f32,
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
+    failed_stickers: &HashMap<String, (u8, std::time::Instant)>,
     preview: Option<&str>,
     preview_loading: bool,
     preview_error: Option<&str>,
@@ -1889,6 +2018,40 @@ pub(super) fn render_message_body(
         );
         return None;
     }
+    let is_e2ee = msg
+        .history_source
+        .as_ref()
+        .and_then(|v| v.get("isE2EE"))
+        .and_then(|x| x.as_i64())
+        == Some(1)
+        || trimmed_text.contains("[Mã hóa đầu cuối]");
+    if is_e2ee {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!("{} Mã hóa đầu cuối", lucide::LOCK))
+                    .size(11.0)
+                    .color(meta_col)
+                    .strong(),
+            );
+        });
+        ui.add_space(2.0);
+    }
+    let is_anti_recalled = trimmed_text.starts_with("[Đã thu hồi]");
+    if is_anti_recalled {
+        egui::Frame::none()
+            .fill(pal.warning.linear_multiply(0.14))
+            .rounding(Rounding::same(6.0))
+            .inner_margin(Margin::symmetric(6.0, 2.0))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!("{} Đã thu hồi (giữ lại)", lucide::SHIELD_CHECK))
+                        .size(11.0)
+                        .color(pal.warning)
+                        .strong(),
+                );
+            });
+        ui.add_space(4.0);
+    }
 
     let sender_label = if msg.is_outgoing {
         "Bạn".to_string()
@@ -1903,14 +2066,13 @@ pub(super) fn render_message_body(
     if is_zalo_photo {
         if let Some(thumb_url) = photo_primary_url(msg) {
             let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
-            if !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
-                if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::FetchStickerImage {
-                        key: key.clone(),
-                        url: thumb_url.to_string(),
-                    });
-                }
-            }
+            crate::gui::queue_sticker_fetch(
+                sticker_textures,
+                loading_stickers,
+                failed_stickers,
+                key.clone(),
+                thumb_url.to_string(),
+            );
             let open_target = msg
                 .link_url
                 .as_deref()
@@ -1941,7 +2103,7 @@ pub(super) fn render_message_body(
                 let [tw, th] = tex.size();
                 if tw <= 2 || th <= 2 {
                     // Expired or empty tombstone image on Zalo CDN (e.g. 1x1 jpeg)
-                    let ph_w = max_text_width.clamp(180.0, 260.0);
+                    let ph_w = max_text_width.min(260.0).max(110.0);
                     let ph_frame = egui::Frame::none()
                         .fill(text_col.linear_multiply(0.05))
                         .stroke(Stroke::new(1.0_f32, pal.border))
@@ -1981,11 +2143,11 @@ pub(super) fn render_message_body(
                 } else {
                     let tw_f = tw as f32;
                     let th_f = th as f32;
-                    let max_w = max_text_width.clamp(220.0, 360.0);
+                    let max_w = max_text_width.min(360.0).max(110.0);
                     let max_h = 340.0_f32;
                     let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
-                    let disp_w = (tw_f * scale).clamp(160.0, max_w);
-                    let disp_h = (th_f * scale).clamp(120.0, max_h);
+                    let disp_w = (tw_f * scale).clamp(max_w.min(140.0), max_w);
+                    let disp_h = (th_f * scale).clamp(90.0, max_h);
                     let img = egui::Image::new(tex)
                         .fit_to_exact_size(Vec2::new(disp_w, disp_h))
                         .rounding(Rounding::same(12.0))
@@ -2039,7 +2201,7 @@ pub(super) fn render_message_body(
                 }
             } else {
                 // Loading / Placeholder frame with visual image icon and loading feedback
-                let disp_w = max_text_width.clamp(200.0, 280.0);
+                let disp_w = max_text_width.min(280.0).max(110.0);
                 let disp_h = 150.0_f32;
                 let (rect, resp) =
                     ui.allocate_exact_size(Vec2::new(disp_w, disp_h), Sense::click());
@@ -2116,10 +2278,89 @@ pub(super) fn render_message_body(
             max_text_width,
             sticker_textures,
             loading_stickers,
+            failed_stickers,
             preview,
             preview_loading,
             preview_error,
         );
+    }
+
+    // Compact structured cards for Location, Contact, Poll/Vote, and Album messages.
+    if msg.kind == crate::message_model::MessageKind::Location
+        || trimmed_text.starts_with("[Vị trí]")
+    {
+        egui::Frame::none()
+            .fill(pal.bg_elevated)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::symmetric(10.0, 7.0))
+            .show(ui, |ui| {
+                ui.set_max_width(max_text_width);
+                ui.label(
+                    RichText::new("📍 Vị trí đã chia sẻ")
+                        .size(13.0)
+                        .color(text_col)
+                        .strong(),
+                );
+                let detail = trimmed_text.strip_prefix("[Vị trí]").unwrap_or(trimmed_text).trim();
+                if !detail.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(detail).size(12.2).color(meta_col)).wrap());
+                }
+            });
+        return None;
+    }
+    if msg.kind == crate::message_model::MessageKind::Contact
+        || trimmed_text.starts_with("[Danh thiếp]")
+    {
+        egui::Frame::none()
+            .fill(pal.bg_elevated)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::symmetric(10.0, 7.0))
+            .show(ui, |ui| {
+                ui.set_max_width(max_text_width);
+                ui.label(
+                    RichText::new(format!("{} Danh thiếp Zalo", lucide::USER))
+                        .size(13.0)
+                        .color(text_col)
+                        .strong(),
+                );
+                let detail = trimmed_text
+                    .strip_prefix("[Danh thiếp]")
+                    .unwrap_or(trimmed_text)
+                    .trim();
+                if !detail.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(detail).size(12.2).color(meta_col)).wrap());
+                }
+            });
+        return None;
+    }
+    if trimmed_text.starts_with("[Khảo sát]")
+        || trimmed_text.starts_with("[Bình chọn]")
+        || trimmed_text.starts_with("[Album]")
+    {
+        let title_tag = if trimmed_text.starts_with("[Album]") {
+            format!("{} Album ảnh", lucide::IMAGE)
+        } else {
+            "📊 Bình chọn nhóm".to_string()
+        };
+        let rest = trimmed_text
+            .split_once(']')
+            .map(|(_, r)| r.trim())
+            .unwrap_or(trimmed_text);
+        egui::Frame::none()
+            .fill(pal.bg_elevated)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::symmetric(10.0, 7.0))
+            .show(ui, |ui| {
+                ui.set_max_width(max_text_width);
+                ui.label(RichText::new(title_tag).size(13.0).color(text_col).strong());
+                if !rest.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(rest).size(12.5).color(meta_col)).wrap());
+                }
+            });
+        return None;
     }
 
     let Some((caption, url, domain)) = extract_message_link_view(msg) else {
@@ -2132,11 +2373,7 @@ pub(super) fn render_message_body(
         return None;
     };
 
-    let link_col = if pal.is_dark {
-        Color32::from_rgb(102, 166, 255) // #66A6FF Zalo dark link blue
-    } else {
-        pal.primary
-    };
+    let link_col = pal.link_text;
 
     // Auto-enrich link metadata if title or thumbnail is missing/expired
     let needs_meta_enrich = msg.link_title.is_none()
@@ -2168,16 +2405,14 @@ pub(super) fn render_message_body(
     // 2. Optional compact thumbnail directly inside the bubble (no nested card box)
     if let Some(thumb_url) = msg.link_thumb.as_deref().filter(|u| !u.is_empty()) {
         let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
-        if !sticker_textures.contains_key(&key)
-            && (thumb_url.starts_with("http://") || thumb_url.starts_with("https://"))
-            && loading_stickers.insert(key.clone())
-        {
-            if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::FetchStickerImage {
-                    key: key.clone(),
-                    url: thumb_url.to_string(),
-                });
-            }
+        if thumb_url.starts_with("http://") || thumb_url.starts_with("https://") {
+            crate::gui::queue_sticker_fetch(
+                sticker_textures,
+                loading_stickers,
+                failed_stickers,
+                key.clone(),
+                thumb_url.to_string(),
+            );
         }
         if let Some(tex) = sticker_textures.get(&key) {
             let [tw, th] = tex.size();
@@ -2264,6 +2499,7 @@ pub(super) fn render_message_body(
     let dom_resp = ui
         .add(
             egui::Label::new(RichText::new(&url_line).size(12.6).color(link_col))
+                .wrap()
                 .sense(Sense::click()),
         )
         .on_hover_cursor(CursorIcon::PointingHand)
@@ -2302,7 +2538,14 @@ pub(super) fn classify_attachment(msg: &crate::chat::ChatMessage) -> Option<Atta
         return None;
     }
     let trimmed = msg.text.trim();
-    if msg.link_src.as_deref() == Some("Video Zalo") || trimmed.starts_with("[Video]") {
+    let is_video = msg.kind == crate::message_model::MessageKind::Video
+        || msg.link_src.as_deref() == Some("Video Zalo")
+        || trimmed.starts_with("[Video]")
+        || msg.link_url.as_deref().is_some_and(|u| {
+            let l = u.to_ascii_lowercase();
+            l.contains("video") || l.contains(".dlmd.me")
+        });
+    if is_video {
         return Some(AttachmentKind::Video);
     }
     if msg.kind == crate::message_model::MessageKind::Voice
@@ -2369,6 +2612,7 @@ fn render_attachment_card(
     max_text_width: f32,
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
+    failed_stickers: &HashMap<String, (u8, std::time::Instant)>,
     preview: Option<&str>,
     preview_loading: bool,
     preview_error: Option<&str>,
@@ -2383,9 +2627,10 @@ fn render_attachment_card(
             max_text_width,
             sticker_textures,
             loading_stickers,
+            failed_stickers,
         ),
         AttachmentKind::Voice | AttachmentKind::Audio => {
-            render_voice_card(ui, msg, kind, file_name, text_col, pal)
+            render_voice_card(ui, msg, kind, file_name, text_col, pal, max_text_width)
         }
         _ => render_doc_card(
             ui,
@@ -2401,6 +2646,80 @@ fn render_attachment_card(
     }
 }
 
+pub(crate) fn compute_video_thumb_size(tw: usize, th: usize, max_text_width: f32) -> (f32, f32) {
+    let tw_f = (tw.max(1)) as f32;
+    let th_f = (th.max(1)) as f32;
+    if th_f > tw_f {
+        // Portrait / vertical video (e.g. 9:16 or 3:4)
+        let max_h = 260.0_f32;
+        let max_w = max_text_width.min(220.0);
+        let scale = (max_w / tw_f).min(max_h / th_f);
+        let w = (tw_f * scale).clamp(140.0, max_w).ceil();
+        let h = (th_f * scale).clamp(160.0, max_h).ceil();
+        (w, h)
+    } else {
+        // Landscape / horizontal video (e.g. 16:9 or 4:3)
+        let max_w = max_text_width.min(280.0);
+        let max_h = 180.0_f32;
+        let scale = (max_w / tw_f).min(max_h / th_f);
+        let w = (tw_f * scale).clamp(160.0, max_w).ceil();
+        let h = (th_f * scale).clamp(100.0, max_h).ceil();
+        (w, h)
+    }
+}
+
+fn render_video_thumb_block(
+    ui: &mut egui::Ui,
+    tex: &TextureHandle,
+    key: &str,
+    msg: &ChatMessage,
+    title_str: &str,
+    text_col: Color32,
+    max_text_width: f32,
+) -> Option<BubbleAction> {
+    let [tw, th] = tex.size();
+    if tw <= 2 || th <= 2 {
+        return None;
+    }
+    let (thumb_w, img_h) = compute_video_thumb_size(tw, th, max_text_width);
+    let img_resp = ui
+        .add(
+            egui::Image::new(tex)
+                .fit_to_exact_size(Vec2::new(thumb_w, img_h))
+                .rounding(Rounding::same(8.0))
+                .sense(Sense::click()),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Bấm để xem video");
+    let pill_r = egui::Rect::from_center_size(img_resp.rect.center(), Vec2::new(46.0, 46.0));
+    ui.painter()
+        .circle_filled(pill_r.center(), 23.0, Color32::from_black_alpha(140));
+    draw_icon_play(
+        ui.painter(),
+        pill_r.center() + Vec2::new(2.0, 0.0),
+        20.0,
+        Color32::WHITE,
+    );
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(truncate_chars(title_str, 60))
+            .size(12.5)
+            .color(text_col),
+    );
+    if img_resp.clicked() {
+        if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
+            return Some(BubbleAction::OpenVideoPlayer {
+                url: url.to_string(),
+                title: title_str.to_string(),
+                sender: msg.sender.clone(),
+                time: msg.time.clone(),
+                thumb_key: Some(key.to_string()),
+            });
+        }
+    }
+    None
+}
+
 /// Video bubble: inline thumbnail (Zalo `link_thumb`, photo CDN, or ffmpeg frame) + play overlay.
 /// Missing ffmpeg or missing thumbnail falls back to the plain clickable card, never a crash.
 #[allow(clippy::too_many_arguments)]
@@ -2413,13 +2732,18 @@ fn render_video_card(
     max_text_width: f32,
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
+    failed_stickers: &HashMap<String, (u8, std::time::Instant)>,
 ) -> Option<BubbleAction> {
-    let title_str = msg
+    let raw_title = msg
         .link_title
         .as_deref()
         .filter(|s| !s.is_empty())
-        .unwrap_or(file_name)
-        .to_string();
+        .unwrap_or(file_name);
+    let title_str = if raw_title.len() > 20 && !raw_title.contains(' ') && !raw_title.contains('.') {
+        "Video".to_string()
+    } else {
+        raw_title.to_string()
+    };
     let thumb_url = msg
         .link_thumb
         .as_deref()
@@ -2435,60 +2759,26 @@ fn render_video_card(
         });
     if let Some(thumb_url) = thumb_url {
         let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
-        if !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
-            if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::FetchStickerImage {
-                    key: key.clone(),
-                    url: thumb_url.to_string(),
-                });
-            }
-        }
+        crate::gui::queue_sticker_fetch(
+            sticker_textures,
+            loading_stickers,
+            failed_stickers,
+            key.clone(),
+            thumb_url.to_string(),
+        );
         if let Some(tex) = sticker_textures.get(&key) {
-            let [tw, th] = tex.size();
-            if tw > 2 && th > 2 {
-                let aspect = (th as f32 / tw as f32).clamp(0.45, 0.85);
-                let thumb_w = max_text_width.min(260.0);
-                let img_h = (thumb_w * aspect).min(150.0);
-                let img_resp = ui
-                    .add(
-                        egui::Image::new(tex)
-                            .fit_to_exact_size(Vec2::new(thumb_w, img_h))
-                            .rounding(Rounding::same(8.0))
-                            .sense(Sense::click()),
-                    )
-                    .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text("Bấm để phát video");
-                let pill_r =
-                    egui::Rect::from_center_size(img_resp.rect.center(), Vec2::new(46.0, 46.0));
-                ui.painter()
-                    .circle_filled(pill_r.center(), 23.0, Color32::from_black_alpha(140));
-                ui.painter().text(
-                    pill_r.center() + Vec2::new(1.5, 0.0),
-                    egui::Align2::CENTER_CENTER,
-                    "▶",
-                    FontId::proportional(20.0),
-                    Color32::WHITE,
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(truncate_chars(&title_str, 60))
-                        .size(12.5)
-                        .color(text_col),
-                );
-                if img_resp.clicked() {
-                    if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-                        if !url.to_ascii_lowercase().contains("/renewmedia") {
-                            let _ = open_external_url(url);
-                        } else {
-                            return Some(BubbleAction::DownloadFile {
-                                url: url.to_string(),
-                                file_name: file_name.to_string(),
-                            });
-                        }
-                    }
-                }
-                return None;
+            if let Some(action) = render_video_thumb_block(
+                ui,
+                tex,
+                &key,
+                msg,
+                &title_str,
+                text_col,
+                max_text_width,
+            ) {
+                return Some(action);
             }
+            return None;
         }
     }
     if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
@@ -2496,55 +2786,24 @@ fn render_video_card(
         if !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::FetchVideoThumbnail {
-                    key,
+                    key: key.clone(),
                     url: url.to_string(),
                 });
             }
         }
-        if let Some(tex) = sticker_textures.get(&video_thumb_key(url)) {
-            let [tw, th] = tex.size();
-            if tw > 2 && th > 2 {
-                let aspect = (th as f32 / tw as f32).clamp(0.45, 0.85);
-                let thumb_w = max_text_width.min(260.0);
-                let img_h = (thumb_w * aspect).min(150.0);
-                let img_resp = ui
-                    .add(
-                        egui::Image::new(tex)
-                            .fit_to_exact_size(Vec2::new(thumb_w, img_h))
-                            .rounding(Rounding::same(8.0))
-                            .sense(Sense::click()),
-                    )
-                    .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text("Bấm để phát video");
-                let pill_r =
-                    egui::Rect::from_center_size(img_resp.rect.center(), Vec2::new(46.0, 46.0));
-                ui.painter()
-                    .circle_filled(pill_r.center(), 23.0, Color32::from_black_alpha(140));
-                ui.painter().text(
-                    pill_r.center() + Vec2::new(1.5, 0.0),
-                    egui::Align2::CENTER_CENTER,
-                    "▶",
-                    FontId::proportional(20.0),
-                    Color32::WHITE,
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(truncate_chars(&title_str, 60))
-                        .size(12.5)
-                        .color(text_col),
-                );
-                if img_resp.clicked() {
-                    if !url.to_ascii_lowercase().contains("/renewmedia") {
-                        let _ = open_external_url(url);
-                    } else {
-                        return Some(BubbleAction::DownloadFile {
-                            url: url.to_string(),
-                            file_name: file_name.to_string(),
-                        });
-                    }
-                }
-                return None;
+        if let Some(tex) = sticker_textures.get(&key) {
+            if let Some(action) = render_video_thumb_block(
+                ui,
+                tex,
+                &key,
+                msg,
+                &title_str,
+                text_col,
+                max_text_width,
+            ) {
+                return Some(action);
             }
+            return None;
         }
     }
     render_video_fallback_card(ui, msg, &title_str, file_name, text_col, pal)
@@ -2554,7 +2813,7 @@ fn render_video_fallback_card(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
     title_str: &str,
-    file_name: &str,
+    _file_name: &str,
     text_col: Color32,
     pal: &ThemePalette,
 ) -> Option<BubbleAction> {
@@ -2574,7 +2833,7 @@ fn render_video_fallback_card(
     let sub_resp = ui
         .add(
             egui::Label::new(
-                RichText::new(format!("{kind_label} · Bấm để mở"))
+                RichText::new(format!("{kind_label} · Bấm để xem"))
                     .size(12.5)
                     .color(link_col),
             )
@@ -2583,14 +2842,13 @@ fn render_video_fallback_card(
         .on_hover_cursor(CursorIcon::PointingHand);
     if sub_resp.clicked() {
         if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-            if !url.to_ascii_lowercase().contains("/renewmedia") {
-                let _ = open_external_url(url);
-            } else {
-                return Some(BubbleAction::DownloadFile {
-                    url: url.to_string(),
-                    file_name: file_name.to_string(),
-                });
-            }
+            return Some(BubbleAction::OpenVideoPlayer {
+                url: url.to_string(),
+                title: title_str.to_string(),
+                sender: msg.sender.clone(),
+                time: msg.time.clone(),
+                thumb_key: None,
+            });
         }
     }
     None
@@ -2605,6 +2863,7 @@ fn render_voice_card(
     file_name: &str,
     text_col: Color32,
     pal: &ThemePalette,
+    max_text_width: f32,
 ) -> Option<BubbleAction> {
     let (icon, kind_label) = attachment_kind_label(kind);
     let duration = voice_duration_secs(msg);
@@ -2612,12 +2871,19 @@ fn render_voice_card(
     ui.horizontal(|ui| {
         let play_resp = ui
             .add(
-                egui::Button::new(RichText::new("▶").size(15.0).color(Color32::WHITE))
+                egui::Button::new("")
                     .min_size(Vec2::new(34.0, 34.0))
+                    .rounding(Rounding::same(17.0))
                     .fill(pal.primary),
             )
             .on_hover_cursor(CursorIcon::PointingHand)
             .on_hover_text("Bấm để nghe tin nhắn thoại");
+        draw_icon_play(
+            ui.painter(),
+            play_resp.rect.center() + Vec2::new(1.5, 0.0),
+            15.0,
+            pal.primary_fg,
+        );
         if play_resp.clicked() {
             if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
                 action = Some(BubbleAction::PlayVoice {
@@ -2634,6 +2900,27 @@ fn render_voice_card(
                     .color(text_col)
                     .strong(),
             );
+            // Vector waveform bars deterministically seeded by message id
+            let wave_w = (max_text_width - 52.0).clamp(56.0, 148.0);
+            let bar_count = ((wave_w / 5.0) as usize).clamp(8, 24);
+            let (wave_rect, _) = ui.allocate_exact_size(Vec2::new(wave_w, 16.0), Sense::hover());
+            let mut seed = msg
+                .id
+                .bytes()
+                .fold(0x9E37_79B9_7F4A_7C15_u64, |acc, b| acc.rotate_left(5) ^ (b as u64));
+            for i in 0..bar_count {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let amp = 0.25 + ((seed >> 48) as f32 / 65535.0) * 0.72;
+                let bh = (14.0 * amp).max(3.5);
+                let bx = wave_rect.left() + (i as f32) * 5.0 + 1.5;
+                if bx + 2.5 <= wave_rect.right() {
+                    let bar_r = Rect::from_center_size(
+                        Pos2::new(bx, wave_rect.center().y),
+                        Vec2::new(2.5, bh),
+                    );
+                    ui.painter().rect_filled(bar_r, Rounding::same(1.2), pal.primary);
+                }
+            }
             ui.label(
                 RichText::new(format_duration_mmss(duration))
                     .size(11.5)
@@ -2674,43 +2961,94 @@ fn render_doc_card(
     preview_error: Option<&str>,
 ) -> Option<BubbleAction> {
     let (icon, kind_label) = attachment_kind_label(kind);
-    let link_col = if pal.is_dark {
-        Color32::from_rgb(97, 175, 239)
-    } else {
-        pal.primary
-    };
-    ui.label(
-        RichText::new(format!("{icon}  {}", truncate_chars(file_name, 42)))
-            .size(13.8)
-            .color(text_col)
-            .strong(),
-    );
-    ui.add_space(2.0);
-    let ext = file_name
-        .rsplit('.')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_uppercase();
-    let meta = if ext.is_empty() {
-        kind_label.to_string()
-    } else {
-        format!("{kind_label} · {ext}")
-    };
-    ui.label(
-        RichText::new(meta)
-            .size(12.0)
-            .color(text_col.linear_multiply(0.7)),
-    );
-    ui.add_space(4.0);
     let mut action = None;
+
+    // 1. Header: 40x40 Icon Badge on left + File Name & Metadata on right
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(10.0, 0.0);
+        let (badge_rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 40.0), Sense::hover());
+        let badge_bg = if pal.is_dark {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+        } else {
+            pal.bg_elevated
+        };
+        ui.painter().rect_filled(badge_rect, Rounding::same(8.0), badge_bg);
+        ui.painter().rect_stroke(badge_rect, Rounding::same(8.0), Stroke::new(1.0_f32, pal.border));
+
+        let icon_col = match kind {
+            AttachmentKind::Pdf => Color32::from_rgb(235, 87, 87),
+            AttachmentKind::Word => Color32::from_rgb(45, 120, 240),
+            AttachmentKind::Excel => Color32::from_rgb(39, 174, 96),
+            AttachmentKind::PowerPoint => Color32::from_rgb(242, 153, 74),
+            AttachmentKind::Archive => Color32::from_rgb(242, 201, 76),
+            _ => pal.primary,
+        };
+        draw_lucide_icon(ui.painter(), badge_rect.center(), icon, 20.0, icon_col);
+
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
+            let display_name = truncate_chars(file_name, 50);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(display_name)
+                        .size(13.5)
+                        .color(text_col)
+                        .strong(),
+                )
+                .wrap(),
+            )
+            .on_hover_text(file_name);
+
+            let ext = if file_name.contains('.') {
+                file_name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_uppercase()
+            } else {
+                String::new()
+            };
+            let meta = if ext.is_empty() {
+                kind_label.to_string()
+            } else {
+                format!("{kind_label} · {ext}")
+            };
+            ui.label(
+                RichText::new(meta)
+                    .size(11.5)
+                    .color(text_col.linear_multiply(0.7)),
+            );
+        });
+    });
+
+    ui.add_space(8.0);
+
+    // 2. Action buttons: harmonious dimensions, matching rounding and styling
+    let secondary_btn_fill = if pal.is_dark {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+    } else {
+        pal.bg_elevated
+    };
+    let primary_btn_fill = pal.primary;
+    let secondary_btn_stroke = Stroke::new(1.0_f32, pal.border);
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
         let open_resp = ui
             .add(
-                egui::Button::new(RichText::new("Mở").size(12.5).color(link_col))
-                    .min_size(Vec2::new(64.0, 26.0)),
+                egui::Button::new(
+                    RichText::new("Mở")
+                        .size(12.0)
+                        .color(Color32::WHITE)
+                        .strong(),
+                )
+                .fill(primary_btn_fill)
+                .stroke(Stroke::NONE)
+                .rounding(Rounding::same(6.0))
+                .min_size(Vec2::new(64.0, 28.0)),
             )
             .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text("Mở bằng ứng dụng ngoài / trình duyệt");
+            .on_hover_text("Mở bằng ứng dụng mặc định / trình duyệt");
         if open_resp.clicked() {
             if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
                 if !url.to_ascii_lowercase().contains("/renewmedia") {
@@ -2725,11 +3063,18 @@ fn render_doc_card(
         }
         let save_resp = ui
             .add(
-                egui::Button::new(RichText::new("Lưu về máy").size(12.5).color(text_col))
-                    .min_size(Vec2::new(92.0, 26.0)),
+                egui::Button::new(
+                    RichText::new("Lưu về máy")
+                        .size(12.0)
+                        .color(text_col),
+                )
+                .fill(secondary_btn_fill)
+                .stroke(secondary_btn_stroke)
+                .rounding(Rounding::same(6.0))
+                .min_size(Vec2::new(96.0, 28.0)),
             )
             .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text("Tải và lưu tập tin với tên gốc");
+            .on_hover_text("Tải và lưu tập tin về máy tính");
         if save_resp.clicked() {
             if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
                 action = Some(BubbleAction::DownloadFile {
@@ -2761,6 +3106,9 @@ fn render_doc_card(
                     egui::Button::new(
                         RichText::new("Xem đầy đủ").size(12.5).color(text_col),
                     )
+                    .fill(secondary_btn_fill)
+                    .stroke(secondary_btn_stroke)
+                    .rounding(Rounding::same(6.0))
                     .min_size(Vec2::new(92.0, 26.0)),
                 )
                 .on_hover_cursor(CursorIcon::PointingHand)
@@ -2785,9 +3133,9 @@ fn render_doc_card(
     } else if let Some(err) = preview_error {
         ui.add_space(2.0);
         ui.label(
-            RichText::new(format!("⚠️ {err}"))
+            RichText::new(format!("Lỗi: {err}"))
                 .size(12.0)
-                .color(pal.danger),
+                .color(pal.danger_text),
         );
     } else if previewable_ext(file_name) {
         ui.add_space(2.0);
@@ -2797,6 +3145,9 @@ fn render_doc_card(
                     egui::Button::new(
                         RichText::new("Xem trước").size(12.5).color(text_col),
                     )
+                    .fill(secondary_btn_fill)
+                    .stroke(secondary_btn_stroke)
+                    .rounding(Rounding::same(6.0))
                     .min_size(Vec2::new(92.0, 26.0)),
                 )
                 .on_hover_cursor(CursorIcon::PointingHand)
@@ -2812,6 +3163,7 @@ fn render_doc_card(
             }
         });
     }
+    ui.add_space(4.0);
     action
 }
 
@@ -2852,16 +3204,18 @@ fn format_duration_mmss(secs: Option<u64>) -> String {
 
 pub(super) fn is_zalo_file_or_video_message(msg: &ChatMessage) -> bool {
     let trimmed = msg.text.trim();
-    matches!(
-        msg.link_src.as_deref(),
-        Some("Tập tin Zalo") | Some("Video Zalo")
-    ) || trimmed.starts_with("[Tập tin]")
+    msg.kind == crate::message_model::MessageKind::Video
+        || msg.kind == crate::message_model::MessageKind::File
+        || matches!(
+            msg.link_src.as_deref(),
+            Some("Tập tin Zalo") | Some("Video Zalo")
+        ) || trimmed.starts_with("[Tập tin]")
         || trimmed.starts_with("[Video]")
         || trimmed.starts_with("[Tin nhắn thoại]")
-        || msg
-            .link_url
-            .as_deref()
-            .is_some_and(|u| u.to_ascii_lowercase().contains("/renewmedia"))
+        || msg.link_url.as_deref().is_some_and(|u| {
+            let l = u.to_ascii_lowercase();
+            l.contains("/renewmedia") || l.contains("video-") || l.contains(".dlmd.me")
+        })
 }
 
 pub(super) fn photo_primary_url(msg: &ChatMessage) -> Option<&str> {
@@ -3018,6 +3372,7 @@ pub(super) fn render_chat_bubble(
     pal: &ThemePalette,
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
+    failed_stickers: &HashMap<String, (u8, std::time::Instant)>,
     emoji_textures: &HashMap<String, TextureHandle>,
     idx: usize,
     vanish_remain: Option<i64>,
@@ -3027,8 +3382,8 @@ pub(super) fn render_chat_bubble(
     preview_error: Option<&str>,
     md: MdOptions,
 ) -> Option<BubbleAction> {
-    let avail_w = ui.available_width();
-    let max_bubble_width = (avail_w * 0.72).clamp(140.0, 520.0);
+    let avail_w = (ui.available_width() - 8.0).max(140.0);
+    let max_bubble_width = (avail_w * 0.72).clamp(140.0, 520.0).min(avail_w);
     let max_text_width = (max_bubble_width - 24.0).max(90.0);
     // Tin đã biến mất: vô hiệu mọi media/link card — chỉ render text hệ thống.
     let vanished = msg.text.trim() == crate::chat::VANISH_EXPIRED_TEXT;
@@ -3079,17 +3434,17 @@ pub(super) fn render_chat_bubble(
         let photo_w = if let Some(tex) = sticker_textures.get(&tkey) {
             let [tw, th] = tex.size();
             if tw <= 2 || th <= 2 {
-                max_text_width.clamp(180.0, 260.0)
+                max_text_width.min(260.0).max(110.0)
             } else {
                 let tw_f = tw as f32;
                 let th_f = th as f32;
-                let max_w = max_text_width.clamp(220.0, 360.0);
+                let max_w = max_text_width.min(360.0).max(110.0);
                 let max_h = 340.0_f32;
                 let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
-                (tw_f * scale).clamp(160.0, max_w).ceil()
+                (tw_f * scale).clamp(max_w.min(140.0), max_w).ceil()
             }
         } else {
-            max_text_width.clamp(200.0, 280.0)
+            max_text_width.min(280.0).max(110.0)
         };
         if let Some(cap_str) = photo_caption {
             let cap_w = ui.fonts(|f| {
@@ -3107,50 +3462,93 @@ pub(super) fn render_chat_bubble(
             photo_w
         }
     } else if is_file_card || has_link_card {
-        let has_loaded_thumb = msg
-            .link_thumb
-            .as_deref()
-            .filter(|u| !u.is_empty())
-            .map(|u| sticker_textures.contains_key(&format!("thumb_{}", crate::crypto::md5_hex(u))))
-            .unwrap_or(false);
-        if has_loaded_thumb {
-            max_text_width.min(260.0)
-        } else {
-            let (cap, url, dom) = extract_message_link_view(msg).unwrap_or_default();
-            let title = msg
-                .link_title
+        let is_video = classify_attachment(msg) == Some(AttachmentKind::Video);
+        let video_thumb_dim = if is_video {
+            let thumb_url = msg
+                .link_thumb
                 .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| {
-                    if !url.is_empty() {
-                        &url
-                    } else {
-                        msg.text.trim()
-                    }
+                .filter(|u| {
+                    !u.is_empty()
+                        && (u.starts_with("http://") || u.starts_with("https://"))
+                        && !u.to_ascii_lowercase().contains("/renewmedia")
+                })
+                .or_else(|| {
+                    msg.link_url
+                        .as_deref()
+                        .filter(|u| !u.is_empty() && crate::chat::is_zalo_photo_cdn_url(u))
                 });
-            let desc = msg.link_desc.as_deref().unwrap_or("");
-            let measure = |s: &str, sz: f32| -> f32 {
-                if s.is_empty() {
-                    0.0
+            let key = thumb_url
+                .map(|u| format!("thumb_{}", crate::crypto::md5_hex(u)))
+                .or_else(|| {
+                    msg.link_url
+                        .as_deref()
+                        .filter(|u| !u.is_empty())
+                        .map(video_thumb_key)
+                });
+            key.and_then(|k| sticker_textures.get(&k)).map(|tex| {
+                let [tw, th] = tex.size();
+                compute_video_thumb_size(tw, th, max_text_width)
+            })
+        } else {
+            None
+        };
+        if let Some((vw, _)) = video_thumb_dim {
+            vw.min(max_text_width)
+        } else {
+            let has_loaded_thumb = msg
+                .link_thumb
+                .as_deref()
+                .filter(|u| !u.is_empty())
+                .map(|u| sticker_textures.contains_key(&format!("thumb_{}", crate::crypto::md5_hex(u))))
+                .unwrap_or(false);
+            if has_loaded_thumb {
+                max_text_width.min(260.0)
+            } else {
+                let (cap, url, dom) = extract_message_link_view(msg).unwrap_or_default();
+                let title = msg
+                    .link_title
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        if !url.is_empty() {
+                            &url
+                        } else {
+                            msg.text.trim()
+                        }
+                    });
+                let desc = msg.link_desc.as_deref().unwrap_or("");
+                let measure = |s: &str, sz: f32| -> f32 {
+                    if s.is_empty() {
+                        0.0
+                    } else {
+                        ui.fonts(|f| {
+                            f.layout(
+                                truncate_chars(s, 110).into_owned(),
+                                FontId::proportional(sz),
+                                Color32::WHITE,
+                                max_text_width.min(340.0),
+                            )
+                            .size()
+                            .x
+                        })
+                    }
+                };
+                let w = if is_file_card {
+                    (measure(title, 13.5) + 58.0).max(180.0)
                 } else {
-                    ui.fonts(|f| {
-                        f.layout(
-                            truncate_chars(s, 110).into_owned(),
-                            FontId::proportional(sz),
-                            Color32::WHITE,
-                            max_text_width.min(340.0),
-                        )
-                        .size()
-                        .x
-                    })
-                }
-            };
-            let w = measure(title, 13.8)
-                .max(measure(&cap, 13.8))
-                .max(measure(desc, 12.3))
-                .max(measure(&dom, 12.6))
-                + 8.0;
-            w.clamp(135.0, max_text_width.min(340.0).max(135.0)).ceil()
+                    measure(title, 13.8)
+                        .max(measure(&cap, 13.8))
+                        .max(measure(desc, 12.3))
+                        .max(measure(&dom, 12.6))
+                        + 8.0
+                };
+                let max_w = if is_file_card { max_text_width.min(380.0) } else { max_text_width.min(360.0) };
+                let preferred_min = if is_file_card { 280.0_f32 } else { 160.0_f32 };
+                let min_card_w = preferred_min.min(max_w);
+                w.clamp(min_card_w, max_w)
+                    .min(max_text_width)
+                    .ceil()
+            }
         }
     } else {
         let display_str = if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
@@ -3244,7 +3642,10 @@ pub(super) fn render_chat_bubble(
     if msg.is_outgoing {
         let out_resp = ui.vertical(|ui| {
             let row_resp = ui.horizontal(|ui| {
-                let left_pad = (ui.available_width() - total_bubble_w - 6.0).max(0.0);
+                // Zero horizontal spacing before the bubble so `left_pad + total_bubble_w`
+                // never ratchets `ScrollArea` wider across frames.
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let left_pad = (ui.available_width() - total_bubble_w - 4.0).max(0.0);
                 if left_pad > 0.0 {
                     ui.add_space(left_pad);
                 }
@@ -3264,8 +3665,11 @@ pub(super) fn render_chat_bubble(
                 } else {
                     pal.bubble_out_bg
                 };
+                let is_anti_recalled = msg.text.trim().starts_with("[Đã thu hồi]");
                 let stroke = if has_sticker || is_frameless_photo {
                     Stroke::NONE
+                } else if is_anti_recalled {
+                    Stroke::new(1.2_f32, pal.warning)
                 } else if let Some(card) = &call_card_opt {
                     let border_col = if card.is_missed_or_failed {
                         Color32::from_rgb(239, 68, 68).linear_multiply(0.55)
@@ -3289,6 +3693,7 @@ pub(super) fn render_chat_bubble(
                     .rounding(rounding)
                     .inner_margin(Margin::symmetric(h_margin, v_margin))
                     .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = ui.ctx().style().spacing.item_spacing;
                         ui.set_min_width(content_width);
                         ui.set_max_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
@@ -3300,6 +3705,7 @@ pub(super) fn render_chat_bubble(
                                 msg,
                                 sticker_textures,
                                 loading_stickers,
+                                failed_stickers,
                             ) {
                                 card_action = render_message_body(
                                     ui,
@@ -3310,6 +3716,7 @@ pub(super) fn render_chat_bubble(
                                     content_width,
                                     sticker_textures,
                                     loading_stickers,
+                                    failed_stickers,
                                     preview,
                                     preview_loading,
                                     preview_error,
@@ -3320,26 +3727,32 @@ pub(super) fn render_chat_bubble(
                             if let Some(act) = render_reactions(ui, msg, pal, emoji_textures) {
                                 reaction_action = Some(act);
                             }
-                            if show_timestamp && !has_sticker && !is_frameless_photo {
-                                ui.add_space(3.5);
-                                let (status_str, status_col) = if is_latest_outgoing {
-                                    match msg.delivery {
-                                        crate::message_model::DeliveryState::Read => {
-                                            (format!("{} · Đã xem", msg.time), pal.primary)
-                                        }
-                                        crate::message_model::DeliveryState::Pending => {
-                                            (format!("{} · Đang gửi…", msg.time), pal.text_muted)
-                                        }
-                                        crate::message_model::DeliveryState::Failed => (
-                                            format!("{} · Lỗi gửi", msg.time),
-                                            Color32::from_rgb(239, 68, 68),
-                                        ),
-                                        _ => {
-                                            (format!("{} · Đã nhận", msg.time), pal.bubble_out_meta)
-                                        }
+                            let is_pending_or_failed = matches!(
+                                msg.delivery,
+                                crate::message_model::DeliveryState::Pending
+                                    | crate::message_model::DeliveryState::Failed
+                            );
+                            if (show_timestamp || is_pending_or_failed)
+                                && !has_sticker
+                                && !is_frameless_photo
+                            {
+                                ui.add_space(if has_interactive_card { 8.0 } else { 3.5 });
+                                let (status_str, status_col) = match msg.delivery {
+                                    crate::message_model::DeliveryState::Pending => (
+                                        format!("{} · Đang gửi…", msg.time),
+                                        pal.text_muted,
+                                    ),
+                                    crate::message_model::DeliveryState::Failed => (
+                                        format!("{} · Lỗi gửi", msg.time),
+                                        pal.danger_text,
+                                    ),
+                                    crate::message_model::DeliveryState::Read if is_latest_outgoing => {
+                                        (format!("{} · Đã xem", msg.time), pal.primary)
                                     }
-                                } else {
-                                    (msg.time.clone(), pal.bubble_out_meta)
+                                    _ if is_latest_outgoing => {
+                                        (format!("{} · Đã nhận", msg.time), pal.bubble_out_meta)
+                                    }
+                                    _ => (msg.time.clone(), pal.bubble_out_meta),
                                 };
                                 // Nhãn "(đã sửa)": tooltip liệt kê bản cũ; click handled
                                 // qua menu "Xem lịch sử sửa" (BubbleAction::ShowEditHistory).
@@ -3436,6 +3849,8 @@ pub(super) fn render_chat_bubble(
             };
             let stroke = if has_sticker || is_frameless_photo {
                 Stroke::NONE
+            } else if msg.text.trim().starts_with("[Đã thu hồi]") {
+                Stroke::new(1.2_f32, pal.warning)
             } else if let Some(card) = &call_card_opt {
                 let border_col = if card.is_missed_or_failed {
                     Color32::from_rgb(239, 68, 68).linear_multiply(0.55)
@@ -3446,7 +3861,7 @@ pub(super) fn render_chat_bubble(
             } else {
                 Stroke::new(1.0_f32, pal.bubble_in_border)
             };
-            let rounding = Rounding::same(8.0);
+            let rounding = Rounding::same(12.0);
 
             ui.vertical(|ui| {
                 ui.set_max_width(total_bubble_w);
@@ -3459,6 +3874,7 @@ pub(super) fn render_chat_bubble(
                     .rounding(rounding)
                     .inner_margin(Margin::symmetric(h_margin, v_margin))
                     .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = ui.ctx().style().spacing.item_spacing;
                         ui.set_min_width(content_width);
                         ui.set_max_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
@@ -3479,6 +3895,7 @@ pub(super) fn render_chat_bubble(
                                 msg,
                                 sticker_textures,
                                 loading_stickers,
+                                failed_stickers,
                             ) {
                                 card_action = render_message_body(
                                     ui,
@@ -3489,6 +3906,7 @@ pub(super) fn render_chat_bubble(
                                     content_width,
                                     sticker_textures,
                                     loading_stickers,
+                                    failed_stickers,
                                     preview,
                                     preview_loading,
                                     preview_error,
@@ -3500,7 +3918,7 @@ pub(super) fn render_chat_bubble(
                                 reaction_action = Some(act);
                             }
                             if show_timestamp && !has_sticker && !is_frameless_photo {
-                                ui.add_space(3.5);
+                                ui.add_space(if has_interactive_card { 8.0 } else { 3.5 });
                                 let ts = if msg.edited {
                                     format!("{} · (đã sửa)", msg.time)
                                 } else {
@@ -3580,6 +3998,13 @@ pub(super) enum BubbleAction {
         title: String,
         sender: String,
         time: String,
+    },
+    OpenVideoPlayer {
+        url: String,
+        title: String,
+        sender: String,
+        time: String,
+        thumb_key: Option<String>,
     },
     DownloadFile {
         url: String,
@@ -3773,7 +4198,8 @@ pub(super) fn bubble_context_menu(
                                 ),
                             );
                         } else {
-                            let resp = menu_item(ui, "🌐", "Dịch tin nhắn ▸", pal.text_primary);
+                            let tr_lbl = format!("Dịch tin nhắn {}", lucide::CHEVRON_RIGHT);
+                            let resp = menu_item(ui, lucide::GLOBE, &tr_lbl, pal.text_primary);
                             if resp.clicked() {
                                 action = Some(BubbleAction::TranslateFrom("auto"));
                                 close_menu = true;
@@ -3889,8 +4315,8 @@ pub(super) fn bubble_context_menu(
                                 msg.text.trim(),
                                 url,
                             );
-                            let label = if resolved_name.len() > 18 {
-                                format!("Lưu \"{}…\"", &resolved_name[..16])
+                            let label = if resolved_name.chars().count() > 18 {
+                                format!("Lưu \"{}…\"", truncate_chars(&resolved_name, 16))
                             } else {
                                 format!("Lưu \"{resolved_name}\"")
                             };
@@ -3925,17 +4351,13 @@ pub(super) fn bubble_context_menu(
                     {
                         let now_ms = crate::login::unix_now() * 1000;
                         if crate::chat::can_edit_message(msg, now_ms)
-                            && menu_item(ui, "✎", "Sửa", pal.text_primary).clicked()
+                            && menu_item(ui, lucide::SLIDERS, "Sửa", pal.text_primary).clicked()
                         {
                             action = Some(BubbleAction::EditMessage);
                             close_menu = true;
                         }
                         if msg.is_outgoing
-                            && (msg.edited
-                                || !crate::store::MessageStore::open_no_migrate("zalo_history.db")
-                                    .map(|s| s.list_message_edits(&msg.id))
-                                    .unwrap_or_default()
-                                    .is_empty())
+                            && msg.edited
                             && menu_item(
                                 ui,
                                 "🕘",
@@ -4310,8 +4732,8 @@ pub(super) fn render_reactions(
 
         if has_star {
             egui::Frame::none()
-                .fill(Color32::from_rgb(234, 179, 8).linear_multiply(0.2))
-                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(234, 179, 8)))
+                .fill(pal.reaction_star.linear_multiply(0.2))
+                .stroke(Stroke::new(1.0_f32, pal.reaction_star))
                 .rounding(Rounding::same(8.0))
                 .inner_margin(Margin::symmetric(5.0, 2.0))
                 .show(ui, |ui| {
@@ -4319,7 +4741,7 @@ pub(super) fn render_reactions(
                         egui::Label::new(
                             RichText::new(lucide::STAR)
                                 .size(11.0)
-                                .color(Color32::from_rgb(234, 179, 8))
+                                .color(pal.reaction_star)
                                 .strong(),
                         )
                         .selectable(false)
@@ -4369,16 +4791,16 @@ pub(super) fn render_reactions(
                                 let key = emoji_to_tex_key(emoji);
                                 if let Some(tex) = emoji_textures.get(key) {
                                     ui.add(
-                                        egui::Image::new(tex).fit_to_exact_size(Vec2::splat(16.0)),
+                                        egui::Image::new(tex).fit_to_exact_size(Vec2::splat(15.0)),
                                     );
                                 } else {
-                                    ui.label(RichText::new(emoji).size(13.0));
+                                    ui.label(RichText::new(emoji).size(12.5));
                                 }
                             }
                             ui.add_space(2.0);
                             ui.label(
                                 RichText::new(total.to_string())
-                                    .size(11.5)
+                                    .size(11.0)
                                     .color(pal.text_primary)
                                     .strong(),
                             );
@@ -4477,6 +4899,7 @@ mod quote_navigation_tests {
                                 &ThemePalette::light(),
                                 &HashMap::new(),
                                 &mut HashSet::new(),
+                                &HashMap::new(),
                                 &HashMap::new(),
                                 0,
                                 None,
@@ -4971,5 +5394,170 @@ mod md_block_tests {
         assert_eq!(parse_ordered_item("- bullet"), None);
         assert_eq!(parse_ordered_item("1.missing space"), None);
         assert_eq!(parse_ordered_item("1234. too long"), None);
+    }
+
+    #[test]
+    fn parses_inline_mentions_italic_snake_case_and_multi_links() {
+        let runs = parse_inline_md_runs("Chào @All và @An, mail a@b.com nhé!", false);
+        assert!(runs.contains(&InlineMdRun::Mention("@All".into())));
+        assert!(runs.contains(&InlineMdRun::Mention("@An".into())));
+        assert!(!runs.contains(&InlineMdRun::Mention("@b.com".into())));
+
+        let style_runs = parse_inline_md_runs("_nghiêng_ foo_bar_baz *đậm* `code`", true);
+        assert!(style_runs.contains(&InlineMdRun::Italic("nghiêng".into())));
+        assert!(style_runs.contains(&InlineMdRun::Bold("đậm".into())));
+        assert!(style_runs.contains(&InlineMdRun::Code("code".into())));
+        assert!(!style_runs.iter().any(|r| matches!(r, InlineMdRun::Italic(s) if s == "bar")));
+
+        let link_runs = parse_inline_md_runs("Xem https://a.vn/1 và https://b.vn/2 nhé.", false);
+        let urls: Vec<&str> = link_runs
+            .iter()
+            .filter_map(|r| match r {
+                InlineMdRun::Link { url, .. } => Some(url.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(urls, vec!["https://a.vn/1", "https://b.vn/2"]);
+    }
+
+    #[test]
+    fn outgoing_doc_and_link_bubbles_stay_within_narrow_scroll_width() {
+        let ctx = egui::Context::default();
+        let pal = ThemePalette::dark();
+        pal.apply_to_ctx_with_anim(&ctx, false, 1.0);
+
+        let doc_msg = ChatMessage {
+            id: "doc-test-msg".into(),
+            text: "GIGABYTE GA-H61M-DS2 REV. 4.01.rar".into(),
+            sender: "Me".into(),
+            is_outgoing: true,
+            kind: crate::message_model::MessageKind::File,
+            link_title: Some("GIGABYTE GA-H61M-DS2 REV. 4.01.rar".to_string()),
+            link_url: Some("https://example.invalid/files/board.rar".to_string()),
+            link_src: Some("Tập tin Zalo".into()),
+            ts: 1730932200000,
+            ..Default::default()
+        };
+
+        let link_msg = ChatMessage {
+            id: "link-test-msg".into(),
+            text: "05. [Coding] Computer Scientist - Google Drive".into(),
+            sender: "Me".into(),
+            is_outgoing: true,
+            link_title: Some("05. [Coding] Computer Scientist - Google Drive".to_string()),
+            link_url: Some(
+                "https://drive.google.com/drive/mobile/folders/1LzMJCdxaZnQFkfm4M1_0o".to_string(),
+            ),
+            ts: 1730932200000,
+            ..Default::default()
+        };
+
+        let screen = Some(egui::Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 500.0)));
+        let empty_tex = HashMap::new();
+        let mut loading = HashSet::new();
+        let failed = HashMap::new();
+        let mut seen_widths = Vec::new();
+
+        for frame in 0..5 {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: screen,
+                    time: Some(frame as f64 * 0.05),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let stream_w = (ui.available_width() - 36.0).max(160.0);
+                        egui::ScrollArea::vertical()
+                            .max_width(ui.available_width())
+                            .show(ui, |ui| {
+                                egui::Frame::none()
+                                    .inner_margin(Margin::symmetric(18.0, 12.0))
+                                    .show(ui, |ui| {
+                                        ui.set_width(stream_w);
+                                        ui.set_max_width(stream_w);
+                                        let _ = render_chat_bubble(
+                                            ui,
+                                            &doc_msg,
+                                            false,
+                                            false,
+                                            true,
+                                            false,
+                                            "Cloud của tôi",
+                                            None,
+                                            &pal,
+                                            &empty_tex,
+                                            &mut loading,
+                                            &failed,
+                                            &empty_tex,
+                                            0,
+                                            None,
+                                            false,
+                                            None,
+                                            false,
+                                            None,
+                                            MdOptions::default(),
+                                        );
+                                        let _ = render_chat_bubble(
+                                            ui,
+                                            &link_msg,
+                                            false,
+                                            false,
+                                            false,
+                                            false,
+                                            "Cloud của tôi",
+                                            None,
+                                            &pal,
+                                            &empty_tex,
+                                            &mut loading,
+                                            &failed,
+                                            &empty_tex,
+                                            1,
+                                            None,
+                                            false,
+                                            None,
+                                            false,
+                                            None,
+                                            MdOptions::default(),
+                                        );
+                                        seen_widths.push(ui.min_rect().width());
+                                    });
+                            });
+                    });
+                },
+            );
+            // Buttons in Dark Mode must never paint bright white/light-gray fill (#FFFFFF / #E6E6E6).
+            let white_button_rects = out.shapes.iter().filter(|s| {
+                matches!(
+                    &s.shape,
+                    egui::Shape::Rect(r)
+                        if r.fill.r() > 210 && r.fill.g() > 210 && r.fill.b() > 210
+                )
+            }).count();
+            assert_eq!(white_button_rects, 0, "Dark mode doc card must not render white buttons");
+        }
+        assert!(
+            seen_widths.iter().all(|&w| w <= 290.0),
+            "Bubbles must not ratchet past narrow stream width: {seen_widths:?}"
+        );
+        assert!(
+            (seen_widths[4] - seen_widths[0]).abs() < 1.0,
+            "Bubble width must stay stable across frames without ratcheting: {seen_widths:?}"
+        );
+    }
+
+    #[test]
+    fn test_compute_video_thumb_size_portrait_and_landscape() {
+        // Portrait 9:16 (e.g. 720x1280)
+        let (pw, ph) = compute_video_thumb_size(720, 1280, 300.0);
+        assert!(ph > pw, "Portrait video must have height > width: ({pw}, {ph})");
+        assert!(pw >= 140.0 && pw <= 220.0, "Portrait width within bounds: {pw}");
+        assert!(ph <= 260.0, "Portrait height capped at 260: {ph}");
+
+        // Landscape 16:9 (e.g. 1280x720)
+        let (lw, lh) = compute_video_thumb_size(1280, 720, 300.0);
+        assert!(lw > lh, "Landscape video must have width > height: ({lw}, {lh})");
+        assert!(lw >= 160.0 && lw <= 280.0, "Landscape width within bounds: {lw}");
+        assert!(lh <= 180.0, "Landscape height capped at 180: {lh}");
     }
 }

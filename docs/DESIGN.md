@@ -2,52 +2,55 @@
 name: ctdozlite (ứng dụng desktop egui)
 description: Ứng dụng Zalo native gọn nhẹ, tối ưu cho người dùng làm việc cả ngày; nền One Dark, bong bóng chat kiểu Zalo PC.
 colors:
-  dark-bg-app: "#181A1F"
-  dark-bg-sidebar: "#21252B"
-  dark-bg-chat-canvas: "#282C34"
-  dark-bg-elevated: "#2C313A"
-  dark-bg-hover: "#323842"
-  dark-bg-selected: "#3A3F4B"
-  dark-bg-input: "#1D1F23"
-  dark-border: "#343942"
-  dark-text-primary: "#D7DAE0"
-  dark-text-secondary: "#ABB2BF"
-  dark-text-muted: "#767E8E"
-  dark-primary: "#528BFF"
-  dark-primary-hover: "#61AFEF"
-  dark-online: "#98C379"
-  dark-danger: "#E06C75"
-  dark-warning: "#E5C07B"
-  dark-bubble-out-bg: "#25374D"
+  dark-bg-app: "#22262B"
+  dark-bg-sidebar: "#22262B"
+  dark-bg-chat-canvas: "#1D2025"
+  dark-bg-elevated: "#282D33"
+  dark-bg-hover: "#2E333A"
+  dark-bg-selected: "#1F344D"
+  dark-bg-input: "#1A1D22"
+  dark-bg-input-track: "#1F2329"
+  dark-border: "#373D45"
+  dark-text-primary: "#E6E9EE"
+  dark-text-secondary: "#AAB2BE"
+  dark-text-muted: "#8E96A4"
+  dark-primary: "#2563EB"
+  dark-primary-hover: "#60A5FA"
+  dark-online: "#4ADE80"
+  dark-danger: "#DC2626"
+  dark-danger-text: "#F87171"
+  dark-warning: "#FBBF24"
+  dark-bubble-out-bg: "#1F344D"
   dark-bubble-out-text: "#EBF0F6"
-  dark-bubble-out-meta: "#9AABC0"
-  dark-bubble-in-bg: "#323842"
-  dark-bubble-in-border: "#3E4451"
-  dark-bubble-in-text: "#D7DAE0"
-  dark-bubble-in-meta: "#8E96A5"
-  light-bg-app: "#FFFFFF"
-  light-bg-sidebar: "#FFFFFF"
+  dark-bubble-out-meta: "#9DB2CC"
+  dark-bubble-in-bg: "#282D33"
+  dark-bubble-in-border: "#373D45"
+  dark-bubble-in-text: "#E6E9EE"
+  dark-bubble-in-meta: "#969FAE"
+  light-bg-app: "#F8FAFC"
+  light-bg-sidebar: "#F8FAFC"
   light-bg-chat-canvas: "#EBF0F7"
   light-bg-elevated: "#FFFFFF"
-  light-bg-hover: "#F1F5F9"
+  light-bg-hover: "#EDF2F7"
   light-bg-selected: "#E5F1FF"
-  light-bg-input: "#F8FAFC"
-  light-border: "#E2E8F0"
+  light-bg-input: "#FFFFFF"
+  light-bg-input-track: "#E6ECF5"
+  light-border: "#CBD5E1"
   light-text-primary: "#0F172A"
   light-text-secondary: "#475569"
-  light-text-muted: "#64748B"
+  light-text-muted: "#5C6470"
   light-primary: "#0068FF"
-  light-primary-hover: "#2563EB"
-  light-online: "#059669"
-  light-danger: "#DC2626"
-  light-warning: "#D97706"
+  light-primary-hover: "#0055D4"
+  light-online: "#047857"
+  light-danger: "#C31818"
+  light-warning: "#9A5B00"
   light-bubble-out-bg: "#E5EFFF"
   light-bubble-out-text: "#0F172A"
-  light-bubble-out-meta: "#475C7A"
+  light-bubble-out-meta: "#435875"
   light-bubble-in-bg: "#FFFFFF"
   light-bubble-in-border: "#D8E0EC"
   light-bubble-in-text: "#0F172A"
-  light-bubble-in-meta: "#64748B"
+  light-bubble-in-meta: "#5C6470"
 typography:
   body:
     fontFamily: "Be Vietnam Pro"
@@ -128,9 +131,9 @@ Bảng màu xám xanh lạnh, một nhấn xanh dương, màu trạng thái dị
 - **Chữ** (`*-text-primary` / `secondary` / `muted`): ba bậc. Muted chỉ dành cho thông tin phụ (giờ, mô tả), phải vẫn đọc được (bản sáng đạt ~4.6:1).
 
 ### Trạng thái
-- **Trực tuyến** (`*-online`): chấm online.
-- **Nguy hiểm** (`*-danger`): xóa, thu hồi, lỗi gửi.
-- **Cảnh báo** (`*-warning`): nhấn nhẹ cảnh báo. Màu "Đã lưu" (sao) dùng vàng `#EAB308` riêng trong code.
+- **Trực tuyến** (`*-online`): chấm online (đạt WCAG 2.1 AA >= 4.5:1 trên mọi nền chính).
+- **Nguy hiểm** (`*-danger` / `dark-danger-text`): nút xóa, thu hồi, lỗi gửi.
+- **Cảnh báo** (`*-warning`): nhấn nhẹ cảnh báo; trạng thái sao "Đã lưu" dùng token `reaction-star` đạt >= 4.5:1 (Dark `#FBBF24`, Light `#9A5B00`).
 
 ### Bong bóng chat
 - **Tin gửi đi** (`*-bubble-out-*`): xanh navy đậm ở bản tối, xanh nhạt ở bản sáng. Chữ phụ (giờ, trạng thái) dùng `bubble-out-meta`.
@@ -146,8 +149,8 @@ Bảng màu xám xanh lạnh, một nhấn xanh dương, màu trạng thái dị
 
 ## Typography
 
-**Font chính:** Be Vietnam Pro (đóng gói sẵn, bảo đảm đủ dấu tiếng Việt)
-**Font biểu tượng:** Lucide (đóng gói sẵn, dùng cho icon dạng glyph)
+**Font chính:** Be Vietnam Pro (`BeVietnamPro-Regular.ttf` + `BeVietnamPro-SemiBold.ttf` đóng gói sẵn, bảo đảm đủ dấu tiếng Việt và phân cấp đậm/nhạt rõ ràng)
+**Font biểu tượng:** Lucide (`lucide.ttf` đóng gói sẵn, dùng cho toàn bộ icon UI dạng glyph)
 **Dự phòng:** font hệ thống cho CJK (YaHei, SimSun, Malgun, YuGothic, PingFang, Noto CJK), chỉ nạp khi cần.
 
 **Character:** Sans hình học, gọn, đọc tốt ở cỡ nhỏ và với dấu tiếng Việt chồng. Không dùng font thứ hai cho chữ; icon luôn là Lucide hoặc ảnh emoji đóng gói.
@@ -166,9 +169,10 @@ Cỡ thực tế đang dùng nhiều nhất (đếm trong `messages.rs`/`workspa
 
 ## Layout
 
-Bố cục desktop ba cột: **thanh điều hướng trái** (rộng 62px, avatar tài khoản 40px ở trên, hành động ở dưới), **sidebar hội thoại** (rộng 300px cố định), **vùng chat** (phần còn lại: danh sách tin, rồi ô soạn tin).
+Bố cục desktop ba cột (chế độ rộng >= 880px): **thanh điều hướng trái** (rộng 62px, avatar tài khoản 40px ở trên, hành động ở dưới), **sidebar hội thoại** (rộng 300px, thu gọn còn 68px có chấm chưa đọc ở < 620px), **vùng chat** (phần còn lại: danh sách tin, rồi ô soạn tin), và **Info Drawer** (nổi dạng **Info Overlay** khi < 880px).
 
-- **Cửa sổ:** mặc định 1020×700, tối thiểu 480×360. Giao diện phải còn dùng được ở 480px; không được để nội dung bị cắt ở mép phải.
+- **Cửa sổ:** mặc định 1020×700, tối thiểu 480×360. Giao diện phải còn dùng được ở 480×360; Composer & nội dung không được bị đẩy khỏi đáy hoặc cắt ở mép phải.
+- **Chuyển động (Animations):** Tích hợp chuyển động mượt cho trượt tab, hover reaction bar, Info Overlay, Sticker Picker và Toast; có nút **Bật/Tắt** và thanh chỉnh tốc độ **50%–200%** trong **Cài đặt → Giao diện** (`animations_enabled`, `animation_speed`). Khi tắt, mọi chuyển trạng thái diễn ra tức thì (0ms).
 - **Nhịp khoảng cách:** khoảng cách giữa các phần tử 8×6px, đệm nút 10×6px (cấu hình trong `apply_to_ctx`).
 - **Bong bóng:** rộng tối đa 72% vùng chat, kẹp trong 140–520px. Đệm trong 12px ngang, 8.5px dọc. Sticker và ảnh không khung dùng đệm 2px và rộng cố định (sticker 116px).
 - **Nhóm tin liền nhau:** cùng người gửi thì cách 2.5px; đổi người cách 9px. Avatar 30px chỉ hiện ở tin đầu của cụm.

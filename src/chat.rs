@@ -320,8 +320,11 @@ impl ChatMessage {
                 .get("msgType")
                 .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()));
             match kind {
-                Some(2..=4) => Some("Hình ảnh Zalo"),
-                Some(19) => Some("Video Zalo"),
+                Some(2) | Some(11) => Some("Hình ảnh Zalo"),
+                Some(3) => Some("Thoại Zalo"),
+                Some(4) | Some(13) => Some("Sticker Zalo"),
+                Some(18) => Some("Video Zalo"),
+                Some(19) => Some("Tập tin Zalo"),
                 _ => None,
             }
         });
@@ -5851,13 +5854,15 @@ fn normalize_msg_type(it: &Value) -> String {
         Some(Value::String(s)) => s.to_ascii_lowercase(),
         Some(Value::Number(n)) => match n.as_i64() {
             Some(1) => "chat.text".into(),
-            Some(2) => "chat.photo".into(),
+            Some(2) | Some(11) => "chat.photo".into(),
             Some(3) => "chat.voice".into(),
-            Some(4) => "chat.video".into(),
-            Some(5) => "chat.sticker".into(),
+            Some(4) | Some(5) | Some(13) => "chat.sticker".into(),
+            Some(6) => "chat.contact".into(),
+            Some(7) => "chat.gif".into(),
+            Some(17) | Some(24) => "chat.location".into(),
+            Some(18) => "chat.video".into(),
             Some(19) => "chat.file".into(),
-            Some(24) => "chat.location".into(),
-            Some(31) => "chat.undo".into(),
+            Some(20) | Some(31) => "chat.undo".into(),
             _ => n.to_string(),
         },
         _ => String::new(),
@@ -6087,22 +6092,27 @@ fn extract_link_info(
             (None, None, None, None, None)
         }
         Value::Object(o) => {
-            // href là chính, nhưng nhiều payload ảnh chỉ có normalUrl/hdUrl/oriUrl/url
+            // href là chính, nhưng nhiều payload ảnh/video chỉ có normalUrl/hdUrl/oriUrl/url/videoUrl
             // hoặc mỗi thumb (#118) — fallback theo thứ tự để không mất URL.
-            let href = ["href", "normalUrl", "hdUrl", "oriUrl", "url", "thumb", "hd"]
-                .iter()
-                .filter_map(|k| o.get(*k).and_then(Value::as_str))
-                .map(str::trim)
-                .find(|h| {
-                    !h.is_empty() && (h.starts_with("http://") || h.starts_with("https://"))
-                })
-                .map(str::to_string);
+            let href = [
+                "href", "normalUrl", "hdUrl", "oriUrl", "url", "videoUrl", "playUrl", "thumb",
+                "hd",
+            ]
+            .iter()
+            .filter_map(|k| o.get(*k).and_then(Value::as_str))
+            .map(str::trim)
+            .find(|h| {
+                !h.is_empty() && (h.starts_with("http://") || h.starts_with("https://"))
+            })
+            .map(str::to_string);
             let Some(url) = href else {
                 return (None, None, None, None, None);
             };
             let thumb = o
                 .get("thumb")
                 .or_else(|| o.get("hd"))
+                .or_else(|| o.get("thumbUrl"))
+                .or_else(|| o.get("video_thumb"))
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|t| {
@@ -6133,6 +6143,20 @@ fn extract_link_info(
             let mut has_file_params =
                 o.get("fileName").is_some() || url.to_ascii_lowercase().contains("/renewmedia");
 
+            let mut is_video = o.get("videoUrl").is_some()
+                || o.get("duration").is_some()
+                || o.get("video_width").is_some()
+                || o.get("video_height").is_some()
+                || url.to_ascii_lowercase().contains("video-")
+                || url.to_ascii_lowercase().contains(".dlmd.me")
+                || url.to_ascii_lowercase().contains("/video/")
+                || file_ext.as_deref().is_some_and(|e| {
+                    matches!(
+                        e.to_ascii_lowercase().as_str(),
+                        "mp4" | "mov" | "mkv" | "webm" | "avi"
+                    )
+                });
+
             if let Some(params_str) = o.get("params").and_then(Value::as_str) {
                 if let Ok(p_json) = serde_json::from_str::<Value>(params_str.trim()) {
                     if title.is_none() {
@@ -6150,6 +6174,12 @@ fn extract_link_info(
                             .and_then(Value::as_str)
                             .map(|s| s.trim().trim_start_matches('.').to_string())
                             .filter(|s| !s.is_empty());
+                    }
+                    if p_json.get("video_width").is_some()
+                        || p_json.get("video_height").is_some()
+                        || p_json.get("duration").is_some()
+                    {
+                        is_video = true;
                     }
                     if p_json.get("fileExt").is_some()
                         || p_json.get("fileSize").is_some()
@@ -6176,7 +6206,19 @@ fn extract_link_info(
                     t.push_str(&suffix);
                 }
             }
-            if src.is_none() && has_file_params {
+            if is_video {
+                src = Some("Video Zalo".to_string());
+                if file_ext.is_none() {
+                    file_ext = Some("mp4".to_string());
+                }
+                if title.is_none()
+                    || title
+                        .as_deref()
+                        .is_some_and(|t| t.len() > 20 && !t.contains(' ') && !t.contains('.'))
+                {
+                    title = Some("Video".to_string());
+                }
+            } else if src.is_none() && has_file_params {
                 src = Some("Tập tin Zalo".to_string());
             }
             if src.is_none() && is_zalo_photo_cdn_url(&url) {
@@ -6221,17 +6263,40 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         .and_then(extract_content_text)
         .unwrap_or_default();
 
-    // Voice ưu tiên trước file: params voice có fileSize khiến extract_link_info
-    // gán nhầm "Tập tin Zalo" (tin thoại thật hiện thành [Tập tin] xxx.aac).
+    // Voice & Video ưu tiên trước file: params voice/video có fileSize khiến extract_link_info
+    // gán nhầm "Tập tin Zalo" (tin thoại/video hiện thành [Tập tin] token).
     let is_voice_msg = matches!(msg_type.as_str(), "chat.voice" | "voice" | "3");
     if is_voice_msg {
         link_src = Some("Thoại Zalo".to_string());
     }
-    let is_photo_msg = matches!(msg_type.as_str(), "chat.photo" | "photo" | "2")
-        || link_src.as_deref() == Some("Hình ảnh Zalo")
-        || link_url.as_deref().is_some_and(is_zalo_photo_cdn_url)
-        || link_thumb.as_deref().is_some_and(is_zalo_photo_cdn_url);
+    let is_video_msg = !is_voice_msg
+        && (matches!(
+            msg_type.as_str(),
+            "chat.video" | "video" | "18" | "chat.video.msg"
+        ) || link_src.as_deref() == Some("Video Zalo")
+            || raw_content_val.and_then(|v| v.get("videoUrl")).is_some()
+            || raw_content_val.and_then(|v| v.get("duration")).is_some()
+            || link_url.as_deref().is_some_and(|u| {
+                let l = u.to_ascii_lowercase();
+                l.ends_with(".mp4")
+                    || l.ends_with(".mov")
+                    || l.ends_with(".webm")
+                    || l.contains("/video/")
+                    || l.contains("videomedia")
+                    || l.contains("video-")
+                    || l.contains("video.")
+                    || l.contains(".dlmd.me")
+            }));
+    if is_video_msg {
+        link_src = Some("Video Zalo".to_string());
+    }
+    let is_photo_msg = !is_video_msg
+        && (matches!(msg_type.as_str(), "chat.photo" | "photo" | "2" | "11")
+            || link_src.as_deref() == Some("Hình ảnh Zalo")
+            || link_url.as_deref().is_some_and(is_zalo_photo_cdn_url)
+            || link_thumb.as_deref().is_some_and(is_zalo_photo_cdn_url));
     let is_file_msg = !is_voice_msg
+        && !is_video_msg
         && (matches!(
             msg_type.as_str(),
             "chat.file" | "file" | "19" | "share.file"
@@ -6240,7 +6305,29 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
                 .as_deref()
                 .is_some_and(|u| u.to_ascii_lowercase().contains("/renewmedia")));
 
-    if is_photo_msg && !is_file_msg && sticker_meta.is_none() {
+    if is_video_msg && sticker_meta.is_none() {
+        link_src = Some("Video Zalo".to_string());
+        if link_thumb.is_none() {
+            link_thumb = link_url.clone();
+        }
+        let is_raw_token_title = link_title.as_deref().is_some_and(|t| {
+            t.len() > 20 && !t.contains(' ') && !t.contains('.')
+        });
+        if link_title.is_none() || is_raw_token_title {
+            link_title = Some("Video".to_string());
+        }
+        let trimmed_c = content.trim();
+        let is_raw_token_content = trimmed_c.len() > 20 && !trimmed_c.contains(' ');
+        let is_raw_url_content =
+            trimmed_c.starts_with("http://") || trimmed_c.starts_with("https://");
+        if trimmed_c.is_empty()
+            || is_raw_url_content
+            || is_raw_token_content
+            || trimmed_c.starts_with("[Tập tin]")
+        {
+            content = "[Video]".to_string();
+        }
+    } else if is_photo_msg && !is_file_msg && sticker_meta.is_none() {
         link_src = Some("Hình ảnh Zalo".to_string());
         if link_thumb.is_none() {
             link_thumb = link_url.clone();
@@ -6309,14 +6396,14 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
 
     if content.is_empty() {
         content = match msg_type.as_str() {
-            "chat.sticker" | "sticker" | "5" => "[Nhãn dán]".to_string(),
-            "chat.photo" | "photo" | "2" => "[Hình ảnh]".to_string(),
+            "chat.sticker" | "sticker" | "4" | "5" | "13" => "[Nhãn dán]".to_string(),
+            "chat.photo" | "photo" | "2" | "11" => "[Hình ảnh]".to_string(),
             "chat.voice" | "voice" | "3" => "[Tin nhắn thoại]".to_string(),
-            "chat.video" | "video" | "4" => "[Video]".to_string(),
+            "chat.video" | "video" | "18" => "[Video]".to_string(),
             "chat.file" | "file" | "19" => "[Tập tin]".to_string(),
-            "chat.location" | "location" | "24" => "[Vị trí]".to_string(),
-            "chat.contact" | "contact" => "[Danh thiếp]".to_string(),
-            "chat.undo" | "undo" | "31" => "[Tin nhắn đã thu hồi]".to_string(),
+            "chat.location" | "location" | "17" | "24" => "[Vị trí]".to_string(),
+            "chat.contact" | "contact" | "6" => "[Danh thiếp]".to_string(),
+            "chat.undo" | "undo" | "20" | "31" => "[Tin nhắn đã thu hồi]".to_string(),
             "chat.recommended" | "share.file" => "[Chia sẻ]".to_string(),
             _ => {
                 let obj = it.get("content").or_else(|| it.get("message"));
@@ -8450,53 +8537,50 @@ pub async fn wake_phone_sync_v2(s: &Session) -> Result<String> {
     Ok(sync_id)
 }
 
-/// Gửi `cmd 590` (SYNC_MESSAGE.REQUEST) SAU KHI user đã xác nhận trên điện
-/// thoại. Keys phải đã sinh bởi [`wake_phone_sync_v2`] (giữ trong RAM).
-pub fn send_sync_v2_request(s: &Session, sync_id: &str) -> Result<bool> {
-    send_sync_v2_request_with_queries(s, sync_id, &[])
-}
-
-/// Gửi `cmd 590` với queries partition thật (`oneone/<globalNoisedId>`).
-/// `noised_ids` rỗng → 1 query conversations (`partition:""`, phone chấp nhận
-/// nhưng không trả batch — dùng cho probe).
-pub fn send_sync_v2_request_with_queries(
+/// Tạo payload cho SyncFull v2 request theo đúng Zalo PC (`shared-worker.js:282247` & `314736`).
+/// Khi `partitions` rỗng: gửi `type: "conversation"` với partition `"conversations"`.
+/// Khi `partitions` có phần tử: gửi `type: "message"` với queries tương ứng.
+pub fn build_sync_v2_payload(
     s: &Session,
     sync_id: &str,
-    noised_ids: &[String],
-) -> Result<bool> {
-    // Manual sync: tempKey rỗng (đúng Zalo PC — tempKey chỉ dùng cho auto sync
-    // sau transfer event; tempKey cũ/hết hạn làm phone crash khi xác nhận).
+    partitions: &[String],
+) -> Result<serde_json::Value> {
     let temp_key = String::new();
-    crate::logger::log_sync("590: tempKey rỗng (manual sync)");
     let keys = crate::history_sync::current_v2_keys()
         .map_err(|_| anyhow::anyhow!("chưa có khóa Sync V2 — gọi wake_phone_sync_v2 trước"))?;
     let (ik_pub, ek_pub) = (keys.ik_pub, keys.ek_pub);
 
-    // Queries với partition thật `oneone/<globalNoisedId>` (lấy từ /api/znoise).
-    // Rỗng → 1 query conversations (phone chấp nhận nhưng không trả batch).
-    let queries: Vec<serde_json::Value> = if noised_ids.is_empty() {
-        vec![json!({
-            "partition": "",
-            "from": 0,
-            "to": 9_007_199_254_740_991_i64,
-            "limit": 9_007_199_254_740_991_i64
-        })]
+    let (req_type, queries) = if partitions.is_empty() {
+        (
+            "conversation",
+            vec![json!({
+                "partition": "conversations",
+                "from": 0,
+                "to": 9_007_199_254_740_991_i64,
+                "limit": 2000
+            })],
+        )
     } else {
-        noised_ids
+        let q: Vec<serde_json::Value> = partitions
             .iter()
-            .map(|n| {
+            .map(|p| {
+                let partition_str = if p.starts_with("oneone/") || p.starts_with("group/") {
+                    p.clone()
+                } else {
+                    format!("oneone/{p}")
+                };
                 json!({
-                    "partition": format!("oneone/{n}"),
+                    "partition": partition_str,
                     "from": 0,
                     "to": 9_007_199_254_740_991_i64,
                     "limit": 9_007_199_254_740_991_i64
                 })
             })
-            .collect()
+            .collect();
+        ("message", q)
     };
 
-    // 2. Build SyncFull v2 request payload matching `shared-worker.js:282247` & `314736`
-    let sync_data = json!({
+    Ok(json!({
         "syncId": sync_id,
         "syncType": 0, // No.d.SyncFull = 0
         "ek": ek_pub,
@@ -8505,18 +8589,143 @@ pub fn send_sync_v2_request_with_queries(
         "tempKey": temp_key,
         "deviceName": s.computer_name,
         "req": {
-            "type": "message",
+            "type": req_type,
             "priority": 1,
             "queries": queries,
             "batchSize": 2000
         },
         "ver": 1,
         "ussidx": 0
+    }))
+}
+
+/// Gửi yêu cầu đồng bộ tin nhắn qua HTTP endpoint `/api/transfer-sync-v2/request-sync` (cmd `12888`, file domain).
+/// Zalo PC gọi hàm này (`ge.requestSyncMessage`) song song hoặc trước WebSocket để đăng ký phiên sync với server.
+pub async fn request_phone_sync_v2_http(
+    s: &Session,
+    req_id: &str,
+    sync_data: &Value,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let body = json!({
+        "reqId": req_id,
+        "data": sync_data.to_string()
     });
-    crate::logger::log_sync(&format!("590 payload: {}", sync_data.to_string().chars().take(600).collect::<String>()));
+    let params = s.encoded_params(&body)?;
+    let path = format!(
+        "/api/transfer-sync-v2/request-sync?{}&params={params}",
+        s.common_params()
+    );
+    if let Ok(resp) = s.get_endpoint("file", &path).await {
+        let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+        if dec.get("error_code").and_then(Value::as_i64) == Some(0) {
+            return Ok(dec);
+        }
+    }
+    let get_url = format!(
+        "{}/api/transfer-sync-v2/request-sync?{}&params={params}",
+        s.domains.file,
+        s.common_params()
+    );
+    let resp = match s.get(&get_url).await {
+        Ok(v) => v,
+        Err(_) => s.post_form(&get_url, format!("params={params}")).await?,
+    };
+    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+}
+
+/// Tra cứu danh sách partition (`oneone/<noised_id>` và `group/<noised_id>`) qua `/api/znoise`.
+pub async fn resolve_thread_partitions(s: &Session, threads: &[Thread]) -> Vec<String> {
+    let mut fids: Vec<i64> = Vec::new();
+    let mut gids: Vec<i64> = Vec::new();
+
+    for t in threads {
+        if t.is_group || t.id.starts_with('g') {
+            let num_str = t.id.trim_start_matches('g');
+            if let Ok(gid) = num_str.parse::<i64>() {
+                if !gids.contains(&gid) {
+                    gids.push(gid);
+                }
+            }
+        } else if let Ok(fid) = t.id.parse::<i64>() {
+            if !fids.contains(&fid) {
+                fids.push(fid);
+            }
+        }
+    }
+
+    if fids.is_empty() && gids.is_empty() {
+        return Vec::new();
+    }
+
+    let noise_body = json!({
+        "fids": fids,
+        "gids": gids
+    });
+
+    let Ok(enc_params) = s.encoded_params(&noise_body) else {
+        return Vec::new();
+    };
+
+    let znoise_url = format!("https://zwid.api.zalo.me/api/znoise?{}", s.common_params());
+    let Ok(resp) = s.post_form(&znoise_url, format!("params={enc_params}")).await else {
+        return Vec::new();
+    };
+    let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+
+    let mut partitions = Vec::new();
+    if let Some(data) = dec.get("data") {
+        if let Some(arr) = data.get("fids").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(nid) = v.as_str() {
+                    if !nid.is_empty() {
+                        partitions.push(format!("oneone/{nid}"));
+                    }
+                }
+            }
+        }
+        if let Some(arr) = data.get("gids").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(nid) = v.as_str() {
+                    if !nid.is_empty() {
+                        partitions.push(format!("group/{nid}"));
+                    }
+                }
+            }
+        }
+    }
+    partitions
+}
+
+/// Gửi `cmd 590` (SYNC_MESSAGE.REQUEST) SAU KHI user đã xác nhận trên điện
+/// thoại. Keys phải đã sinh bởi [`wake_phone_sync_v2`] (giữ trong RAM).
+pub fn send_sync_v2_request(s: &Session, sync_id: &str) -> Result<bool> {
+    send_sync_v2_request_with_queries(s, sync_id, &[])
+}
+
+/// Gửi `cmd 590` với queries partition thật (`oneone/<globalNoisedId>` hoặc `group/<globalNoisedId>`).
+/// Kèm gửi `cmd 592` (wake up) để đánh thức client mobile.
+pub fn send_sync_v2_request_with_queries(
+    s: &Session,
+    sync_id: &str,
+    noised_ids: &[String],
+) -> Result<bool> {
+    let sync_data = build_sync_v2_payload(s, sync_id, noised_ids)?;
+    crate::logger::log_sync(&format!(
+        "590 payload: {}",
+        sync_data.to_string().chars().take(600).collect::<String>()
+    ));
     let sent_ws = crate::socket::send_sync_message_ws_request(&sync_data);
-    crate::logger::log_sync(&format!("590 gửi sau confirm: sync={} ws={}", &sync_id.chars().take(8).collect::<String>(), sent_ws));
-    Ok(sent_ws)
+    let sent_wake = crate::socket::send_mobile_wakeup(sync_id);
+    crate::logger::log_sync(&format!(
+        "590/592 gửi: sync={} ws_590={} ws_592={}",
+        &sync_id.chars().take(8).collect::<String>(),
+        sent_ws,
+        sent_wake
+    ));
+    Ok(sent_ws || sent_wake)
 }
 
 
@@ -8826,6 +9035,46 @@ pub async fn delete_conversation(
         let resp = s.post_form(&url, format!("params={params}")).await?;
         Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
     }
+}
+
+/// Leave a Zalo group: `POST {domains.group}/api/group/leave?{common}` (commandId 11189).
+/// Payload (AES encrypted): `{ "grids": [clean_grid], "imei": s.imei, "silent": 0|1, "language": "vi" }`
+pub async fn leave_group(s: &Session, grid: &str, silent: bool) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let clean = grid
+        .trim()
+        .trim_start_matches("g_")
+        .trim_start_matches("group_")
+        .trim();
+    if clean.is_empty() {
+        anyhow::bail!("group ID không hợp lệ");
+    }
+    let body = json!({
+        "grids": [clean],
+        "imei": s.imei,
+        "silent": if silent { 1 } else { 0 },
+        "language": "vi"
+    });
+    let params = s.encoded_params(&body)?;
+    let url = format!(
+        "{}/api/group/leave?{}",
+        s.domains.group,
+        s.common_params()
+    );
+    let resp = s.post_form(&url, format!("params={params}")).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = resp
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("Không thể rời nhóm");
+            anyhow::bail!("{msg} (mã {code})");
+        }
+    }
+    Ok(resp)
 }
 
 #[cfg(test)]
@@ -10553,5 +10802,28 @@ mod send_identity_tests {
         );
         assert_eq!(threads[0].messages[0].text, "[Đã thu hồi] Tin nhắn gốc");
         assert_eq!(threads[0].messages[0].ts, 1700000010000);
+    }
+
+    #[tokio::test]
+    async fn leave_group_requires_login_and_validates_grid() {
+        let s = Session::new(false, false, false).unwrap();
+        let res = leave_group(&s, "g_123456", false).await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().to_string(), "chưa đăng nhập");
+    }
+
+    #[test]
+    fn test_parse_video_message_with_raw_token() {
+        let video_raw = json!({
+            "msgId": "vid-1",
+            "msgType": 18,
+            "content": "2aOboRCNJyrsnJG0K5FnqP4zCs9HLAKnoazCx0iG",
+            "uidFrom": "user_vid",
+            "ts": 1700000000000_i64
+        });
+        let parsed = parse_chat_message(&video_raw).expect("parse video message");
+        assert_eq!(parsed.text, "[Video]");
+        assert_eq!(parsed.link_src.as_deref(), Some("Video Zalo"));
+        assert_eq!(parsed.link_title.as_deref(), Some("Video"));
     }
 }

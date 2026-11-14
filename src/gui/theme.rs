@@ -14,6 +14,7 @@ pub(super) struct ThemePalette {
     pub(super) bg_hover: Color32,
     pub(super) bg_selected: Color32,
     pub(super) bg_input: Color32,
+    pub(super) bg_input_track: Color32,
     pub(super) border: Color32,
     pub(super) text_primary: Color32,
     pub(super) text_secondary: Color32,
@@ -22,7 +23,11 @@ pub(super) struct ThemePalette {
     pub(super) primary_hover: Color32,
     pub(super) accent_online: Color32,
     pub(super) danger: Color32,
+    pub(super) danger_text: Color32,
     pub(super) warning: Color32,
+    pub(super) reaction_star: Color32,
+    pub(super) code_bg: Color32,
+    pub(super) link_text: Color32,
     pub(super) primary_fg: Color32,
     pub(super) bubble_out_bg: Color32,
     pub(super) bubble_out_text: Color32,
@@ -53,86 +58,108 @@ pub(crate) fn contrast_ratio(c1: Color32, c2: Color32) -> f32 {
 
 impl ThemePalette {
     pub(super) fn dark() -> Self {
-        // Zalo PC dark tokens
+        // Atom One Dark + WCAG 2.1 AA compliant contrast tokens (>= 4.5:1)
         Self {
             is_dark: true,
-            bg_app: Color32::from_rgb(34, 38, 43), // #22262B
-            bg_sidebar: Color32::from_rgb(34, 38, 43), // #22262B
-            bg_chat_canvas: Color32::from_rgb(29, 32, 37), // #1D2025
-            bg_elevated: Color32::from_rgb(40, 45, 51), // #282D33
-            bg_hover: Color32::from_rgb(46, 51, 58),
-            bg_selected: Color32::from_rgb(31, 52, 77), // #1F344D selected row
-            bg_input: Color32::from_rgb(40, 45, 51), // #282D33
-            border: Color32::from_rgb(55, 61, 69),
-            text_primary: Color32::from_rgb(230, 233, 238),
-            text_secondary: Color32::from_rgb(170, 178, 190),
-            text_muted: Color32::from_rgb(139, 150, 167), // #8B96A7
-            primary: Color32::from_rgb(51, 132, 255), // #3384FF
-            primary_hover: Color32::from_rgb(102, 166, 255), // #66A6FF
-            accent_online: Color32::from_rgb(55, 179, 97), // #37B361
-            danger: Color32::from_rgb(233, 73, 73), // #E94949
-            warning: Color32::from_rgb(229, 192, 123),
+            bg_app: Color32::from_rgb(34, 38, 43),          // #22262B
+            bg_sidebar: Color32::from_rgb(34, 38, 43),      // #22262B
+            bg_chat_canvas: Color32::from_rgb(29, 32, 37),  // #1D2025
+            bg_elevated: Color32::from_rgb(40, 45, 51),     // #282D33
+            bg_hover: Color32::from_rgb(46, 51, 58),        // #2E333A
+            bg_selected: Color32::from_rgb(31, 52, 77),     // #1F344D
+            bg_input: Color32::from_rgb(26, 29, 34),        // #1A1D22 (darker than bg_elevated)
+            bg_input_track: Color32::from_rgb(31, 35, 41),  // #1F2329 segmented track
+            border: Color32::from_rgb(55, 61, 69),          // #373D45
+            text_primary: Color32::from_rgb(230, 233, 238), // #E6E9EE
+            text_secondary: Color32::from_rgb(170, 178, 190), // #AAB2BE
+            text_muted: Color32::from_rgb(142, 150, 164),   // #8E96A4 (4.66-5.48:1)
+            primary: Color32::from_rgb(37, 99, 235),        // #2563EB (5.17:1 with white)
+            primary_hover: Color32::from_rgb(96, 165, 250), // #60A5FA (4.99-5.51:1 on dark)
+            accent_online: Color32::from_rgb(74, 222, 128), // #4ADE80 (7.96-9.37:1 on dark)
+            danger: Color32::from_rgb(220, 38, 38),         // #DC2626 (4.83:1 with white)
+            danger_text: Color32::from_rgb(248, 113, 113),  // #F87171 (5.02-5.91:1 on dark)
+            warning: Color32::from_rgb(251, 191, 36),       // #FBBF24 (8.31-9.79:1 on dark)
+            reaction_star: Color32::from_rgb(251, 191, 36), // #FBBF24
+            code_bg: Color32::from_rgb(22, 25, 29),         // #16191D
+            link_text: Color32::from_rgb(96, 165, 250),     // #60A5FA
             primary_fg: Color32::WHITE,
-            bubble_out_bg: Color32::from_rgb(31, 52, 77), // #1F344D
-            bubble_out_text: Color32::from_rgb(235, 240, 246),
-            bubble_out_meta: Color32::from_rgb(154, 171, 192),
-            bubble_in_bg: Color32::from_rgb(40, 45, 51), // #282D33
-            bubble_in_border: Color32::from_rgb(55, 61, 69),
-            bubble_in_text: Color32::from_rgb(230, 233, 238),
-            bubble_in_meta: Color32::from_rgb(139, 150, 167),
+            bubble_out_bg: Color32::from_rgb(31, 52, 77),     // #1F344D
+            bubble_out_text: Color32::from_rgb(235, 240, 246), // #EBF0F6
+            bubble_out_meta: Color32::from_rgb(157, 178, 204), // #9DB2CC (5.84:1)
+            bubble_in_bg: Color32::from_rgb(40, 45, 51),      // #282D33
+            bubble_in_border: Color32::from_rgb(55, 61, 69),  // #373D45
+            bubble_in_text: Color32::from_rgb(230, 233, 238), // #E6E9EE
+            bubble_in_meta: Color32::from_rgb(150, 159, 174), // #969FAE (5.20:1)
         }
     }
 
     pub(super) fn light() -> Self {
-        // Zalo PC light tokens
+        // Zalo PC Light + layered surface depth + WCAG 2.1 AA contrast (>= 4.5:1)
         Self {
             is_dark: false,
-            bg_app: Color32::from_rgb(255, 255, 255), // #FFFFFF
-            bg_sidebar: Color32::from_rgb(255, 255, 255),
-            bg_chat_canvas: Color32::from_rgb(255, 255, 255),
-            bg_elevated: Color32::from_rgb(255, 255, 255),
-            bg_hover: Color32::from_rgb(241, 242, 244), // #F1F2F4
-            bg_selected: Color32::from_rgb(229, 241, 255), // #E5F1FF
-            bg_input: Color32::from_rgb(255, 255, 255),
-            border: Color32::from_rgb(229, 231, 235), // #E5E7EB
-            text_primary: Color32::from_rgb(8, 27, 58), // #081B3A
-            text_secondary: Color32::from_rgb(90, 105, 129), // #5A6981
-            text_muted: Color32::from_rgb(99, 113, 136), // #637188 (~5.4:1 trên trắng)
-            primary: Color32::from_rgb(0, 104, 255), // #0068FF
-            primary_hover: Color32::from_rgb(0, 88, 220),
-            accent_online: Color32::from_rgb(55, 179, 97), // #37B361
-            danger: Color32::from_rgb(195, 24, 24), // #C31818
-            warning: Color32::from_rgb(217, 119, 6),
+            bg_app: Color32::from_rgb(248, 250, 252),         // #F8FAFC
+            bg_sidebar: Color32::from_rgb(248, 250, 252),     // #F8FAFC
+            bg_chat_canvas: Color32::from_rgb(235, 240, 247), // #EBF0F7
+            bg_elevated: Color32::WHITE,                      // #FFFFFF
+            bg_hover: Color32::from_rgb(237, 242, 247),       // #EDF2F7
+            bg_selected: Color32::from_rgb(229, 241, 255),    // #E5F1FF
+            bg_input: Color32::WHITE,                         // #FFFFFF
+            bg_input_track: Color32::from_rgb(230, 236, 245), // #E6ECF5 segmented track
+            border: Color32::from_rgb(203, 213, 225),         // #CBD5E1
+            text_primary: Color32::from_rgb(15, 23, 42),      // #0F172A
+            text_secondary: Color32::from_rgb(71, 85, 105),   // #475569
+            text_muted: Color32::from_rgb(92, 100, 112),      // #5C6470 (5.22-5.98:1)
+            primary: Color32::from_rgb(0, 104, 255),          // #0068FF (4.75:1 with white)
+            primary_hover: Color32::from_rgb(0, 85, 212),     // #0055D4 (5.65:1 on #E5F1FF)
+            accent_online: Color32::from_rgb(4, 120, 87),     // #047857 (4.79-5.48:1)
+            danger: Color32::from_rgb(195, 24, 24),           // #C31818 (5.30-6.06:1)
+            danger_text: Color32::from_rgb(195, 24, 24),      // #C31818
+            warning: Color32::from_rgb(154, 91, 0),           // #9A5B00 (4.74-5.43:1)
+            reaction_star: Color32::from_rgb(154, 91, 0),     // #9A5B00
+            code_bg: Color32::from_rgb(241, 245, 249),        // #F1F5F9
+            link_text: Color32::from_rgb(0, 85, 212),         // #0055D4
             primary_fg: Color32::WHITE,
-            bubble_out_bg: Color32::from_rgb(229, 241, 255), // #E5F1FF
-            bubble_out_text: Color32::from_rgb(8, 27, 58),
-            bubble_out_meta: Color32::from_rgb(90, 105, 129),
-            bubble_in_bg: Color32::WHITE,
-            bubble_in_border: Color32::from_rgb(229, 231, 235), // #E5E7EB
-            bubble_in_text: Color32::from_rgb(8, 27, 58),
-            bubble_in_meta: Color32::from_rgb(99, 113, 136),
+            bubble_out_bg: Color32::from_rgb(229, 239, 255),  // #E5EFFF
+            bubble_out_text: Color32::from_rgb(15, 23, 42),   // #0F172A
+            bubble_out_meta: Color32::from_rgb(67, 88, 117),  // #435875 (6.27:1)
+            bubble_in_bg: Color32::WHITE,                     // #FFFFFF
+            bubble_in_border: Color32::from_rgb(216, 224, 236), // #D8E0EC
+            bubble_in_text: Color32::from_rgb(15, 23, 42),    // #0F172A
+            bubble_in_meta: Color32::from_rgb(92, 100, 112),  // #5C6470 (5.98:1)
         }
     }
 
-    pub(super) fn apply_to_ctx(&self, ctx: &egui::Context) {
-        let mut style = (*ctx.style()).clone();
+    pub(super) fn apply_to_ctx_with_anim(
+        &self,
+        ctx: &egui::Context,
+        animations_enabled: bool,
+        animation_speed: f32,
+    ) {
+        let target_theme = if self.is_dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        };
+        let mut style = (*ctx.style_of(target_theme)).clone();
         let mut visuals = if self.is_dark {
             egui::Visuals::dark()
         } else {
             egui::Visuals::light()
         };
+        visuals.dark_mode = self.is_dark;
 
         visuals.panel_fill = self.bg_app;
         visuals.window_fill = self.bg_elevated;
         visuals.extreme_bg_color = self.bg_input;
         visuals.faint_bg_color = self.bg_hover;
         visuals.override_text_color = Some(self.text_primary);
+        visuals.widgets.noninteractive.weak_bg_fill = self.bg_app;
         visuals.selection.bg_fill =
             self.primary
                 .linear_multiply(if self.is_dark { 0.45 } else { 0.22 });
         visuals.selection.stroke = Stroke::new(1.5_f32, self.primary);
 
-        let r = Rounding::same(6.0);
+        let r = Rounding::same(8.0);
         visuals.widgets.noninteractive.bg_fill = self.bg_app;
         visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.border);
         visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, self.text_primary);
@@ -156,14 +183,24 @@ impl ThemePalette {
         visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, self.primary_fg);
         visuals.widgets.active.rounding = r;
 
-        style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.button_padding = Vec2::new(10.0, 6.0);
         style.spacing.scroll = egui::style::ScrollStyle::solid();
         style.spacing.scroll.bar_width = 6.0;
-        style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
-        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(13.5));
+        style.animation_time = if animations_enabled {
+            (0.12 / animation_speed.clamp(0.5, 2.0)).clamp(0.03, 0.35)
+        } else {
+            0.0
+        };
+        style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(13.5));
+        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
         style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
         style.visuals = visuals;
+
+        // Bind active egui::Theme, style slot, and current style so OS theme/persistence
+        // never reverts widgets (Buttons, TextEdits) back to default Light visuals.
+        ctx.set_theme(target_theme);
+        ctx.set_style_of(target_theme, style.clone());
         ctx.set_style(style);
     }
 
@@ -198,6 +235,7 @@ impl ThemePalette {
             ("bg_hover", &mut self.bg_hover),
             ("bg_selected", &mut self.bg_selected),
             ("bg_input", &mut self.bg_input),
+            ("bg_input_track", &mut self.bg_input_track),
             ("border", &mut self.border),
             ("text_primary", &mut self.text_primary),
             ("text_secondary", &mut self.text_secondary),
@@ -206,7 +244,11 @@ impl ThemePalette {
             ("primary_hover", &mut self.primary_hover),
             ("accent_online", &mut self.accent_online),
             ("danger", &mut self.danger),
+            ("danger_text", &mut self.danger_text),
             ("warning", &mut self.warning),
+            ("reaction_star", &mut self.reaction_star),
+            ("code_bg", &mut self.code_bg),
+            ("link_text", &mut self.link_text),
             ("bubble_out_bg", &mut self.bubble_out_bg),
             ("bubble_out_text", &mut self.bubble_out_text),
             ("bubble_out_meta", &mut self.bubble_out_meta),
@@ -236,6 +278,7 @@ impl ThemePalette {
                 "bg_hover": format_hex_color(p.bg_hover),
                 "bg_selected": format_hex_color(p.bg_selected),
                 "bg_input": format_hex_color(p.bg_input),
+                "bg_input_track": format_hex_color(p.bg_input_track),
                 "border": format_hex_color(p.border),
                 "text_primary": format_hex_color(p.text_primary),
                 "text_secondary": format_hex_color(p.text_secondary),
@@ -244,7 +287,11 @@ impl ThemePalette {
                 "primary_hover": format_hex_color(p.primary_hover),
                 "accent_online": format_hex_color(p.accent_online),
                 "danger": format_hex_color(p.danger),
+                "danger_text": format_hex_color(p.danger_text),
                 "warning": format_hex_color(p.warning),
+                "reaction_star": format_hex_color(p.reaction_star),
+                "code_bg": format_hex_color(p.code_bg),
+                "link_text": format_hex_color(p.link_text),
                 "bubble_out_bg": format_hex_color(p.bubble_out_bg),
                 "bubble_out_text": format_hex_color(p.bubble_out_text),
                 "bubble_out_meta": format_hex_color(p.bubble_out_meta),
@@ -271,16 +318,29 @@ impl ThemePalette {
         bubble_out_hex: Option<&str>,
         bubble_in_hex: Option<&str>,
     ) {
+        let blend_over = |fg: Color32, bg: Color32| -> Color32 {
+            if fg.a() == u8::MAX {
+                return fg;
+            }
+            let a = fg.a() as f32 / 255.0;
+            let mix = |f: u8, b: u8| -> u8 {
+                ((f as f32 * a) + (b as f32 * (1.0 - a))).round().clamp(0.0, 255.0) as u8
+            };
+            Color32::from_rgb(mix(fg.r(), bg.r()), mix(fg.g(), bg.g()), mix(fg.b(), bg.b()))
+        };
+
         if let Some(hex) = primary_hex {
-            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() > 0) {
+                let effective = blend_over(c, self.bg_app);
                 self.primary = c;
-                self.primary_hover = Color32::from_rgb(
+                self.primary_hover = Color32::from_rgba_unmultiplied(
                     c.r().saturating_add(25),
                     c.g().saturating_add(25),
                     c.b().saturating_add(25),
+                    c.a(),
                 );
-                self.primary_fg = if contrast_ratio(Color32::WHITE, c)
-                    >= contrast_ratio(Color32::from_rgb(15, 23, 42), c)
+                self.primary_fg = if contrast_ratio(Color32::WHITE, effective)
+                    >= contrast_ratio(Color32::from_rgb(15, 23, 42), effective)
                 {
                     Color32::WHITE
                 } else {
@@ -289,26 +349,29 @@ impl ThemePalette {
             }
         }
         if let Some(hex) = accent_hex {
-            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() > 0) {
                 self.accent_online = c;
             }
         }
         if let Some(hex) = bubble_out_hex {
-            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() > 0) {
+                let effective = blend_over(c, self.bg_chat_canvas);
                 self.bubble_out_bg = c;
                 let dark_text = Color32::from_rgb(15, 23, 42);
                 let light_text = Color32::from_rgb(235, 240, 246);
                 self.bubble_out_text =
-                    if contrast_ratio(dark_text, c) >= contrast_ratio(light_text, c) {
+                    if contrast_ratio(dark_text, effective) >= contrast_ratio(light_text, effective)
+                    {
                         dark_text
                     } else {
                         light_text
                     };
 
-                let dark_meta = Color32::from_rgb(71, 92, 122);
-                let light_meta = Color32::from_rgb(154, 171, 192);
+                let dark_meta = Color32::from_rgb(67, 88, 117);
+                let light_meta = Color32::from_rgb(157, 178, 204);
                 self.bubble_out_meta =
-                    if contrast_ratio(dark_meta, c) >= contrast_ratio(light_meta, c) {
+                    if contrast_ratio(dark_meta, effective) >= contrast_ratio(light_meta, effective)
+                    {
                         dark_meta
                     } else {
                         light_meta
@@ -316,21 +379,24 @@ impl ThemePalette {
             }
         }
         if let Some(hex) = bubble_in_hex {
-            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() == u8::MAX) {
+            if let Some(c) = parse_hex_color(hex).filter(|c| c.a() > 0) {
+                let effective = blend_over(c, self.bg_chat_canvas);
                 self.bubble_in_bg = c;
                 let dark_text = Color32::from_rgb(15, 23, 42);
-                let light_text = Color32::from_rgb(215, 218, 224);
+                let light_text = Color32::from_rgb(230, 233, 238);
                 self.bubble_in_text =
-                    if contrast_ratio(dark_text, c) >= contrast_ratio(light_text, c) {
+                    if contrast_ratio(dark_text, effective) >= contrast_ratio(light_text, effective)
+                    {
                         dark_text
                     } else {
                         light_text
                     };
 
-                let dark_meta = Color32::from_rgb(100, 116, 139);
-                let light_meta = Color32::from_rgb(142, 150, 165);
+                let dark_meta = Color32::from_rgb(92, 100, 112);
+                let light_meta = Color32::from_rgb(150, 159, 174);
                 self.bubble_in_meta =
-                    if contrast_ratio(dark_meta, c) >= contrast_ratio(light_meta, c) {
+                    if contrast_ratio(dark_meta, effective) >= contrast_ratio(light_meta, effective)
+                    {
                         dark_meta
                     } else {
                         light_meta
@@ -338,6 +404,64 @@ impl ThemePalette {
             }
         }
     }
+}
+
+/// Animate a scalar `0.0..=1.0` smoothly when animations are enabled, or jump immediately when disabled.
+pub(super) fn animate_value_scaled(
+    ctx: &egui::Context,
+    id: egui::Id,
+    target: f32,
+    base_secs: f32,
+    animations_enabled: bool,
+    animation_speed: f32,
+) -> f32 {
+    if !animations_enabled {
+        ctx.animate_value_with_time(id, target, 0.0)
+    } else {
+        let speed = if animation_speed.is_finite() {
+            animation_speed.clamp(0.5, 2.0)
+        } else {
+            1.0
+        };
+        let duration = (base_secs / speed).clamp(0.02, 0.45);
+        ctx.animate_value_with_time(id, target, duration)
+    }
+}
+
+/// Animate a boolean transition (`0.0` / `1.0`) respecting user animation settings.
+pub(super) fn animate_bool_scaled(
+    ctx: &egui::Context,
+    id: egui::Id,
+    value: bool,
+    base_secs: f32,
+    animations_enabled: bool,
+    animation_speed: f32,
+) -> f32 {
+    animate_value_scaled(
+        ctx,
+        id,
+        if value { 1.0 } else { 0.0 },
+        base_secs,
+        animations_enabled,
+        animation_speed,
+    )
+}
+
+/// Shared styled `egui::Frame` wrapper for standard text inputs (`Radius-Ladder` 8px).
+pub(super) fn styled_input_frame(pal: &ThemePalette, focused: bool) -> egui::Frame {
+    egui::Frame::none()
+        .fill(pal.bg_input)
+        .stroke(Stroke::new(
+            if focused { 1.4_f32 } else { 1.0_f32 },
+            if focused { pal.primary } else { pal.border },
+        ))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(Margin::symmetric(10.0, 6.0))
+}
+
+/// Font family identifier for SemiBold headings/labels (backed by `BeVietnamPro-SemiBold.ttf`).
+pub(super) fn font_family_semibold() -> egui::FontFamily {
+    egui::FontFamily::Name("semibold".into())
 }
 
 pub(super) fn parse_hex_color(s: &str) -> Option<Color32> {
@@ -758,7 +882,7 @@ pub mod lucide {
     pub const PHONE_OFF: &str = "\u{e138}";
     pub const VIDEO: &str = "\u{e1a5}";
     pub const VIDEO_OFF: &str = "\u{e1a6}";
-    pub const CAMERA: &str = "\u{e062}";
+    pub const CAMERA: &str = "\u{e064}";
     pub const IMAGE: &str = "\u{e0f6}";
     pub const PAPERCLIP: &str = "\u{e12d}";
     pub const CHECK: &str = "\u{e06c}";
@@ -784,6 +908,7 @@ pub mod lucide {
     pub const BAN: &str = "\u{e051}";
     pub const MIC: &str = "\u{e118}";
     pub const MIC_OFF: &str = "\u{e119}";
+    pub const CLOCK: &str = "\u{e087}";
     pub const LOG_OUT: &str = "\u{e10e}";
     pub const FILE_TEXT: &str = "\u{e0cc}";
     pub const FILM: &str = "\u{e0d0}";
@@ -852,6 +977,10 @@ pub(super) fn draw_icon_camera(painter: &egui::Painter, center: Pos2, size: f32,
     draw_lucide_icon(painter, center, lucide::CAMERA, size, color);
 }
 
+pub(super) fn draw_icon_mic(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    draw_lucide_icon(painter, center, lucide::MIC, size, color);
+}
+
 pub(super) fn draw_icon_attachment(
     painter: &egui::Painter,
     center: Pos2,
@@ -902,6 +1031,99 @@ pub(super) fn draw_icon_user_plus(
     draw_lucide_icon(painter, center, lucide::USER_PLUS, size, color);
 }
 
+/// Draw a crisp diagonal vector pencil (avoids missing `✎` glyph boxes across system fonts).
+pub(super) fn draw_icon_pencil(
+    painter: &egui::Painter,
+    center: Pos2,
+    size: f32,
+    color: Color32,
+) {
+    let r = (size * 0.38).max(3.0);
+    let sw = (size * 0.13).clamp(1.2, 2.0);
+    let tip = Pos2::new(center.x - r * 0.85, center.y + r * 0.85);
+    let tail = Pos2::new(center.x + r * 0.78, center.y - r * 0.78);
+    let body_start = Pos2::new(center.x - r * 0.35, center.y + r * 0.35);
+    painter.line_segment([body_start, tail], Stroke::new(sw * 1.35, color));
+    painter.line_segment([tip, body_start], Stroke::new(sw * 0.9, color));
+    let cap_a = Pos2::new(center.x + r * 0.42, center.y - r * 0.95);
+    let cap_b = Pos2::new(center.x + r * 0.95, center.y - r * 0.42);
+    painter.line_segment([cap_a, cap_b], Stroke::new(sw * 0.95, color));
+}
+
+/// Draw a crisp filled right-pointing play triangle (avoids missing `▶` glyph boxes).
+pub(super) fn draw_icon_play(
+    painter: &egui::Painter,
+    center: Pos2,
+    size: f32,
+    color: Color32,
+) {
+    let r = (size * 0.38).max(3.5);
+    let pts = vec![
+        Pos2::new(center.x - r * 0.55, center.y - r * 0.85),
+        Pos2::new(center.x + r * 0.95, center.y),
+        Pos2::new(center.x - r * 0.55, center.y + r * 0.85),
+    ];
+    painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+}
+
+/// Draw a crisp vector pause icon (two vertical bars).
+pub(super) fn draw_icon_pause(
+    painter: &egui::Painter,
+    center: Pos2,
+    size: f32,
+    color: Color32,
+) {
+    let bar_w = (size * 0.18).clamp(2.0, 4.0);
+    let bar_h = (size * 0.65).max(6.0);
+    let gap = (size * 0.22).max(3.0);
+    let b1 = Rect::from_center_size(Pos2::new(center.x - gap, center.y), Vec2::new(bar_w, bar_h));
+    let b2 = Rect::from_center_size(Pos2::new(center.x + gap, center.y), Vec2::new(bar_w, bar_h));
+    painter.rect_filled(b1, Rounding::same(1.0), color);
+    painter.rect_filled(b2, Rounding::same(1.0), color);
+}
+
+/// Draw a crisp vector clock icon (avoids missing `🕒` glyph boxes).
+pub(super) fn draw_icon_clock(
+    painter: &egui::Painter,
+    center: Pos2,
+    size: f32,
+    color: Color32,
+) {
+    let r = (size * 0.40).max(4.5);
+    let sw = (size * 0.10).clamp(1.2, 1.8);
+    painter.circle_stroke(center, r, Stroke::new(sw, color));
+    painter.line_segment([center, Pos2::new(center.x, center.y - r * 0.52)], Stroke::new(sw, color));
+    painter.line_segment(
+        [center, Pos2::new(center.x + r * 0.42, center.y + r * 0.18)],
+        Stroke::new(sw, color),
+    );
+}
+
+/// Draw a crisp vector warning triangle with exclamation mark (avoids missing `⚠` glyph boxes).
+pub(super) fn draw_icon_warning(
+    painter: &egui::Painter,
+    center: Pos2,
+    size: f32,
+    color: Color32,
+) {
+    let r = (size * 0.44).max(4.5);
+    let sw = (size * 0.11).clamp(1.2, 1.8);
+    let top = Pos2::new(center.x, center.y - r * 0.85);
+    let left = Pos2::new(center.x - r * 0.92, center.y + r * 0.78);
+    let right = Pos2::new(center.x + r * 0.92, center.y + r * 0.78);
+    painter.line_segment([top, right], Stroke::new(sw, color));
+    painter.line_segment([right, left], Stroke::new(sw, color));
+    painter.line_segment([left, top], Stroke::new(sw, color));
+    painter.line_segment(
+        [
+            Pos2::new(center.x, center.y - r * 0.25),
+            Pos2::new(center.x, center.y + r * 0.26),
+        ],
+        Stroke::new(sw, color),
+    );
+    painter.circle_filled(Pos2::new(center.x, center.y + r * 0.50), sw * 0.55, color);
+}
+
 pub const REACTION_LIST: [(&str, &str, &str); 6] = [
     ("👍", "like", "Thích"),
     ("❤️", "heart", "Yêu thích"),
@@ -912,14 +1134,14 @@ pub const REACTION_LIST: [(&str, &str, &str); 6] = [
 ];
 
 pub fn emoji_to_tex_key(emoji: &str) -> &'static str {
-    match emoji {
+    match emoji.trim() {
         "👍" | "/-strong" => "like",
         "❤️" | "❤" | "/-heart" => "heart",
         "😆" | ":>" => "smile",
         "😮" | ":o" => "surprised",
-        "😢" | ":-(( " | ":-((" => "cry",
+        "😢" | ":-((" => "cry",
         "😠" | ":-h" => "rage",
-        _ => "like",
+        _ => "",
     }
 }
 
@@ -1208,12 +1430,17 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
         egui::FontData::from_static(LUCIDE_BYTES),
     );
 
-    // 2. Bundled Vietnamese sans-serif so diacritics render identically on every OS.
-    //    System fonts below are only an optional aesthetic override, never a requirement.
+    // 2. Bundled Vietnamese sans-serif (Regular + SemiBold) so diacritics & bold headings
+    //    render identically on every OS. System fonts below are only an optional override.
     const BUNDLED_SANS: &[u8] = include_bytes!("../assets/fonts/BeVietnamPro-Regular.ttf");
+    const BUNDLED_SANS_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/BeVietnamPro-SemiBold.ttf");
     fonts.font_data.insert(
         "bundled_sans".to_owned(),
         egui::FontData::from_static(BUNDLED_SANS),
+    );
+    fonts.font_data.insert(
+        "bundled_sans_semibold".to_owned(),
+        egui::FontData::from_static(BUNDLED_SANS_SEMIBOLD),
     );
 
     // 3. Optional user-selected system or custom font family (Requirement R2)
@@ -1369,6 +1596,20 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
     }
     mono.push("lucide_font".to_owned());
 
+    let semibold = fonts.families.entry(font_family_semibold()).or_default();
+    if selected_font_loaded {
+        semibold.push("selected_font".to_owned());
+    }
+    semibold.push("bundled_sans_semibold".to_owned());
+    semibold.push("bundled_sans".to_owned());
+    if fonts.font_data.contains_key("vietnamese_font") {
+        semibold.push("vietnamese_font".to_owned());
+    }
+    if fonts.font_data.contains_key("cjk_font") {
+        semibold.push("cjk_font".to_owned());
+    }
+    semibold.push("lucide_font".to_owned());
+
     ctx.set_fonts(fonts);
 }
 
@@ -1424,5 +1665,56 @@ mod tests {
         );
         assert_eq!(pal.bubble_out_bg, Color32::from_rgb(30, 41, 59));
         assert_eq!(pal.bubble_out_text, Color32::from_rgb(235, 240, 246));
+    }
+
+    #[test]
+    fn test_wcag_aa_contrast_matrix_dark_and_light() {
+        for pal in [ThemePalette::dark(), ThemePalette::light()] {
+            assert!(contrast_ratio(pal.primary_fg, pal.primary) >= 4.5);
+            assert!(contrast_ratio(pal.text_primary, pal.bg_app) >= 4.5);
+            assert!(contrast_ratio(pal.text_primary, pal.bg_elevated) >= 4.5);
+            assert!(contrast_ratio(pal.text_secondary, pal.bg_chat_canvas) >= 4.5);
+            assert!(contrast_ratio(pal.text_muted, pal.bg_chat_canvas) >= 4.5);
+            assert!(contrast_ratio(pal.text_muted, pal.bg_elevated) >= 4.5);
+            assert!(contrast_ratio(pal.accent_online, pal.bg_elevated) >= 4.5);
+            assert!(contrast_ratio(pal.danger_text, pal.bg_elevated) >= 4.5);
+            assert!(contrast_ratio(pal.warning, pal.bg_elevated) >= 4.5);
+            assert!(contrast_ratio(pal.link_text, pal.bg_chat_canvas) >= 4.5);
+            assert!(contrast_ratio(pal.bubble_out_text, pal.bubble_out_bg) >= 4.5);
+            assert!(contrast_ratio(pal.bubble_out_meta, pal.bubble_out_bg) >= 4.5);
+            assert!(contrast_ratio(pal.bubble_in_text, pal.bubble_in_bg) >= 4.5);
+            assert!(contrast_ratio(pal.bubble_in_meta, pal.bubble_in_bg) >= 4.5);
+        }
+    }
+
+    #[test]
+    fn test_emoji_to_tex_key_unknown_returns_empty() {
+        assert_eq!(emoji_to_tex_key("👍"), "like");
+        assert_eq!(emoji_to_tex_key("/-heart"), "heart");
+        assert_eq!(emoji_to_tex_key(":-(("), "cry");
+        assert_eq!(emoji_to_tex_key("🔥"), "");
+        assert_eq!(emoji_to_tex_key("🎉"), "");
+    }
+
+    #[test]
+    fn test_apply_to_ctx_syncs_dark_and_light_visuals() {
+        let ctx = egui::Context::default();
+        let dark = ThemePalette::dark();
+        dark.apply_to_ctx_with_anim(&ctx, true, 1.0);
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        let dark_style = ctx.style();
+        assert!(dark_style.visuals.dark_mode);
+        assert_eq!(dark_style.visuals.extreme_bg_color, dark.bg_input);
+        assert_eq!(dark_style.visuals.widgets.inactive.weak_bg_fill, dark.bg_elevated);
+        assert_eq!(dark_style.visuals.panel_fill, dark.bg_app);
+
+        let light = ThemePalette::light();
+        light.apply_to_ctx_with_anim(&ctx, false, 1.0);
+        assert_eq!(ctx.theme(), egui::Theme::Light);
+        let light_style = ctx.style();
+        assert!(!light_style.visuals.dark_mode);
+        assert_eq!(light_style.visuals.extreme_bg_color, light.bg_input);
+        assert_eq!(light_style.visuals.widgets.inactive.weak_bg_fill, light.bg_elevated);
+        assert_eq!(light_style.visuals.panel_fill, light.bg_app);
     }
 }

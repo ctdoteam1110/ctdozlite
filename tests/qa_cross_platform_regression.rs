@@ -732,3 +732,14 @@ fn qa_updater_asset_selection_and_transactional_rollback() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn qa_emoji_to_tex_key_known_and_unknown() {
+    assert_eq!(zalo_rust::gui::emoji_to_tex_key("👍"), "like");
+    assert_eq!(zalo_rust::gui::emoji_to_tex_key("❤️"), "heart");
+    assert_eq!(zalo_rust::gui::emoji_to_tex_key("🤔"), "");
+    assert_eq!(zalo_rust::gui::emoji_to_tex_key("🔥"), "");
+    for (emoji, tex_key, _) in zalo_rust::gui::REACTION_LIST {
+        assert_eq!(zalo_rust::gui::emoji_to_tex_key(emoji), tex_key);
+    }
+}

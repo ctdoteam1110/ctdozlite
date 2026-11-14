@@ -112,6 +112,9 @@ impl ZaloGuiApp {
             });
         }
 
+        let screen = ctx.screen_rect();
+        let dlg_w = (screen.width() - 24.0).clamp(240.0, 340.0);
+        let dlg_h = (screen.height() - 32.0).clamp(240.0, 380.0);
         let mut open = true;
         let mut next_tab = tab;
         egui::Window::new("Cảm xúc")
@@ -119,7 +122,7 @@ impl ZaloGuiApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(340.0, 380.0))
+            .fixed_size(Vec2::new(dlg_w, dlg_h))
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
@@ -137,7 +140,11 @@ impl ZaloGuiApp {
                     for s in &summaries {
                         let Some(kind) = s.r_type else { continue };
                         let label = RichText::new(s.count.to_string()).size(12.5).strong();
-                        let button = match self.emoji_textures.get(emoji_to_tex_key(&s.emoji)) {
+                        let tex_key = emoji_to_tex_key(&s.emoji);
+                        let button = match (!tex_key.is_empty())
+                            .then(|| self.emoji_textures.get(tex_key))
+                            .flatten()
+                        {
                             Some(tex) => egui::Button::image_and_text(
                                 egui::Image::new(tex).fit_to_exact_size(Vec2::splat(16.0)),
                                 label,
@@ -209,7 +216,11 @@ impl ZaloGuiApp {
                                                     .color(pal.text_secondary),
                                             );
                                         }
-                                        match self.emoji_textures.get(emoji_to_tex_key(emoji)) {
+                                        let tex_key = emoji_to_tex_key(emoji);
+                                        match (!tex_key.is_empty())
+                                            .then(|| self.emoji_textures.get(tex_key))
+                                            .flatten()
+                                        {
                                             Some(tex) => {
                                                 ui.add(
                                                     egui::Image::new(tex)

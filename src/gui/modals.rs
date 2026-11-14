@@ -492,59 +492,22 @@ impl ZaloGuiApp {
     pub(super) fn render_toast_overlay(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         fn get_desktop_bottom_right_pos(ctx: &egui::Context, popup_w: f32, popup_h: f32) -> Pos2 {
             #[cfg(target_os = "windows")]
-            {
-                #[repr(C)]
-                #[derive(Default)]
-                struct WinRect {
-                    left: i32,
-                    top: i32,
-                    right: i32,
-                    bottom: i32,
-                }
-                #[link(name = "user32")]
-                extern "system" {
-                    fn SystemParametersInfoW(
-                        ui_action: u32,
-                        ui_param: u32,
-                        pv_param: *mut WinRect,
-                        f_win_ini: u32,
-                    ) -> i32;
-                    fn GetDC(hwnd: usize) -> usize;
-                    fn ReleaseDC(hwnd: usize, hdc: usize) -> i32;
-                }
-                #[link(name = "gdi32")]
-                extern "system" {
-                    fn GetDeviceCaps(hdc: usize, index: i32) -> i32;
-                }
-                let mut work = WinRect::default();
-                let ok = unsafe { SystemParametersInfoW(0x0030, 0, &mut work, 0) };
-                if ok != 0 && work.right > work.left && work.bottom > work.top {
-                    let hdc = unsafe { GetDC(0) };
-                    let dpi_x = if hdc != 0 {
-                        let d = unsafe { GetDeviceCaps(hdc, 88) };
-                        unsafe { ReleaseDC(0, hdc) };
-                        d
-                    } else {
-                        96
-                    };
-                    let scale = if dpi_x > 0 {
-                        (dpi_x as f32 / 96.0).max(1.0)
-                    } else {
-                        ctx.pixels_per_point().max(1.0)
-                    };
-                    let right_pt = work.right as f32 / scale;
-                    let bottom_pt = work.bottom as f32 / scale;
-                    return Pos2::new(
-                        (right_pt - popup_w - 18.0).max(16.0),
-                        (bottom_pt - popup_h - 18.0).max(16.0),
-                    );
-                }
+            if let Some(work) = super::win32_frameless::active_window_work_area() {
+                let scale = ctx.pixels_per_point().max(1.0);
+                let left_pt = work.left as f32 / scale;
+                let top_pt = work.top as f32 / scale;
+                let right_pt = work.right as f32 / scale;
+                let bottom_pt = work.bottom as f32 / scale;
+                return Pos2::new(
+                    (right_pt - popup_w - 14.0).max(left_pt + 14.0),
+                    (bottom_pt - popup_h - 14.0).max(top_pt + 14.0),
+                );
             }
             if let Some(mon) = ctx.input(|i| i.viewport().monitor_size) {
                 if mon.x > popup_w && mon.y > popup_h {
                     return Pos2::new(
-                        (mon.x - popup_w - 18.0).max(16.0),
-                        (mon.y - popup_h - 48.0).max(16.0),
+                        (mon.x - popup_w - 14.0).max(14.0),
+                        (mon.y - popup_h - 48.0).max(14.0),
                     );
                 }
             }
@@ -563,13 +526,14 @@ impl ZaloGuiApp {
             if elapsed_ms >= POPUP_DURATION_MS || !self.settings.enable_notifications {
                 close_popup = true;
             } else {
+                const POPUP_TITLE: &str = "ctdozlite — Tin nhắn mới";
                 ctx.request_repaint_after(Duration::from_millis(40));
-                let popup_w = 380.0_f32;
-                let popup_h = 156.0_f32;
+                let popup_w = 376.0_f32;
+                let popup_h = 148.0_f32;
                 let corner_pos = get_desktop_bottom_right_pos(ctx, popup_w, popup_h);
                 let vp_id = egui::ViewportId::from_hash_of("zalo_corner_notification_popup");
                 let builder = egui::ViewportBuilder::default()
-                    .with_title("ctdozlite — Tin nhắn mới")
+                    .with_title(POPUP_TITLE)
                     .with_decorations(false)
                     .with_always_on_top()
                     .with_taskbar(false)
@@ -590,9 +554,15 @@ impl ZaloGuiApp {
                 let logo_tex = self.app_logo_texture.clone();
                 let mut draft_local = popup.reply_draft.clone();
                 let mut paused = !draft_local.trim().is_empty();
+                let anim_enabled = self.settings.animations_enabled;
+                let anim_speed = self.settings.normalized_animation_speed();
 
                 ctx.show_viewport_immediate(vp_id, builder, |vp_ctx, _class| {
-                    pal.apply_to_ctx(vp_ctx);
+                    #[cfg(target_os = "windows")]
+                    if super::win32_frameless::sync_frameless_window_by_title(POPUP_TITLE, true) {
+                        vp_ctx.request_repaint();
+                    }
+                    pal.apply_to_ctx_with_anim(vp_ctx, anim_enabled, anim_speed);
                     vp_ctx.request_repaint_after(Duration::from_millis(40));
                     if vp_ctx.input(|i| i.pointer.has_pointer()) {
                         paused = true;
@@ -615,8 +585,8 @@ impl ZaloGuiApp {
                             // Top accent line
                             ui.painter().rect_filled(
                                 Rect::from_min_size(
-                                    Pos2::new(full_rect.left() - 12.0, full_rect.top() - 10.0),
-                                    Vec2::new(popup_w, 3.0),
+                                    Pos2::new(full_rect.left() - 14.0, full_rect.top() - 10.0),
+                                    Vec2::new(popup_w, 2.0),
                                 ),
                                 Rounding {
                                     nw: 12.0,
@@ -819,7 +789,7 @@ impl ZaloGuiApp {
                                         egui::Button::new(
                                             RichText::new("Gửi")
                                                 .size(12.0)
-                                                .color(Color32::WHITE)
+                                                .color(pal.primary_fg)
                                                 .strong(),
                                         )
                                         .fill(pal.primary)
@@ -910,12 +880,24 @@ impl ZaloGuiApp {
             self.toast_notice = None;
             return;
         }
-        ctx.request_repaint_after(Duration::from_millis(200));
+        let slide = if self.settings.animations_enabled {
+            let dur = (0.18 / self.settings.normalized_animation_speed()).max(0.05);
+            let raw = (ts.elapsed().as_secs_f32() / dur).clamp(0.0, 1.0);
+            if raw < 1.0 {
+                ctx.request_repaint();
+            }
+            self.anim_value(ctx, Id::new("floating_toast_slide"), raw, 0.08)
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(200));
+            1.0
+        };
+        let toast_w = (screen.width() - 28.0).clamp(180.0, 340.0);
+        let slide_y = (1.0 - slide) * 14.0;
         egui::Area::new(Id::new("floating_toast_notice"))
             .order(egui::Order::Tooltip)
             .fixed_pos(Pos2::new(
-                (screen.right() - 320.0).max(80.0),
-                screen.bottom() - 54.0,
+                (screen.right() - toast_w - 14.0).max(screen.left() + 14.0),
+                (screen.bottom() - 54.0 + slide_y).max(screen.top() + 14.0),
             ))
             .interactable(false)
             .show(ctx, |ui| {
@@ -925,15 +907,33 @@ impl ZaloGuiApp {
                     .rounding(Rounding::same(10.0))
                     .inner_margin(Margin::symmetric(14.0, 9.0))
                     .show(ui, |ui| {
+                        ui.set_max_width((toast_w - 28.0).max(120.0));
+                        let max_r = ui.max_rect();
+                        ui.painter().rect_filled(
+                            Rect::from_min_size(
+                                Pos2::new(max_r.left() - 14.0, max_r.top() - 9.0),
+                                Vec2::new(2.0, 32.0),
+                            ),
+                            Rounding {
+                                nw: 10.0,
+                                sw: 10.0,
+                                ne: 0.0,
+                                se: 0.0,
+                            },
+                            pal.primary,
+                        );
                         ui.horizontal(|ui| {
                             let (dr, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
                             ui.painter()
                                 .circle_filled(dr.center(), 4.0, pal.accent_online);
-                            ui.label(
-                                RichText::new(text)
-                                    .size(12.0)
-                                    .color(pal.text_primary)
-                                    .strong(),
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(text)
+                                        .size(12.0)
+                                        .color(pal.text_primary)
+                                        .strong(),
+                                )
+                                .wrap(),
                             );
                         });
                     });
@@ -1343,8 +1343,14 @@ impl ZaloGuiApp {
 
         let mut open = true;
         let screen = ctx.screen_rect();
-        let win_w = (screen.width() * 0.88).clamp(620.0, 780.0);
-        let win_h = (screen.height() * 0.82).clamp(480.0, 600.0);
+        let win_w = (screen.width() * 0.90)
+            .min(screen.width() - 16.0)
+            .clamp(280.0, 780.0);
+        let win_h = (screen.height() * 0.88)
+            .min(screen.height() - 16.0)
+            .clamp(260.0, 600.0);
+        let sidebar_w = if win_w < 560.0 { 148.0 } else { 200.0 };
+        let content_pad_x = if win_w < 560.0 { 12.0 } else { 24.0 };
         let modal_rect = Rect::from_center_size(screen.center(), Vec2::new(win_w, win_h));
 
         // Full-screen blurred & dimmed backdrop behind the Settings modal (blocks background clicks)
@@ -1426,12 +1432,12 @@ impl ZaloGuiApp {
                     Stroke::new(1.6_f32, pal.primary_hover);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    // Left Tabs Navigation Sidebar (200px)
+                    // Left Tabs Navigation Sidebar
                     egui::Frame::none()
                         .fill(pal.bg_sidebar)
                         .inner_margin(Margin::symmetric(10.0, 16.0))
                         .show(ui, |ui| {
-                            ui.set_width(200.0);
+                            ui.set_width(sidebar_w);
                             ui.set_height(win_h - 32.0);
                             ui.vertical(|ui| {
                                 ui.add_space(4.0);
@@ -1441,117 +1447,123 @@ impl ZaloGuiApp {
                                         .color(pal.text_primary)
                                         .strong(),
                                 );
-                                ui.add_space(14.0);
+                                ui.add_space(10.0);
 
-                                let tabs = [
-                                    (SettingsTab::General, lucide::SETTINGS, "Cài đặt chung"),
-                                    (SettingsTab::Account, lucide::USER, "Tài khoản"),
-                                    (SettingsTab::Privacy, lucide::LOCK, "Quyền riêng tư"),
-                                    (SettingsTab::Sync, lucide::REFRESH, "Đồng bộ tin nhắn"),
-                                    (SettingsTab::Appearance, lucide::PAINTBRUSH, "Giao diện"),
-                                    (SettingsTab::Notifications, lucide::BELL, "Thông báo"),
-                                    (SettingsTab::Messages, lucide::MESSAGE_SQUARE, "Tin nhắn"),
-                                    (SettingsTab::Utilities, lucide::SLIDERS, "Tiện ích"),
-                                    (SettingsTab::Update, lucide::SPARKLES, "Cập nhật"),
-                                ];
-                                for (tab, icon, title) in tabs {
-                                    let is_active = self.settings_tab == tab;
-                                    let text_col = if is_active {
-                                        pal.primary_hover
-                                    } else {
-                                        pal.text_secondary
-                                    };
-
-                                    let (rect, resp) = ui.allocate_exact_size(
-                                        Vec2::new(196.0, 36.0),
-                                        Sense::click(),
-                                    );
-                                    if is_active || resp.hovered() {
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            Rounding::same(8.0),
-                                            if is_active {
-                                                pal.bg_selected
+                                egui::ScrollArea::vertical()
+                                    .id_salt("settings_sidebar_tabs_scroll")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        let tab_w = (sidebar_w - 4.0).max(120.0);
+                                        let tabs = [
+                                            (SettingsTab::General, lucide::SETTINGS, "Cài đặt chung"),
+                                            (SettingsTab::Account, lucide::USER, "Tài khoản"),
+                                            (SettingsTab::Privacy, lucide::LOCK, "Quyền riêng tư"),
+                                            (SettingsTab::Sync, lucide::REFRESH, "Đồng bộ tin nhắn"),
+                                            (SettingsTab::Appearance, lucide::PAINTBRUSH, "Giao diện"),
+                                            (SettingsTab::Notifications, lucide::BELL, "Thông báo"),
+                                            (SettingsTab::Messages, lucide::MESSAGE_SQUARE, "Tin nhắn"),
+                                            (SettingsTab::Utilities, lucide::SLIDERS, "Tiện ích"),
+                                            (SettingsTab::Update, lucide::SPARKLES, "Cập nhật"),
+                                        ];
+                                        for (tab, icon, title) in tabs {
+                                            let is_active = self.settings_tab == tab;
+                                            let text_col = if is_active {
+                                                pal.primary_hover
                                             } else {
-                                                pal.bg_hover
-                                            },
+                                                pal.text_secondary
+                                            };
+
+                                            let (rect, resp) = ui.allocate_exact_size(
+                                                Vec2::new(tab_w, 36.0),
+                                                Sense::click(),
+                                            );
+                                            if is_active || resp.hovered() {
+                                                ui.painter().rect_filled(
+                                                    rect,
+                                                    Rounding::same(8.0),
+                                                    if is_active {
+                                                        pal.bg_selected
+                                                    } else {
+                                                        pal.bg_hover
+                                                    },
+                                                );
+                                            }
+                                            let icon_pt = Pos2::new(rect.left() + 14.0, rect.center().y);
+                                            draw_lucide_icon(
+                                                ui.painter(),
+                                                icon_pt,
+                                                icon,
+                                                14.5,
+                                                text_col,
+                                            );
+                                            let text_pt = Pos2::new(rect.left() + 34.0, rect.center().y);
+                                            ui.painter().text(
+                                                text_pt,
+                                                egui::Align2::LEFT_CENTER,
+                                                title,
+                                                FontId::proportional(13.0),
+                                                if is_active {
+                                                    pal.text_primary
+                                                } else {
+                                                    text_col
+                                                },
+                                            );
+
+                                            if resp
+                                                .on_hover_cursor(CursorIcon::PointingHand)
+                                                .clicked()
+                                            {
+                                                self.settings_tab = tab;
+                                            }
+                                            ui.add_space(2.0);
+                                        }
+                                        ui.add_space(8.0);
+                                        ui.separator();
+                                        ui.add_space(8.0);
+
+                                        let (lo_rect, lo_resp) = ui.allocate_exact_size(
+                                            Vec2::new(tab_w, 36.0),
+                                            Sense::click(),
                                         );
-                                    }
-                                    let icon_pt = Pos2::new(rect.left() + 18.0, rect.center().y);
-                                    draw_lucide_icon(
-                                        ui.painter(),
-                                        icon_pt,
-                                        icon,
-                                        14.5,
-                                        text_col,
-                                    );
-                                    let text_pt = Pos2::new(rect.left() + 38.0, rect.center().y);
-                                    ui.painter().text(
-                                        text_pt,
-                                        egui::Align2::LEFT_CENTER,
-                                        title,
-                                        FontId::proportional(13.2),
-                                        if is_active {
-                                            pal.text_primary
-                                        } else {
-                                            text_col
-                                        },
-                                    );
-
-                                    if resp
-                                        .on_hover_cursor(CursorIcon::PointingHand)
-                                        .clicked()
-                                    {
-                                        self.settings_tab = tab;
-                                    }
-                                    ui.add_space(2.0);
-                                }
-                                ui.add_space(8.0);
-                                ui.separator();
-                                ui.add_space(8.0);
-
-                                let (lo_rect, lo_resp) = ui.allocate_exact_size(
-                                    Vec2::new(196.0, 36.0),
-                                    Sense::click(),
-                                );
-                                if lo_resp.hovered() {
-                                    ui.painter().rect_filled(
-                                        lo_rect,
-                                        Rounding::same(8.0),
-                                        pal.danger.linear_multiply(0.18),
-                                    );
-                                }
-                                let lo_icon_pt = Pos2::new(lo_rect.left() + 18.0, lo_rect.center().y);
-                                draw_lucide_icon(
-                                    ui.painter(),
-                                    lo_icon_pt,
-                                    lucide::LOG_OUT,
-                                    14.5,
-                                    pal.danger,
-                                );
-                                let lo_text_pt = Pos2::new(lo_rect.left() + 38.0, lo_rect.center().y);
-                                ui.painter().text(
-                                    lo_text_pt,
-                                    egui::Align2::LEFT_CENTER,
-                                    "Đăng xuất",
-                                    FontId::proportional(13.2),
-                                    pal.danger,
-                                );
-                                if lo_resp
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Đăng xuất khỏi tài khoản Zalo hiện tại")
-                                    .clicked()
-                                {
-                                    do_logout = true;
-                                }
+                                        if lo_resp.hovered() {
+                                            ui.painter().rect_filled(
+                                                lo_rect,
+                                                Rounding::same(8.0),
+                                                pal.danger.linear_multiply(0.18),
+                                            );
+                                        }
+                                        let lo_icon_pt = Pos2::new(lo_rect.left() + 14.0, lo_rect.center().y);
+                                        draw_lucide_icon(
+                                            ui.painter(),
+                                            lo_icon_pt,
+                                            lucide::LOG_OUT,
+                                            14.5,
+                                            pal.danger,
+                                        );
+                                        let lo_text_pt = Pos2::new(lo_rect.left() + 34.0, lo_rect.center().y);
+                                        ui.painter().text(
+                                            lo_text_pt,
+                                            egui::Align2::LEFT_CENTER,
+                                            "Đăng xuất",
+                                            FontId::proportional(13.0),
+                                            pal.danger,
+                                        );
+                                        if lo_resp
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .on_hover_text("Đăng xuất khỏi tài khoản Zalo hiện tại")
+                                            .clicked()
+                                        {
+                                            do_logout = true;
+                                        }
+                                    });
                             });
                         });
 
                     // Right Content Panel
-                    let content_w = (win_w - 268.0).max(350.0);
+                    let content_w = (win_w - sidebar_w - 20.0 - content_pad_x * 2.0).max(160.0);
                     egui::Frame::none()
                         .fill(pal.bg_chat_canvas)
-                        .inner_margin(Margin::symmetric(24.0, 16.0))
+                        .inner_margin(Margin::symmetric(content_pad_x, 16.0))
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
                                 ui.set_min_width(content_w);
@@ -2368,12 +2380,17 @@ impl ZaloGuiApp {
                                                 .rounding(Rounding::same(10.0))
                                                 .inner_margin(Margin::symmetric(18.0, 16.0))
                                                 .show(ui, |ui| {
-                                                    let card_avail_w = (inner_w - 36.0).max(300.0);
+                                                    let card_avail_w = (inner_w - 36.0).max(160.0);
                                                     ui.set_min_width(card_avail_w);
                                                     ui.set_max_width(card_avail_w);
                                                     ui.horizontal(|ui| {
-                                                        let col_w = 132.0_f32;
-                                                        let gap = 18.0_f32;
+                                                        let col_w = ((card_avail_w - 24.0) / 3.0)
+                                                            .clamp(76.0, 132.0);
+                                                        let gap = if col_w < 110.0 {
+                                                            8.0_f32
+                                                        } else {
+                                                            18.0_f32
+                                                        };
                                                         let total_w = col_w * 3.0 + gap * 2.0;
                                                         let left_pad =
                                                             ((card_avail_w - total_w) * 0.5).max(0.0);
@@ -2394,7 +2411,7 @@ impl ZaloGuiApp {
                                                                 |ui| {
                                                                     let (card_r, c_resp) =
                                                                         ui.allocate_exact_size(
-                                                                            Vec2::new(132.0, 84.0),
+                                                                            Vec2::new(col_w, 84.0),
                                                                             Sense::click(),
                                                                         );
                                                                     let stroke_col = if selected {
@@ -2530,7 +2547,11 @@ impl ZaloGuiApp {
                                                                     {
                                                                         self.settings.theme_mode =
                                                                             mode_key.into();
-                                                                        self.dark_mode = is_dark_val;
+                                                                        self.dark_mode =
+                                                                            super::resolve_dark_mode(
+                                                                                &self.settings.theme_mode,
+                                                                                ui.ctx(),
+                                                                            );
                                                                         theme_switched = true;
                                                                     }
                                                                 },
@@ -2628,6 +2649,82 @@ impl ZaloGuiApp {
                                                     }
                                                     if scale_changed {
                                                         ui.ctx().set_zoom_factor(self.settings.normalized_font_scale());
+                                                        self.settings.save();
+                                                        ui.ctx().request_repaint();
+                                                    }
+                                                });
+                                            ui.add_space(16.0);
+
+                                            // ---------------------------------------------------------------
+                                            // Animation Controls (Toggle + Speed Presets/Slider)
+                                            // ---------------------------------------------------------------
+                                            ui.label(RichText::new("Hiệu ứng chuyển động").color(pal.text_primary).size(13.5).strong());
+                                            ui.add_space(6.0);
+                                            egui::Frame::none()
+                                                .fill(pal.bg_elevated)
+                                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                                .rounding(Rounding::same(8.0))
+                                                .inner_margin(Margin::symmetric(14.0, 12.0))
+                                                .show(ui, |ui| {
+                                                    let mut anim_changed = false;
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        if ui.checkbox(
+                                                            &mut self.settings.animations_enabled,
+                                                            RichText::new("Bật hiệu ứng mượt khi chuyển tab, mở drawer và popup")
+                                                                .color(pal.text_primary)
+                                                                .size(13.0)
+                                                                .strong(),
+                                                        ).changed() {
+                                                            anim_changed = true;
+                                                        }
+                                                    });
+                                                    ui.add_space(8.0);
+                                                    ui.add_enabled_ui(self.settings.animations_enabled, |ui| {
+                                                        ui.horizontal_wrapped(|ui| {
+                                                            ui.label(
+                                                                RichText::new("Tốc độ hiệu ứng:")
+                                                                    .color(pal.text_secondary)
+                                                                    .size(12.2),
+                                                            );
+                                                            for (lbl, spd) in [
+                                                                ("0.75x Chậm", 0.75_f32),
+                                                                ("1.0x Chuẩn", 1.0_f32),
+                                                                ("1.5x Nhanh", 1.5_f32),
+                                                            ] {
+                                                                let is_sel = (self.settings.animation_speed - spd).abs() < 0.05;
+                                                                if ui.selectable_label(is_sel, lbl).clicked() {
+                                                                    self.settings.animation_speed = spd;
+                                                                    anim_changed = true;
+                                                                }
+                                                            }
+                                                        });
+                                                        ui.add_space(4.0);
+                                                        ui.horizontal(|ui| {
+                                                            let norm = self.settings.normalized_animation_speed();
+                                                            ui.label(
+                                                                RichText::new(format!("{norm:.2}x"))
+                                                                    .color(pal.text_secondary)
+                                                                    .size(12.0),
+                                                            );
+                                                            let mut spd = norm;
+                                                            let slider = egui::Slider::new(&mut spd, 0.5_f32..=2.0_f32)
+                                                                .step_by(0.05)
+                                                                .suffix("x")
+                                                                .show_value(true);
+                                                            if ui.add(slider).changed() {
+                                                                self.settings.animation_speed = (spd * 20.0).round() / 20.0;
+                                                                anim_changed = true;
+                                                            }
+                                                        });
+                                                    });
+                                                    if anim_changed {
+                                                        self.settings.animation_speed = self.settings.normalized_animation_speed();
+                                                        pal.apply_to_ctx_with_anim(
+                                                            ui.ctx(),
+                                                            self.settings.animations_enabled,
+                                                            self.settings.animation_speed,
+                                                        );
+                                                        self.theme_dirty = true;
                                                         self.settings.save();
                                                         ui.ctx().request_repaint();
                                                     }
@@ -3487,7 +3584,7 @@ impl ZaloGuiApp {
                                                         ui.vertical(|ui| {
                                                             ui.horizontal(|ui| {
                                                                 ui.label(
-                                                                    RichText::new("Zalo Lite")
+                                                                    RichText::new("ctdozlite")
                                                                         .size(15.0)
                                                                         .color(pal.text_primary)
                                                                         .strong(),
@@ -4914,12 +5011,16 @@ impl ZaloGuiApp {
         let Some((msg_id, current)) = self.edit_history_open.clone() else {
             return;
         };
+        let screen = ctx.screen_rect();
         let mut open = true;
         egui::Window::new("Lịch sử sửa")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_size([420.0, 320.0])
+            .default_size([
+                (screen.width() - 24.0).clamp(260.0, 420.0),
+                (screen.height() - 32.0).clamp(220.0, 320.0),
+            ])
             .show(ctx, |ui| {
                 let items = self.edit_history_cache.get(&msg_id).cloned().unwrap_or_default();
                 if items.is_empty() {
@@ -4969,11 +5070,15 @@ impl ZaloGuiApp {
         let mut open = true;
         let mut changed = false;
         let mut delete_idx: Option<usize> = None;
+        let screen = ctx.screen_rect();
         egui::Window::new("Quản lý thư mục chat")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_size([440.0, 480.0])
+            .default_size([
+                (screen.width() - 24.0).clamp(260.0, 440.0),
+                (screen.height() - 32.0).clamp(240.0, 480.0),
+            ])
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new("Nhóm hội thoại thành tab lọc kiểu Telegram.")
@@ -5138,11 +5243,15 @@ impl ZaloGuiApp {
         let mut jump_to: Option<(usize, String)> = None;
         let mut unsave: Option<String> = None;
         let mut save_note: Option<(String, String, String, i64)> = None;
+        let screen = ctx.screen_rect();
         egui::Window::new("Đã lưu")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_size([460.0, 520.0])
+            .default_size([
+                (screen.width() - 24.0).clamp(260.0, 460.0),
+                (screen.height() - 32.0).clamp(240.0, 520.0),
+            ])
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new("Tin đã lưu (mọi hội thoại). Star = lưu, đồng bộ 2 chiều.")
@@ -5479,9 +5588,11 @@ impl ZaloGuiApp {
                             pal.accent_online.linear_multiply(0.16)
                         };
                         let pill_fg = if has_err {
-                            Color32::from_rgb(252, 165, 165)
-                        } else {
+                            pal.danger_text
+                        } else if pal.is_dark {
                             Color32::from_rgb(110, 231, 183)
+                        } else {
+                            Color32::from_rgb(4, 120, 87)
                         };
                         let badge_txt = if call.is_group {
                             format!("{} Họp Zavi", lucide::VIDEO)
@@ -5725,7 +5836,7 @@ impl ZaloGuiApp {
                             ui.label(
                                 RichText::new("Cuộc gọi chưa kết nối được")
                                     .size(12.5)
-                                    .color(Color32::from_rgb(248, 113, 113))
+                                    .color(pal.danger_text)
                                     .strong(),
                             );
                             ui.add_space(6.0);
@@ -5740,14 +5851,14 @@ impl ZaloGuiApp {
                             ui.painter().rect_filled(
                                 err_rect,
                                 Rounding::same(10.0),
-                                Color32::from_rgba_unmultiplied(127, 29, 29, 68),
+                                pal.danger.linear_multiply(0.14),
                             );
                             ui.painter().rect_stroke(
                                 err_rect,
                                 Rounding::same(10.0),
                                 Stroke::new(
                                     1.0_f32,
-                                    Color32::from_rgba_unmultiplied(239, 68, 68, 110),
+                                    pal.danger.linear_multiply(0.45),
                                 ),
                             );
                             ui.painter().text(
@@ -5755,7 +5866,7 @@ impl ZaloGuiApp {
                                 egui::Align2::CENTER_CENTER,
                                 truncate_chars(clean_err, 58),
                                 FontId::proportional(12.0),
-                                Color32::from_rgb(254, 226, 226),
+                                pal.danger_text,
                             );
                         } else {
                             let status_full = format!("{}  ·  {}", call.state_label, timer_str);
@@ -5763,7 +5874,7 @@ impl ZaloGuiApp {
                                 f.layout_no_wrap(
                                     status_full,
                                     FontId::proportional(13.0),
-                                    Color32::WHITE,
+                                    pal.text_primary,
                                 )
                                 .size()
                                 .x
@@ -5781,7 +5892,7 @@ impl ZaloGuiApp {
                             ui.painter().rect_filled(
                                 pill_rect,
                                 Rounding::same(14.0),
-                                Color32::from_rgb(30, 41, 59),
+                                pal.bg_elevated,
                             );
                             ui.painter().rect_stroke(
                                 pill_rect,
@@ -5794,7 +5905,7 @@ impl ZaloGuiApp {
                                 0.0,
                                 egui::TextFormat {
                                     font_id: FontId::proportional(12.5),
-                                    color: Color32::from_rgb(203, 213, 225),
+                                    color: pal.text_primary,
                                     ..Default::default()
                                 },
                             );
@@ -5807,12 +5918,17 @@ impl ZaloGuiApp {
                                     ..Default::default()
                                 },
                             );
+                            let timer_col = if pal.is_dark {
+                                pal.accent_online
+                            } else {
+                                Color32::from_rgb(4, 120, 87)
+                            };
                             job.append(
                                 &timer_str,
                                 0.0,
                                 egui::TextFormat {
                                     font_id: FontId::monospace(13.0),
-                                    color: pal.accent_online,
+                                    color: timer_col,
                                     ..Default::default()
                                 },
                             );
@@ -6693,8 +6809,6 @@ impl ZaloGuiApp {
                                         }
                                         if let Some(sr) = strip_rs.get(s_i).copied() {
                                             out[i] = sr;
-                                        } else {
-                                            out[i] = main_r;
                                         }
                                         s_i += 1;
                                     }
@@ -6709,7 +6823,11 @@ impl ZaloGuiApp {
                                     !call.mic_muted && crate::media::mic_level_permille() > 45;
 
                                 for idx in 0..n_tiles {
-                                    let Some(tile_rect) = tile_rects.get(idx).copied() else {
+                                    let Some(tile_rect) = tile_rects
+                                        .get(idx)
+                                        .copied()
+                                        .filter(|r| *r != Rect::NOTHING && r.is_positive())
+                                    else {
                                         continue;
                                     };
                                     let global_idx = page_start + idx;
@@ -7245,6 +7363,7 @@ impl ZaloGuiApp {
         if !self.wipe_confirm_open {
             return;
         }
+        let screen = ctx.screen_rect();
         let mut open = true;
         let mut confirm = false;
         let mut cancel = false;
@@ -7253,57 +7372,70 @@ impl ZaloGuiApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(380.0, 150.0))
+            .fixed_size(Vec2::new(
+                (screen.width() - 24.0).clamp(260.0, 380.0),
+                (screen.height() - 32.0).clamp(150.0, 210.0),
+            ))
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new(
-                        "Xoá zalo_history.db và threads_cache.json trên máy này. \
-                         Không thể hoàn tác, và tin nhắn cũ chỉ tải lại được từ đám mây Zalo.",
-                    )
-                    .size(12.5)
-                    .color(pal.text_secondary),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Phiên đăng nhập trong session.json giữ nguyên.")
-                        .size(12.0)
-                        .color(pal.text_muted),
-                );
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_sized(
-                            [140.0, 30.0],
-                            egui::Button::new(
-                                RichText::new("Xoá dữ liệu")
-                                    .size(12.5)
-                                    .color(pal.danger)
-                                    .strong(),
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(
+                                    "Xoá zalo_history.db và threads_cache.json trên máy này. \
+                                     Không thể hoàn tác, và tin nhắn cũ chỉ tải lại được từ đám mây Zalo.",
+                                )
+                                .size(12.5)
+                                .color(pal.text_secondary),
                             )
-                            .fill(pal.danger.linear_multiply(0.12))
-                            .rounding(Rounding::same(7.0)),
-                        )
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        confirm = true;
-                    }
-                    if ui
-                        .add_sized(
-                            [100.0, 30.0],
-                            egui::Button::new(
-                                RichText::new("Huỷ").size(12.5).color(pal.text_secondary),
+                            .wrap(),
+                        );
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new("Phiên đăng nhập trong session.json giữ nguyên.")
+                                    .size(12.0)
+                                    .color(pal.text_muted),
                             )
-                            .fill(pal.bg_input)
-                            .stroke(Stroke::new(1.0_f32, pal.border))
-                            .rounding(Rounding::same(7.0)),
-                        )
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        cancel = true;
-                    }
-                });
+                            .wrap(),
+                        );
+                        ui.add_space(12.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_sized(
+                                    [140.0, 30.0],
+                                    egui::Button::new(
+                                        RichText::new("Xoá dữ liệu")
+                                            .size(12.5)
+                                            .color(pal.danger_text)
+                                            .strong(),
+                                    )
+                                    .fill(pal.danger.linear_multiply(0.12))
+                                    .rounding(Rounding::same(7.0)),
+                                )
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                confirm = true;
+                            }
+                            if ui
+                                .add_sized(
+                                    [100.0, 30.0],
+                                    egui::Button::new(
+                                        RichText::new("Huỷ").size(12.5).color(pal.text_secondary),
+                                    )
+                                    .fill(pal.bg_input)
+                                    .stroke(Stroke::new(1.0_f32, pal.border))
+                                    .rounding(Rounding::same(7.0)),
+                                )
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                cancel = true;
+                            }
+                        });
+                    });
             });
         if confirm {
             self.wipe_confirm_open = false;
@@ -7323,6 +7455,7 @@ impl ZaloGuiApp {
             self.logout_confirm_open = false;
             return;
         }
+        let screen = ctx.screen_rect();
         let mut open = true;
         let mut confirm = false;
         let mut cancel = false;
@@ -7331,63 +7464,76 @@ impl ZaloGuiApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(390.0, 165.0))
+            .fixed_size(Vec2::new(
+                (screen.width() - 24.0).clamp(260.0, 390.0),
+                (screen.height() - 32.0).clamp(165.0, 220.0),
+            ))
             .show(ctx, |ui| {
-                let acc_label = if self.user_name.trim().is_empty() {
-                    "tài khoản hiện tại".to_string()
-                } else {
-                    format!("tài khoản \"{}\"", self.user_name)
-                };
-                ui.label(
-                    RichText::new(format!("Bạn có chắc chắn muốn đăng xuất khỏi {acc_label}?"))
-                        .size(13.0)
-                        .color(pal.text_primary)
-                        .strong(),
-                );
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(
-                        "Phiên đăng nhập và lịch sử trò chuyện vẫn được lưu trong danh sách tài khoản trên thiết bị để bạn có thể đăng nhập lại chỉ với 1 cú nhấp mà không cần quét lại mã QR.",
-                    )
-                    .size(12.0)
-                    .color(pal.text_secondary),
-                );
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_sized(
-                            [140.0, 32.0],
-                            egui::Button::new(
-                                RichText::new("Đăng xuất")
-                                    .size(12.5)
-                                    .color(pal.danger)
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let acc_label = if self.user_name.trim().is_empty() {
+                            "tài khoản hiện tại".to_string()
+                        } else {
+                            format!("tài khoản \"{}\"", self.user_name)
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("Bạn có chắc chắn muốn đăng xuất khỏi {acc_label}?"))
+                                    .size(13.0)
+                                    .color(pal.text_primary)
                                     .strong(),
                             )
-                            .fill(pal.danger.linear_multiply(0.14))
-                            .stroke(Stroke::new(1.0_f32, pal.danger.linear_multiply(0.45)))
-                            .rounding(Rounding::same(7.0)),
-                        )
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        confirm = true;
-                    }
-                    if ui
-                        .add_sized(
-                            [105.0, 32.0],
-                            egui::Button::new(
-                                RichText::new("Hủy").size(12.5).color(pal.text_secondary),
+                            .wrap(),
+                        );
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(
+                                    "Phiên đăng nhập và lịch sử trò chuyện vẫn được lưu trong danh sách tài khoản trên thiết bị để bạn có thể đăng nhập lại chỉ với 1 cú nhấp mà không cần quét lại mã QR.",
+                                )
+                                .size(12.0)
+                                .color(pal.text_secondary),
                             )
-                            .fill(pal.bg_input)
-                            .stroke(Stroke::new(1.0_f32, pal.border))
-                            .rounding(Rounding::same(7.0)),
-                        )
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        cancel = true;
-                    }
-                });
+                            .wrap(),
+                        );
+                        ui.add_space(14.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_sized(
+                                    [140.0, 32.0],
+                                    egui::Button::new(
+                                        RichText::new("Đăng xuất")
+                                            .size(12.5)
+                                            .color(pal.danger_text)
+                                            .strong(),
+                                    )
+                                    .fill(pal.danger.linear_multiply(0.14))
+                                    .stroke(Stroke::new(1.0_f32, pal.danger.linear_multiply(0.45)))
+                                    .rounding(Rounding::same(7.0)),
+                                )
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                confirm = true;
+                            }
+                            if ui
+                                .add_sized(
+                                    [105.0, 32.0],
+                                    egui::Button::new(
+                                        RichText::new("Hủy").size(12.5).color(pal.text_secondary),
+                                    )
+                                    .fill(pal.bg_input)
+                                    .stroke(Stroke::new(1.0_f32, pal.border))
+                                    .rounding(Rounding::same(7.0)),
+                                )
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                cancel = true;
+                            }
+                        });
+                    });
             });
         if confirm {
             self.logout_confirm_open = false;
@@ -7587,6 +7733,7 @@ impl ZaloGuiApp {
             .filter(|t| query.is_empty() || t.name.to_lowercase().contains(&query))
             .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
             .collect();
+        let screen = ctx.screen_rect();
         let mut open = true;
         let mut chosen: Option<(String, bool, String)> = None;
         egui::Window::new("Chuyển tiếp tin nhắn")
@@ -7594,7 +7741,10 @@ impl ZaloGuiApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(360.0, 420.0))
+            .fixed_size(Vec2::new(
+                (screen.width() - 24.0).clamp(260.0, 360.0),
+                (screen.height() - 32.0).clamp(240.0, 420.0),
+            ))
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(format!("Nội dung: {preview}"))
@@ -8018,6 +8168,471 @@ impl ZaloGuiApp {
             self.image_viewer = None;
         } else {
             self.image_viewer = Some(viewer);
+        }
+    }
+
+    pub(super) fn render_video_player_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        let Some(mut viewer) = self.video_player.clone() else {
+            return;
+        };
+
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.video_player = None;
+            return;
+        }
+
+        let screen_rect = ctx.screen_rect();
+        // Start below the 32px custom frameless title bar so window controls stay accessible
+        let viewer_top = (screen_rect.top() + 32.0).min(screen_rect.bottom());
+        let toolbar_h = 46.0_f32;
+        let toolbar_rect = Rect::from_min_max(
+            Pos2::new(screen_rect.left(), viewer_top),
+            Pos2::new(
+                screen_rect.right(),
+                (viewer_top + toolbar_h).min(screen_rect.bottom()),
+            ),
+        );
+        let stage_area_rect = Rect::from_min_max(
+            Pos2::new(screen_rect.left(), toolbar_rect.bottom()),
+            screen_rect.max,
+        );
+        let mut should_close = false;
+        let mut trigger_play = ctx.input(|i| i.key_pressed(Key::Space) || i.key_pressed(Key::Enter));
+
+        // Check if video file has finished downloading to temp dir
+        if !viewer.is_downloaded {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            let hash = crate::crypto::md5_hex(&viewer.url);
+            let temp_file = std::env::temp_dir().join(format!("zlite_video_{hash}.mp4"));
+            if temp_file.exists()
+                && std::fs::metadata(&temp_file).map(|m| m.len() > 0).unwrap_or(false)
+            {
+                viewer.cached_path = Some(temp_file.clone());
+                viewer.is_downloaded = true;
+                viewer.is_downloading = false;
+                if viewer.play_on_download {
+                    viewer.play_on_download = false;
+                    let _ = open_external_url(temp_file.to_str().unwrap_or(&viewer.url));
+                    self.show_toast("🎬 Đang phát video bằng Windows Media Player…");
+                }
+            }
+        }
+
+        // Texture lookup
+        let active_tex = viewer
+            .thumb_key
+            .as_ref()
+            .and_then(|k| self.sticker_textures.get(k))
+            .cloned();
+
+        let max_stage_w = (stage_area_rect.width() - 48.0).max(160.0);
+        let max_stage_h = (stage_area_rect.height() - 96.0).max(120.0);
+
+        let (disp_w, disp_h) = if let Some(ref tex) = active_tex {
+            let [tw, th] = tex.size();
+            let tw_f = (tw.max(1)) as f32;
+            let th_f = (th.max(1)) as f32;
+            let fit_scale = (max_stage_w / tw_f).min(max_stage_h / th_f).min(2.0);
+            (tw_f * fit_scale, th_f * fit_scale)
+        } else {
+            (480.0_f32.min(max_stage_w), 270.0_f32.min(max_stage_h))
+        };
+
+        // 1. Stage Backdrop Canvas
+        egui::Area::new(Id::new("video_player_backdrop"))
+            .order(egui::Order::Foreground)
+            .constrain(false)
+            .fixed_pos(stage_area_rect.min)
+            .show(ctx, |ui| {
+                let (bg_rect, bg_resp) =
+                    ui.allocate_exact_size(stage_area_rect.size(), Sense::click());
+                let painter = ui.painter().with_clip_rect(bg_rect);
+                let bg_col = Color32::from_rgba_unmultiplied(12, 14, 18, 248);
+                painter.rect_filled(bg_rect, Rounding::ZERO, bg_col);
+
+                let video_center = Pos2::new(bg_rect.center().x, bg_rect.center().y - 28.0);
+                let video_rect = Rect::from_center_size(video_center, Vec2::new(disp_w, disp_h));
+
+                if let Some(ref tex) = active_tex {
+                    painter.image(
+                        tex.id(),
+                        video_rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    painter.rect_stroke(
+                        video_rect,
+                        Rounding::same(8.0),
+                        Stroke::new(1.0_f32, pal.border),
+                    );
+
+                    // Large Center Play Indicator
+                    let center_btn_r =
+                        Rect::from_center_size(video_rect.center(), Vec2::splat(68.0));
+                    let is_hovered = bg_resp
+                        .hover_pos()
+                        .map(|p| video_rect.contains(p))
+                        .unwrap_or(false);
+
+                    let btn_col = if is_hovered {
+                        pal.primary
+                    } else {
+                        Color32::from_black_alpha(150)
+                    };
+                    painter.circle_filled(center_btn_r.center(), 34.0, btn_col);
+                    painter.circle_stroke(
+                        center_btn_r.center(),
+                        34.0,
+                        Stroke::new(1.5_f32, Color32::WHITE),
+                    );
+                    draw_icon_play(
+                        &painter,
+                        center_btn_r.center() + Vec2::new(3.0, 0.0),
+                        28.0,
+                        Color32::WHITE,
+                    );
+
+                    let hint_pos = center_btn_r.center() + Vec2::new(0.0, 48.0);
+                    painter.text(
+                        hint_pos,
+                        egui::Align2::CENTER_CENTER,
+                        if viewer.is_downloading { "⏳ Đang tải video…" } else { "▶ Bấm để phát video" },
+                        FontId::proportional(13.0),
+                        Color32::WHITE,
+                    );
+
+                    if bg_resp.clicked() {
+                        let ptr = bg_resp
+                            .interact_pointer_pos()
+                            .or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+                        if let Some(p) = ptr {
+                            if video_rect.contains(p) {
+                                trigger_play = true;
+                            } else {
+                                should_close = true;
+                            }
+                        }
+                    }
+                } else {
+                    painter.rect_filled(video_rect, Rounding::same(8.0), pal.bg_elevated);
+                    painter.rect_stroke(
+                        video_rect,
+                        Rounding::same(8.0),
+                        Stroke::new(1.0_f32, pal.border),
+                    );
+                    painter.text(
+                        video_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if viewer.is_downloading { "⏳ Đang tải video…" } else { "▶ Bấm để phát video" },
+                        FontId::proportional(14.0),
+                        pal.text_primary,
+                    );
+                    if bg_resp.clicked() {
+                        trigger_play = true;
+                    }
+                }
+            });
+
+        // 2. Bottom Player Controls Dock (Glassmorphism Pill)
+        let controls_w = (stage_area_rect.width() - 48.0).clamp(320.0, 520.0);
+        let controls_h = 48.0_f32;
+        let controls_pos = Pos2::new(
+            stage_area_rect.center().x - controls_w * 0.5,
+            (stage_area_rect.bottom() - controls_h - 20.0).max(stage_area_rect.top() + 60.0),
+        );
+
+        egui::Area::new(Id::new("video_player_controls"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(controls_pos)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(Color32::from_rgba_unmultiplied(26, 29, 36, 240))
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding::same(24.0))
+                    .inner_margin(Margin::symmetric(14.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.set_min_size(Vec2::new(controls_w - 28.0, controls_h - 12.0));
+                        ui.set_max_size(Vec2::new(controls_w - 28.0, controls_h - 12.0));
+                        ui.horizontal_centered(|ui| {
+                            // Primary Play button
+                            let play_label = if viewer.is_downloading {
+                                "⏳ Đang tải video…"
+                            } else {
+                                "▶  Phát video"
+                            };
+                            let play_btn = egui::Button::new(
+                                RichText::new(play_label)
+                                    .size(13.0)
+                                    .color(pal.primary_fg)
+                                    .strong(),
+                            )
+                            .fill(pal.primary)
+                            .stroke(Stroke::new(1.0_f32, pal.primary_hover))
+                            .rounding(Rounding::same(16.0))
+                            .min_size(Vec2::new(130.0, 32.0));
+                            if ui
+                                .add(play_btn)
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .on_hover_text("Phát video đầy đủ âm thanh và hình ảnh (Windows Media Player)")
+                                .clicked()
+                            {
+                                trigger_play = true;
+                            }
+
+                            ui.add_space(8.0);
+
+                            // Status / Info
+                            let status_text = if viewer.is_downloaded {
+                                "✅ Đã tải về bộ nhớ đệm"
+                            } else {
+                                "⏳ Đang kết nối máy chủ…"
+                            };
+                            ui.label(
+                                RichText::new(status_text)
+                                    .size(12.0)
+                                    .color(pal.text_muted),
+                            );
+
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+
+                                // Close button [Esc]
+                                let close_dock_btn = egui::Button::new(
+                                    RichText::new("✕ Đóng")
+                                        .size(11.8)
+                                        .color(pal.text_secondary),
+                                )
+                                .fill(pal.bg_elevated)
+                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .rounding(Rounding::same(14.0))
+                                .min_size(Vec2::new(64.0, 28.0));
+                                if ui
+                                    .add(close_dock_btn)
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("Đóng xem video (Esc)")
+                                    .clicked()
+                                {
+                                    should_close = true;
+                                }
+
+                                // Open in OS Player button
+                                let os_btn = egui::Button::new(
+                                    RichText::new(format!("{} Mở trình phát máy", lucide::EXTERNAL_LINK))
+                                        .size(11.8)
+                                        .color(pal.text_primary),
+                                )
+                                .fill(pal.bg_elevated)
+                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .rounding(Rounding::same(14.0))
+                                .min_size(Vec2::new(130.0, 28.0));
+                                if ui
+                                    .add(os_btn)
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    trigger_play = true;
+                                }
+                            });
+                        });
+                    });
+            });
+
+        // Handle Play request (from click, space, enter, dock)
+        if trigger_play {
+            if let Some(ref cp) = viewer.cached_path {
+                let _ = open_external_url(cp.to_str().unwrap_or(&viewer.url));
+                self.show_toast("🎬 Đang phát video bằng Windows Media Player…");
+            } else {
+                let hash = crate::crypto::md5_hex(&viewer.url);
+                let temp_path = std::env::temp_dir().join(format!("zlite_video_{hash}.mp4"));
+                if temp_path.exists()
+                    && std::fs::metadata(&temp_path).map(|m| m.len() > 0).unwrap_or(false)
+                {
+                    viewer.cached_path = Some(temp_path.clone());
+                    viewer.is_downloaded = true;
+                    viewer.is_downloading = false;
+                    let _ = open_external_url(temp_path.to_str().unwrap_or(&viewer.url));
+                    self.show_toast("🎬 Đang phát video bằng Windows Media Player…");
+                } else {
+                    viewer.play_on_download = true;
+                    self.show_toast("⏳ Đang tải video để phát… Vui lòng đợi trong giây lát");
+                }
+            }
+        }
+
+        // 3. Top Toolbar Bar
+        let clean_title = if viewer.title.trim().is_empty() || viewer.title == "Video" {
+            "Xem Video".to_string()
+        } else {
+            truncate_chars(&viewer.title, 40).to_string()
+        };
+
+        egui::Area::new(Id::new("video_player_top_bar"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(toolbar_rect.min)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(pal.bg_sidebar)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .inner_margin(Margin::symmetric(16.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.set_min_size(Vec2::new(
+                            (toolbar_rect.width() - 32.0).max(200.0),
+                            toolbar_h - 12.0,
+                        ));
+                        ui.set_max_size(Vec2::new(
+                            (toolbar_rect.width() - 32.0).max(200.0),
+                            toolbar_h - 12.0,
+                        ));
+                        ui.horizontal_centered(|ui| {
+                            // Left badge + title + sender
+                            let (badge_r, _) =
+                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                            ui.painter()
+                                .rect_filled(badge_r, Rounding::same(6.0), pal.bg_elevated);
+                            draw_lucide_icon(
+                                ui.painter(),
+                                badge_r.center(),
+                                lucide::FILM,
+                                15.0,
+                                pal.primary_hover,
+                            );
+                            ui.add_space(4.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                ui.label(
+                                    RichText::new(&clean_title)
+                                        .size(13.0)
+                                        .color(pal.text_primary)
+                                        .strong(),
+                                );
+                                let sub = if viewer.time.is_empty() {
+                                    viewer.sender.clone()
+                                } else {
+                                    format!("Gửi bởi {} lúc {}", viewer.sender, viewer.time)
+                                };
+                                ui.label(RichText::new(sub).size(11.0).color(pal.text_muted));
+                            });
+
+                            // Right controls: Save to disk + Copy link + Close
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+
+                                // Close button [X]
+                                let (close_r, close_resp) =
+                                    ui.allocate_exact_size(Vec2::new(30.0, 28.0), Sense::click());
+                                ui.painter().rect_filled(
+                                    close_r,
+                                    Rounding::same(6.0),
+                                    if close_resp.hovered() {
+                                        pal.danger
+                                    } else {
+                                        pal.bg_elevated
+                                    },
+                                );
+                                ui.painter().rect_stroke(
+                                    close_r,
+                                    Rounding::same(6.0),
+                                    Stroke::new(1.0_f32, pal.border),
+                                );
+                                draw_lucide_icon(
+                                    ui.painter(),
+                                    close_r.center(),
+                                    lucide::X,
+                                    14.5,
+                                    if close_resp.hovered() {
+                                        Color32::WHITE
+                                    } else {
+                                        pal.text_secondary
+                                    },
+                                );
+                                if close_resp
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("Đóng xem video (Esc)")
+                                    .clicked()
+                                {
+                                    should_close = true;
+                                }
+
+                                // Save to disk button
+                                let save_btn = egui::Button::new(
+                                    RichText::new("📥 Lưu về máy")
+                                        .size(11.8)
+                                        .color(pal.text_primary),
+                                )
+                                .fill(pal.bg_elevated)
+                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .rounding(Rounding::same(6.0))
+                                .min_size(Vec2::new(88.0, 28.0));
+                                if ui
+                                    .add(save_btn)
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("Lưu video vào thư mục Tải về")
+                                    .clicked()
+                                {
+                                    let download_dir = if self.settings.download_dir.trim().is_empty() {
+                                        std::env::temp_dir()
+                                    } else {
+                                        std::path::PathBuf::from(self.settings.download_dir.trim())
+                                    };
+                                    let _ = std::fs::create_dir_all(&download_dir);
+                                    let dest_name = if viewer.title.ends_with(".mp4") {
+                                        viewer.title.clone()
+                                    } else {
+                                        format!("zlite_video_{}.mp4", crate::login::unix_now())
+                                    };
+                                    let dest_path = download_dir.join(dest_name);
+
+                                    if let Some(ref cp) = viewer.cached_path {
+                                        if std::fs::copy(cp, &dest_path).is_ok() {
+                                            self.show_toast(format!(
+                                                "Đã lưu video vào {}",
+                                                dest_path.display()
+                                            ));
+                                        } else {
+                                            self.show_toast("Lỗi khi lưu video vào máy");
+                                        }
+                                    } else if let Some(tx) = WORKER_TX.get() {
+                                        let _ = tx.send(WorkerCmd::DownloadFile {
+                                            url: viewer.url.clone(),
+                                            file_name: "video.mp4".into(),
+                                            download_dir: download_dir.to_string_lossy().to_string(),
+                                        });
+                                        self.show_toast("Đang tải video về máy…");
+                                    }
+                                }
+
+                                // Copy link button
+                                if !viewer.url.is_empty() {
+                                    let copy_btn = egui::Button::new(
+                                        RichText::new(format!("{} Sao chép", lucide::COPY))
+                                            .size(11.8)
+                                            .color(pal.text_secondary),
+                                    )
+                                    .fill(pal.bg_elevated)
+                                    .stroke(Stroke::new(1.0_f32, pal.border))
+                                    .rounding(Rounding::same(6.0))
+                                    .min_size(Vec2::new(78.0, 28.0));
+                                    if ui
+                                        .add(copy_btn)
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        ui.ctx().copy_text(viewer.url.clone());
+                                        self.show_toast(
+                                            "Đã sao chép liên kết video vào bộ nhớ tạm",
+                                        );
+                                    }
+                                }
+                            });
+                        });
+                    });
+            });
+
+        if should_close {
+            self.video_player = None;
+        } else {
+            self.video_player = Some(viewer);
         }
     }
 

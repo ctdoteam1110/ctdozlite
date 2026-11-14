@@ -237,6 +237,11 @@ pub enum WorkerCmd {
         is_group: bool,
         last_cli_msg_id: String,
     },
+    /// Rời nhóm Zalo (endpoint `/api/group/leave`, cmd 11189)
+    LeaveGroup {
+        group_id: String,
+        silent: bool,
+    },
     FetchSocialProfile {
         target_uid: String,
     },
@@ -1528,6 +1533,33 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     &last_cli_msg_id,
                                 )
                                 .await;
+                            });
+                        }
+                        WorkerCmd::LeaveGroup { group_id, silent } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let egui_ctx_clone = egui_ctx.clone();
+                            let gid = group_id.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                match crate::chat::leave_group(&s, &gid, silent).await {
+                                    Ok(_) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::GroupLeft {
+                                            group_id: gid.clone(),
+                                            success: true,
+                                            error: None,
+                                        });
+                                        egui_ctx_clone.request_repaint();
+                                    }
+                                    Err(e) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::GroupLeft {
+                                            group_id: gid.clone(),
+                                            success: false,
+                                            error: Some(e.to_string()),
+                                        });
+                                        egui_ctx_clone.request_repaint();
+                                    }
+                                }
                             });
                         }
                         WorkerCmd::RequestQr => {
@@ -3497,6 +3529,15 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 };
 
                                 let Some(path) = picked_path else {
+                                    if !caption.is_empty() {
+                                        let _ = gui_tx_clone.send(
+                                            GuiEvent::AttachmentPickerCancelled {
+                                                thread_id: to_id,
+                                                caption,
+                                            },
+                                        );
+                                        ctx_clone.request_repaint();
+                                    }
                                     return;
                                 };
                                 let fname = path

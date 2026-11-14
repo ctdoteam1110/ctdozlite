@@ -1852,6 +1852,25 @@ impl MessageStore {
                             .map(str::to_string);
                     }
                 }
+                let is_video_url = link_url.as_deref().is_some_and(|u| {
+                    let l = u.to_ascii_lowercase();
+                    l.contains("video-")
+                        || l.contains(".dlmd.me")
+                        || l.contains("/video/")
+                        || l.ends_with(".mp4")
+                });
+                let mut final_text = sm.text;
+                let mut final_kind = crate::message_model::MessageKind::Text;
+                if is_video_url || link_src.as_deref() == Some("Video Zalo") {
+                    link_src = Some("Video Zalo".to_string());
+                    link_title = Some("Video".to_string());
+                    final_kind = crate::message_model::MessageKind::Video;
+                    if final_text.starts_with("[Tập tin]")
+                        || (final_text.len() > 20 && !final_text.contains(' '))
+                    {
+                        final_text = "[Video]".to_string();
+                    }
+                }
                 let cm = ChatMessage {
                     id: sm.msg_id,
                     sender: if !sm.sender_name.is_empty() {
@@ -1859,7 +1878,7 @@ impl MessageStore {
                     } else {
                         sm.sender_id
                     },
-                    text: sm.text,
+                    text: final_text,
                     time,
                     is_outgoing: sm.is_outgoing,
                     ts: sm.ts,
@@ -1868,6 +1887,7 @@ impl MessageStore {
                     } else {
                         crate::message_model::DeliveryState::Unknown
                     },
+                    kind: final_kind,
                     sticker_id,
                     sticker_cate_id,
                     sticker_type,

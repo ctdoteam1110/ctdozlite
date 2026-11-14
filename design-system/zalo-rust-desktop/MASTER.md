@@ -1,5 +1,7 @@
 # Design System Master File
 
+> **SSOT NOTICE:** Với ứng dụng desktop `egui` (`src/gui/`), [`docs/DESIGN.md`](../../docs/DESIGN.md) là nguồn chuẩn chính thức về token màu (`ThemePalette`), bo góc (`Radius-Ladder: 6/8/11/12/16px`), font (`Be Vietnam Pro Regular/SemiBold` + `Lucide`) và Animations. Tài liệu này tóm tắt chuẩn tương phản & thành phần dùng chung.
+
 > **LOGIC:** When building a specific page, first check `design-system/pages/[page-name].md`.
 > If that file exists, its rules **override** this Master file.
 > If not, strictly follow the rules below.
@@ -19,12 +21,12 @@
 
 | Role | Hex | CSS Variable |
 |------|-----|--------------|
-| Primary | `#2563EB` | `--color-primary` |
-| On Primary | `#FFFFFF` | `--color-on-primary` |
+| Primary (Dark / Light) | `#2563EB` / `#0068FF` | `--color-primary` |
+| On Primary | `#FFFFFF` (WCAG `5.17:1` / `4.75:1`) | `--color-on-primary` |
 | Secondary | `#6366F1` | `--color-secondary` |
 | On Secondary | `#000000` | `--color-on-secondary` |
 | Accent/CTA | `#059669` | `--color-accent` |
-| On Accent/CTA | `#000000` | `--color-on-accent` |
+| On Accent/CTA | `#000000` (WCAG `5.57:1`) | `--color-on-accent` |
 | Background | `#FFFFFF` | `--color-background` |
 | Foreground | `#0F172A` | `--color-foreground` |
 | Card | `#FFFFFF` | `--color-card` |
@@ -40,15 +42,10 @@
 
 ### Typography
 
-- **Heading Font:** Inter
-- **Body Font:** Inter
+- **Heading Font:** Be Vietnam Pro (SemiBold 600)
+- **Body Font:** Be Vietnam Pro (Regular 400)
+- **Icon Font:** Lucide (`lucide.ttf`)
 - **Mood:** minimal, clean, swiss, functional, neutral, professional
-- **Google Fonts:** [Inter + Inter](https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap)
-
-**CSS Import:**
-```css
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-```
 
 ### Spacing Variables
 
@@ -80,14 +77,25 @@
 ### Buttons
 
 ```css
-/* Primary Button */
+/* Primary Button (WCAG 2.1 AA >= 4.5:1) */
 .btn-primary {
-  background: #059669;
-  color: white;
-  padding: 12px 24px;
+  background: #2563EB;
+  color: #FFFFFF;
+  padding: 10px 20px;
   border-radius: 8px;
   font-weight: 600;
-  transition: all 200ms ease;
+  transition: all 150ms ease;
+  cursor: pointer;
+}
+
+/* Success CTA Button (#059669 requires #000000 text = 5.57:1) */
+.btn-success {
+  background: #059669;
+  color: #000000;
+  padding: 10px 20px;
+  border-radius: 8px;
+  font-weight: 600;
+  transition: all 150ms ease;
   cursor: pointer;
 }
 

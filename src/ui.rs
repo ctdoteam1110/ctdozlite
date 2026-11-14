@@ -2,7 +2,7 @@
 //!
 //! Deliberately dependency-free (no ratatui): ANSI + Win32 console mode is all it needs.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::Result;
 
@@ -35,13 +35,64 @@ pub fn prompt_default(label: &str, default: &str) -> Result<String> {
 
 /// Password prompt.
 ///
-/// Deliberately does NOT touch console mode. Toggling `ENABLE_ECHO_INPUT` around
-/// `std::io::stdin()` deadlocks on Windows because the Rust stdin handle keeps its own
-/// line buffer and the line never completes while echo is off. Reading normally is
-/// slightly worse UX but always works; `--pass-stdin` covers unattended runs.
+/// When connected to an interactive terminal, reads keystrokes in crossterm raw mode and
+/// echoes `*` characters instead of plaintext without touching `std::io::stdin()`'s line buffer.
+/// Falls back to reading a line when stdin is piped/non-TTY (e.g. `--pass-stdin`).
 pub fn prompt_password(label: &str) -> Result<String> {
     print!("{label}");
     io::stdout().flush()?;
+
+    if io::stdin().is_terminal() {
+        struct RawGuard;
+        impl Drop for RawGuard {
+            fn drop(&mut self) {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+        }
+        if crossterm::terminal::enable_raw_mode().is_ok() {
+            let _guard = RawGuard;
+            let mut pass = String::new();
+            let mut out = io::stdout();
+            loop {
+                match crossterm::event::read()? {
+                    crossterm::event::Event::Key(ev)
+                        if ev.kind == crossterm::event::KeyEventKind::Press =>
+                    {
+                        match ev.code {
+                            crossterm::event::KeyCode::Enter => {
+                                let _ = write!(out, "\r\n");
+                                let _ = out.flush();
+                                return Ok(pass);
+                            }
+                            crossterm::event::KeyCode::Backspace => {
+                                if pass.pop().is_some() {
+                                    let _ = write!(out, "\x08 \x08");
+                                    let _ = out.flush();
+                                }
+                            }
+                            crossterm::event::KeyCode::Char('c')
+                                if ev
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            {
+                                let _ = write!(out, "\r\n");
+                                let _ = out.flush();
+                                anyhow::bail!("Cancelled password prompt");
+                            }
+                            crossterm::event::KeyCode::Char(c) if !c.is_control() => {
+                                pass.push(c);
+                                let _ = write!(out, "*");
+                                let _ = out.flush();
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     let mut s = String::new();
     io::stdin().lock().read_line(&mut s)?;
     Ok(s.trim_end_matches(['\r', '\n']).to_string())

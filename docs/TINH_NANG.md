@@ -103,9 +103,11 @@ Cột **Issue** trỏ tới nơi đang theo dõi. Nếu issue đã đóng, tính
 
 | Tính năng | Trạng thái | Ghi chú | Issue |
 |---|---|---|---|
-| Giao diện đồ họa (GUI) | ✅ | `--gui`, mặc định | |
-| Giao diện terminal (TUI) | ✅ | `--tui` | |
-| Chủ đề sáng / tối & Theme JSON tùy chỉnh | ✅ | Hỗ trợ ghi đè bảng màu qua `theme.json` (**Cài đặt → Giao diện**) | [#7](https://github.com/ctdoteam1110/ctdozlite/issues/7) |
+| Giao diện đồ họa (GUI) | ✅ | `--gui`, mặc định; hỗ trợ kéo co giãn xuống `480×360` và Info Overlay `< 880px` | |
+| Giao diện terminal (TUI) | ✅ | `--tui`; tương thích terminal `80×24`, tìm kiếm cho phép nhập `j`/`k`, cuộn Help | |
+| Hiệu ứng chuyển động (Animations) | ✅ | Bật/tắt và chỉnh tốc độ (`0.5x–2.0x`) trong **Cài đặt → Giao diện → Hiệu ứng chuyển động** | |
+| Chủ đề sáng / tối & Theme JSON tùy chỉnh | ✅ | Chuẩn tương phản WCAG 2.1 AA; hỗ trợ ghi đè bảng màu qua `theme.json` (**Cài đặt → Giao diện**) | [#7](https://github.com/ctdoteam1110/ctdozlite/issues/7) |
+| Nhập mật khẩu CLI ẩn ký tự (`*`) | ✅ | Ẩn ký tự khi nhập mật khẩu trực tiếp trên terminal (hỗ trợ `--pass-stdin`) | |
 | Hiển thị tiếng Việt và tiếng Trung (CJK) | ✅ | Tự nạp font hệ thống đa ngôn ngữ + fallback Noto Sans CJK | [#6](https://github.com/ctdoteam1110/ctdozlite/issues/6), [#5](https://github.com/ctdoteam1110/ctdozlite/issues/5) |
 | Tự động kiểm tra & cập nhật phiên bản mới | ✅ | Kiểm tra qua GitHub Releases & `latest.json` kèm xác thực SHA-256 trước khi cài đặt | [#12](https://github.com/ctdoteam1110/ctdozlite/issues/12), [#29](https://github.com/ctdoteam1110/ctdozlite/issues/29) |
 | iOS (Sắp có) | 🟡 | Hoạt động dưới dạng phiên phụ (`zpw_type=30`), sẽ phát hành gói `.ipa` trong bản cập nhật tới | |
