@@ -3528,10 +3528,9 @@ impl ZaloGuiApp {
                     if next_state != banner_state {
                         self.reaction_banner_mark.1 = next_state.clone();
                         let uin = self.user_uin.clone();
-                        // shortcut: writer threads are unordered, so an older state may land
-                        // last; that only re-banners once. Serialize writes if it ever matters.
+                        let generation = crate::reactions::next_banner_save_generation();
                         std::thread::spawn(move || {
-                            crate::reactions::save_banner_mark(&uin, &next_state)
+                            crate::reactions::save_banner_mark(&uin, &next_state, generation)
                         });
                     }
                     if !reaction_banners.is_empty() && reactions_notify_on {

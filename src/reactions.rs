@@ -199,11 +199,44 @@ pub fn load_banner_mark(uin: &str) -> BannerMark {
     }
 }
 
-/// Persist the progress. Callers run this off the UI thread.
-pub fn save_banner_mark(uin: &str, state: &BannerMark) {
+static BANNER_SAVE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Last generation written per uin; held across the write so writers never interleave.
+static BANNER_SAVED_GEN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Take the next save generation. Call it where the state is produced (the UI thread), so the
+/// generation order matches the state order.
+pub fn next_banner_save_generation() -> u64 {
+    BANNER_SAVE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// `true` (and records it) when `generation` is newer than the last one written for `uin`.
+fn claim_banner_write(
+    written: &mut std::collections::HashMap<String, u64>,
+    uin: &str,
+    generation: u64,
+) -> bool {
+    let last = written.entry(uin.to_string()).or_insert(0);
+    if generation <= *last {
+        return false;
+    }
+    *last = generation;
+    true
+}
+
+/// Persist the progress. Callers run this off the UI thread; an older `generation` that
+/// finishes after a newer one is dropped, so a lower mark never replaces a higher one.
+pub fn save_banner_mark(uin: &str, state: &BannerMark, generation: u64) {
     let Some(path) = banner_mark_path(uin) else {
         return;
     };
+    let Ok(mut written) = BANNER_SAVED_GEN.lock() else {
+        return;
+    };
+    if !claim_banner_write(&mut written, uin, generation) {
+        return;
+    }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -1006,6 +1039,23 @@ mod tests {
             !state.is_done(&ev("", 0)),
             "no numeric id: never suppressed"
         );
+    }
+
+    #[test]
+    fn older_banner_save_never_replaces_a_newer_one() {
+        let mut written = std::collections::HashMap::new();
+        assert!(claim_banner_write(&mut written, "a", 2));
+        assert!(
+            !claim_banner_write(&mut written, "a", 1),
+            "late older writer is dropped"
+        );
+        assert!(!claim_banner_write(&mut written, "a", 2));
+        assert!(
+            claim_banner_write(&mut written, "b", 1),
+            "generations are per account"
+        );
+        let (g1, g2) = (next_banner_save_generation(), next_banner_save_generation());
+        assert!(g2 > g1);
     }
 
     #[test]
