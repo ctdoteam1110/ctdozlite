@@ -131,6 +131,44 @@ pub struct ReactionVersion {
 fn known_id(id: &str) -> bool {
     !id.is_empty() && id != "0"
 }
+
+/// Server sequence of a reaction (`msgId`, equal to the queue `actionId`), if numeric.
+///
+/// The `610_1`/`611_1` queues replay every retained reaction on each start (the inbox needs
+/// that), so banners are gated on this id instead of on `ts`, which is not ordered (re-notes/39).
+pub fn banner_seq(ev: &ReactionEvent) -> Option<u64> {
+    ev.event_id.parse().ok().filter(|&n| n > 0)
+}
+
+/// `true` when `ev` was already bannered in an earlier run (`seq <= mark`). Events without a
+/// numeric id are never suppressed.
+pub fn already_bannered(ev: &ReactionEvent, mark: u64) -> bool {
+    banner_seq(ev).is_some_and(|seq| seq <= mark)
+}
+
+fn banner_mark_path(uin: &str) -> Option<std::path::PathBuf> {
+    crate::account_manager::is_safe_uin(uin)
+        .then(|| crate::account_manager::account_dir(uin).join("reaction_banner_mark"))
+}
+
+/// Highest reaction sequence already bannered for `uin`; 0 when unknown or unreadable.
+pub fn load_banner_mark(uin: &str) -> u64 {
+    banner_mark_path(uin)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Persist the mark. Callers run this off the UI thread.
+pub fn save_banner_mark(uin: &str, mark: u64) {
+    let Some(path) = banner_mark_path(uin) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = crate::data_dir::write_private_atomic(&path, mark.to_string().as_bytes());
+}
 fn id_order(a: &str, b: &str) -> std::cmp::Ordering {
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
@@ -903,6 +941,28 @@ impl ReactionInbox {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn banner_gate_uses_server_seq_not_ts() {
+        // Ids and ts from a live 610_1 replay (2026-11-15): seq order differs from ts order.
+        let ev = |id: &str, ts: i64| ReactionEvent {
+            event_id: id.into(),
+            ts,
+            r_type: 5,
+            ..Default::default()
+        };
+        let a = ev("8492232107943", 1794750560261);
+        let b = ev("8492232109138", 1794750560188);
+        let mark = [&a, &b].iter().filter_map(|e| banner_seq(e)).max().unwrap();
+        assert_eq!(mark, 8492232109138);
+        assert!(already_bannered(&a, mark) && already_bannered(&b, mark));
+        assert!(!already_bannered(&ev("8492421889729", 1794753880382), mark));
+        assert!(
+            !already_bannered(&ev("", 0), mark),
+            "no numeric id: never suppressed"
+        );
+        assert!(!already_bannered(&a, 0), "first run: nothing suppressed");
+    }
 
     /// Shape captured from the live socket (`cmd=610`): sender is `uidFrom:"0"` (the account itself),
     /// every event has its own `msgId`. Replaying the same frame must never add to the count.

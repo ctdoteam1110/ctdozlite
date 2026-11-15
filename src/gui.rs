@@ -1556,6 +1556,8 @@ pub struct ZaloGuiApp {
     reaction_unread_counts: HashMap<String, usize>,
     /// Message IDs that have already triggered an unread bump/notification in this session (#146).
     notified_msg_ids: HashSet<String>,
+    /// `(uin, highest reaction seq bannered)`: persisted so replayed reactions do not re-banner.
+    reaction_banner_mark: (String, u64),
     link_metadata_cache: HashMap<String, crate::chat::LinkMetadata>,
     loading_link_previews: HashSet<String>,
     /// Tin đang chờ dịch (translate_request_key) → disable menu Dịch.
@@ -1937,6 +1939,7 @@ impl ZaloGuiApp {
             unread_counts: HashMap::new(),
             reaction_unread_counts: HashMap::new(),
             notified_msg_ids: HashSet::new(),
+            reaction_banner_mark: (String::new(), 0),
             link_metadata_cache: HashMap::new(),
             loading_link_previews: HashSet::new(),
             translate_pending: HashSet::new(),
@@ -3405,8 +3408,18 @@ impl ZaloGuiApp {
                     let reactions_sound_on =
                         self.settings.enable_notifications && self.settings.play_notification_sound;
                     let now_ts_react = crate::login::unix_now();
+                    if self.reaction_banner_mark.0 != self.user_uin {
+                        self.reaction_banner_mark = (
+                            self.user_uin.clone(),
+                            crate::reactions::load_banner_mark(&self.user_uin),
+                        );
+                    }
+                    let banner_mark = self.reaction_banner_mark.1;
                     for ev in &accepted {
-                        if ev.r_type < 0 || ev.historical {
+                        if ev.r_type < 0
+                            || ev.historical
+                            || crate::reactions::already_bannered(ev, banner_mark)
+                        {
                             continue;
                         }
                         if ev.sender_id.is_empty() || ev.sender_id == my_uid {
@@ -3450,7 +3463,10 @@ impl ZaloGuiApp {
                     let is_focused_now = ctx.input(|i| i.focused);
                     let my_uid_count = self.user_uin.clone();
                     for ev in &accepted {
-                        if ev.r_type < 0 || ev.historical {
+                        if ev.r_type < 0
+                            || ev.historical
+                            || crate::reactions::already_bannered(ev, banner_mark)
+                        {
                             continue;
                         }
                         if ev.sender_id.is_empty() || ev.sender_id == my_uid_count {
@@ -3493,6 +3509,18 @@ impl ZaloGuiApp {
                             continue;
                         }
                         *self.reaction_unread_counts.entry(tid).or_insert(0) += 1;
+                    }
+                    if let Some(top) = accepted
+                        .iter()
+                        .filter_map(crate::reactions::banner_seq)
+                        .max()
+                        .filter(|&top| top > banner_mark)
+                    {
+                        self.reaction_banner_mark.1 = top;
+                        let uin = self.user_uin.clone();
+                        // shortcut: writer threads are unordered, so an older mark may land last;
+                        // that only re-banners once. Serialize writes if it ever matters.
+                        std::thread::spawn(move || crate::reactions::save_banner_mark(&uin, top));
                     }
                     if !reaction_banners.is_empty() && reactions_notify_on {
                         for (title, body) in &reaction_banners {
