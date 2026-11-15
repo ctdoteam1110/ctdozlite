@@ -549,9 +549,14 @@ pub(super) fn pick_native_folder_dialog(title: &str) -> Option<std::path::PathBu
              $d.Description = '{title_esc}'; $d.ShowNewFolderButton = $true; \
              if ($d.ShowDialog() -eq 'OK') {{ $d.SelectedPath }}"
         );
-        if let Ok(out) = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-            .output()
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps]);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        if let Ok(out) = cmd.output()
         {
             if out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -619,10 +624,13 @@ pub(super) fn pick_native_folder_dialog_result(title: &str) -> FolderPick {
         None => {
             // Thiếu helper → launch fail có hướng dẫn; user bấm Cancel vẫn là Cancel.
             #[cfg(target_os = "windows")]
-            let missing = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", "exit 0"])
-                .output()
-                .is_err();
+            let missing = {
+                use std::os::windows::process::CommandExt;
+                let mut cmd = std::process::Command::new("powershell");
+                cmd.args(["-NoProfile", "-Command", "exit 0"]);
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                cmd.output().is_err()
+            };
             #[cfg(target_os = "macos")]
             let missing = std::process::Command::new("osascript")
                 .args(["-e", "return 1"])

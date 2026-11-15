@@ -4935,28 +4935,34 @@ async fn download_preview_bytes(
 fn extract_first_video_frame(bytes: &[u8]) -> Option<image::RgbaImage> {
     // Lấy kích thước frame đã scale trực tiếp từ header PNG của ffmpeg
     // (image2pipe + png): không còn lệch 480x360 vs 320x240 (#4226).
-    let mut child = std::process::Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            "pipe:0",
-            "-vframes",
-            "1",
-            "-vf",
-            "scale=480:-1",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "pipe:1",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        "-vframes",
+        "1",
+        "-vf",
+        "scale=480:-1",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "png",
+        "pipe:1",
+    ])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+
+    let mut child = cmd.spawn().ok()?;
     use std::io::Write;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(bytes);
@@ -4972,9 +4978,11 @@ fn extract_first_video_frame(bytes: &[u8]) -> Option<image::RgbaImage> {
 pub(crate) fn capture_screen_interactive(gui_tx: crate::gui::GuiTx, ctx: egui::Context) {
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", "Start-Process ms-screenclip:"])
-            .status();
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", "Start-Process ms-screenclip:"]);
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let _ = cmd.status();
         let _ = gui_tx.send(crate::gui::GuiEvent::StatusUpdate(
             "Đã mở công cụ chụp ảnh màn hình — sau khi chụp hãy nhấn Ctrl+V để dán".into(),
         ));
