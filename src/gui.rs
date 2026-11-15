@@ -1556,6 +1556,8 @@ pub struct ZaloGuiApp {
     reaction_unread_counts: HashMap<String, usize>,
     /// Message IDs that have already triggered an unread bump/notification in this session (#146).
     notified_msg_ids: HashSet<String>,
+    /// `(uin, banner progress)`: persisted so replayed reactions do not re-banner.
+    reaction_banner_mark: (String, crate::reactions::BannerMark),
     link_metadata_cache: HashMap<String, crate::chat::LinkMetadata>,
     loading_link_previews: HashSet<String>,
     /// Tin đang chờ dịch (translate_request_key) → disable menu Dịch.
@@ -1937,6 +1939,7 @@ impl ZaloGuiApp {
             unread_counts: HashMap::new(),
             reaction_unread_counts: HashMap::new(),
             notified_msg_ids: HashSet::new(),
+            reaction_banner_mark: (String::new(), Default::default()),
             link_metadata_cache: HashMap::new(),
             loading_link_previews: HashSet::new(),
             translate_pending: HashSet::new(),
@@ -3405,8 +3408,15 @@ impl ZaloGuiApp {
                     let reactions_sound_on =
                         self.settings.enable_notifications && self.settings.play_notification_sound;
                     let now_ts_react = crate::login::unix_now();
+                    if self.reaction_banner_mark.0 != self.user_uin {
+                        self.reaction_banner_mark = (
+                            self.user_uin.clone(),
+                            crate::reactions::load_banner_mark(&self.user_uin),
+                        );
+                    }
+                    let banner_state = self.reaction_banner_mark.1.clone();
                     for ev in &accepted {
-                        if ev.r_type < 0 || ev.historical {
+                        if ev.r_type < 0 || ev.historical || banner_state.is_done(ev) {
                             continue;
                         }
                         if ev.sender_id.is_empty() || ev.sender_id == my_uid {
@@ -3450,7 +3460,7 @@ impl ZaloGuiApp {
                     let is_focused_now = ctx.input(|i| i.focused);
                     let my_uid_count = self.user_uin.clone();
                     for ev in &accepted {
-                        if ev.r_type < 0 || ev.historical {
+                        if ev.r_type < 0 || ev.historical || banner_state.is_done(ev) {
                             continue;
                         }
                         if ev.sender_id.is_empty() || ev.sender_id == my_uid_count {
@@ -3493,6 +3503,35 @@ impl ZaloGuiApp {
                             continue;
                         }
                         *self.reaction_unread_counts.entry(tid).or_insert(0) += 1;
+                    }
+                    // A peer reaction whose target message is not loaded yet got no banner
+                    // decision: keep it pending so a later replay can still banner it.
+                    let mut next_state = banner_state.clone();
+                    for ev in &accepted {
+                        let Some(seq) = crate::reactions::banner_seq(ev) else {
+                            continue;
+                        };
+                        if banner_state.is_done(ev) {
+                            continue;
+                        }
+                        let needs_target = !(ev.r_type < 0
+                            || ev.historical
+                            || ev.sender_id.is_empty()
+                            || ev.sender_id == my_uid);
+                        let resolved = !needs_target
+                            || self
+                                .threads
+                                .iter()
+                                .any(|t| find_reaction_target(&t.messages, ev).is_some());
+                        next_state.record(seq, resolved);
+                    }
+                    if next_state != banner_state {
+                        self.reaction_banner_mark.1 = next_state.clone();
+                        let uin = self.user_uin.clone();
+                        let generation = crate::reactions::next_banner_save_generation();
+                        std::thread::spawn(move || {
+                            crate::reactions::save_banner_mark(&uin, &next_state, generation)
+                        });
                     }
                     if !reaction_banners.is_empty() && reactions_notify_on {
                         for (title, body) in &reaction_banners {

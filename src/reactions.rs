@@ -131,6 +131,119 @@ pub struct ReactionVersion {
 fn known_id(id: &str) -> bool {
     !id.is_empty() && id != "0"
 }
+
+/// Server sequence of a reaction (`msgId`, equal to the queue `actionId`), if numeric.
+///
+/// The `610_1`/`611_1` queues replay every retained reaction on each start (the inbox needs
+/// that), so banners are gated on this id instead of on `ts`, which is not ordered (re-notes/39).
+pub fn banner_seq(ev: &ReactionEvent) -> Option<u64> {
+    ev.event_id.parse().ok().filter(|&n| n > 0)
+}
+
+/// Banner progress per account: every reaction up to `mark` is done, except `pending` ones whose
+/// target message was not loaded when they arrived; those stay eligible on later replays.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct BannerMark {
+    pub mark: u64,
+    pub pending: std::collections::BTreeSet<u64>,
+}
+
+/// Pending ids kept at most; the oldest are dropped (their banner is lost, as before this gate).
+const MAX_PENDING_BANNERS: usize = 256;
+
+impl BannerMark {
+    /// `true` when `ev` was handled in an earlier batch. Events without a numeric id never are.
+    pub fn is_done(&self, ev: &ReactionEvent) -> bool {
+        banner_seq(ev).is_some_and(|seq| seq <= self.mark && !self.pending.contains(&seq))
+    }
+
+    /// Record one not-yet-done event: `resolved` means its banner decision was made (shown or
+    /// skipped on purpose); unresolved events stay pending instead of being covered by `mark`.
+    pub fn record(&mut self, seq: u64, resolved: bool) {
+        if resolved {
+            self.pending.remove(&seq);
+        } else {
+            self.pending.insert(seq);
+            while self.pending.len() > MAX_PENDING_BANNERS {
+                self.pending.pop_first();
+            }
+        }
+        self.mark = self.mark.max(seq);
+    }
+}
+
+fn banner_mark_path(uin: &str) -> Option<std::path::PathBuf> {
+    crate::account_manager::is_safe_uin(uin)
+        .then(|| crate::account_manager::account_dir(uin).join("reaction_banner_mark"))
+}
+
+/// Banner progress for `uin` (line 1: mark, line 2: pending ids); empty when unreadable.
+pub fn load_banner_mark(uin: &str) -> BannerMark {
+    let text = banner_mark_path(uin)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    let mut lines = text.lines();
+    BannerMark {
+        mark: lines
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or(0),
+        pending: lines
+            .next()
+            .map(|l| {
+                l.split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+static BANNER_SAVE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Last generation written per uin; held across the write so writers never interleave.
+static BANNER_SAVED_GEN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Take the next save generation. Call it where the state is produced (the UI thread), so the
+/// generation order matches the state order.
+pub fn next_banner_save_generation() -> u64 {
+    BANNER_SAVE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// `true` (and records it) when `generation` is newer than the last one written for `uin`.
+fn claim_banner_write(
+    written: &mut std::collections::HashMap<String, u64>,
+    uin: &str,
+    generation: u64,
+) -> bool {
+    let last = written.entry(uin.to_string()).or_insert(0);
+    if generation <= *last {
+        return false;
+    }
+    *last = generation;
+    true
+}
+
+/// Persist the progress. Callers run this off the UI thread; an older `generation` that
+/// finishes after a newer one is dropped, so a lower mark never replaces a higher one.
+pub fn save_banner_mark(uin: &str, state: &BannerMark, generation: u64) {
+    let Some(path) = banner_mark_path(uin) else {
+        return;
+    };
+    let Ok(mut written) = BANNER_SAVED_GEN.lock() else {
+        return;
+    };
+    if !claim_banner_write(&mut written, uin, generation) {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let pending: Vec<String> = state.pending.iter().map(u64::to_string).collect();
+    let text = format!("{}\n{}", state.mark, pending.join(" "));
+    let _ = crate::data_dir::write_private_atomic(&path, text.as_bytes());
+}
 fn id_order(a: &str, b: &str) -> std::cmp::Ordering {
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
@@ -903,6 +1016,79 @@ impl ReactionInbox {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn banner_gate_uses_server_seq_not_ts() {
+        // Ids and ts from a live 610_1 replay (2026-11-15): seq order differs from ts order.
+        let ev = |id: &str, ts: i64| ReactionEvent {
+            event_id: id.into(),
+            ts,
+            r_type: 5,
+            ..Default::default()
+        };
+        let a = ev("8492232107943", 1794750560261);
+        let b = ev("8492232109138", 1794750560188);
+        let mut state = BannerMark::default();
+        assert!(!state.is_done(&a), "first run: nothing suppressed");
+        state.record(banner_seq(&a).unwrap(), true);
+        state.record(banner_seq(&b).unwrap(), true);
+        assert_eq!(state.mark, 8492232109138);
+        assert!(state.is_done(&a) && state.is_done(&b));
+        assert!(!state.is_done(&ev("8492421889729", 1794753880382)));
+        assert!(
+            !state.is_done(&ev("", 0)),
+            "no numeric id: never suppressed"
+        );
+    }
+
+    #[test]
+    fn older_banner_save_never_replaces_a_newer_one() {
+        let mut written = std::collections::HashMap::new();
+        assert!(claim_banner_write(&mut written, "a", 2));
+        assert!(
+            !claim_banner_write(&mut written, "a", 1),
+            "late older writer is dropped"
+        );
+        assert!(!claim_banner_write(&mut written, "a", 2));
+        assert!(
+            claim_banner_write(&mut written, "b", 1),
+            "generations are per account"
+        );
+        let (g1, g2) = (next_banner_save_generation(), next_banner_save_generation());
+        assert!(g2 > g1);
+    }
+
+    #[test]
+    fn unresolved_reaction_stays_eligible_until_its_message_loads() {
+        let ev = |id: &str| ReactionEvent {
+            event_id: id.into(),
+            r_type: 5,
+            ..Default::default()
+        };
+        let (early, later) = (ev("100"), ev("200"));
+        let mut state = BannerMark::default();
+        // Batch 1: `early` targets a message not loaded yet; `later` is bannered.
+        state.record(100, false);
+        state.record(200, true);
+        assert_eq!(state.mark, 200);
+        assert!(
+            state.is_done(&later),
+            "a newer resolved event must not re-banner"
+        );
+        assert!(!state.is_done(&early), "the unresolved one stays eligible");
+        // Next replay: the message is loaded, so `early` resolves and leaves pending.
+        state.record(100, true);
+        assert!(state.is_done(&early) && state.pending.is_empty());
+
+        for seq in 1..=(MAX_PENDING_BANNERS as u64 + 5) {
+            state.record(1_000 + seq, false);
+        }
+        assert_eq!(state.pending.len(), MAX_PENDING_BANNERS);
+        assert!(
+            !state.pending.contains(&1_001),
+            "oldest pending ids are dropped"
+        );
+    }
 
     /// Shape captured from the live socket (`cmd=610`): sender is `uidFrom:"0"` (the account itself),
     /// every event has its own `msgId`. Replaying the same frame must never add to the count.
