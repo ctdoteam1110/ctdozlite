@@ -51,16 +51,18 @@ This was rejected as the fix for these reasons:
 *   Passive sockets would advance the cursor past events they drop.
 *   It has no recovery if the server rejects or evicts the cursor.
 
-The design is in `docs/designs/reaction_banner_watermark.md`.
-
 ## Fix
 
-`reactions::{banner_seq, already_bannered, load_banner_mark, save_banner_mark}`
+`reactions::{banner_seq, BannerMark, load_banner_mark, save_banner_mark}`
 and the `GuiEvent::ReactionEventsReceived` handler.
 
-*   A banner is shown, and the reaction-unread count goes up, only when
-    `msgId > mark`.
-*   The mark is persisted in `accounts/<uin>/reaction_banner_mark`.
+*   A banner is shown, and the reaction-unread count goes up, only for events
+    that are not done: `msgId > mark`, or listed as pending.
+*   A peer reaction whose target message is not loaded yet (replays usually
+    arrive before history) gets no banner decision. It stays pending, so a
+    later replay can still banner it. At most 256 pending ids are kept.
+*   State is persisted in `accounts/<uin>/reaction_banner_mark`: line 1 is the
+    mark, line 2 the pending ids.
 *   An event without a numeric id is never suppressed.
 
 Open question: whether live pushes (`cmd 601`) carry the same `msgId`.
