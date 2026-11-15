@@ -140,10 +140,36 @@ pub fn banner_seq(ev: &ReactionEvent) -> Option<u64> {
     ev.event_id.parse().ok().filter(|&n| n > 0)
 }
 
-/// `true` when `ev` was already bannered in an earlier run (`seq <= mark`). Events without a
-/// numeric id are never suppressed.
-pub fn already_bannered(ev: &ReactionEvent, mark: u64) -> bool {
-    banner_seq(ev).is_some_and(|seq| seq <= mark)
+/// Banner progress per account: every reaction up to `mark` is done, except `pending` ones whose
+/// target message was not loaded when they arrived; those stay eligible on later replays.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct BannerMark {
+    pub mark: u64,
+    pub pending: std::collections::BTreeSet<u64>,
+}
+
+/// Pending ids kept at most; the oldest are dropped (their banner is lost, as before this gate).
+const MAX_PENDING_BANNERS: usize = 256;
+
+impl BannerMark {
+    /// `true` when `ev` was handled in an earlier batch. Events without a numeric id never are.
+    pub fn is_done(&self, ev: &ReactionEvent) -> bool {
+        banner_seq(ev).is_some_and(|seq| seq <= self.mark && !self.pending.contains(&seq))
+    }
+
+    /// Record one not-yet-done event: `resolved` means its banner decision was made (shown or
+    /// skipped on purpose); unresolved events stay pending instead of being covered by `mark`.
+    pub fn record(&mut self, seq: u64, resolved: bool) {
+        if resolved {
+            self.pending.remove(&seq);
+        } else {
+            self.pending.insert(seq);
+            while self.pending.len() > MAX_PENDING_BANNERS {
+                self.pending.pop_first();
+            }
+        }
+        self.mark = self.mark.max(seq);
+    }
 }
 
 fn banner_mark_path(uin: &str) -> Option<std::path::PathBuf> {
@@ -151,23 +177,39 @@ fn banner_mark_path(uin: &str) -> Option<std::path::PathBuf> {
         .then(|| crate::account_manager::account_dir(uin).join("reaction_banner_mark"))
 }
 
-/// Highest reaction sequence already bannered for `uin`; 0 when unknown or unreadable.
-pub fn load_banner_mark(uin: &str) -> u64 {
-    banner_mark_path(uin)
+/// Banner progress for `uin` (line 1: mark, line 2: pending ids); empty when unreadable.
+pub fn load_banner_mark(uin: &str) -> BannerMark {
+    let text = banner_mark_path(uin)
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
+        .unwrap_or_default();
+    let mut lines = text.lines();
+    BannerMark {
+        mark: lines
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or(0),
+        pending: lines
+            .next()
+            .map(|l| {
+                l.split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
 }
 
-/// Persist the mark. Callers run this off the UI thread.
-pub fn save_banner_mark(uin: &str, mark: u64) {
+/// Persist the progress. Callers run this off the UI thread.
+pub fn save_banner_mark(uin: &str, state: &BannerMark) {
     let Some(path) = banner_mark_path(uin) else {
         return;
     };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = crate::data_dir::write_private_atomic(&path, mark.to_string().as_bytes());
+    let pending: Vec<String> = state.pending.iter().map(u64::to_string).collect();
+    let text = format!("{}\n{}", state.mark, pending.join(" "));
+    let _ = crate::data_dir::write_private_atomic(&path, text.as_bytes());
 }
 fn id_order(a: &str, b: &str) -> std::cmp::Ordering {
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
@@ -953,15 +995,49 @@ mod tests {
         };
         let a = ev("8492232107943", 1794750560261);
         let b = ev("8492232109138", 1794750560188);
-        let mark = [&a, &b].iter().filter_map(|e| banner_seq(e)).max().unwrap();
-        assert_eq!(mark, 8492232109138);
-        assert!(already_bannered(&a, mark) && already_bannered(&b, mark));
-        assert!(!already_bannered(&ev("8492421889729", 1794753880382), mark));
+        let mut state = BannerMark::default();
+        assert!(!state.is_done(&a), "first run: nothing suppressed");
+        state.record(banner_seq(&a).unwrap(), true);
+        state.record(banner_seq(&b).unwrap(), true);
+        assert_eq!(state.mark, 8492232109138);
+        assert!(state.is_done(&a) && state.is_done(&b));
+        assert!(!state.is_done(&ev("8492421889729", 1794753880382)));
         assert!(
-            !already_bannered(&ev("", 0), mark),
+            !state.is_done(&ev("", 0)),
             "no numeric id: never suppressed"
         );
-        assert!(!already_bannered(&a, 0), "first run: nothing suppressed");
+    }
+
+    #[test]
+    fn unresolved_reaction_stays_eligible_until_its_message_loads() {
+        let ev = |id: &str| ReactionEvent {
+            event_id: id.into(),
+            r_type: 5,
+            ..Default::default()
+        };
+        let (early, later) = (ev("100"), ev("200"));
+        let mut state = BannerMark::default();
+        // Batch 1: `early` targets a message not loaded yet; `later` is bannered.
+        state.record(100, false);
+        state.record(200, true);
+        assert_eq!(state.mark, 200);
+        assert!(
+            state.is_done(&later),
+            "a newer resolved event must not re-banner"
+        );
+        assert!(!state.is_done(&early), "the unresolved one stays eligible");
+        // Next replay: the message is loaded, so `early` resolves and leaves pending.
+        state.record(100, true);
+        assert!(state.is_done(&early) && state.pending.is_empty());
+
+        for seq in 1..=(MAX_PENDING_BANNERS as u64 + 5) {
+            state.record(1_000 + seq, false);
+        }
+        assert_eq!(state.pending.len(), MAX_PENDING_BANNERS);
+        assert!(
+            !state.pending.contains(&1_001),
+            "oldest pending ids are dropped"
+        );
     }
 
     /// Shape captured from the live socket (`cmd=610`): sender is `uidFrom:"0"` (the account itself),
