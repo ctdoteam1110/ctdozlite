@@ -324,16 +324,16 @@ where
         crate::logger::log_sync(&format!("Tìm được {} partitions cho sync", partitions.len()));
 
         let v2_sync_id = match chat::wake_phone_sync_v2(s).await {
-            Ok(sync_id) => match chat::build_sync_v2_payload(s, &sync_id, &partitions) {
-                Ok(sync_data) => {
+            Ok(sync_id) => match chat::build_sync_v2_payload(s, &sync_id, &[]) {
+                Ok(init_payload) => {
                     // 1. Gửi HTTP request-sync (cmd 12888) lên file server để kích hoạt push notification tới phone
                     let s_clone = s.clone();
-                    let sync_data_clone = sync_data.clone();
+                    let init_payload_clone = init_payload.clone();
                     let _sid_clone = sync_id.clone();
                     tokio::spawn(async move {
                         let req_id = format!("req_12888_{}", crate::login::unix_now());
                         if let Err(e) =
-                            chat::request_phone_sync_v2_http(&s_clone, &req_id, &sync_data_clone)
+                            chat::request_phone_sync_v2_http(&s_clone, &req_id, &init_payload_clone)
                                 .await
                         {
                             crate::logger::log_sync(&format!("HTTP request-sync 12888 err: {e}"));
@@ -343,7 +343,7 @@ where
                     });
 
                     // 2. Gửi WS cmd 590 & cmd 592
-                    let sent_ws = crate::socket::send_sync_message_ws_request(&sync_data);
+                    let sent_ws = crate::socket::send_sync_message_ws_request(&init_payload);
                     let sent_wake = crate::socket::send_mobile_wakeup(&sync_id);
                     crate::logger::log_sync(&format!(
                         "590/592 mở session: sync={} ws_590={sent_ws} ws_592={sent_wake}",
@@ -425,7 +425,12 @@ where
         }
 
         if confirmed {
-            // Đã xác nhận → chỉ chờ batch (meta + message), không gửi lại 590.
+            // Đã xác nhận: gửi truy vấn phân vùng tin nhắn cụ thể
+            if let Some(ref sid) = v2_sync_id {
+                if !partitions.is_empty() {
+                    let _ = chat::send_sync_v2_request_with_queries(s, sid, &partitions);
+                }
+            }
             on_progress(0.50, "📲 Đã xác nhận — chờ điện thoại nén & gửi gói tin…".to_string());
             let finish_deadline = std::time::Instant::now() + Duration::from_secs(180);
             let mut ok = false;
@@ -1703,5 +1708,17 @@ mod tests {
         // Ghi đè cùng sync_id không trùng lặp.
         record_sync_v2_session("sync-1", "sess-bbb");
         assert!(has_sync_v2_session("sync-1"));
+    }
+
+    #[test]
+    fn sync_v2_initiation_payload_uses_conversation_partition() {
+        let mut s = Session::new(false, false, false).unwrap();
+        s.computer_name = "TEST-PC".to_string();
+        if generate_sync_v2_keys().is_ok() {
+            let payload = crate::chat::build_sync_v2_payload(&s, "test_sync_id_123", &[]).unwrap();
+            assert_eq!(payload["syncId"], "test_sync_id_123");
+            assert_eq!(payload["req"]["type"], "conversation");
+            assert_eq!(payload["req"]["queries"][0]["partition"], "conversations");
+        }
     }
 }

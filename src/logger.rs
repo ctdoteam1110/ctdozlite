@@ -149,11 +149,33 @@ pub fn log_error(context: &str, err: &str) {
 /// chẩn đoán đồng bộ điện thoại. Xoay file khi > 1MB.
 pub fn log_sync(msg: &str) {
     use std::io::Write;
-    // Absolute path: app mở từ Finder có CWD=/ (không ghi được). Thử data dir
-    // trước, fallback /tmp.
+    #[cfg(target_os = "windows")]
+    let path: std::path::PathBuf = std::env::var("APPDATA")
+        .or_else(|_| std::env::var("USERPROFILE").map(|u| format!("{u}\\AppData\\Roaming")))
+        .map(|appdata| {
+            let dir = std::path::PathBuf::from(appdata).join("ctdozlite");
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join("sync_debug.log")
+        })
+        .unwrap_or_else(|_| std::path::PathBuf::from("sync_debug.log"));
+
+    #[cfg(target_os = "macos")]
     let path: std::path::PathBuf = std::env::var("HOME")
         .map(|h| {
-            std::path::PathBuf::from(h).join("Library/Application Support/ctdozlite/sync_debug.log")
+            let dir = std::path::PathBuf::from(h).join("Library/Application Support/ctdozlite");
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join("sync_debug.log")
+        })
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/sync_debug.log"));
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let path: std::path::PathBuf = std::env::var("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))
+        .map(|d| {
+            let dir = d.join("ctdozlite");
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join("sync_debug.log")
         })
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/sync_debug.log"));
     let path = path.as_path();

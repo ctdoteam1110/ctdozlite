@@ -8863,25 +8863,12 @@ pub async fn request_phone_sync_v2_http(
         "data": sync_data.to_string()
     });
     let params = s.encoded_params(&body)?;
-    let path = format!(
-        "/api/transfer-sync-v2/request-sync?{}&params={params}",
-        s.common_params()
-    );
-    if let Ok(resp) = s.get_endpoint("file", &path).await {
-        let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-        if dec.get("error_code").and_then(Value::as_i64) == Some(0) {
-            return Ok(dec);
-        }
-    }
-    let get_url = format!(
-        "{}/api/transfer-sync-v2/request-sync?{}&params={params}",
+    let url = format!(
+        "{}/api/transfer-sync-v2/request-sync?{}",
         s.domains.file,
         s.common_params()
     );
-    let resp = match s.get(&get_url).await {
-        Ok(v) => v,
-        Err(_) => s.post_form(&get_url, format!("params={params}")).await?,
-    };
+    let resp = s.post_form(&url, format!("params={params}")).await?;
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
