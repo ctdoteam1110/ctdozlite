@@ -97,10 +97,7 @@ pub async fn sync_thread(s: &Session, t: &mut Thread) -> Result<usize> {
             return Ok(added);
         }
         is_old = next_is_old;
-        match resp_cursor.or_else(|| next_cursor(t, "")) {
-            Some(c) => cursor = c,
-            None => return Ok(added),
-        }
+        cursor = require_next_cursor(resp_cursor.or_else(|| next_cursor(t, "")), "")?;
         tokio::time::sleep(PAUSE).await;
     } else if cursor.is_empty() {
         cursor = next_cursor(t, "").unwrap_or_else(|| "0".to_string());
@@ -128,16 +125,27 @@ pub async fn sync_thread(s: &Session, t: &mut Thread) -> Result<usize> {
             continue;
         }
         is_old = next_is_old;
-        if !has_more || t.messages.len() == before {
+        if !has_more {
             break;
         }
-        match resp_cursor.or_else(|| next_cursor(t, &cursor)) {
-            Some(c) if c != cursor => cursor = c,
-            _ => break,
-        }
+        cursor = require_next_cursor(resp_cursor.or_else(|| next_cursor(t, &cursor)), &cursor)?;
         tokio::time::sleep(PAUSE).await;
     }
     Ok(added)
+}
+
+fn sync_error_summary(error: &anyhow::Error) -> String {
+    if let Some(error) = error.downcast_ref::<crate::session::SessionError>() {
+        format!("Zalo trả mã lỗi {}", error.code)
+    } else if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        if error.is_timeout() {
+            "hết thời gian chờ kết nối".into()
+        } else {
+            "lỗi kết nối đến Zalo".into()
+        }
+    } else {
+        "lỗi đồng bộ; xem log --dev".into()
+    }
 }
 
 /// The oldest server message id after a merge, or `None` when the page didn't move the cursor
@@ -150,6 +158,14 @@ fn next_cursor(t: &Thread, current: &str) -> Option<String> {
         .map(|m| m.id.as_str())
         .find(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))?;
     (oldest != current).then(|| oldest.to_string())
+}
+
+fn require_next_cursor(candidate: Option<String>, current: &str) -> Result<String> {
+    candidate
+        .filter(|cursor| !cursor.is_empty() && cursor != current)
+        .ok_or_else(|| {
+            anyhow::anyhow!("server indicated more history but the cursor did not advance")
+        })
 }
 
 static LATEST_MOBILE_TEMP_KEY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
@@ -287,6 +303,14 @@ where
     sync_phone_messages_opts(s, poll_state, threads, true, on_progress).await
 }
 
+/// Detailed result for the GUI so partial fetch failures are not reported as success.
+#[derive(Debug, Default)]
+pub(crate) struct PhoneSyncReport {
+    pub(crate) added: usize,
+    pub(crate) active_threads: usize,
+    pub(crate) warnings: Vec<String>,
+}
+
 /// Synchronize messages with explicit control over whether to send a wake-up/pull prompt
 /// (`send_phone_prompt`) to the user's phone or only drain server/cloud queues.
 pub async fn sync_phone_messages_opts<F>(
@@ -294,8 +318,28 @@ pub async fn sync_phone_messages_opts<F>(
     poll_state: &tokio::sync::Mutex<chat::PollState>,
     threads: &mut Vec<Thread>,
     send_phone_prompt: bool,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<(usize, usize)>
+where
+    F: FnMut(f32, String),
+{
+    let report =
+        sync_phone_messages_with_report(s, poll_state, threads, send_phone_prompt, on_progress)
+            .await?;
+    Ok((report.added, report.active_threads))
+}
+
+/// Synchronize messages and retain non-fatal endpoint failures for the completion event.
+///
+/// # Errors
+/// Returns an error when there is no active login or required local persistence fails.
+pub(crate) async fn sync_phone_messages_with_report<F>(
+    s: &Session,
+    poll_state: &tokio::sync::Mutex<chat::PollState>,
+    threads: &mut Vec<Thread>,
+    send_phone_prompt: bool,
+    mut on_progress: F,
+) -> Result<PhoneSyncReport>
 where
     F: FnMut(f32, String),
 {
@@ -304,6 +348,7 @@ where
     }
     let pub_key = generate_sync_public_key();
     let before_total: usize = threads.iter().map(|t| t.messages.len()).sum();
+    let mut warnings = Vec::new();
 
     if send_phone_prompt {
         set_last_mobile_sync_status(None);
@@ -369,7 +414,7 @@ where
                     remove_sync_v2_session(sid);
                 }
                 set_active_v2_sync_id(None);
-                return Ok((0, 0));
+                return Ok(PhoneSyncReport::default());
             }
             if let Some(st) = last_mobile_sync_status().as_deref() {
                 let is_error = st.contains("Lỗi") || st.contains("Không thể") || st.contains("thất bại");
@@ -405,7 +450,7 @@ where
                 remove_sync_v2_session(sid);
             }
             set_active_v2_sync_id(None);
-            return Ok((0, 0));
+            return Ok(PhoneSyncReport::default());
         }
 
         if confirmed {
@@ -482,7 +527,7 @@ where
 
     if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
         let _ = chat::cancel_phone_sync(s, &pub_key).await;
-        return Ok((0, 0));
+        return Ok(PhoneSyncReport::default());
     }
 
     // Phase 2: Drain `lp_chat` multi-batch action queues (`getChatFromPolling`)
@@ -493,14 +538,21 @@ where
     for batch_idx in 0..5 {
         if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
             let _ = chat::cancel_phone_sync(s, &pub_key).await;
-            return Ok((0, 0));
+            return Ok(PhoneSyncReport {
+                warnings,
+                ..PhoneSyncReport::default()
+            });
         }
         let lp_res = {
             let mut ps = poll_state.lock().await;
             chat::get_chat_from_polling(s, &mut ps).await
         };
-        let Ok(lp_resp) = lp_res else {
-            break;
+        let lp_resp = match lp_res {
+            Ok(response) => response,
+            Err(error) => {
+                warnings.push(format!("Hàng đợi tin nhắn: {}", sync_error_summary(&error)));
+                break;
+            }
         };
         chat::merge_previews(threads, &lp_resp);
         if let Some(data_node) = lp_resp.get("data") {
@@ -529,8 +581,12 @@ where
         0.45,
         "🔄 Đang đồng bộ tin nhắn các cuộc trò chuyện 1-1 & nhóm…".to_string(),
     );
-    if let Ok(preview_resp) = chat::get_last_msgs(s, &[]).await {
-        chat::merge_previews(threads, &preview_resp);
+    match chat::get_last_msgs(s, &[]).await {
+        Ok(response) => chat::merge_previews(threads, &response),
+        Err(error) => warnings.push(format!(
+            "Tải danh sách hội thoại: {}",
+            sync_error_summary(&error)
+        )),
     }
     let known_ids: Vec<String> = threads
         .iter()
@@ -550,8 +606,13 @@ where
             let _ = chat::cancel_phone_sync(s, &pub_key).await;
             break;
         }
-        if let Ok(preview_resp) = chat::get_last_msgs(s, chunk).await {
-            chat::merge_previews(threads, &preview_resp);
+        match chat::get_last_msgs(s, chunk).await {
+            Ok(response) => chat::merge_previews(threads, &response),
+            Err(error) => warnings.push(format!(
+                "Tải tin nhắn xem trước lô {}: {}",
+                idx + 1,
+                sync_error_summary(&error)
+            )),
         }
         let frac = 0.45 + 0.25 * ((idx + 1) as f32 / total_chunks as f32);
         on_progress(
@@ -596,18 +657,35 @@ where
             frac,
             format!("☁️ Đang đồng bộ lịch sử: {tname} ({}/{total_cm})…", pos + 1),
         );
-        if let Ok(cm_resp) = chat::get_cloud_messages(s, &tid, "0", false, PAGE).await {
-            chat::merge_group_history(&mut threads[tidx], &cm_resp);
-            let (has_more, is_old, last_msg_id) = chat::parse_cloud_page_meta(&cm_resp);
-            if has_more {
-                if let Some(oldest) = last_msg_id.or_else(|| next_cursor(&threads[tidx], "")) {
-                    if let Ok(old_resp) =
-                        chat::get_cloud_messages(s, &tid, &oldest, is_old, PAGE).await
-                    {
-                        chat::merge_group_history(&mut threads[tidx], &old_resp);
+        match chat::get_cloud_messages(s, &tid, "0", false, PAGE).await {
+            Ok(response) => {
+                chat::merge_group_history(&mut threads[tidx], &response);
+                let (has_more, is_old, last_msg_id) = chat::parse_cloud_page_meta(&response);
+                if has_more {
+                    if let Some(oldest) = last_msg_id.or_else(|| next_cursor(&threads[tidx], "")) {
+                        match chat::get_cloud_messages(s, &tid, &oldest, is_old, PAGE).await {
+                            Ok(old_response) => {
+                                chat::merge_group_history(&mut threads[tidx], &old_response);
+                            }
+                            Err(error) if chat::is_cloud_stop_retry(&error) => {}
+                            Err(error) => warnings.push(format!(
+                                "Tải trang lịch sử Cloud/Nhóm: {}",
+                                sync_error_summary(&error)
+                            )),
+                        }
+                    } else {
+                        warnings.push(
+                            "Cloud/Nhóm: máy chủ báo còn lịch sử nhưng không có mốc phân trang"
+                                .into(),
+                        );
                     }
                 }
             }
+            Err(error) if chat::is_cloud_stop_retry(&error) => {}
+            Err(error) => warnings.push(format!(
+                "Tải lịch sử Cloud/Nhóm: {}",
+                sync_error_summary(&error)
+            )),
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
@@ -642,13 +720,25 @@ where
     let mobile_added = sync_v2_imported_count();
     let added = (db_added + mobile_added).max(after_total.saturating_sub(before_total));
     let active_threads = threads.iter().filter(|t| !t.messages.is_empty()).count();
-    let final_msg = if let Some(phone_note) = last_mobile_sync_status() {
-        format!("{phone_note} · Đã đồng bộ Cloud/Nhóm: +{added} tin nhắn ({active_threads} hội thoại)")
+    let final_msg = if !warnings.is_empty() {
+        format!(
+            "⚠️ Đồng bộ chưa đầy đủ: +{added} tin nhắn ({active_threads} hội thoại), {} lỗi tải dữ liệu (vd. {})",
+            warnings.len(),
+            warnings[0]
+        )
+    } else if let Some(phone_note) = last_mobile_sync_status() {
+        format!(
+            "{phone_note} · Đã đồng bộ Cloud/Nhóm: +{added} tin nhắn ({active_threads} hội thoại)"
+        )
     } else {
         format!("✅ Đã gửi yêu cầu tới điện thoại & đồng bộ Cloud/Nhóm: +{added} tin nhắn ({active_threads} hội thoại). Hãy mở Zalo trên điện thoại để xác nhận nếu muốn kéo tin nhắn 1-1 cũ.")
     };
     on_progress(1.0, final_msg);
-    Ok((added, active_threads))
+    Ok(PhoneSyncReport {
+        added,
+        active_threads,
+        warnings,
+    })
 }
 
 /// Download, decrypt, decompress and ingest a mobile backup container (.db.crypt)
@@ -2276,6 +2366,24 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn history_sync_requires_an_advancing_cursor_when_more_pages_exist() {
+        assert_eq!(require_next_cursor(Some("20".into()), "10").unwrap(), "20");
+        assert!(require_next_cursor(None, "10").is_err());
+        assert!(require_next_cursor(Some("10".into()), "10").is_err());
+    }
+
+    #[test]
+    fn sync_error_summary_does_not_expose_session_details() {
+        let error: anyhow::Error = crate::session::SessionError::new(600, "private message")
+            .at("https://example.test/?params=private-token")
+            .into();
+
+        let summary = sync_error_summary(&error);
+        assert_eq!(summary, "Zalo trả mã lỗi 600");
+        assert!(!summary.contains("private"));
     }
 
     #[test]

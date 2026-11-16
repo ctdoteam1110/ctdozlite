@@ -889,6 +889,7 @@ pub enum GuiEvent {
         error: Option<String>,
         /// Why the phone (Sync V2) step could not start, captured by the worker for this run.
         phone_error: Option<String>,
+        warnings: Vec<String>,
     },
     /// Result of pinning/unpinning a single chat message through the group-board API.
     MessagePinResult {
@@ -997,12 +998,15 @@ fn phone_sync_completion_message(
     cancelled: bool,
     error: Option<&str>,
     phone_error: Option<&str>,
+    warnings: &[String],
 ) -> String {
     if let Some(err) = error {
         return format!("⚠️ Đồng bộ thất bại: {err}");
     }
     let prefix = if cancelled {
         "Đã dừng"
+    } else if !warnings.is_empty() {
+        "Đồng bộ chưa đầy đủ"
     } else {
         "Đã hoàn tất"
     };
@@ -1010,7 +1014,11 @@ fn phone_sync_completion_message(
         Some(err) => format!("Không đồng bộ được từ điện thoại: {err}"),
         None => "Lịch sử điện thoại chưa được tải vào ứng dụng.".to_string(),
     };
-    format!("{prefix} yêu cầu: {added} tin mới từ Cloud/Nhóm ({active_threads} hội thoại). {phone_note}")
+    let warning_note = warnings
+        .first()
+        .map(|first| format!(" · {} lỗi tải dữ liệu (vd. {first})", warnings.len()))
+        .unwrap_or_default();
+    format!("{prefix} yêu cầu: {added} tin mới từ Cloud/Nhóm ({active_threads} hội thoại). {phone_note}{warning_note}")
 }
 
 #[derive(Debug, Clone)]
@@ -4354,6 +4362,7 @@ impl ZaloGuiApp {
                     cancelled,
                     error,
                     phone_error,
+                    warnings,
                 } => {
                     self.phone_sync_progress = 0.0;
                     if !threads.is_empty() {
@@ -4400,6 +4409,7 @@ impl ZaloGuiApp {
                         cancelled,
                         error.as_deref(),
                         phone_error.as_deref(),
+                        &warnings,
                     );
                     self.phone_sync_status = msg.clone();
                     self.status_msg = msg.clone();
@@ -6289,24 +6299,44 @@ mod tests {
 
     #[test]
     fn phone_sync_completion_does_not_claim_phone_messages_were_imported() {
-        let none = phone_sync_completion_message(0, 0, false, None, None);
+        let none = phone_sync_completion_message(0, 0, false, None, None, &[]);
         assert!(none.contains("Lịch sử điện thoại chưa được tải vào ứng dụng"));
         assert!(none.contains("0 tin mới từ Cloud/Nhóm"));
 
-        let cloud = phone_sync_completion_message(12, 3, false, None, None);
+        let cloud = phone_sync_completion_message(12, 3, false, None, None, &[]);
         assert!(cloud.contains("12 tin mới từ Cloud/Nhóm (3 hội thoại)"));
         assert!(cloud.contains("Lịch sử điện thoại chưa được tải vào ứng dụng"));
 
-        let failed = phone_sync_completion_message(0, 0, false, Some("network"), None);
+        let failed = phone_sync_completion_message(0, 0, false, Some("network"), None, &[]);
         assert!(failed.contains("Đồng bộ thất bại: network"));
     }
 
     #[test]
     fn phone_sync_completion_keeps_phone_step_error_visible() {
-        let msg = phone_sync_completion_message(5, 2, false, None, Some("Không tìm thấy Zalo PC trên máy này"));
+        let msg = phone_sync_completion_message(
+            5,
+            2,
+            false,
+            None,
+            Some("Không tìm thấy Zalo PC trên máy này"),
+            &[],
+        );
         assert!(msg.contains("5 tin mới từ Cloud/Nhóm (2 hội thoại)"));
-        assert!(msg.contains("Không đồng bộ được từ điện thoại: Không tìm thấy Zalo PC trên máy này"));
+        assert!(
+            msg.contains("Không đồng bộ được từ điện thoại: Không tìm thấy Zalo PC trên máy này")
+        );
         assert!(!msg.contains("Lịch sử điện thoại chưa được tải"));
+    }
+
+    #[test]
+    fn phone_sync_completion_marks_partial_fetch_failures() {
+        let warnings = vec!["Tải lịch sử Cloud/Nhóm: lỗi kết nối đến Zalo".into()];
+        let msg = phone_sync_completion_message(2, 1, false, None, None, &warnings);
+
+        assert!(msg.contains("Đồng bộ chưa đầy đủ"));
+        assert!(msg.contains("1 lỗi tải dữ liệu"));
+        assert!(msg.contains("lỗi kết nối đến Zalo"));
+        assert!(!msg.contains("Đã hoàn tất"));
     }
 
     #[test]

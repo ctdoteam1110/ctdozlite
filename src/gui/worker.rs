@@ -4521,7 +4521,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 let s = session_clone.lock().await.clone();
                                 let gui_tx_prog = gui_tx_clone.clone();
                                 let ctx_prog = ctx_clone.clone();
-                                let res = crate::history_sync::sync_phone_messages_opts(
+                                let res = crate::history_sync::sync_phone_messages_with_report(
                                     &s,
                                     &poll_clone,
                                     &mut threads,
@@ -4541,14 +4541,15 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 // this global as soon as it starts.
                                 let phone_error = crate::history_sync::last_phone_sync_error();
                                 match res {
-                                    Ok((added, active_threads)) => {
+                                    Ok(report) => {
                                         let _ = gui_tx_clone.send(GuiEvent::PhoneSyncFinished {
                                             threads,
-                                            added,
-                                            active_threads,
+                                            added: report.added,
+                                            active_threads: report.active_threads,
                                             cancelled,
                                             error: None,
                                             phone_error,
+                                            warnings: report.warnings,
                                         });
                                     }
                                     Err(e) => {
@@ -4559,6 +4560,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             cancelled,
                                             error: Some(e.to_string()),
                                             phone_error,
+                                            warnings: Vec::new(),
                                         });
                                     }
                                 }
