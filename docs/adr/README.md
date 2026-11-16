@@ -35,6 +35,9 @@ What we will do, in one paragraph, present tense.
 
 | ADR | Title | Status |
 | :--- | :--- | :--- |
-| — | No decisions recorded yet | — |
+| [0001](0001-history-sync.md) | History sync and backup import | accepted |
+| [0002](0002-self-updater.md) | Self-updater and `latest.json` contract | accepted |
+| [0003](0003-changelog-policy.md) | Changelog and release notes policy | accepted |
+| [0004](0004-local-api-authentication.md) | Local REST API authentication and CORS | proposed |
 
 Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).

@@ -3005,7 +3005,7 @@ impl CallBridge {
                                             .lock()
                                             .await
                                             .as_ref()
-                                            .map(|s| {
+                                            .map(|_s| {
                                                 // group_id dạng số; server nhận cả string.
                                                 gid.to_string()
                                             })

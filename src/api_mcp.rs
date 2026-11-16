@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -21,6 +22,9 @@ use crate::store::{self, MessageStore};
 
 pub const AUTOREPLY_FILE: &str = "autoreply_rules.json";
 pub const DEFAULT_API_PORT: u16 = 17890;
+
+const API_METHODS: &[&str] = &["GET", "POST", "DELETE"];
+const API_HEADERS: &[&str] = &["authorization", "content-type"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutoReplyRule {
@@ -831,85 +835,294 @@ pub async fn handle_rest_request(
     }
 }
 
+#[derive(Clone)]
+struct ApiHttpConfig {
+    port: u16,
+    token: String,
+    allowed_origins: Vec<String>,
+}
+
+impl ApiHttpConfig {
+    fn from_env(port: u16) -> Result<Self> {
+        let token = std::env::var("CTDOZLITE_API_TOKEN").map_err(|_| {
+            anyhow::anyhow!("CTDOZLITE_API_TOKEN is required to start the REST API")
+        })?;
+        let origins = match std::env::var("CTDOZLITE_API_ALLOWED_ORIGINS") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("CTDOZLITE_API_ALLOWED_ORIGINS must be valid UTF-8")
+            }
+        };
+        Self::new(port, &token, &origins)
+    }
+
+    fn new(port: u16, token: &str, origins: &str) -> Result<Self> {
+        if token.is_empty() || !token.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+            anyhow::bail!("CTDOZLITE_API_TOKEN must be a non-empty printable ASCII token")
+        }
+
+        let mut allowed_origins = Vec::new();
+        for origin in origins
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let normalized = normalize_origin(origin).ok_or_else(|| {
+                anyhow::anyhow!("CTDOZLITE_API_ALLOWED_ORIGINS contains an invalid origin")
+            })?;
+            if !allowed_origins.contains(&normalized) {
+                allowed_origins.push(normalized);
+            }
+        }
+
+        Ok(Self {
+            port,
+            token: token.to_owned(),
+            allowed_origins,
+        })
+    }
+
+    fn allows_host(&self, host: &str) -> bool {
+        let port = self.port.to_string();
+        host.eq_ignore_ascii_case(&format!("127.0.0.1:{port}"))
+            || host.eq_ignore_ascii_case(&format!("localhost:{port}"))
+            || (self.port == 80
+                && (host.eq_ignore_ascii_case("127.0.0.1")
+                    || host.eq_ignore_ascii_case("localhost")))
+    }
+
+    fn allowed_origin(&self, origin: &str) -> Option<String> {
+        let normalized = normalize_origin(origin)?;
+        self.allowed_origins
+            .contains(&normalized)
+            .then_some(normalized)
+    }
+}
+
+fn normalize_origin(value: &str) -> Option<String> {
+    if value.contains('@') || value.contains('\\') {
+        return None;
+    }
+    let url = reqwest::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let origin = url.origin().ascii_serialization();
+    (origin != "null").then_some(origin)
+}
+
+enum HeaderValue<'a> {
+    Missing,
+    Single(&'a str),
+    Duplicate,
+}
+
+fn single_header<'a>(head: &'a str, name: &str) -> HeaderValue<'a> {
+    let mut values = head.lines().skip(1).filter_map(|line| {
+        let (header, value) = line.split_once(':')?;
+        header.eq_ignore_ascii_case(name).then_some(value.trim())
+    });
+    let value = values.next();
+    match (value, values.next()) {
+        (None, _) => HeaderValue::Missing,
+        (Some(_), Some(_)) => HeaderValue::Duplicate,
+        (Some(value), None) => HeaderValue::Single(value),
+    }
+}
+
+fn has_valid_bearer_token(head: &str, expected: &str) -> bool {
+    let HeaderValue::Single(value) = single_header(head, "authorization") else {
+        return false;
+    };
+    let Some((scheme, token)) = value.split_once(' ') else {
+        return false;
+    };
+    let token = token.trim();
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return false;
+    }
+    bool::from(token.as_bytes().ct_eq(expected.as_bytes()))
+}
+
+fn valid_preflight(head: &str) -> bool {
+    let HeaderValue::Single(method) = single_header(head, "access-control-request-method") else {
+        return false;
+    };
+    if !API_METHODS
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(method))
+    {
+        return false;
+    }
+
+    let headers = match single_header(head, "access-control-request-headers") {
+        HeaderValue::Single(value) => value,
+        HeaderValue::Missing => "",
+        HeaderValue::Duplicate => return false,
+    };
+    headers.is_empty()
+        || headers.split(',').all(|header| {
+            let header = header.trim();
+            !header.is_empty()
+                && API_HEADERS
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(header))
+        })
+}
+
+async fn write_http_response(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    body: &str,
+    origin: Option<&str>,
+    preflight: bool,
+) {
+    let status_text = match status {
+        204 => "No Content",
+        200 => "OK",
+        202 => "Accepted",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        _ => "Internal Server Error",
+    };
+    let mut response = format!(
+        "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n",
+        body.len()
+    );
+    if !body.is_empty() {
+        response.push_str("Content-Type: application/json; charset=utf-8\r\n");
+    }
+    if let Some(origin) = origin {
+        response.push_str(&format!(
+            "Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"
+        ));
+    }
+    if preflight {
+        response.push_str(
+            "Access-Control-Allow-Methods: GET, POST, DELETE\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n",
+        );
+    }
+    response.push_str("\r\n");
+    response.push_str(body);
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+async fn write_http_error(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    message: &str,
+    origin: Option<&str>,
+) {
+    let body = json!({ "ok": false, "error": message }).to_string();
+    write_http_response(stream, status, &body, origin, false).await;
+}
+
+async fn handle_http_connection(
+    mut stream: tokio::net::TcpStream,
+    session: Arc<Mutex<Session>>,
+    db_path: String,
+    config: ApiHttpConfig,
+) {
+    let mut buf = vec![0u8; 65536];
+    let Ok(n) = stream.read(&mut buf).await else {
+        return;
+    };
+    if n == 0 {
+        return;
+    }
+    let raw = String::from_utf8_lossy(&buf[..n]);
+    let (head, body_part) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+    let mut lines = head.lines();
+    let req_line = lines.next().unwrap_or("");
+    let mut parts = req_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET");
+    let path = parts.next().unwrap_or("/");
+
+    let HeaderValue::Single(host) = single_header(head, "host") else {
+        write_http_error(&mut stream, 403, "Forbidden", None).await;
+        return;
+    };
+    if !config.allows_host(host) {
+        write_http_error(&mut stream, 403, "Forbidden", None).await;
+        return;
+    }
+
+    let origin = match single_header(head, "origin") {
+        HeaderValue::Single(value) => match config.allowed_origin(value) {
+            Some(origin) => Some(origin),
+            None => {
+                write_http_error(&mut stream, 403, "Forbidden", None).await;
+                return;
+            }
+        },
+        HeaderValue::Missing => None,
+        HeaderValue::Duplicate => {
+            write_http_error(&mut stream, 403, "Forbidden", None).await;
+            return;
+        }
+    };
+
+    if method == "OPTIONS" {
+        if origin.is_none() || !valid_preflight(head) {
+            write_http_error(&mut stream, 403, "Forbidden", None).await;
+            return;
+        }
+        write_http_response(&mut stream, 204, "", origin.as_deref(), true).await;
+        return;
+    }
+
+    if !has_valid_bearer_token(head, &config.token) {
+        write_http_error(&mut stream, 401, "Unauthorized", origin.as_deref()).await;
+        return;
+    }
+
+    let (status, json_val) = handle_rest_request(&session, method, path, body_part, &db_path).await;
+    let body = serde_json::to_string(&json_val).unwrap_or_else(|_| "{}".into());
+    write_http_response(&mut stream, status, &body, origin.as_deref(), false).await;
+}
+
+async fn serve_local_http(
+    listener: TcpListener,
+    session: Arc<Mutex<Session>>,
+    db_path: String,
+    config: ApiHttpConfig,
+) -> Result<()> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        tokio::spawn(handle_http_connection(
+            stream,
+            session.clone(),
+            db_path.clone(),
+            config.clone(),
+        ));
+    }
+}
+
 /// Spawn the local HTTP REST & MCP server on `127.0.0.1:<port>`.
+///
+/// # Errors
+/// Returns an error if the required API token or origin configuration is invalid, the local port
+/// cannot be bound, or accepting a connection fails.
 pub async fn run_local_http_server(
     session: Arc<Mutex<Session>>,
     port: u16,
     db_path: String,
 ) -> Result<()> {
-    let bind_addr = format!("127.0.0.1:{port}");
-    let listener = TcpListener::bind(&bind_addr).await?;
-    let expected_token = std::env::var("CTDOZLITE_API_TOKEN")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-
-    loop {
-        let (mut stream, _) = listener.accept().await?;
-        let sess = session.clone();
-        let db = db_path.clone();
-        let tok = expected_token.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
-            let Ok(n) = stream.read(&mut buf).await else {
-                return;
-            };
-            if n == 0 {
-                return;
-            }
-            let raw = String::from_utf8_lossy(&buf[..n]);
-            let (head, body_part) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
-            let mut lines = head.lines();
-            let req_line = lines.next().unwrap_or("");
-            let mut parts = req_line.split_whitespace();
-            let method = parts.next().unwrap_or("GET");
-            let path = parts.next().unwrap_or("/");
-
-            if method == "OPTIONS" {
-                let cors = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: 0\r\n\r\n";
-                let _ = stream.write_all(cors.as_bytes()).await;
-                return;
-            }
-
-            if let Some(ref expected) = tok {
-                let authorized = head.lines().any(|line| {
-                    let lower = line.to_ascii_lowercase();
-                    if lower.starts_with("authorization:") {
-                        let val = line[14..].trim().trim_start_matches("Bearer ").trim();
-                        val == expected
-                    } else {
-                        false
-                    }
-                });
-                if !authorized {
-                    let body_str = json!({ "ok": false, "error": "Unauthorized: invalid or missing Bearer token" }).to_string();
-                    let resp = format!(
-                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
-                        body_str.len(),
-                        body_str
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    return;
-                }
-            }
-
-            let (status, json_val) =
-                handle_rest_request(&sess, method, path, body_part, &db).await;
-            let status_text = match status {
-                200 => "200 OK",
-                202 => "202 Accepted",
-                400 => "400 Bad Request",
-                404 => "404 Not Found",
-                _ => "500 Internal Server Error",
-            };
-            let body_str = serde_json::to_string(&json_val).unwrap_or_else(|_| "{}".into());
-            let resp = format!(
-                "HTTP/1.1 {status_text}\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body_str.len(),
-                body_str
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-        });
-    }
+    let config = ApiHttpConfig::from_env(port)?;
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
+    serve_local_http(listener, session, db_path, config).await
 }
 
 fn url_decode(s: &str) -> String {
@@ -941,6 +1154,155 @@ fn url_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    async fn start_test_server(
+        origins: &str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = ApiHttpConfig::new(address.port(), "test-api-token", origins).unwrap();
+        let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
+        let task = tokio::spawn(async move {
+            let _ = serve_local_http(listener, session, ":memory:".into(), config).await;
+        });
+        (address, task)
+    }
+
+    async fn send_http_request(
+        address: std::net::SocketAddr,
+        method: &str,
+        host: &str,
+        headers: &str,
+    ) -> String {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "{method} /api/v1/search?q=test HTTP/1.1\r\nHost: {host}\r\n{headers}Connection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    fn local_host(address: std::net::SocketAddr) -> String {
+        format!("127.0.0.1:{}", address.port())
+    }
+
+    #[test]
+    fn api_http_config_requires_token_and_valid_origins() {
+        assert!(ApiHttpConfig::new(17890, "", "").is_err());
+        assert!(ApiHttpConfig::new(17890, "test-token", "*").is_err());
+        assert!(ApiHttpConfig::new(17890, "test-token", "https://trusted.example/path").is_err());
+    }
+
+    #[tokio::test]
+    async fn http_api_rejects_missing_and_invalid_tokens() {
+        let (address, task) = start_test_server("").await;
+        let host = local_host(address);
+
+        let missing = send_http_request(address, "GET", &host, "").await;
+        assert!(missing.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(missing.contains("\r\nCache-Control: no-store\r\n"));
+
+        let invalid = send_http_request(
+            address,
+            "GET",
+            &host,
+            "Authorization: Bearer wrong-token\r\n",
+        )
+        .await;
+        assert!(invalid.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(invalid.contains("Unauthorized"));
+        assert!(!invalid.contains("wrong-token"));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_api_echoes_only_configured_origins() {
+        let (address, task) = start_test_server("http://localhost:3000").await;
+        let host = local_host(address);
+
+        let trusted = send_http_request(
+            address,
+            "GET",
+            &host,
+            "Authorization: Bearer test-api-token\r\nOrigin: http://localhost:3000\r\n",
+        )
+        .await;
+        assert!(trusted.starts_with("HTTP/1.1 200 OK"));
+        assert!(trusted.contains("\r\nAccess-Control-Allow-Origin: http://localhost:3000\r\n"));
+        assert!(!trusted.contains("Access-Control-Allow-Origin: *"));
+
+        let untrusted = send_http_request(
+            address,
+            "GET",
+            &host,
+            "Authorization: Bearer test-api-token\r\nOrigin: https://attacker.example\r\n",
+        )
+        .await;
+        assert!(untrusted.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(!untrusted.contains("Access-Control-Allow-Origin:"));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_api_allows_authenticated_non_browser_clients() {
+        let (address, task) = start_test_server("").await;
+        let response = send_http_request(
+            address,
+            "GET",
+            &local_host(address),
+            "Authorization: Bearer test-api-token\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(!response.contains("Access-Control-Allow-Origin:"));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn preflight_does_not_authorize_the_follow_up_request() {
+        let (address, task) = start_test_server("http://localhost:3000").await;
+        let host = local_host(address);
+        let preflight = send_http_request(
+            address,
+            "OPTIONS",
+            &host,
+            "Origin: http://localhost:3000\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: authorization, content-type\r\n",
+        )
+        .await;
+        assert!(preflight.starts_with("HTTP/1.1 204 No Content"));
+        assert!(preflight.contains("\r\nAccess-Control-Allow-Origin: http://localhost:3000\r\n"));
+        assert!(preflight.contains("\r\nAccess-Control-Allow-Methods: GET, POST, DELETE\r\n"));
+        assert!(!preflight.contains("Access-Control-Allow-Origin: *"));
+
+        let follow_up =
+            send_http_request(address, "POST", &host, "Origin: http://localhost:3000\r\n").await;
+        assert!(follow_up.starts_with("HTTP/1.1 401 Unauthorized"));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_api_rejects_untrusted_host_headers() {
+        let (address, task) = start_test_server("").await;
+        let response = send_http_request(
+            address,
+            "GET",
+            &format!("attacker.example:{}", address.port()),
+            "Authorization: Bearer test-api-token\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        task.abort();
+    }
 
     #[test]
     fn autoreply_rules_match_contains_exact_prefix_and_scope() {

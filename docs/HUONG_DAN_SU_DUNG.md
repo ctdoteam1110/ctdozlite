@@ -21,6 +21,34 @@ Tài liệu tóm tắt các tùy chọn dòng lệnh, thao tác trên giao diệ
 
 ---
 
+### API REST cục bộ
+
+REST API và MCP qua HTTP chỉ lắng nghe trên `127.0.0.1` và bắt buộc có token. Trước khi bật API, đặt `CTDOZLITE_API_TOKEN` thành một chuỗi ASCII in được, không có khoảng trắng và đủ dài (khuyến nghị tạo 32 byte ngẫu nhiên bằng `openssl rand -hex 32`). Mỗi request HTTP phải gửi `Authorization: Bearer <token>`.
+
+```sh
+export CTDOZLITE_API_TOKEN="<token-ngau-nhien>"
+```
+
+Trong PowerShell:
+
+```powershell
+$env:CTDOZLITE_API_TOKEN = "<token-ngau-nhien>"
+```
+
+Client chạy trong trình duyệt cần thêm origin chính xác vào `CTDOZLITE_API_ALLOWED_ORIGINS`, phân tách nhiều origin bằng dấu phẩy. Origin gồm scheme, hostname và port nếu có, ví dụ `http://localhost:3000`; không thêm đường dẫn. Để trống biến này sẽ chặn mọi request có `Origin`. Client dòng lệnh hoặc ứng dụng native không gửi `Origin` chỉ cần token.
+
+```sh
+export CTDOZLITE_API_ALLOWED_ORIGINS="http://localhost:3000"
+```
+
+Trong PowerShell:
+
+```powershell
+$env:CTDOZLITE_API_ALLOWED_ORIGINS = "http://localhost:3000"
+```
+
+Preflight `OPTIONS` chỉ được trả lời cho origin đã cho phép; request thực tế vẫn phải có token hợp lệ. Khi nâng cấp từ phiên bản trước, hãy cấu hình `CTDOZLITE_API_TOKEN` và cập nhật client để gửi Bearer token. Với client trình duyệt, cấu hình thêm `CTDOZLITE_API_ALLOWED_ORIGINS`; API sẽ không khởi động nếu thiếu token.
+
 Trên macOS, bản `.app` mặc định lưu dữ liệu trong `~/Library/Application Support/ctdozlite`, kể cả khi khởi chạy với thư mục làm việc `/`. Bản CLI ngoài bundle giữ thư mục làm việc hiện tại để tiếp tục dùng dữ liệu cũ. `--data-dir` ghi đè cả hai lựa chọn; thư mục chỉ định và thư mục mặc định của bundle có quyền `0700` trên Unix. Nếu thư mục không ghi được, chương trình báo lỗi trước khi mở dữ liệu.
 
 `--version` không chuẩn bị thư mục dữ liệu. Chương trình không tự di chuyển, sao chép hay xóa dữ liệu cũ khi thay đổi thư mục; có thể dùng `--data-dir` để chọn lại thư mục đã có dữ liệu.

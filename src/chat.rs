@@ -1805,7 +1805,7 @@ pub(crate) fn next_client_message_id() -> u64 {
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     let previous = LAST_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
             Some(now.max(last.saturating_add(1)))
         })
         .unwrap_or_else(|last| last);
