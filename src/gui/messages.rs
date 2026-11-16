@@ -1447,6 +1447,9 @@ pub(crate) fn parse_inline_md_runs(text: &str, zalo_bold: bool) -> Vec<InlineMdR
                     }
                     prev_is_space = true;
                 } else {
+                    if prev_is_space && !ch.is_uppercase() {
+                        break;
+                    }
                     prev_is_space = false;
                 }
                 end_idx = idx + ch.len_utf8();
