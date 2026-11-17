@@ -1312,6 +1312,58 @@ fn find_next_bare_url(s: &str) -> Option<usize> {
     best
 }
 
+thread_local! {
+    /// Exact display names tagged in the message currently being rendered (from the wire
+    /// `mentions` pos/len). Lets the inline parser underline only the name, not the words after.
+    static MENTION_NAMES: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Names tagged in `msg`, taken from `mentions` (live) or `meta/mentionsList` (history).
+/// `pos`/`len` are UTF-16 offsets into the text, as produced by the Zalo web client.
+/// `None` when the message carries no mention data.
+fn mention_names(msg: &ChatMessage, text: &str) -> Option<Vec<String>> {
+    let raw = msg.wire_ref.fields.get("mentions").or_else(|| {
+        msg.history_source
+            .as_ref()
+            .and_then(|s| s.pointer("/meta/mentionsList"))
+    })?;
+    let list: Vec<serde_json::Value> = match raw {
+        serde_json::Value::Array(a) => a.clone(),
+        serde_json::Value::String(s) => serde_json::from_str(s).ok()?,
+        _ => return None,
+    };
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let num = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .map(|n| n as usize)
+    };
+    let mut names: Vec<String> = list
+        .iter()
+        .filter_map(|m| {
+            let pos = num(m.get("pos"))?;
+            let len = num(m.get("len"))?;
+            let slice = utf16.get(pos..pos.checked_add(len)?)?;
+            let name = String::from_utf16(slice).ok()?;
+            let name = name.trim().trim_start_matches('@').trim().to_string();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect();
+    // Longest first so "Minh Ngọc Anh" wins over "Minh Ngọc".
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    names.dedup();
+    Some(names)
+}
+
+/// Render `f` with the tagged names of `msg` available to the inline parser.
+fn with_mention_names<R>(msg: &ChatMessage, text: &str, f: impl FnOnce() -> R) -> R {
+    let names = mention_names(msg, text);
+    MENTION_NAMES.with(|m| *m.borrow_mut() = names);
+    let out = f();
+    MENTION_NAMES.with(|m| *m.borrow_mut() = None);
+    out
+}
+
 pub(crate) fn parse_inline_md_runs(text: &str, zalo_bold: bool) -> Vec<InlineMdRun> {
     let mut runs: Vec<InlineMdRun> = Vec::new();
     let mut rest = text;
@@ -1414,6 +1466,20 @@ pub(crate) fn parse_inline_md_runs(text: &str, zalo_bold: bool) -> Vec<InlineMdR
                 }
             }
 
+            // Exact tagged names from the wire data: underline just the name.
+            let known = MENTION_NAMES.with(|m| m.borrow().clone());
+            if let Some(names) = &known {
+                if let Some(name) = names.iter().find(|n| after.starts_with(n.as_str())) {
+                    let mention_len = 1 + name.len();
+                    runs.push(InlineMdRun::Mention(rest[..mention_len].to_string()));
+                    rest = &rest[mention_len..];
+                    continue;
+                }
+            }
+            // No mention data: guess at most two words (typical Vietnamese short name);
+            // with mention data and no match this "@" is not a tag.
+            let max_words = if known.is_some() { 0 } else { 2 };
+
             let mut end_idx = 0;
             let mut word_count = 0;
             let mut prev_is_space = false;
@@ -1442,7 +1508,7 @@ pub(crate) fn parse_inline_md_runs(text: &str, zalo_bold: bool) -> Vec<InlineMdR
                 }
                 if ch.is_whitespace() {
                     word_count += 1;
-                    if word_count >= 5 || prev_is_space {
+                    if word_count >= max_words || prev_is_space {
                         break;
                     }
                     prev_is_space = true;
@@ -1452,7 +1518,8 @@ pub(crate) fn parse_inline_md_runs(text: &str, zalo_bold: bool) -> Vec<InlineMdR
                 end_idx = idx + ch.len_utf8();
             }
             let candidate_name = after[..end_idx].trim_end();
-            if !candidate_name.is_empty()
+            if max_words > 0
+                && !candidate_name.is_empty()
                 && candidate_name.chars().next().is_some_and(char::is_alphanumeric)
             {
                 let mention_len = 1 + candidate_name.len();
@@ -2283,7 +2350,9 @@ pub(super) fn render_message_body(
         } else {
             &msg.text
         };
-        render_chat_markdown_block_opts(ui, display_text, text_col, pal, md.enabled, md.zalo_bold);
+        with_mention_names(msg, display_text, || {
+            render_chat_markdown_block_opts(ui, display_text, text_col, pal, md.enabled, md.zalo_bold)
+        });
         return None;
     };
 
@@ -4130,7 +4199,13 @@ pub(super) fn render_chat_bubble(
                 if fr.response.double_clicked() {
                     return Some(BubbleAction::Reply);
                 }
+                let quick_react = if vanished {
+                    None
+                } else {
+                    quick_react_button(ui, fr.response.rect, msg, idx, pal, emoji_textures)
+                };
                 reaction_action
+                    .or(quick_react)
                     .or(quote_action)
                     .or(card_action)
                     // Album tiles open their own menus; a row-wide one would target photo 1.
@@ -4293,7 +4368,13 @@ pub(super) fn render_chat_bubble(
                 if fr.response.double_clicked() {
                     return Some(BubbleAction::Reply);
                 }
+                let quick_react = if vanished {
+                    None
+                } else {
+                    quick_react_button(ui, fr.response.rect, msg, idx, pal, emoji_textures)
+                };
                 reaction_action
+                    .or(quick_react)
                     .or(quote_action)
                     .or(card_action)
                     // Album tiles open their own menus; a row-wide one would target photo 1.
@@ -4315,6 +4396,96 @@ pub(super) fn render_chat_bubble(
         })
         .inner
     }
+}
+
+/// Zalo-style quick reaction: a small round ❤️ button on the bubble's bottom-right corner,
+/// shown while the pointer is over the bubble (or the button). One click sends a heart;
+/// other reactions stay in the right-click menu.
+fn quick_react_button(
+    ui: &mut egui::Ui,
+    bubble_rect: Rect,
+    msg: &ChatMessage,
+    idx: usize,
+    pal: &ThemePalette,
+    emoji_textures: &HashMap<String, TextureHandle>,
+) -> Option<BubbleAction> {
+    const D: f32 = 22.0;
+    let menu_open = ui.ctx().data(|d| {
+        d.get_temp::<(String, Pos2, usize)>(Id::new("active_bubble_context_menu"))
+            .is_some()
+    });
+    if menu_open || ui.memory(|m| m.any_popup_open()) {
+        return None;
+    }
+    let center = Pos2::new(bubble_rect.right() - 10.0, bubble_rect.bottom() - 2.0);
+    let btn_rect = Rect::from_center_size(center, Vec2::splat(D));
+    // Only inside the visible part of the message list (the button floats in its own layer).
+    if !ui.clip_rect().contains_rect(btn_rect) {
+        return None;
+    }
+    let pointer = ui.ctx().input(|i| i.pointer.hover_pos());
+    let hovered_zone = pointer.is_some_and(|p| {
+        bubble_rect.expand(4.0).contains(p) || btn_rect.expand(4.0).contains(p)
+    });
+    if !hovered_zone {
+        return None;
+    }
+
+    let mut action = None;
+    egui::Area::new(Id::new(("quick_react_btn", idx, msg.ts, &msg.id)))
+        .order(egui::Order::Middle)
+        .fixed_pos(btn_rect.min)
+        .show(ui.ctx(), |ui| {
+            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(D), Sense::click());
+            let painter = ui.painter();
+            let fill = if pal.is_dark {
+                Color32::from_rgb(45, 50, 58)
+            } else {
+                Color32::WHITE
+            };
+            painter.circle_filled(
+                rect.center() + Vec2::new(0.0, 1.0),
+                D / 2.0 + 0.5,
+                Color32::from_black_alpha(if pal.is_dark { 90 } else { 28 }),
+            );
+            painter.circle(
+                rect.center(),
+                D / 2.0,
+                if resp.hovered() { pal.bg_hover } else { fill },
+                Stroke::new(1.0_f32, pal.border),
+            );
+            let icon = Rect::from_center_size(
+                rect.center(),
+                Vec2::splat(if resp.hovered() { 15.0 } else { 13.0 }),
+            );
+            if let Some(tex) = emoji_textures.get("heart") {
+                painter.image(
+                    tex.id(),
+                    icon,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            } else {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "❤",
+                    FontId::proportional(12.0),
+                    pal.danger,
+                );
+            }
+            let clicked = resp
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("Thả tim · chuột phải vào tin để chọn cảm xúc khác")
+                .clicked();
+            if clicked {
+                action = Some(BubbleAction::React("❤️"));
+            }
+        });
+    if action.is_some() {
+        ui.ctx().request_repaint();
+    }
+    action
 }
 
 #[derive(Clone, PartialEq)]
@@ -5944,6 +6115,18 @@ mod md_block_tests {
         assert_eq!(parse_ordered_item("- bullet"), None);
         assert_eq!(parse_ordered_item("1.missing space"), None);
         assert_eq!(parse_ordered_item("1234. too long"), None);
+    }
+
+    #[test]
+    fn mention_underlines_only_the_tagged_name() {
+        // With wire mention data: exactly the tagged name, nothing after it.
+        MENTION_NAMES.with(|m| *m.borrow_mut() = Some(vec!["Minh Ngọc".into()]));
+        let runs = parse_inline_md_runs("@Minh Ngọc a xem cuối tuần", false);
+        MENTION_NAMES.with(|m| *m.borrow_mut() = None);
+        assert_eq!(runs[0], InlineMdRun::Mention("@Minh Ngọc".into()));
+        // Without data: at most two words are guessed.
+        let runs = parse_inline_md_runs("@Minh Ngọc vận động nặng", false);
+        assert_eq!(runs[0], InlineMdRun::Mention("@Minh Ngọc".into()));
     }
 
     #[test]
