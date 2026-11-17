@@ -37,6 +37,9 @@ use wasmtime::{Caller, Engine, Extern, Func, Instance, Linker, Memory, Module, S
 // WASM location (same order as scripts/sync_v2_helper.js findWasm)
 // ---------------------------------------------------------------------------
 
+/// Folder inside the data folder where a user can drop `libzproto_wasm_bg.*.wasm`.
+pub const WASM_DATA_SUBDIR: &str = "zproto";
+
 /// Locate `libzproto_wasm_bg.*.wasm` without bundling it in the repo.
 /// Search order: `CTDOZLITE_ZPROTO_WASM` absolute path, installed Zalo PC,
 /// own app bundle `Contents/Resources`, dev copy under `scripts/assets`.
@@ -78,6 +81,12 @@ pub fn find_wasm_path() -> Option<PathBuf> {
             roots.push(PathBuf::from(prog).join("Zalo"));
         }
     }
+    // User-provided copy in the data folder (the process cwd, see `data_dir`). Linux has
+    // no Zalo PC to borrow the module from, and the data folder is no longer the repo
+    // checkout, so the relative `scripts/assets` below no longer finds the dev copy.
+    roots.push(PathBuf::from(WASM_DATA_SUBDIR));
+    #[cfg(target_os = "linux")]
+    roots.push(PathBuf::from("/usr/share/ctdozlite"));
     roots.push(PathBuf::from("scripts/assets"));
     if let Ok(exe) = std::env::current_exe() {
         let mut d = exe.parent();
@@ -813,9 +822,12 @@ impl ZprotoHost {
             crate::logger::log_sync(&format!("libzproto WASM từ {origin}"));
             return Self::load_from_bytes(&bytes);
         }
+        let data_hint = std::env::current_dir()
+            .map(|d| d.join(WASM_DATA_SUBDIR).display().to_string())
+            .unwrap_or_else(|_| WASM_DATA_SUBDIR.to_string());
         Err(anyhow!(
             "Không tìm thấy Zalo PC trên máy này (cần file libzproto_wasm_bg.*.wasm của Zalo PC). \
-             Cài Zalo PC hoặc đặt CTDOZLITE_ZPROTO_WASM trỏ tới file WASM."
+             Cài Zalo PC, chép file WASM vào {data_hint}, hoặc đặt CTDOZLITE_ZPROTO_WASM trỏ tới file WASM."
         ))
     }
 
