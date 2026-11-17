@@ -926,6 +926,7 @@ pub mod lucide {
     pub const SHARE_2: &str = "\u{e156}";
     pub const TRASH_2: &str = "\u{e18e}";
     pub const INFO: &str = "\u{e0f9}";
+    pub const DOWNLOAD: &str = "\u{e0b2}";
 }
 
 pub(super) fn draw_lucide_icon(
