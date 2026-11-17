@@ -24,8 +24,16 @@ match it to a message.
 - `gMsgID` from `server_message_id` (wire `msgId`/`globalMsgId`),
 - `cMsgID` from `client_message_id` (wire `cliMsgId`).
 
-The previous values remain only as fallbacks when no wire identity is stored
-(legacy SQLite rows). Request shape, host, cipher, signing and cookies are
+Fallbacks when no wire identity is stored (legacy SQLite rows), in order:
+
+- `gMsgID`: `ChatMessage::id` (empty for local `out_`/`local_` rows), as before.
+- `cMsgID`: `ChatMessage::id` when numeric, then `ts`, then the current time.
+  Before this change `ts` came first. `id` now wins because `parse_chat_message`
+  stores `cliMsgId` there when present (note 35), so for legacy rows it is the
+  best available client id; `ts` is a time, not an id, and only matches when the
+  sender happened to use it as `cliMsgId`.
+
+Request shape, host, cipher, signing and cookies are
 unchanged; only the values of the two existing fields differ. This matches the
 `rMsg: [{ gMsgID: msgId, cMsgID: cliMsgId, msgType }]` contract of
 `sendReactionMessage` in the web client.
