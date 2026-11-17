@@ -27,6 +27,8 @@ mod modals;
 mod reactions_dialog;
 mod stickers;
 mod theme;
+#[cfg(target_os = "linux")]
+mod tray;
 mod worker;
 mod workspace;
 
@@ -1696,6 +1698,9 @@ pub struct ZaloGuiApp {
     pub(crate) folder_modal_open: bool,
     last_typing_sent_at: Option<(String, std::time::Instant)>,
     last_synced_icon_unread: Option<usize>,
+    /// System-tray icon with an unread dot; `None` when the tray thread could not start.
+    #[cfg(target_os = "linux")]
+    tray: Option<tray::TrayHandle>,
     // Background channels
     event_rx: Receiver<GuiEvent>,
     #[allow(dead_code)]
@@ -2044,6 +2049,8 @@ impl ZaloGuiApp {
             folder_modal_open: false,
             last_typing_sent_at: None,
             last_synced_icon_unread: None,
+            #[cfg(target_os = "linux")]
+            tray: tray::spawn(cc.egui_ctx.clone()),
             event_rx: rx,
             event_tx: tx.clone(),
             chat_render_window: (String::new(), CHAT_RENDER_STEP),
@@ -4632,6 +4639,10 @@ impl eframe::App for ZaloGuiApp {
                 let _ = tx.send(WorkerCmd::EndCall);
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(tray) = self.tray.as_mut() {
+            tray.set_unread(self.unread_counts.values().sum());
         }
         if ctx.input(|i| {
             (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::P)
