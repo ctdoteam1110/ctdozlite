@@ -1005,8 +1005,13 @@ impl ZaloGuiApp {
         let Some((ref text, ts)) = self.toast_notice else {
             return;
         };
-        if ts.elapsed() > Duration::from_millis(2500) {
+        let text = text.clone();
+        let reveal_path = self.toast_reveal_path.clone();
+        // A toast with a button stays longer so there is time to reach it.
+        let lifetime = if reveal_path.is_some() { 6000 } else { 2500 };
+        if ts.elapsed() > Duration::from_millis(lifetime) {
             self.toast_notice = None;
+            self.toast_reveal_path = None;
             return;
         }
         let slide = if self.settings.animations_enabled {
@@ -1022,13 +1027,16 @@ impl ZaloGuiApp {
         };
         let toast_w = (screen.width() - 28.0).clamp(180.0, 340.0);
         let slide_y = (1.0 - slide) * 14.0;
-        egui::Area::new(Id::new("floating_toast_notice"))
+        // The button row makes the toast taller; lift it so it stays on screen.
+        let bottom_gap = if reveal_path.is_some() { 92.0 } else { 54.0 };
+        let mut reveal_clicked = false;
+        let area = egui::Area::new(Id::new("floating_toast_notice"))
             .order(egui::Order::Tooltip)
             .fixed_pos(Pos2::new(
                 (screen.right() - toast_w - 14.0).max(screen.left() + 14.0),
-                (screen.bottom() - 54.0 + slide_y).max(screen.top() + 14.0),
+                (screen.bottom() - bottom_gap + slide_y).max(screen.top() + 14.0),
             ))
-            .interactable(false)
+            .interactable(reveal_path.is_some())
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(pal.bg_elevated)
@@ -1057,7 +1065,7 @@ impl ZaloGuiApp {
                                 .circle_filled(dr.center(), 4.0, pal.accent_online);
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(text)
+                                    RichText::new(&text)
                                         .size(12.0)
                                         .color(pal.text_primary)
                                         .strong(),
@@ -1065,8 +1073,42 @@ impl ZaloGuiApp {
                                 .wrap(),
                             );
                         });
+                        if reveal_path.is_some() {
+                            ui.add_space(6.0);
+                            let btn = egui::Button::new(
+                                RichText::new(format!("{} Mở thư mục", lucide::FOLDER_OPEN))
+                                    .size(11.8)
+                                    .color(pal.text_primary),
+                            )
+                            .fill(pal.bg_app)
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .rounding(Rounding::same(6.0))
+                            .min_size(Vec2::new(96.0, 26.0));
+                            reveal_clicked = ui
+                                .add(btn)
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .on_hover_text("Mở thư mục chứa tập tin vừa lưu")
+                                .clicked();
+                        }
                     });
             });
+        if let Some(path) = reveal_path {
+            if reveal_clicked {
+                super::reveal_in_file_manager(&path);
+                self.toast_notice = None;
+                self.toast_reveal_path = None;
+            } else if ctx
+                .input(|i| i.pointer.hover_pos())
+                .is_some_and(|p| area.response.rect.contains(p))
+            {
+                // Hold the toast while the pointer is on it; restart the countdown with the
+                // slide-in already finished.
+                if let Some((_, ts)) = self.toast_notice.as_mut() {
+                    *ts = std::time::Instant::now() - Duration::from_millis(1000);
+                }
+            }
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
     }
 
     pub(super) fn render_phone_lookup_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
@@ -8403,6 +8445,27 @@ impl ZaloGuiApp {
                                 }
 
                                 if !viewer.full_url.is_empty() {
+                                    let save_btn = egui::Button::new(
+                                        RichText::new(format!("{} Tải về", lucide::DOWNLOAD))
+                                            .size(11.8)
+                                            .color(pal.text_primary),
+                                    )
+                                    .fill(pal.bg_elevated)
+                                    .stroke(Stroke::new(1.0_f32, pal.border))
+                                    .rounding(Rounding::same(6.0))
+                                    .min_size(Vec2::new(72.0, 28.0));
+                                    if ui
+                                        .add(save_btn)
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .on_hover_text("Tải ảnh về máy (thư mục Downloads)")
+                                        .clicked()
+                                    {
+                                        self.save_media(
+                                            viewer.full_url.clone(),
+                                            viewer.title.clone(),
+                                        );
+                                    }
+
                                     let ext_btn = egui::Button::new(
                                         RichText::new(format!("{} Mở gốc", lucide::EXTERNAL_LINK))
                                             .size(11.8)
@@ -8912,14 +8975,10 @@ impl ZaloGuiApp {
                                 if ui
                                     .add(save_btn)
                                     .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Lưu video vào thư mục Tải về")
+                                    .on_hover_text("Lưu video vào thư mục Downloads")
                                     .clicked()
                                 {
-                                    let download_dir = if self.settings.download_dir.trim().is_empty() {
-                                        std::env::temp_dir()
-                                    } else {
-                                        std::path::PathBuf::from(self.settings.download_dir.trim())
-                                    };
+                                    let download_dir = crate::account_manager::os_downloads_dir();
                                     let _ = std::fs::create_dir_all(&download_dir);
                                     let dest_name = if viewer.title.ends_with(".mp4") {
                                         viewer.title.clone()
@@ -8937,13 +8996,8 @@ impl ZaloGuiApp {
                                         } else {
                                             self.show_toast("Lỗi khi lưu video vào máy");
                                         }
-                                    } else if let Some(tx) = WORKER_TX.get() {
-                                        let _ = tx.send(WorkerCmd::DownloadFile {
-                                            url: viewer.url.clone(),
-                                            file_name: "video.mp4".into(),
-                                            download_dir: download_dir.to_string_lossy().to_string(),
-                                        });
-                                        self.show_toast("Đang tải video về máy…");
+                                    } else {
+                                        self.save_media(viewer.url.clone(), viewer.title.clone());
                                     }
                                 }
 

@@ -2080,7 +2080,9 @@ pub(super) fn render_message_body(
                             },
                         ),
                     );
-                    if resp.hovered() {
+                    // Pointer-in-rect rather than `hovered()`: the save button on top steals
+                    // hover, and the dimmed overlay should not flicker off under it.
+                    if ui.rect_contains_pointer(resp.rect) {
                         ui.painter().rect_filled(
                             resp.rect,
                             Rounding::same(12.0),
@@ -2101,7 +2103,13 @@ pub(super) fn render_message_body(
                             Color32::WHITE,
                         );
                     }
-                    if resp.clicked() {
+                    if media_save_overlay(ui, resp.rect, Id::new(("photo_save", &msg.id, msg.ts)))
+                    {
+                        body_action = Some(BubbleAction::SaveMedia {
+                            url: open_target.clone(),
+                            file_name: title_label.clone(),
+                        });
+                    } else if resp.clicked() {
                         body_action = Some(BubbleAction::OpenImagePopup {
                             tex_key: key,
                             full_url: open_target,
@@ -2730,10 +2738,10 @@ fn render_image_file_card(
                             .min_size(Vec2::new(98.0, 28.0)),
                         )
                         .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text("Tải và lưu tập tin về máy tính");
+                        .on_hover_text("Tải ảnh về máy (thư mục Downloads)");
                     if save_resp.clicked() {
                         if let Some(dl_url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-                            action = Some(BubbleAction::DownloadFile {
+                            action = Some(BubbleAction::SaveMedia {
                                 url: dl_url.to_string(),
                                 file_name: file_name.to_string(),
                             });
@@ -2780,6 +2788,38 @@ pub(crate) fn compute_video_thumb_size(tw: usize, th: usize, max_text_width: f32
     }
 }
 
+/// Round download button over the top-right corner of a photo or video, shown while the
+/// pointer is over `media_rect`. Registered after the media widget so it wins the click.
+/// Returns `true` when it was clicked.
+fn media_save_overlay(ui: &mut egui::Ui, media_rect: Rect, id: Id) -> bool {
+    if !ui.rect_contains_pointer(media_rect) {
+        return false;
+    }
+    let size = (media_rect.width().min(media_rect.height()) * 0.4).clamp(18.0, 30.0);
+    let btn = Rect::from_min_size(
+        Pos2::new(media_rect.right() - size - 6.0, media_rect.top() + 6.0),
+        Vec2::splat(size),
+    );
+    let resp = ui
+        .interact(btn, id, Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Tải về máy (thư mục Downloads)");
+    let alpha = if resp.hovered() { 240 } else { 190 };
+    ui.painter().circle_filled(
+        btn.center(),
+        size * 0.5,
+        Color32::from_rgba_unmultiplied(15, 23, 42, alpha),
+    );
+    draw_lucide_icon(
+        ui.painter(),
+        btn.center(),
+        lucide::DOWNLOAD,
+        size * 0.55,
+        Color32::WHITE,
+    );
+    resp.clicked()
+}
+
 fn render_video_thumb_block(
     ui: &mut egui::Ui,
     tex: &TextureHandle,
@@ -2812,12 +2852,22 @@ fn render_video_thumb_block(
         20.0,
         Color32::WHITE,
     );
+    let save_clicked =
+        media_save_overlay(ui, img_resp.rect, Id::new(("video_save", &msg.id, msg.ts)));
     ui.add_space(4.0);
     ui.label(
         RichText::new(truncate_chars(title_str, 60))
             .size(12.5)
             .color(text_col),
     );
+    if save_clicked {
+        if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
+            return Some(BubbleAction::SaveMedia {
+                url: url.to_string(),
+                file_name: title_str.to_string(),
+            });
+        }
+    }
     if img_resp.clicked() {
         if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
             return Some(BubbleAction::OpenVideoPlayer {
@@ -3535,6 +3585,8 @@ fn render_photo_album_grid(
                         Stroke::new(1.6_f32, pal.primary),
                     );
                 }
+                let save_clicked =
+                    media_save_overlay(ui, resp.rect, Id::new(("album_save", &m.id, m.ts)));
                 // Each tile has its own menu so reply / delete / recall hit this photo,
                 // not the album's first one.
                 if let Some(tile_action) = bubble_context_menu(
@@ -3553,11 +3605,16 @@ fn render_photo_album_grid(
                         action: Box::new(tile_action),
                     });
                 }
-                if resp
+                let open_clicked = resp
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text("Bấm để xem ảnh phóng to trong ứng dụng")
-                    .clicked()
-                {
+                    .clicked();
+                if save_clicked {
+                    action = Some(BubbleAction::SaveMedia {
+                        url: open_target,
+                        file_name: "Hình ảnh".to_string(),
+                    });
+                } else if open_clicked {
                     action = Some(BubbleAction::OpenImagePopup {
                         tex_key: key,
                         full_url: open_target,
@@ -4359,6 +4416,11 @@ pub(super) enum BubbleAction {
         url: String,
         file_name: String,
     },
+    /// Save a photo or video into the OS user's Downloads folder.
+    SaveMedia {
+        url: String,
+        file_name: String,
+    },
     /// An action picked on one photo of an album row; `idx` is that photo's message index.
     AlbumMember {
         idx: usize,
@@ -4684,6 +4746,19 @@ pub(super) fn bubble_context_menu(
                                 });
                                 close_menu = true;
                             }
+                            if menu_item(ui, lucide::DOWNLOAD, "Tải ảnh về máy", pal.text_primary)
+                                .clicked()
+                            {
+                                action = Some(BubbleAction::SaveMedia {
+                                    url: msg
+                                        .link_url
+                                        .clone()
+                                        .filter(|u| !u.is_empty())
+                                        .unwrap_or_else(|| thumb_url.to_string()),
+                                    file_name: msg.link_title.clone().unwrap_or_default(),
+                                });
+                                close_menu = true;
+                            }
                         }
                     }
 
@@ -4713,7 +4788,24 @@ pub(super) fn bubble_context_menu(
                                 });
                                 close_menu = true;
                             }
-                            if menu_item(ui, lucide::PAPERCLIP, &label, pal.text_primary).clicked()
+                            // Photos and videos go to the OS Downloads folder; other files keep
+                            // the configurable per-account download folder.
+                            let is_media = matches!(
+                                classify_attachment(msg),
+                                Some(AttachmentKind::Image | AttachmentKind::Video)
+                            );
+                            if is_media {
+                                if menu_item(ui, lucide::DOWNLOAD, "Tải về máy", pal.text_primary)
+                                    .clicked()
+                                {
+                                    action = Some(BubbleAction::SaveMedia {
+                                        url: url.to_string(),
+                                        file_name: resolved_name,
+                                    });
+                                    close_menu = true;
+                                }
+                            } else if menu_item(ui, lucide::PAPERCLIP, &label, pal.text_primary)
+                                .clicked()
                             {
                                 action = Some(BubbleAction::DownloadFile {
                                     url: url.to_string(),

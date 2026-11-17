@@ -579,6 +579,13 @@ pub enum WorkerCmd {
         file_name: String,
         download_dir: String,
     },
+    /// Save a photo or video into the OS user's Downloads folder
+    /// ([`crate::account_manager::os_downloads_dir`]); answered with `GuiEvent::MediaSaved`.
+    SaveMedia {
+        url: String,
+        /// Display name or title; used as the file name when it looks like one.
+        file_name: String,
+    },
     /// Tải bytes tài liệu (giới hạn 10MB) + trích text xem trước trong app.
     FetchDocPreview {
         msg_id: String,
@@ -4614,6 +4621,18 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 ctx_clone.request_repaint();
                             });
                         }
+                        WorkerCmd::SaveMedia { url, file_name } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let client = session_clone.lock().await.http.clone();
+                                let result =
+                                    save_media_to_downloads(&client, &url, &file_name).await;
+                                let _ = gui_tx_clone.send(GuiEvent::MediaSaved { url, result });
+                                ctx_clone.request_repaint();
+                            });
+                        }
                         WorkerCmd::FetchDocPreview {
                             msg_id,
                             url,
@@ -5024,34 +5043,178 @@ async fn download_attachment_with_original_name(
     // Each account saves into its own subfolder so received files never mix.
     let target_dir = crate::account_manager::account_download_dir(&target_dir, account_uin);
 
-    tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(&target_dir)
-            .map_err(|e| format!("Không thể tạo thư mục lưu file: {e}"))?;
+    tokio::task::spawn_blocking(move || write_unique_file(&target_dir, &clean_name, &bytes))
+        .await
+        .map_err(|e| format!("Lỗi tác vụ lưu file: {e}"))?
+}
 
-        let (stem, ext) = match clean_name.rfind('.') {
-            Some(dot_idx) if dot_idx > 0 && dot_idx + 1 < clean_name.len() => {
-                (&clean_name[..dot_idx], Some(&clean_name[dot_idx + 1..]))
-            }
-            _ => (clean_name.as_str(), None),
-        };
+/// Write `bytes` into `target_dir` as `name`, appending ` (1)`, ` (2)`, ... before the
+/// extension instead of overwriting an existing file. Returns `(final_name, full_path)`.
+fn write_unique_file(
+    target_dir: &std::path::Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(String, String), String> {
+    std::fs::create_dir_all(target_dir)
+        .map_err(|e| format!("Không thể tạo thư mục lưu file: {e}"))?;
 
-        let mut dest_path = target_dir.join(&clean_name);
-        let mut final_name = clean_name.clone();
-        let mut suffix_idx = 1_u32;
-        while dest_path.exists() {
-            final_name = match ext {
-                Some(e) => format!("{stem} ({suffix_idx}).{e}"),
-                None => format!("{stem} ({suffix_idx})"),
-            };
-            dest_path = target_dir.join(&final_name);
-            suffix_idx += 1;
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot_idx) if dot_idx > 0 && dot_idx + 1 < name.len() => {
+            (&name[..dot_idx], Some(&name[dot_idx + 1..]))
         }
+        _ => (name, None),
+    };
 
-        std::fs::write(&dest_path, &bytes).map_err(|e| format!("Không thể ghi tập tin: {e}"))?;
-        Ok((final_name, dest_path.display().to_string()))
-    })
-    .await
-    .map_err(|e| format!("Lỗi tác vụ lưu file: {e}"))?
+    let mut dest_path = target_dir.join(name);
+    let mut final_name = name.to_string();
+    let mut suffix_idx = 1_u32;
+    while dest_path.exists() {
+        final_name = match ext {
+            Some(e) => format!("{stem} ({suffix_idx}).{e}"),
+            None => format!("{stem} ({suffix_idx})"),
+        };
+        dest_path = target_dir.join(&final_name);
+        suffix_idx += 1;
+    }
+
+    std::fs::write(&dest_path, bytes).map_err(|e| format!("Không thể ghi tập tin: {e}"))?;
+    Ok((final_name, dest_path.display().to_string()))
+}
+
+/// Download a photo or video and save it straight into the OS Downloads folder (no
+/// per-account subfolder), so saved media sits where the user's other downloads are.
+async fn save_media_to_downloads(
+    client: &reqwest::Client,
+    url: &str,
+    hint: &str,
+) -> Result<(String, String), String> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Không thể tải tập tin: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Máy chủ trả về mã HTTP {}", resp.status()));
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Lỗi đọc dữ liệu tập tin: {e}"))?;
+    let name = media_file_name(hint, url, &content_type, crate::login::unix_now());
+    let target_dir = crate::account_manager::os_downloads_dir();
+    tokio::task::spawn_blocking(move || write_unique_file(&target_dir, &name, &bytes))
+        .await
+        .map_err(|e| format!("Lỗi tác vụ lưu file: {e}"))?
+}
+
+const MEDIA_EXTENSIONS: [&str; 12] = [
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "mp4", "mov", "webm", "mkv", "m4v",
+];
+
+/// Pick a safe file name for saved media: the hint when it already carries a media extension,
+/// else the URL's last path segment, else `zalo_<ts>`; the extension comes from the
+/// `Content-Type` when neither source has one.
+fn media_file_name(hint: &str, url: &str, content_type: &str, ts: i64) -> String {
+    fn media_ext(name: &str) -> Option<&str> {
+        let (stem, ext) = name.rsplit_once('.')?;
+        (!stem.is_empty() && MEDIA_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+            .then_some(ext)
+    }
+    fn sanitize(name: &str) -> String {
+        let cleaned: String = name
+            .chars()
+            .map(|c| match c {
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                c if c.is_control() => '_',
+                c => c,
+            })
+            .collect();
+        cleaned.trim().trim_matches('.').to_string()
+    }
+
+    let hint = sanitize(hint);
+    if media_ext(&hint).is_some() {
+        return hint;
+    }
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    let segment = sanitize(path.rsplit('/').next().unwrap_or_default());
+    if media_ext(&segment).is_some() {
+        return segment;
+    }
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let ext = match mime.as_str() {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        "image/heic" => "heic",
+        "video/quicktime" => "mov",
+        "video/webm" => "webm",
+        m if m.starts_with("video/") => "mp4",
+        _ => "jpg",
+    };
+    format!("zalo_{ts}.{ext}")
+}
+
+#[cfg(test)]
+mod save_media_tests {
+    use super::*;
+
+    #[test]
+    fn media_name_prefers_hint_then_url_segment() {
+        assert_eq!(
+            media_file_name("beach.png", "https://x/a.jpg", "", 1),
+            "beach.png"
+        );
+        assert_eq!(
+            media_file_name("Hình ảnh", "https://f1.zdn.vn/jpg/9/abc.jpg?x=1", "", 1),
+            "abc.jpg"
+        );
+    }
+
+    #[test]
+    fn media_name_falls_back_to_timestamp_with_mime_extension() {
+        assert_eq!(
+            media_file_name("Hình ảnh", "https://x/renewMedia", "image/png", 42),
+            "zalo_42.png"
+        );
+        assert_eq!(
+            media_file_name("", "https://x/v", "video/mp4; codecs=avc1", 7),
+            "zalo_7.mp4"
+        );
+        assert_eq!(media_file_name("", "https://x/", "", 3), "zalo_3.jpg");
+    }
+
+    #[test]
+    fn media_name_strips_path_separators() {
+        assert_eq!(
+            media_file_name("../../etc/a.jpg", "https://x/", "", 1),
+            "_.._etc_a.jpg"
+        );
+    }
+
+    #[test]
+    fn unique_file_appends_counter_instead_of_overwriting() {
+        let dir = std::env::temp_dir().join(format!("ctdoz_save_media_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (first, _) = write_unique_file(&dir, "a.jpg", b"1").unwrap();
+        let (second, path) = write_unique_file(&dir, "a.jpg", b"2").unwrap();
+        assert_eq!(first, "a.jpg");
+        assert_eq!(second, "a (1).jpg");
+        assert_eq!(std::fs::read(path).unwrap(), b"2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 /// Download attachment bytes for in-app preview, bounded at 10 MiB (no disk write).
 async fn download_preview_bytes(

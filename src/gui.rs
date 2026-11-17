@@ -906,6 +906,11 @@ pub enum GuiEvent {
     },
     ProxyUpdated(Result<Option<String>, String>),
     FileDownloaded(Result<(String, String), String>),
+    /// Answer to `WorkerCmd::SaveMedia`; `result` is `(file_name, full_path)`.
+    MediaSaved {
+        url: String,
+        result: Result<(String, String), String>,
+    },
     /// Worker đã tải + trích text xem trước tài liệu (session-only).
     DocPreviewReady {
         msg_id: String,
@@ -1505,6 +1510,8 @@ pub struct ZaloGuiApp {
     /// "Đăng xuất" is pending confirmation (#130).
     pub(crate) logout_confirm_open: bool,
     toast_notice: Option<(String, std::time::Instant)>,
+    /// Saved file shown by the current toast's "Mở thư mục" button, if any.
+    toast_reveal_path: Option<String>,
     /// Rich corner notification popup for incoming messages
     incoming_popup: Option<IncomingPopupState>,
     phone_modal_open: bool,
@@ -1614,6 +1621,8 @@ pub struct ZaloGuiApp {
     doc_previews: HashMap<String, String>,
     /// msg_id đang tải xem trước (tránh gửi trùng mỗi frame).
     doc_preview_loading: HashSet<String>,
+    /// Media URLs being saved to Downloads, so repeated clicks do not save duplicates.
+    saving_media: HashSet<String>,
     /// msg_id xem trước lỗi (msg_id → message): hiện lỗi + cho thử lại.
     doc_preview_errors: HashMap<String, String>,
     /// Popup xem đầy đủ text tài liệu (msg_id, file_name, text).
@@ -1887,6 +1896,7 @@ impl ZaloGuiApp {
             wipe_confirm_open: false,
             logout_confirm_open: false,
             toast_notice: None,
+            toast_reveal_path: None,
             incoming_popup: None,
             phone_modal_open: false,
             phone_modal_input: String::new(),
@@ -1974,6 +1984,7 @@ impl ZaloGuiApp {
             pending_leave_group: None,
             doc_previews: HashMap::new(),
             doc_preview_loading: HashSet::new(),
+            saving_media: HashSet::new(),
             doc_preview_errors: HashMap::new(),
             doc_viewer: None,
             user_online_map: HashMap::new(),
@@ -2152,6 +2163,19 @@ pub(crate) fn queue_sticker_fetch(
 }
 
 impl ZaloGuiApp {
+    /// Ask the worker to save a photo/video into the OS Downloads folder, ignoring repeat
+    /// clicks while the same URL is still being saved.
+    pub(super) fn save_media(&mut self, url: String, file_name: String) {
+        if !self.saving_media.insert(url.clone()) {
+            self.show_toast("⏳ Đang tải, vui lòng chờ…");
+            return;
+        }
+        self.show_toast("⏳ Đang tải về thư mục Downloads…");
+        if let Some(tx) = WORKER_TX.get() {
+            let _ = tx.send(WorkerCmd::SaveMedia { url, file_name });
+        }
+    }
+
     /// Queues a worker download for a sticker/avatar/thumbnail once retry backoff allows it.
     pub(super) fn request_sticker_image(&mut self, key: String, url: String) {
         queue_sticker_fetch(
@@ -4508,11 +4532,12 @@ impl ZaloGuiApp {
                 },
                 GuiEvent::FileDownloaded(res) => match res {
                     Ok((fname, path)) => {
-                        let msg = format!("✅ Đã lưu tập tin \"{fname}\" tại {path}");
-                        self.status_msg = msg.clone();
-                        self.show_toast(msg);
-                        // Mở thư mục chứa file để user khỏi mất công tìm (#102).
-                        reveal_in_file_manager(&path);
+                        // The toast's "Mở thư mục" button reveals the file on demand (#102)
+                        // instead of popping the file manager up after every download.
+                        self.show_toast_with_reveal(
+                            format!("✅ Đã lưu tập tin \"{fname}\" tại {path}"),
+                            path,
+                        );
                     }
                     Err(e) => {
                         let msg = format!("⚠️ Lỗi lưu tập tin: {e}");
@@ -4520,6 +4545,18 @@ impl ZaloGuiApp {
                         self.show_toast(msg);
                     }
                 },
+                GuiEvent::MediaSaved { url, result } => {
+                    self.saving_media.remove(&url);
+                    // No file-manager pop-up here: Downloads is usually large and slow to open,
+                    // and the user stays in the chat; the toast carries the path instead.
+                    match result {
+                        Ok((fname, path)) => self.show_toast_with_reveal(
+                            format!("✅ Đã lưu \"{fname}\" vào thư mục Downloads"),
+                            path,
+                        ),
+                        Err(e) => self.show_toast(format!("⚠️ Lỗi tải về: {e}")),
+                    }
+                }
                 GuiEvent::DocPreviewReady { msg_id, text } => {
                     self.doc_preview_loading.remove(&msg_id);
                     self.doc_preview_errors.remove(&msg_id);
@@ -4604,12 +4641,55 @@ fn reveal_in_file_manager(path: &str) {
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let parent = std::path::Path::new(path)
-            .parent()
-            .map(|p| p.as_os_str())
-            .unwrap_or(std::ffi::OsStr::new("."));
-        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+        // Ask the file manager to open the folder with the file selected
+        // (`org.freedesktop.FileManager1`, Nautilus/Dolphin/Nemo); fall back to opening the
+        // parent folder. Runs on its own thread because `gdbus` is waited on.
+        let path = path.to_string();
+        let _ = std::thread::Builder::new()
+            .name("reveal-file".into())
+            .spawn(move || {
+                let uri = file_uri(&path);
+                let shown = std::process::Command::new("gdbus")
+                    .args([
+                        "call",
+                        "--session",
+                        "--dest",
+                        "org.freedesktop.FileManager1",
+                        "--object-path",
+                        "/org/freedesktop/FileManager1",
+                        "--method",
+                        "org.freedesktop.FileManager1.ShowItems",
+                        &format!("['{uri}']"),
+                        "",
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if !shown {
+                    let parent = std::path::Path::new(&path)
+                        .parent()
+                        .map(|p| p.as_os_str().to_owned())
+                        .unwrap_or_else(|| ".".into());
+                    let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+                }
+            });
     }
+}
+
+/// `file://` URI for an absolute path, percent-encoding everything outside the RFC 3986
+/// unreserved set (and `'`, which would break the GVariant string literal).
+#[cfg_attr(any(target_os = "windows", target_os = "macos"), allow(dead_code))]
+fn file_uri(path: &str) -> String {
+    let mut out = String::from("file://");
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -5856,6 +5936,13 @@ impl ZaloGuiApp {
         let text = msg.into();
         self.status_msg = text.clone();
         self.toast_notice = Some((text, std::time::Instant::now()));
+        self.toast_reveal_path = None;
+    }
+
+    /// Toast with an "Mở thư mục" button that reveals `path` in the OS file manager.
+    fn show_toast_with_reveal(&mut self, msg: impl Into<String>, path: String) {
+        self.show_toast(msg);
+        self.toast_reveal_path = Some(path);
     }
 
     /// Append files to the composer queue, skipping duplicates and anything past the cap,
@@ -6107,6 +6194,14 @@ fn unread_counts_from_read_points(threads: &[Thread]) -> HashMap<String, usize> 
 #[cfg(test)]
 mod tests {
     use super::{is_newer_semver, phone_sync_completion_message};
+
+    #[test]
+    fn file_uri_percent_encodes_spaces_unicode_and_quotes() {
+        assert_eq!(
+            super::file_uri("/home/u/Tải về/a b'c.jpg"),
+            "file:///home/u/T%E1%BA%A3i%20v%E1%BB%81/a%20b%27c.jpg"
+        );
+    }
 
     fn unread_fixture(seen: Option<&str>, ids: &[(&str, bool)]) -> crate::chat::Thread {
         let mut thread = crate::chat::Thread {

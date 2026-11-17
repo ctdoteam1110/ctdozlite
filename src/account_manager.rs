@@ -159,6 +159,64 @@ pub fn ensure_media_cache_dir() -> PathBuf {
     dir
 }
 
+/// The OS user's own Downloads folder, where photos and videos saved from a chat land.
+///
+/// Linux honours `XDG_DOWNLOAD_DIR` from `user-dirs.dirs`, so a localised folder name
+/// (e.g. `~/Tải về`) is respected; other platforms use `<home>/Downloads`. Falls back to the
+/// home directory, then the working directory, when no Downloads folder can be resolved.
+pub fn os_downloads_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    #[cfg(target_os = "linux")]
+    if let Some(home) = &home {
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        if let Ok(contents) = std::fs::read_to_string(config.join("user-dirs.dirs")) {
+            if let Some(dir) = parse_xdg_download_dir(&contents, home) {
+                return dir;
+            }
+        }
+    }
+    match home {
+        Some(home) => {
+            let downloads = home.join("Downloads");
+            if downloads.is_dir() {
+                downloads
+            } else {
+                home
+            }
+        }
+        None => PathBuf::from("."),
+    }
+}
+
+/// Extract `XDG_DOWNLOAD_DIR` from a `user-dirs.dirs` file. The spec only allows `$HOME/...`
+/// or absolute paths; a value equal to `$HOME` itself means "disabled" and is ignored.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_xdg_download_dir(contents: &str, home: &Path) -> Option<PathBuf> {
+    let value = contents
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| l.strip_prefix("XDG_DOWNLOAD_DIR="))?
+        .trim()
+        .trim_matches('"');
+    let path = if let Some(rest) = value.strip_prefix("$HOME") {
+        let rest = rest.trim_start_matches('/');
+        if rest.is_empty() {
+            return None;
+        }
+        home.join(rest)
+    } else if value.starts_with('/') {
+        PathBuf::from(value)
+    } else {
+        return None;
+    };
+    Some(path)
+}
+
 /// Folder that receives files downloaded by `uin`, nested under the user's download root
 /// so attachments of different accounts never mix.
 pub fn account_download_dir(base: &Path, uin: &str) -> PathBuf {
@@ -307,6 +365,29 @@ pub fn delete_saved_account(uin: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xdg_download_dir_resolves_home_relative_and_absolute_values() {
+        let home = Path::new("/home/u");
+        let file = "# comment\nXDG_DESKTOP_DIR=\"$HOME/Desktop\"\nXDG_DOWNLOAD_DIR=\"$HOME/Tải về\"\n";
+        assert_eq!(
+            parse_xdg_download_dir(file, home),
+            Some(PathBuf::from("/home/u/Tải về"))
+        );
+        assert_eq!(
+            parse_xdg_download_dir("XDG_DOWNLOAD_DIR=\"/data/dl\"", home),
+            Some(PathBuf::from("/data/dl"))
+        );
+    }
+
+    #[test]
+    fn xdg_download_dir_ignores_missing_disabled_and_relative_values() {
+        let home = Path::new("/home/u");
+        assert_eq!(parse_xdg_download_dir("XDG_MUSIC_DIR=\"$HOME/Music\"", home), None);
+        assert_eq!(parse_xdg_download_dir("XDG_DOWNLOAD_DIR=\"$HOME/\"", home), None);
+        assert_eq!(parse_xdg_download_dir("XDG_DOWNLOAD_DIR=\"dl\"", home), None);
+        assert_eq!(parse_xdg_download_dir("#XDG_DOWNLOAD_DIR=\"/x\"", home), None);
+    }
 
     #[test]
     fn media_cache_is_scoped_per_account() {

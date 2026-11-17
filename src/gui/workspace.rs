@@ -7334,6 +7334,9 @@ impl ZaloGuiApp {
                                         });
                                     }
                                 }
+                                BubbleAction::SaveMedia { url, file_name } => {
+                                    self.save_media(url, file_name);
+                                }
                                 BubbleAction::FetchDocPreview { url, file_name, msg_id } => {
                                     // Chặn gửi trùng khi user bấm liên tục.
                                     if self.doc_preview_loading.insert(msg_id.clone()) {
