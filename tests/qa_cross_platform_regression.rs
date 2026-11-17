@@ -538,10 +538,12 @@ fn qa_cross_platform_data_dir_and_profile_isolation() {
     let mac_bundle_exe = PathBuf::from("/Applications/ctdozlite.app/Contents/MacOS/ctdozlite");
     let linux_bin_exe = PathBuf::from("/usr/bin/ctdozlite");
     let home = PathBuf::from("/Users/tester");
+    let linux_home = PathBuf::from("/home/tester");
 
     // macOS .app bundle tự động ánh xạ vào Application Support và bật chế độ private
     let (mac_path, mac_priv) =
-        data_dir::resolve(&[], &cwd, &mac_bundle_exe, Some(&home), true).unwrap();
+        data_dir::resolve(&[], &cwd, &mac_bundle_exe, Some(&home), data_dir::Platform::MacOs)
+            .unwrap();
     assert_eq!(
         mac_path,
         PathBuf::from("/Users/tester/Library/Application Support/ctdozlite")
@@ -554,7 +556,7 @@ fn qa_cross_platform_data_dir_and_profile_isolation() {
         &cwd,
         &mac_bundle_exe,
         Some(&home),
-        true,
+        data_dir::Platform::MacOs,
     )
     .unwrap();
     assert_eq!(
@@ -567,12 +569,27 @@ fn qa_cross_platform_data_dir_and_profile_isolation() {
         &["--profile".to_string(), "acc_2".to_string()],
         &cwd,
         &linux_bin_exe,
-        None,
-        false,
+        Some(&linux_home),
+        data_dir::Platform::Linux { xdg_data_home: None },
     )
     .unwrap();
-    assert_eq!(prof_linux, cwd.join("profiles").join("acc_2"));
+    assert_eq!(
+        prof_linux,
+        linux_home.join(".local/share/ctdozlite/profiles/acc_2")
+    );
     assert!(prof_linux_priv);
+
+    // Windows keeps the working directory.
+    let (prof_other, prof_other_priv) = data_dir::resolve(
+        &["--profile".to_string(), "acc_2".to_string()],
+        &cwd,
+        &linux_bin_exe,
+        None,
+        data_dir::Platform::Other,
+    )
+    .unwrap();
+    assert_eq!(prof_other, cwd.join("profiles").join("acc_2"));
+    assert!(prof_other_priv);
 }
 
 // ============================================================================

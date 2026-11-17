@@ -139,18 +139,28 @@ fn finder_bundle_with_root_cwd_selects_private_application_support() {
 }
 
 #[test]
-fn legacy_cli_keeps_cwd_and_version_does_not_prepare_storage() {
+fn default_cli_storage_and_version_does_not_prepare_storage() {
     eprintln!(
         "CARGO_BIN_EXE_ctdozlite={}",
         env!("CARGO_BIN_EXE_ctdozlite")
     );
     let fixture = Fixture::new();
-    let result = Command::new(env!("CARGO_BIN_EXE_ctdozlite"))
+    // Never let a test resolve (or migrate into) the developer's real HOME.
+    let fake_home = Fixture::new();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ctdozlite"));
+    command
         .args(["--print-data-dir", "--logout"])
-        .current_dir(&fixture.0)
-        .output()
-        .unwrap();
-    assert!(result.status.success());
+        .current_dir(&fixture.0);
+    #[cfg(target_os = "linux")]
+    command
+        .env("HOME", &fake_home.0)
+        .env("XDG_DATA_HOME", fake_home.0.join("xdg"));
+    let result = command.output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let stdout_path = std::path::PathBuf::from(String::from_utf8_lossy(&result.stdout).trim());
     #[cfg(target_os = "macos")]
     let expected = {
@@ -159,7 +169,9 @@ fn legacy_cli_keeps_cwd_and_version_does_not_prepare_storage() {
             .expect("HOME environment variable required on macOS");
         home.join("Library/Application Support/ctdozlite")
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    let expected = fake_home.0.join("xdg/ctdozlite");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let expected = fixture.0.clone();
 
     assert_eq!(

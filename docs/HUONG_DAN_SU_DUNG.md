@@ -21,9 +21,19 @@ Tài liệu tóm tắt các tùy chọn dòng lệnh, thao tác trên giao diệ
 
 ---
 
-Trên macOS, bản `.app` mặc định lưu dữ liệu trong `~/Library/Application Support/ctdozlite`, kể cả khi khởi chạy với thư mục làm việc `/`. Bản CLI ngoài bundle giữ thư mục làm việc hiện tại để tiếp tục dùng dữ liệu cũ. `--data-dir` ghi đè cả hai lựa chọn; thư mục chỉ định và thư mục mặc định của bundle có quyền `0700` trên Unix. Nếu thư mục không ghi được, chương trình báo lỗi trước khi mở dữ liệu.
+Thư mục dữ liệu mặc định (phiên đăng nhập, lịch sử tin nhắn, cache, cài đặt) không phụ thuộc vào thư mục khởi chạy:
 
-`--version` không chuẩn bị thư mục dữ liệu. Chương trình không tự di chuyển, sao chép hay xóa dữ liệu cũ khi thay đổi thư mục; có thể dùng `--data-dir` để chọn lại thư mục đã có dữ liệu.
+| Hệ điều hành | Thư mục mặc định |
+| :--- | :--- |
+| macOS | `~/Library/Application Support/ctdozlite` |
+| Linux | `$XDG_DATA_HOME/ctdozlite`, nếu không đặt thì `~/.local/share/ctdozlite` |
+| Windows | Thư mục làm việc hiện tại (như cũ) |
+
+Vì vậy mở app từ menu ứng dụng hay từ terminal ở bất kỳ thư mục nào đều dùng chung một bộ dữ liệu. `--profile <tên>` dùng thư mục con `profiles/<tên>`. `--data-dir` ghi đè mọi lựa chọn trên. Thư mục mặc định trên macOS/Linux và thư mục chỉ định bằng `--data-dir` có quyền `0700` trên Unix. Nếu thư mục không ghi được, chương trình báo lỗi trước khi mở dữ liệu.
+
+**Chuyển dữ liệu cũ trên Linux:** trước đây bản Linux lưu dữ liệu vào thư mục làm việc (thường là `~` khi mở từ menu). Lần đầu chạy bản mới, nếu thư mục mặc định còn trống, chương trình tự **sao chép** dữ liệu cũ từ thư mục làm việc hoặc `~` (chọn nơi dùng gần nhất) sang thư mục mới. Chỉ các tệp dữ liệu của app được sao chép (`session*.json`, `zalo_history.db`, `accounts/`, `app_settings.json`, `stickers_cache/`, …); log và tệp khác không bị đụng tới. Bản gốc được giữ nguyên, có thể tự xóa sau khi kiểm tra. Không sao chép khi đã dùng `--data-dir`.
+
+`--version` không chuẩn bị thư mục dữ liệu. Có thể dùng `--data-dir` để chọn lại thư mục đã có dữ liệu.
 
 ## 2. Giao diện đồ họa (GUI)
 

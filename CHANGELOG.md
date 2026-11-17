@@ -5,6 +5,9 @@ Xem thêm quy ước tại [ADR 0003 — Chính sách Changelog & Release Notes]
 
 ## [Unreleased]
 
+### Fixed (Sửa lỗi)
+- **Linux: dữ liệu không còn phụ thuộc thư mục khởi chạy (`src/data_dir.rs`):** Bản Linux lưu phiên, lịch sử tin nhắn và cache vào `$XDG_DATA_HOME/ctdozlite` (mặc định `~/.local/share/ctdozlite`) thay vì thư mục làm việc, nên mở từ menu hay terminal đều thấy cùng dữ liệu. Lần đầu chạy, dữ liệu cũ ở thư mục làm việc hoặc `~` được tự sao chép sang (bản gốc giữ nguyên).
+
 ## [0.1.2] - 2026-11-16
 
 ### Added (Tính năng mới & Cập nhật)
