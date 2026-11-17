@@ -7358,6 +7358,7 @@ impl ZaloGuiApp {
                                         is_downloading: !is_cached,
                                         play_on_download: !is_cached,
                                         cached_path,
+                                        download: None,
                                     });
 
                                     if is_cached {
@@ -7367,7 +7368,10 @@ impl ZaloGuiApp {
                                         && (url.starts_with("http://") || url.starts_with("https://"))
                                     {
                                         self.show_toast("⏳ Đang tải video để phát…");
-                                        spawn_video_download(url.clone());
+                                        let download = spawn_video_download(url.clone());
+                                        if let Some(viewer) = self.video_player.as_mut() {
+                                            viewer.download = Some(download);
+                                        }
                                     }
                                 }
                                 BubbleAction::DownloadFile { url, file_name } => {
@@ -10578,21 +10582,29 @@ fn truncate_to_width(ui: &egui::Ui, text: &str, font: FontId, max_w: f32) -> Str
     chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
 }
 
-/// Download failures by video URL, reported to the open video player (see
-/// [`take_video_download_error`]). The player otherwise only polls for the file.
+/// Download failures by attempt id, reported to the video player that started that
+/// attempt (see [`take_video_download_error`]). Keyed per attempt so a stale attempt
+/// for the same URL cannot cancel a newer one.
 static VIDEO_DOWNLOAD_ERRORS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, String>>,
+    std::sync::Mutex<std::collections::HashMap<u64, String>>,
 > = std::sync::LazyLock::new(Default::default);
+static NEXT_VIDEO_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Fetch `url` into [`crate::data_dir::video_cache_path`] on a background thread.
-/// Any failure (network, HTTP status, empty body, unwritable folder) is recorded so
-/// the player can stop waiting and offer a retry.
-pub(super) fn spawn_video_download(url: String) {
-    if let Ok(mut errors) = VIDEO_DOWNLOAD_ERRORS.lock() {
-        errors.remove(&url);
-    }
+/// One running video download: its attempt id and the file it will create.
+#[derive(Debug, Clone)]
+pub(crate) struct VideoDownload {
+    pub attempt: u64,
+    pub target: std::path::PathBuf,
+}
+
+/// Fetch `url` on a background thread into a target resolved once, here, and returned
+/// so the player polls exactly that file. Any failure (network, HTTP status, empty
+/// body, unwritable folder) is recorded for this attempt so the player can retry.
+pub(super) fn spawn_video_download(url: String) -> VideoDownload {
+    let attempt = NEXT_VIDEO_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let target = crate::data_dir::video_cache_path(&url);
+    let download = VideoDownload { attempt, target: target.clone() };
     std::thread::spawn(move || {
-        let target = crate::data_dir::video_cache_path(&url);
         let result: Result<(), String> = (|| {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -10617,13 +10629,14 @@ pub(super) fn spawn_video_download(url: String) {
         })();
         if let Err(e) = result {
             if let Ok(mut errors) = VIDEO_DOWNLOAD_ERRORS.lock() {
-                errors.insert(url, e);
+                errors.insert(attempt, e);
             }
         }
     });
+    download
 }
 
-/// Take (and clear) the recorded download failure for `url`, if any.
-pub(super) fn take_video_download_error(url: &str) -> Option<String> {
-    VIDEO_DOWNLOAD_ERRORS.lock().ok()?.remove(url)
+/// Take (and clear) the recorded failure of download `attempt`, if any.
+pub(super) fn take_video_download_error(attempt: u64) -> Option<String> {
+    VIDEO_DOWNLOAD_ERRORS.lock().ok()?.remove(&attempt)
 }

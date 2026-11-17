@@ -427,10 +427,16 @@ fn preferred_video_dir() -> Option<PathBuf> {
     }
 }
 
-/// Write a downloaded video atomically: a `.part` file next to `target`, then rename,
-/// so the player never opens a half-written file. Fails if the folder is not writable.
+/// Write a downloaded video atomically: a uniquely named `.part` file next to `target`,
+/// then rename, so the player never opens a half-written file and two concurrent saves
+/// of the same video cannot share (and corrupt) one temp file. Fails if the folder is
+/// not writable.
 pub fn save_video_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let part = target.with_extension("mp4.part");
+    let part = target.with_extension(format!(
+        "mp4.{}-{}.part",
+        std::process::id(),
+        NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+    ));
     let result = std::fs::write(&part, bytes).and_then(|()| std::fs::rename(&part, target));
     if result.is_err() {
         let _ = std::fs::remove_file(&part);
@@ -837,7 +843,20 @@ mod tests {
         let target = dir.join("v.mp4");
         save_video_file(&target, b"ok").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"ok");
-        assert!(!dir.join("v.mp4.part").exists());
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+            .count();
+        assert_eq!(leftovers, 0, "temp file renamed away");
+        // Two saves of the same target use distinct temp files and both publish whole files.
+        let (a, b) = (vec![1u8; 4096], vec![2u8; 4096]);
+        std::thread::scope(|s| {
+            s.spawn(|| save_video_file(&target, &a).unwrap());
+            s.spawn(|| save_video_file(&target, &b).unwrap());
+        });
+        let got = std::fs::read(&target).unwrap();
+        assert!(got == a || got == b, "never a mix of two writes");
 
         let ro = dir.join("ro");
         std::fs::create_dir(&ro).unwrap();
