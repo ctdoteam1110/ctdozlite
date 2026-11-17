@@ -8546,7 +8546,11 @@ impl ZaloGuiApp {
 
         // A failed download stops the "downloading" state so the user can retry.
         if !viewer.is_downloaded && viewer.is_downloading {
-            if let Some(err) = super::workspace::take_video_download_error(&viewer.url) {
+            let failed = viewer
+                .download
+                .as_ref()
+                .and_then(|d| super::workspace::take_video_download_error(d.attempt));
+            if let Some(err) = failed {
                 viewer.is_downloading = false;
                 viewer.play_on_download = false;
                 self.show_toast(format!(
@@ -8557,7 +8561,12 @@ impl ZaloGuiApp {
         // Check if video file has finished downloading to temp dir
         if !viewer.is_downloaded {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
-            let temp_file = crate::data_dir::video_cache_path(&viewer.url);
+            // Poll the file the running download writes, not a freshly resolved path.
+            let temp_file = viewer
+                .download
+                .as_ref()
+                .map(|d| d.target.clone())
+                .unwrap_or_else(|| crate::data_dir::video_cache_path(&viewer.url));
             if temp_file.exists()
                 && std::fs::metadata(&temp_file).map(|m| m.len() > 0).unwrap_or(false)
             {
@@ -8813,7 +8822,8 @@ impl ZaloGuiApp {
                         && (viewer.url.starts_with("http://") || viewer.url.starts_with("https://"))
                     {
                         viewer.is_downloading = true;
-                        super::workspace::spawn_video_download(viewer.url.clone());
+                        viewer.download =
+                            Some(super::workspace::spawn_video_download(viewer.url.clone()));
                     }
                     self.show_toast("⏳ Đang tải video để phát… Vui lòng đợi trong giây lát");
                 }
