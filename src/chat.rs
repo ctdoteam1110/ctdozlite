@@ -4642,6 +4642,68 @@ pub fn icon_to_emoji(icon: &str) -> &'static str {
     }
 }
 
+/// Replace Zalo `/-code` emoticon tokens in message text with emoji for display
+/// (e.g. the quick "like" button sends the text `/-strong`). Only whole whitespace-separated
+/// tokens with a known code are replaced; unknown codes and all other text stay as typed.
+pub fn text_emoticons_to_emoji(text: &str) -> std::borrow::Cow<'_, str> {
+    fn emoji_for(token: &str) -> Option<&'static str> {
+        Some(match token {
+            "/-strong" => "👍",
+            "/-weak" => "👎",
+            "/-heart" => "❤️",
+            "/-break" => "💔",
+            "/-ok" => "👌",
+            "/-v" => "✌️",
+            "/-rose" => "🌹",
+            _ => return None,
+        })
+    }
+    if !text.contains("/-") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    // `split_inclusive` keeps each separator so spacing and line breaks are preserved.
+    for piece in text.split_inclusive(char::is_whitespace) {
+        let token = piece.trim_end_matches(char::is_whitespace);
+        match emoji_for(token) {
+            Some(emoji) => {
+                out.push_str(emoji);
+                out.push_str(&piece[token.len()..]);
+                changed = true;
+            }
+            None => out.push_str(piece),
+        }
+    }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+#[cfg(test)]
+mod text_emoticon_tests {
+    use super::text_emoticons_to_emoji;
+
+    #[test]
+    fn known_codes_become_emoji_and_spacing_is_kept() {
+        assert_eq!(text_emoticons_to_emoji("/-strong"), "👍");
+        assert_eq!(text_emoticons_to_emoji("ok /-heart\n/-strong "), "ok ❤️\n👍 ");
+    }
+
+    #[test]
+    fn unknown_codes_and_embedded_text_are_untouched() {
+        assert_eq!(text_emoticons_to_emoji("/-xyz"), "/-xyz");
+        assert_eq!(text_emoticons_to_emoji("a/-strong"), "a/-strong");
+        assert_eq!(text_emoticons_to_emoji("path /-strong/x"), "path /-strong/x");
+        assert!(matches!(
+            text_emoticons_to_emoji("plain text"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+}
+
 /// Special reaction code sent to clear all of our own reactions on a message (`rType = -1`, `rIcon = ""`).
 pub const CLEAR_REACTION_CODE: &str = "/-remove";
 

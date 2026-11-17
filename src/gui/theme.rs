@@ -604,8 +604,33 @@ fn paint_circular_image(
         (Pos2::new(0.0, crop), Pos2::new(1.0, 1.0 - crop))
     };
 
-    let mut mesh = egui::Mesh::with_texture(tex.id());
-    let n_pts = 48;
+    painter.add(egui::Shape::mesh(circular_image_mesh(
+        tex.id(),
+        center,
+        radius,
+        uv_min,
+        uv_max,
+        painter.ctx().pixels_per_point(),
+    )));
+}
+
+/// Textured disc with a one-physical-pixel feathered rim. egui anti-aliases its own shapes
+/// but not textured meshes, so without the rim the edge of every avatar is jagged.
+fn circular_image_mesh(
+    texture: egui::TextureId,
+    center: Pos2,
+    radius: f32,
+    uv_min: Pos2,
+    uv_max: Pos2,
+    pixels_per_point: f32,
+) -> egui::Mesh {
+    let feather = 1.0 / pixels_per_point.max(0.5);
+    let inner_r = (radius - feather * 0.5).max(0.0);
+    let outer_r = radius + feather * 0.5;
+    // Enough segments that the polygon stays round on large profile avatars.
+    let n_pts = ((radius * pixels_per_point) as u32).clamp(32, 128);
+
+    let mut mesh = egui::Mesh::with_texture(texture);
     mesh.vertices.push(egui::epaint::Vertex {
         pos: center,
         uv: Pos2::new((uv_min.x + uv_max.x) * 0.5, (uv_min.y + uv_max.y) * 0.5),
@@ -614,21 +639,59 @@ fn paint_circular_image(
     for i in 0..=n_pts {
         let angle = (i as f32) / (n_pts as f32) * std::f32::consts::TAU;
         let (sin_a, cos_a) = angle.sin_cos();
-        let pos = Pos2::new(center.x + radius * cos_a, center.y + radius * sin_a);
-        let u = uv_min.x + (cos_a * 0.5 + 0.5) * (uv_max.x - uv_min.x);
-        let v = uv_min.y + (sin_a * 0.5 + 0.5) * (uv_max.y - uv_min.y);
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos,
-            uv: Pos2::new(u, v),
-            color: Color32::WHITE,
-        });
-        if i > 0 {
-            mesh.indices.push(0);
-            mesh.indices.push(i as u32);
-            mesh.indices.push((i + 1) as u32);
+        let uv = Pos2::new(
+            uv_min.x + (cos_a * 0.5 + 0.5) * (uv_max.x - uv_min.x),
+            uv_min.y + (sin_a * 0.5 + 0.5) * (uv_max.y - uv_min.y),
+        );
+        for (r, color) in [(inner_r, Color32::WHITE), (outer_r, Color32::TRANSPARENT)] {
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: Pos2::new(center.x + r * cos_a, center.y + r * sin_a),
+                uv,
+                color,
+            });
         }
     }
-    painter.add(egui::Shape::mesh(mesh));
+    // Vertex layout: 0 = centre, then (inner_i, outer_i) pairs at 1 + 2i and 2 + 2i.
+    for i in 0..n_pts {
+        let inner = 1 + 2 * i;
+        let outer = inner + 1;
+        let next_inner = inner + 2;
+        let next_outer = inner + 3;
+        mesh.indices.extend_from_slice(&[0, inner, next_inner]);
+        mesh.indices.extend_from_slice(&[inner, outer, next_outer]);
+        mesh.indices.extend_from_slice(&[inner, next_outer, next_inner]);
+    }
+    mesh
+}
+
+#[cfg(test)]
+mod circular_image_tests {
+    use super::*;
+
+    #[test]
+    fn mesh_has_opaque_disc_and_transparent_feathered_rim() {
+        let mesh = circular_image_mesh(
+            egui::TextureId::default(),
+            Pos2::new(10.0, 10.0),
+            8.0,
+            Pos2::ZERO,
+            Pos2::new(1.0, 1.0),
+            2.0,
+        );
+        assert!(mesh.is_valid());
+        let n = 32; // radius * ppp = 16, clamped up to the 32-segment minimum
+        assert_eq!(mesh.vertices.len(), 1 + 2 * (n + 1));
+        assert_eq!(mesh.indices.len(), 9 * n);
+        let dist = |v: &egui::epaint::Vertex| v.pos.distance(Pos2::new(10.0, 10.0));
+        let inner = &mesh.vertices[1];
+        let outer = &mesh.vertices[2];
+        // Rim is one physical pixel (0.5 pt at 2x) wide, centred on the radius.
+        assert!((dist(inner) - 7.75).abs() < 1e-4);
+        assert!((dist(outer) - 8.25).abs() < 1e-4);
+        assert_eq!(inner.color, Color32::WHITE);
+        assert_eq!(outer.color, Color32::TRANSPARENT);
+        assert_eq!(inner.uv, outer.uv);
+    }
 }
 
 fn paint_single_circle_avatar(

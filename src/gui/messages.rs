@@ -2283,7 +2283,8 @@ pub(super) fn render_message_body(
         } else {
             &msg.text
         };
-        render_chat_markdown_block_opts(ui, display_text, text_col, pal, md.enabled, md.zalo_bold);
+        let display_text = crate::chat::text_emoticons_to_emoji(display_text);
+        render_chat_markdown_block_opts(ui, &display_text, text_col, pal, md.enabled, md.zalo_bold);
         return None;
     };
 

@@ -3709,7 +3709,18 @@ impl ZaloGuiApp {
                 GuiEvent::StickerImageReady { key, image } => {
                     self.loading_stickers.remove(&key);
                     self.failed_stickers.remove(&key);
-                    let tex = ctx.load_texture(&key, image, TextureOptions::LINEAR);
+                    // Avatars and thumbnails are drawn far below their pixel size; without
+                    // mipmaps the downscale aliases into a grainy image. Live call frames are
+                    // replaced every frame, so they skip the mipmap generation cost.
+                    let options = if key.starts_with("call_") {
+                        TextureOptions::LINEAR
+                    } else {
+                        TextureOptions {
+                            mipmap_mode: Some(egui::TextureFilter::Linear),
+                            ..TextureOptions::LINEAR
+                        }
+                    };
+                    let tex = ctx.load_texture(&key, image, options);
                     self.sticker_textures.insert(key, tex);
                 }
                 GuiEvent::StickerImageFailed { key } => {
