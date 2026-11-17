@@ -4384,14 +4384,63 @@ pub(super) enum BubbleAction {
     TranslateFrom(&'static str),
 }
 
+/// Borderless context-menu row: icon column + label, rounded hover fill only.
 fn menu_item(ui: &mut egui::Ui, icon: &str, label: &str, text_color: Color32) -> egui::Response {
-    let text = RichText::new(format!("{icon}   {label}"))
-        .size(13.0)
-        .color(text_color);
-    let btn = egui::Button::new(text)
-        .fill(Color32::TRANSPARENT)
-        .min_size(Vec2::new(ui.available_width(), 26.0));
-    ui.add(btn)
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        if resp.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                Rounding::same(6.0),
+                ui.visuals().widgets.hovered.weak_bg_fill,
+            );
+        }
+        menu_item_paint(ui, rect, icon, label, text_color);
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn menu_item_paint(ui: &egui::Ui, rect: Rect, icon: &str, label: &str, text_color: Color32) {
+    let painter = ui.painter();
+    let font = FontId::proportional(13.0);
+    painter.text(
+        Pos2::new(rect.left() + 18.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        font.clone(),
+        text_color,
+    );
+    painter.text(
+        Pos2::new(rect.left() + 36.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font,
+        text_color,
+    );
+}
+
+/// Text-only flyout row (no icon column).
+fn menu_text_item(ui: &mut egui::Ui, label: &str, text_color: Color32) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        if resp.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                Rounding::same(6.0),
+                ui.visuals().widgets.hovered.weak_bg_fill,
+            );
+        }
+        ui.painter().text(
+            Pos2::new(rect.left() + 10.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(13.0),
+            text_color,
+        );
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 /// Right-click menu on a chat bubble / row: quote/reply, forward/share, copy, pin, star, delete-for-me.
@@ -4461,6 +4510,9 @@ pub(super) fn bubble_context_menu(
         ),
     );
 
+    let flyout_rect_key = Id::new("bubble_translate_flyout_rect");
+    let mut translate_row: Option<Rect> = None;
+    let mut menu_frame_rect: Option<Rect> = None;
     egui::Area::new(Id::new(("active_ctx_menu_area", idx, msg.ts, &msg.id)))
         .order(egui::Order::Foreground)
         .fixed_pos(pos)
@@ -4482,7 +4534,15 @@ pub(super) fn bubble_context_menu(
                 .inner_margin(Margin::symmetric(10.0, 10.0))
                 .show(ui, |ui| {
                     ui.set_width(menu_w);
-                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
+                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
+                    // No outlines on anything inside the menu; hover shows a soft fill.
+                    {
+                        let w = &mut ui.visuals_mut().widgets;
+                        w.inactive.bg_stroke = Stroke::NONE;
+                        w.inactive.weak_bg_fill = Color32::TRANSPARENT;
+                        w.hovered.bg_stroke = Stroke::NONE;
+                        w.active.bg_stroke = Stroke::NONE;
+                    }
 
                     // Tin đã biến mất: vô hiệu mọi thao tác media/link (chỉ cho xoá).
                     let vanished =
@@ -4571,46 +4631,41 @@ pub(super) fn bubble_context_menu(
                                 close_menu = true;
                             }
                         } else if pending_translate {
-                            ui.add_enabled(
-                                false,
-                                egui::Button::new(
-                                    RichText::new("🌐   Đang dịch…").size(13.0).color(pal.text_muted),
-                                ),
-                            );
+                            ui.add_enabled_ui(false, |ui| {
+                                menu_item(ui, lucide::GLOBE, "Đang dịch…", pal.text_muted);
+                            });
                         } else {
-                            let tr_lbl = format!("Dịch tin nhắn {}", lucide::CHEVRON_RIGHT);
-                            let resp = menu_item(ui, lucide::GLOBE, &tr_lbl, pal.text_primary);
+                            let sub_open: bool = ui
+                                .ctx()
+                                .data(|d| d.get_temp(translate_sub_key).unwrap_or(false));
+                            let resp = menu_item(ui, lucide::GLOBE, "Dịch tin nhắn", pal.text_primary);
+                            if sub_open && !resp.hovered() {
+                                // Keep the row highlighted while its flyout is open.
+                                ui.painter().rect_filled(
+                                    resp.rect,
+                                    Rounding::same(6.0),
+                                    ui.visuals().widgets.hovered.weak_bg_fill,
+                                );
+                                menu_item_paint(ui, resp.rect, lucide::GLOBE, "Dịch tin nhắn", pal.text_primary);
+                            }
+                            ui.painter().text(
+                                Pos2::new(resp.rect.right() - 12.0, resp.rect.center().y),
+                                egui::Align2::CENTER_CENTER,
+                                lucide::CHEVRON_RIGHT,
+                                FontId::proportional(12.0),
+                                pal.text_muted,
+                            );
                             if resp.clicked() {
                                 action = Some(BubbleAction::TranslateFrom("auto"));
                                 close_menu = true;
                             }
-                            // Hover mở dải chọn nguồn ngay dưới (trong cùng menu).
+                            // Hover opens the source-language flyout beside the menu.
                             if resp.hovered() {
                                 ui.ctx().data_mut(|d| {
                                     d.insert_temp(translate_sub_key, true);
                                 });
                             }
-                            let sub_open: bool = ui
-                                .ctx()
-                                .data(|d| d.get_temp(translate_sub_key).unwrap_or(false));
-                            if sub_open {
-                                for (code, label) in [
-                                    ("auto", "Tự động"),
-                                    ("en", "Tiếng Anh"),
-                                    ("zh", "Tiếng Trung"),
-                                    ("ja", "Tiếng Nhật"),
-                                    ("ko", "Tiếng Hàn"),
-                                    ("fr", "Tiếng Pháp"),
-                                    ("es", "Tây Ban Nha"),
-                                    ("de", "Tiếng Đức"),
-                                    ("ru", "Tiếng Nga"),
-                                ] {
-                                    if menu_item(ui, "·", label, pal.text_primary).clicked() {
-                                        action = Some(BubbleAction::TranslateFrom(code));
-                                        close_menu = true;
-                                    }
-                                }
-                            }
+                            translate_row = Some(resp.rect);
                         }
                     }
 
@@ -4779,16 +4834,28 @@ pub(super) fn bubble_context_menu(
                     }
 
                     let menu_rect = ui.min_rect();
+                    menu_frame_rect = Some(menu_rect);
                     let pointer_pos = ui
                         .ctx()
                         .input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
+                    let flyout_rect: Option<Rect> = ui
+                        .ctx()
+                        .data(|d| d.get_temp(flyout_rect_key));
+                    // Hovering another row of the main menu closes the flyout.
+                    if let (Some(pos), Some(row)) = (ui.ctx().input(|i| i.pointer.hover_pos()), translate_row) {
+                        let in_row_band = pos.y >= row.top() && pos.y <= row.bottom();
+                        if menu_rect.contains(pos) && !in_row_band {
+                            ui.ctx().data_mut(|d| d.remove::<bool>(translate_sub_key));
+                        }
+                    }
                     let open_time: f64 =
                         ui.ctx().data(|d| d.get_temp(open_time_key)).unwrap_or(0.0);
                     if ui.input(|i| i.time) > open_time + 0.05 {
                         let pressed = ui.ctx().input(|i| i.pointer.any_pressed());
                         if pressed {
                             if let Some(pos) = pointer_pos {
-                                if !menu_rect.expand(4.0).contains(pos) {
+                                let in_flyout = flyout_rect.is_some_and(|r| r.expand(4.0).contains(pos));
+                                if !menu_rect.expand(4.0).contains(pos) && !in_flyout {
                                     close_menu = true;
                                 }
                             }
@@ -4800,7 +4867,77 @@ pub(super) fn bubble_context_menu(
                 });
         });
 
+    let sub_open: bool = ui
+        .ctx()
+        .data(|d| d.get_temp(translate_sub_key).unwrap_or(false));
+    match (sub_open && !close_menu, translate_row, menu_frame_rect) {
+        (true, Some(row), Some(menu_rect)) => {
+            const FLY_W: f32 = 150.0;
+            let screen = ui.ctx().screen_rect();
+            // Content rect -> frame edge is the 10 px inner margin.
+            let right_x = menu_rect.right() + 10.0 + 4.0;
+            let x = if right_x + FLY_W + 20.0 <= screen.right() {
+                right_x
+            } else {
+                menu_rect.left() - 10.0 - 4.0 - FLY_W - 12.0
+            };
+            let fly_h = 9.0 * 31.0 + 12.0;
+            let y = (row.top() - 6.0).min(screen.bottom() - fly_h - 8.0).max(screen.top() + 8.0);
+            let shown = egui::Area::new(Id::new(("bubble_translate_flyout", idx, msg.ts, &msg.id)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(Pos2::new(x, y))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::none()
+                        .fill(if pal.is_dark {
+                            Color32::from_rgb(33, 37, 43)
+                        } else {
+                            Color32::WHITE
+                        })
+                        .stroke(Stroke::new(1.0_f32, pal.border))
+                        .rounding(Rounding::same(8.0))
+                        .shadow(egui::epaint::Shadow {
+                            offset: Vec2::new(0.0, 4.0),
+                            blur: 16.0,
+                            spread: 0.0,
+                            color: Color32::from_black_alpha(if pal.is_dark { 130 } else { 45 }),
+                        })
+                        .inner_margin(Margin::same(6.0))
+                        .show(ui, |ui| {
+                            ui.set_width(FLY_W);
+                            ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
+                            ui.label(
+                                RichText::new("Dịch từ ngôn ngữ")
+                                    .size(11.5)
+                                    .color(pal.text_muted),
+                            );
+                            for (code, label) in [
+                                ("auto", "Tự động nhận diện"),
+                                ("en", "Tiếng Anh"),
+                                ("zh", "Tiếng Trung"),
+                                ("ja", "Tiếng Nhật"),
+                                ("ko", "Tiếng Hàn"),
+                                ("fr", "Tiếng Pháp"),
+                                ("es", "Tây Ban Nha"),
+                                ("de", "Tiếng Đức"),
+                                ("ru", "Tiếng Nga"),
+                            ] {
+                                if menu_text_item(ui, label, pal.text_primary).clicked() {
+                                    action = Some(BubbleAction::TranslateFrom(code));
+                                    close_menu = true;
+                                }
+                            }
+                        });
+                });
+            let r = shown.response.rect;
+            ui.ctx().data_mut(|d| d.insert_temp(flyout_rect_key, r));
+        }
+        _ => {
+            ui.ctx().data_mut(|d| d.remove::<Rect>(flyout_rect_key));
+        }
+    }
+
     if close_menu {
+        ui.ctx().data_mut(|d| d.remove::<Rect>(flyout_rect_key));
         ui.ctx()
             .data_mut(|d| d.remove::<(String, Pos2, usize)>(ctx_menu_key));
         ui.ctx()
