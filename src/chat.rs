@@ -4642,6 +4642,103 @@ pub fn icon_to_emoji(icon: &str) -> &'static str {
     }
 }
 
+/// Replace Zalo `/-code` emoticon tokens in message text with emoji for display
+/// (e.g. the quick "like" button sends the text `/-strong`). Only whole whitespace-separated
+/// tokens with a known code are replaced; unknown codes and all other text stay as typed.
+pub fn text_emoticons_to_emoji(text: &str) -> std::borrow::Cow<'_, str> {
+    fn emoji_for(token: &str) -> Option<&'static str> {
+        Some(match token {
+            "/-strong" => "👍",
+            "/-weak" => "👎",
+            "/-heart" => "❤️",
+            "/-break" => "💔",
+            "/-ok" => "👌",
+            "/-v" => "✌️",
+            "/-rose" => "🌹",
+            _ => return None,
+        })
+    }
+    if !text.contains("/-") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut convert_words = |segment: &str, out: &mut String| {
+        // `split_inclusive` keeps each separator so spacing and line breaks are preserved.
+        for piece in segment.split_inclusive(char::is_whitespace) {
+            let token = piece.trim_end_matches(char::is_whitespace);
+            match emoji_for(token) {
+                Some(emoji) => {
+                    out.push_str(emoji);
+                    out.push_str(&piece[token.len()..]);
+                    changed = true;
+                }
+                None => out.push_str(piece),
+            }
+        }
+    };
+    // Code is left verbatim so a code block's Copy button returns the original text:
+    // skip fenced ``` blocks and `inline code` spans.
+    let mut in_fence = false;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence {
+            out.push_str(line);
+            continue;
+        }
+        for (i, segment) in line.split('`').enumerate() {
+            if i > 0 {
+                out.push('`');
+            }
+            if i % 2 == 1 {
+                out.push_str(segment);
+            } else {
+                convert_words(segment, &mut out);
+            }
+        }
+    }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+#[cfg(test)]
+mod text_emoticon_tests {
+    use super::text_emoticons_to_emoji;
+
+    #[test]
+    fn known_codes_become_emoji_and_spacing_is_kept() {
+        assert_eq!(text_emoticons_to_emoji("/-strong"), "👍");
+        assert_eq!(text_emoticons_to_emoji("ok /-heart\n/-strong "), "ok ❤️\n👍 ");
+    }
+
+    #[test]
+    fn unknown_codes_and_embedded_text_are_untouched() {
+        assert_eq!(text_emoticons_to_emoji("/-xyz"), "/-xyz");
+        assert_eq!(text_emoticons_to_emoji("a/-strong"), "a/-strong");
+        assert_eq!(text_emoticons_to_emoji("path /-strong/x"), "path /-strong/x");
+        // Code stays verbatim (fenced blocks and inline spans), text around it converts.
+        assert_eq!(
+            text_emoticons_to_emoji("/-ok\n```\necho /-strong\n```\n/-heart"),
+            "👌\n```\necho /-strong\n```\n❤️"
+        );
+        assert_eq!(
+            text_emoticons_to_emoji("run `echo /-strong` /-strong"),
+            "run `echo /-strong` 👍"
+        );
+        assert!(matches!(
+            text_emoticons_to_emoji("plain text"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+}
+
 /// Special reaction code sent to clear all of our own reactions on a message (`rType = -1`, `rIcon = ""`).
 pub const CLEAR_REACTION_CODE: &str = "/-remove";
 

@@ -2167,7 +2167,8 @@ pub(super) fn render_message_body(
             }
             if let Some(cap) = extract_photo_user_caption(msg) {
                 ui.add_space(5.0);
-                render_chat_markdown_block_opts(ui, cap, text_col, pal, md.enabled, md.zalo_bold);
+                let cap = crate::chat::text_emoticons_to_emoji(cap);
+                render_chat_markdown_block_opts(ui, &cap, text_col, pal, md.enabled, md.zalo_bold);
             }
             return body_action;
         }
@@ -2283,7 +2284,8 @@ pub(super) fn render_message_body(
         } else {
             &msg.text
         };
-        render_chat_markdown_block_opts(ui, display_text, text_col, pal, md.enabled, md.zalo_bold);
+        let display_text = crate::chat::text_emoticons_to_emoji(display_text);
+        render_chat_markdown_block_opts(ui, &display_text, text_col, pal, md.enabled, md.zalo_bold);
         return None;
     };
 
@@ -2312,6 +2314,7 @@ pub(super) fn render_message_body(
 
     // 1. Optional user comment above the link
     if !caption.is_empty() && caption != url {
+        let caption = crate::chat::text_emoticons_to_emoji(&caption);
         render_chat_markdown_block_opts(ui, &caption, text_col, pal, md.enabled, md.zalo_bold);
         ui.add_space(4.0);
     }
