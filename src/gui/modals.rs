@@ -8871,6 +8871,16 @@ impl ZaloGuiApp {
         let mut should_close = false;
         let mut trigger_play = ctx.input(|i| i.key_pressed(Key::Space) || i.key_pressed(Key::Enter));
 
+        // A failed download stops the "downloading" state so the user can retry.
+        if !viewer.is_downloaded && viewer.is_downloading {
+            if let Some(err) = super::workspace::take_video_download_error(&viewer.url) {
+                viewer.is_downloading = false;
+                viewer.play_on_download = false;
+                self.show_toast(format!(
+                    "⚠️ Không tải được video ({err}). Bấm \"Phát video\" để thử lại."
+                ));
+            }
+        }
         // Check if video file has finished downloading to temp dir
         if !viewer.is_downloaded {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -9125,6 +9135,13 @@ impl ZaloGuiApp {
                     self.show_toast("🎬 Đang mở video bằng trình phát của máy…");
                 } else {
                     viewer.play_on_download = true;
+                    // Retry after a failure (or when no download is running).
+                    if !viewer.is_downloading
+                        && (viewer.url.starts_with("http://") || viewer.url.starts_with("https://"))
+                    {
+                        viewer.is_downloading = true;
+                        super::workspace::spawn_video_download(viewer.url.clone());
+                    }
                     self.show_toast("⏳ Đang tải video để phát… Vui lòng đợi trong giây lát");
                 }
             }

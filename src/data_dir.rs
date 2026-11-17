@@ -427,6 +427,17 @@ fn preferred_video_dir() -> Option<PathBuf> {
     }
 }
 
+/// Write a downloaded video atomically: a `.part` file next to `target`, then rename,
+/// so the player never opens a half-written file. Fails if the folder is not writable.
+pub fn save_video_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let part = target.with_extension("mp4.part");
+    let result = std::fs::write(&part, bytes).and_then(|()| std::fs::rename(&part, target));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    result
+}
+
 /// File path for the video at `url` inside [`video_cache_dir`] (stable per URL).
 pub fn video_cache_path(url: &str) -> PathBuf {
     video_cache_dir().join(format!("zlite_video_{}.mp4", crate::crypto::md5_hex(url)))
@@ -816,5 +827,28 @@ mod tests {
             "zlite_video_{}.mp4",
             crate::crypto::md5_hex("https://x/a.mp4")
         )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_video_file_reports_a_read_only_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fixture();
+        let target = dir.join("v.mp4");
+        save_video_file(&target, b"ok").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"ok");
+        assert!(!dir.join("v.mp4.part").exists());
+
+        let ro = dir.join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores directory permissions; the check only means something otherwise.
+        let writable_anyway = std::fs::write(ro.join("probe"), b"").is_ok();
+        if !writable_anyway {
+            assert!(save_video_file(&ro.join("v.mp4"), b"x").is_err());
+            assert!(!ro.join("v.mp4").exists());
+        }
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
