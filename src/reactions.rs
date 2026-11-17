@@ -115,6 +115,32 @@ pub struct ReactionEvent {
     pub historical: bool,
 }
 
+/// Wall-clock start of this GUI session (ms). Set once by [`mark_session_start`].
+static SESSION_START_MS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+/// Tolerance for server/local clock skew when comparing event times with the start.
+const SESSION_START_SKEW_MS: i64 = 5_000;
+
+/// Record when the GUI session started; later calls keep the first value.
+pub fn mark_session_start() {
+    let _ = SESSION_START_MS.set(chrono::Utc::now().timestamp_millis());
+}
+
+/// `true` when `event` happened before this session started. After a restart the server
+/// replays recent `chat.reaction` frames; the in-memory inbox no longer knows them, so
+/// without this gate every old reaction raised a banner and an unread count again.
+/// Counts are unaffected: this only gates notifications.
+pub fn before_session(event: &ReactionEvent) -> bool {
+    match SESSION_START_MS.get() {
+        Some(&start) => is_before(event.ts, start),
+        None => false,
+    }
+}
+
+fn is_before(event_ts: i64, start_ms: i64) -> bool {
+    let ts = crate::clock::normalize_ts_ms(event_ts);
+    ts > 0 && ts < start_ms - SESSION_START_SKEW_MS
+}
+
 /// Persisted per-reactor ledger. IDs deduplicate replay; chronological replay handles old pages.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1152,6 +1178,16 @@ mod tests {
         assert_eq!(r[0].thread_id, "peer");
         assert_eq!(r[1].thread_id, "g99");
     }
+    #[test]
+    fn events_from_before_the_session_are_not_notified() {
+        let start = 1_793_984_400_000;
+        assert!(is_before(1_793_984_355_844, start), "replayed frame from earlier");
+        assert!(is_before(1_793_984_355, start), "seconds are normalised");
+        assert!(!is_before(start - 1_000, start), "within clock-skew tolerance");
+        assert!(!is_before(start + 60_000, start), "live event");
+        assert!(!is_before(0, start), "unknown time is treated as live");
+    }
+
     #[test]
     fn unread_gate_skips_own_removal_and_historical() {
         // Documents the reaction-unread counting gate: peer adds count;
