@@ -4665,9 +4665,10 @@ pub fn is_clear_reaction(emoji_or_code: &str) -> bool {
 }
 
 /// `rMsg` identity of the reacted message: (`gMsgID` = server msgId, `cMsgID` = the
-/// sender's cliMsgId). `ChatMessage::id` prefers cliMsgId (re-notes/35), so it is not
-/// the server id; and `ts` is not a client id. Using them made the server accept the
-/// reaction while other devices could not match it to a message (re-notes/36).
+/// sender's cliMsgId), taken from the wire identity. `ChatMessage::id` may hold either
+/// id (re-notes/35) and `ts` is not an id; using them made the server accept the
+/// reaction while other devices could not match it to a message (re-notes/39).
+/// Without wire identity the fallbacks are best effort.
 fn reaction_target_ids(msg: &ChatMessage, now: u64) -> (Value, u64) {
     let is_local_id =
         msg.id.is_empty() || msg.id.starts_with("out_") || msg.id.starts_with("local_");
