@@ -8874,8 +8874,7 @@ impl ZaloGuiApp {
         // Check if video file has finished downloading to temp dir
         if !viewer.is_downloaded {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
-            let hash = crate::crypto::md5_hex(&viewer.url);
-            let temp_file = std::env::temp_dir().join(format!("zlite_video_{hash}.mp4"));
+            let temp_file = crate::data_dir::video_cache_path(&viewer.url);
             if temp_file.exists()
                 && std::fs::metadata(&temp_file).map(|m| m.len() > 0).unwrap_or(false)
             {
@@ -8885,7 +8884,7 @@ impl ZaloGuiApp {
                 if viewer.play_on_download {
                     viewer.play_on_download = false;
                     let _ = open_external_url(temp_file.to_str().unwrap_or(&viewer.url));
-                    self.show_toast("🎬 Đang phát video bằng Windows Media Player…");
+                    self.show_toast("🎬 Đang mở video bằng trình phát của máy…");
                 }
             }
         }
@@ -9045,7 +9044,7 @@ impl ZaloGuiApp {
                             if ui
                                 .add(play_btn)
                                 .on_hover_cursor(CursorIcon::PointingHand)
-                                .on_hover_text("Phát video đầy đủ âm thanh và hình ảnh (Windows Media Player)")
+                                .on_hover_text("Mở video bằng trình phát mặc định của máy (VLC, mpv…)")
                                 .clicked()
                             {
                                 trigger_play = true;
@@ -9113,10 +9112,9 @@ impl ZaloGuiApp {
         if trigger_play {
             if let Some(ref cp) = viewer.cached_path {
                 let _ = open_external_url(cp.to_str().unwrap_or(&viewer.url));
-                self.show_toast("🎬 Đang phát video bằng Windows Media Player…");
+                self.show_toast("🎬 Đang mở video bằng trình phát của máy…");
             } else {
-                let hash = crate::crypto::md5_hex(&viewer.url);
-                let temp_path = std::env::temp_dir().join(format!("zlite_video_{hash}.mp4"));
+                let temp_path = crate::data_dir::video_cache_path(&viewer.url);
                 if temp_path.exists()
                     && std::fs::metadata(&temp_path).map(|m| m.len() > 0).unwrap_or(false)
                 {
@@ -9124,7 +9122,7 @@ impl ZaloGuiApp {
                     viewer.is_downloaded = true;
                     viewer.is_downloading = false;
                     let _ = open_external_url(temp_path.to_str().unwrap_or(&viewer.url));
-                    self.show_toast("🎬 Đang phát video bằng Windows Media Player…");
+                    self.show_toast("🎬 Đang mở video bằng trình phát của máy…");
                 } else {
                     viewer.play_on_download = true;
                     self.show_toast("⏳ Đang tải video để phát… Vui lòng đợi trong giây lát");

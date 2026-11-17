@@ -390,6 +390,51 @@ pub fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     result
 }
 
+/// Folder for videos downloaded to be opened in the system player.
+///
+/// On Linux this is `<XDG videos dir>/ctdozlite` (usually `~/Videos/ctdozlite`):
+/// sandboxed players such as snap/flatpak VLC have a private `/tmp` and cannot read
+/// hidden folders like `~/.cache`, so a file there fails with "No such file".
+/// Other platforms keep the system temp folder.
+pub fn video_cache_dir() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let config = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".config"));
+            let videos = std::fs::read_to_string(config.join("user-dirs.dirs"))
+                .ok()
+                .and_then(|text| xdg_user_dir(&text, "XDG_VIDEOS_DIR", &home))
+                .unwrap_or_else(|| home.join("Videos"));
+            return videos.join("ctdozlite");
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// File path for the video at `url` inside [`video_cache_dir`] (stable per URL).
+pub fn video_cache_path(url: &str) -> PathBuf {
+    video_cache_dir().join(format!("zlite_video_{}.mp4", crate::crypto::md5_hex(url)))
+}
+
+/// Parse one `KEY="$HOME/…"` line of `user-dirs.dirs`. Ignores values equal to `$HOME`
+/// itself (the spec's way of saying "disabled").
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn xdg_user_dir(text: &str, key: &str, home: &Path) -> Option<PathBuf> {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.strip_prefix(key).is_some_and(|rest| rest.trim_start().starts_with('=')))?;
+    let value = line.split_once('=')?.1.trim().trim_matches('"');
+    let path = match value.strip_prefix("$HOME") {
+        Some(rest) => home.join(rest.trim_start_matches('/')),
+        None if value.starts_with('/') => PathBuf::from(value),
+        None => return None,
+    };
+    (path != home).then_some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,5 +762,22 @@ mod tests {
         assert_eq!(from, Some(newer));
         assert_eq!(std::fs::read(target.join("session.json")).unwrap(), b"newer");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn xdg_videos_dir_is_parsed_and_home_means_disabled() {
+        let home = Path::new("/home/u");
+        let text = "# comment\nXDG_DOWNLOAD_DIR=\"$HOME/Tải về\"\nXDG_VIDEOS_DIR=\"$HOME/Video\"\n";
+        assert_eq!(
+            xdg_user_dir(text, "XDG_VIDEOS_DIR", home),
+            Some(PathBuf::from("/home/u/Video"))
+        );
+        assert_eq!(xdg_user_dir("XDG_VIDEOS_DIR=\"$HOME/\"", "XDG_VIDEOS_DIR", home), None);
+        assert_eq!(xdg_user_dir("XDG_VIDEOS_DIR=\"/media/v\"", "XDG_VIDEOS_DIR", home), Some(PathBuf::from("/media/v")));
+        assert_eq!(xdg_user_dir(text, "XDG_MUSIC_DIR", home), None);
+        assert!(video_cache_path("https://x/a.mp4").ends_with(format!(
+            "zlite_video_{}.mp4",
+            crate::crypto::md5_hex("https://x/a.mp4")
+        )));
     }
 }
