@@ -771,9 +771,11 @@ impl State {
                         let contents = contents.replace("\r\n", "\n");
                         if !contents.is_empty() {
                             self.egui_input.events.push(egui::Event::Paste(contents));
+                            return;
                         }
                     }
-                    return;
+                    // No text on the clipboard (e.g. an image): fall through and emit the
+                    // key event so the app can still detect the paste shortcut.
                 }
             }
 
