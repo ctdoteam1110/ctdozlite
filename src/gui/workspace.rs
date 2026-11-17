@@ -7270,8 +7270,8 @@ impl ZaloGuiApp {
                                     time,
                                     thumb_key,
                                 } => {
-                                    let hash = crate::crypto::md5_hex(&url);
-                                    let temp_path = std::env::temp_dir().join(format!("zlite_video_{hash}.mp4"));
+                                    let temp_path = crate::data_dir::video_cache_path(&url);
+                                    let _ = std::fs::create_dir_all(crate::data_dir::video_cache_dir());
                                     let is_cached = temp_path.exists()
                                         && std::fs::metadata(&temp_path).map(|m| m.len() > 0).unwrap_or(false);
                                     let cached_path = if is_cached { Some(temp_path.clone()) } else { None };
@@ -7290,7 +7290,7 @@ impl ZaloGuiApp {
 
                                     if is_cached {
                                         let _ = open_external_url(temp_path.to_str().unwrap_or(&url));
-                                        self.show_toast("🎬 Đang phát video bằng Windows Media Player…");
+                                        self.show_toast("🎬 Đang mở video bằng trình phát của máy…");
                                     } else if !url.is_empty()
                                         && (url.starts_with("http://") || url.starts_with("https://"))
                                     {
