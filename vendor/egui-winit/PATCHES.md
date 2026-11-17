@@ -35,6 +35,30 @@ dedents the block). Ignoring whitespace, the diff against upstream is:
                          }
 ```
 
+## `src/lib.rs`: keep the paste key event when the clipboard has no text
+
+Upstream turns `Ctrl+V` / `Shift+Insert` / `Paste` into `Event::Paste(text)`
+and returns early, dropping the key event even when the clipboard holds no
+text. When the clipboard only holds an image (for example an Ubuntu
+screenshot, `image/png` only), the app then sees nothing and cannot read the
+bitmap itself. Windows hides this with a `GetAsyncKeyState` fallback in
+`is_clipboard_paste_triggered`; Linux and macOS have no such fallback.
+
+The patch returns early only when a non-empty text paste was emitted;
+otherwise the normal `Event::Key` is pushed. `TextEdit` does not act on a
+bare `Ctrl+V` key event, so text input is unaffected.
+
+```diff
+                         if !contents.is_empty() {
+                             self.egui_input.events.push(egui::Event::Paste(contents));
++                            return;
+                         }
+                     }
+-                    return;
++                    // No text on the clipboard (e.g. an image): fall through ...
+                 }
+```
+
 ## When to remove this
 
 Delete the `vendor/` directory and the `[patch.crates-io]` entry once the
