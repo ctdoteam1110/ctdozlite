@@ -4664,6 +4664,27 @@ pub fn is_clear_reaction(emoji_or_code: &str) -> bool {
     reaction_code_and_type(emoji_or_code).1 == -1
 }
 
+/// `rMsg` identity of the reacted message: (`gMsgID` = server msgId, `cMsgID` = the
+/// sender's cliMsgId). `ChatMessage::id` prefers cliMsgId (re-notes/35), so it is not
+/// the server id; and `ts` is not a client id. Using them made the server accept the
+/// reaction while other devices could not match it to a message (re-notes/36).
+fn reaction_target_ids(msg: &ChatMessage, now: u64) -> (Value, u64) {
+    let is_local_id =
+        msg.id.is_empty() || msg.id.starts_with("out_") || msg.id.starts_with("local_");
+    let server = server_message_id(msg).filter(|id| !is_local_id || id != &msg.id);
+    let g_msg_id = match server {
+        Some(id) => json!(id),
+        None if is_local_id => json!(""),
+        None => json!(msg.id),
+    };
+    let c_msg_id = client_message_id(msg)
+        .and_then(|id| id.parse::<u64>().ok())
+        .or_else(|| (!is_local_id).then(|| msg.id.parse::<u64>().ok()).flatten())
+        .or_else(|| (msg.ts > 0).then_some(msg.ts as u64))
+        .unwrap_or(now);
+    (g_msg_id, c_msg_id)
+}
+
 /// Send a message reaction (`sendReactionMessage` in `compact-app-pc.b7bec208c4c8f73e09f8.js:14317097`, cmd `12410` / `12411`).
 pub async fn send_reaction(
     s: &Session,
@@ -4681,18 +4702,7 @@ pub async fn send_reaction(
         .unwrap_or(0);
 
     let (r_icon, r_type) = reaction_code_and_type(reaction);
-    let is_local_id =
-        msg.id.is_empty() || msg.id.starts_with("out_") || msg.id.starts_with("local_");
-    let g_msg_id_val = if is_local_id {
-        json!("")
-    } else {
-        json!(msg.id)
-    };
-    let c_msg_id = if msg.ts > 0 {
-        msg.ts as u64
-    } else {
-        msg.id.parse::<u64>().unwrap_or(now)
-    };
+    let (g_msg_id_val, c_msg_id) = reaction_target_ids(msg, now);
 
     let inner_msg = json!({
         "rMsg": [{
@@ -10302,6 +10312,32 @@ mod tests {
         let parsed = parse_chat_message(&msg).unwrap();
         assert_eq!(parsed.text, "Xin chao buoi sang");
         assert_eq!(parsed.sender, "Charlie");
+    }
+
+    #[test]
+    fn reaction_targets_server_and_client_ids_not_timestamp() {
+        let mut msg = ChatMessage {
+            id: "1700000000123".into(),
+            client_message_id: "1700000000123".into(),
+            ts: 1_700_000_000_000,
+            ..Default::default()
+        };
+        msg.wire_ref.server_id = Some(json!("7012345678901"));
+        msg.wire_ref.client_id = Some(json!("1700000000123"));
+        let (g, c) = reaction_target_ids(&msg, 1);
+        assert_eq!(g, json!("7012345678901"));
+        assert_eq!(c, 1_700_000_000_123);
+
+        // Optimistic local row without server identity: empty gMsgID, client id kept.
+        let local = ChatMessage {
+            id: "out_42".into(),
+            client_message_id: "1700000000999".into(),
+            ts: 1_700_000_000_500,
+            ..Default::default()
+        };
+        let (g, c) = reaction_target_ids(&local, 1);
+        assert_eq!(g, json!(""));
+        assert_eq!(c, 1_700_000_000_999);
     }
 
     #[test]
