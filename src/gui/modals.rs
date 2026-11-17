@@ -1555,10 +1555,20 @@ impl ZaloGuiApp {
                     .inner_margin(Margin::ZERO),
             )
             .show(ctx, |ui| {
-                ui.visuals_mut().widgets.inactive.bg_stroke =
-                    Stroke::new(1.4_f32, pal.text_muted);
-                ui.visuals_mut().widgets.hovered.bg_stroke =
-                    Stroke::new(1.6_f32, pal.primary_hover);
+                // Form controls inside Settings: thin neutral outline, a visible slider rail
+                // (inactive.bg_fill) and the filled part of sliders in the accent colour.
+                {
+                    let v = ui.visuals_mut();
+                    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, pal.border);
+                    v.widgets.inactive.bg_fill = pal.bg_input_track;
+                    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, pal.primary_hover);
+                    v.slider_trailing_fill = true;
+                    let r = Rounding::same(6.0);
+                    v.widgets.inactive.rounding = r;
+                    v.widgets.hovered.rounding = r;
+                    v.widgets.active.rounding = r;
+                    v.widgets.open.rounding = r;
+                }
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     // Left Tabs Navigation Sidebar
@@ -1694,6 +1704,15 @@ impl ZaloGuiApp {
                         .fill(pal.bg_chat_canvas)
                         .inner_margin(Margin::symmetric(content_pad_x, 16.0))
                         .show(ui, |ui| {
+                            // The sidebar row above zeroes horizontal spacing; restore it so
+                            // buttons, labels and inputs in every tab do not touch each other.
+                            {
+                                let s = ui.spacing_mut();
+                                s.item_spacing = Vec2::new(8.0, 6.0);
+                                s.interact_size.y = 28.0;
+                                s.button_padding = Vec2::new(10.0, 5.0);
+                                s.slider_width = 160.0;
+                            }
                             ui.vertical(|ui| {
                                 ui.set_min_width(content_w);
                                 ui.set_max_width(content_w);
@@ -2008,7 +2027,7 @@ impl ZaloGuiApp {
                                                             ui.add(
                                                                 egui::TextEdit::singleline(&mut self.settings.proxy_url)
                                                                     .hint_text("http://user:pass@ip:port hoặc socks5://127.0.0.1:1080")
-                                                                    .desired_width((inner_w - 190.0).max(160.0)),
+                                                                    .desired_width((ui.available_width() - 170.0).max(140.0)),
                                                             );
                                                             if ui.button("Áp dụng Proxy").clicked() {
                                                                 apply_proxy_now = true;
@@ -3353,10 +3372,10 @@ impl ZaloGuiApp {
                                                         self.settings.quick_reply_items.iter_mut().enumerate()
                                                     {
                                                         ui.horizontal(|ui| {
-                                                            let w = (ui.available_width() - 34.0).max(120.0);
+                                                            let w = (ui.available_width() - 40.0).max(120.0);
                                                             if ui
                                                                 .add_sized(
-                                                                    [w, 26.0],
+                                                                    [w, 28.0],
                                                                     egui::TextEdit::singleline(item)
                                                                         .char_limit(120),
                                                                 )
@@ -3372,7 +3391,7 @@ impl ZaloGuiApp {
                                                                             .size(13.5)
                                                                             .strong(),
                                                                     )
-                                                                    .min_size(Vec2::new(24.0, 24.0)),
+                                                                    .min_size(Vec2::new(28.0, 28.0)),
                                                                 )
                                                                 .on_hover_text("Xóa mẫu này")
                                                                 .clicked()
@@ -3393,9 +3412,9 @@ impl ZaloGuiApp {
                                                     }
                                                     if self.settings.quick_reply_items.len() < 5 {
                                                         ui.horizontal(|ui| {
-                                                            let w = (ui.available_width() - 68.0).max(110.0);
+                                                            let w = (ui.available_width() - 82.0).max(110.0);
                                                             let resp = ui.add_sized(
-                                                                [w, 26.0],
+                                                                [w, 28.0],
                                                                 egui::TextEdit::singleline(
                                                                     &mut self.settings.quick_reply_draft,
                                                                 )

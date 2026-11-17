@@ -1441,8 +1441,23 @@ impl ZaloGuiApp {
                                 } else {
                                     text_left
                                 };
+                                // Reserve the measured width of the time (+ pin/mute icons) so a
+                                // long name is cut before it, never drawn underneath it.
+                                let time_w = if t.time.is_empty() {
+                                    0.0
+                                } else {
+                                    ui.fonts(|f| {
+                                        f.layout_no_wrap(
+                                            t.time.clone(),
+                                            FontId::proportional(11.5),
+                                            pal.text_muted,
+                                        )
+                                        .size()
+                                        .x
+                                    })
+                                };
                                 let reserved_right = if !t.time.is_empty() {
-                                    let mut r = 45.0;
+                                    let mut r = 9.0 + time_w + 10.0;
                                     if is_pinned_cloud { r += 14.0; }
                                     if is_muted { r += 14.0; }
                                     r
@@ -1450,8 +1465,12 @@ impl ZaloGuiApp {
                                     16.0
                                 };
                                 let avail_name_w = (row_rect.right() - name_x - reserved_right).max(35.0);
-                                let max_name_chars = ((avail_name_w / 7.2) as usize).clamp(8, 45);
-                                let display_name = truncate_chars(&t.name, max_name_chars);
+                                let display_name = truncate_to_width(
+                                    ui,
+                                    &t.name,
+                                    FontId::proportional(14.0),
+                                    avail_name_w,
+                                );
                                 ui.painter().text(
                                     Pos2::new(name_x, row_rect.top() + 12.0),
                                     egui::Align2::LEFT_TOP,
@@ -10502,4 +10521,27 @@ mod quote_navigation_tests {
         assert_eq!(new_draft, "Nhắc @Anh Tuấn về báo cáo");
         assert_eq!(next_cursor, "Nhắc @Anh Tuấn".chars().count());
     }
+}
+
+/// Cut `text` with a trailing "…" so it fits `max_w` pixels in `font`.
+fn truncate_to_width(ui: &egui::Ui, text: &str, font: FontId, max_w: f32) -> String {
+    let width = |s: String| {
+        ui.fonts(|f| f.layout_no_wrap(s, font.clone(), Color32::WHITE).size().x)
+    };
+    if width(text.to_string()) <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    // Binary search the longest prefix that still fits together with the ellipsis.
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let candidate: String = chars[..mid].iter().collect::<String>() + "…";
+        if width(candidate) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
 }
