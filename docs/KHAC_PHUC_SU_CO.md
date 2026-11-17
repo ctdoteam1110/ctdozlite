@@ -55,7 +55,7 @@ Nguyên nhân: ứng dụng coi **mọi lỗi mạng** (mất Wi-Fi, DNS hỏng,
 
 Nguyên nhân: địa chỉ API bạn bè bị ghi đè bằng tên miền cũ `.zaloapp.com`; tên miền đúng là `.chat.zalo.me`. Địa chỉ sai được lưu vào `session.json` nên lần mở sau vẫn lỗi.
 
-**Cách sửa tạm thời:** mở `session.json` trong thư mục làm việc, tìm khối `"domains"` và sửa hai dòng sau thành:
+**Cách sửa tạm thời:** mở `session.json` trong thư mục dữ liệu (xem bằng `ctdozlite --print-data-dir`), tìm khối `"domains"` và sửa hai dòng sau thành:
 
 ```json
 "friend": "https://tt-friend-wpa.chat.zalo.me",
