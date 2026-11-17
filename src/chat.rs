@@ -4672,7 +4672,16 @@ pub fn is_clear_reaction(emoji_or_code: &str) -> bool {
 fn reaction_target_ids(msg: &ChatMessage, now: u64) -> (Value, u64) {
     let is_local_id =
         msg.id.is_empty() || msg.id.starts_with("out_") || msg.id.starts_with("local_");
-    let server = server_message_id(msg).filter(|id| !is_local_id || id != &msg.id);
+    // When `id` is the client id (a merged row that kept its bare cliMsgId), use the wire
+    // server id even if the wire client id is missing; `server_message_id` would return `id`.
+    let wire_server = wire_identity(msg.wire_ref.server_id.as_ref());
+    let id_is_client = !msg.client_message_id.is_empty() && msg.id == msg.client_message_id;
+    let server = if id_is_client {
+        wire_server.or_else(|| server_message_id(msg))
+    } else {
+        server_message_id(msg)
+    }
+    .filter(|id| !is_local_id || id != &msg.id);
     let g_msg_id = match server {
         Some(id) => json!(id),
         None if is_local_id => json!(""),
@@ -10339,6 +10348,17 @@ mod tests {
         let (g, c) = reaction_target_ids(&local, 1);
         assert_eq!(g, json!(""));
         assert_eq!(c, 1_700_000_000_999);
+
+        // Merged row: `id` is the bare client id and only a wire server id is known.
+        let mut merged = ChatMessage {
+            id: "1700000000777".into(),
+            client_message_id: "1700000000777".into(),
+            ..Default::default()
+        };
+        merged.wire_ref.server_id = Some(json!("7012345670000"));
+        let (g, c) = reaction_target_ids(&merged, 1);
+        assert_eq!(g, json!("7012345670000"));
+        assert_eq!(c, 1_700_000_000_777);
     }
 
     #[test]

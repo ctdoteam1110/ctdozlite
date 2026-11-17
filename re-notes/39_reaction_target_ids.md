@@ -25,15 +25,20 @@ match it to a message.
 - `gMsgID` from `server_message_id` (wire `msgId`/`globalMsgId`),
 - `cMsgID` from `client_message_id` (wire `cliMsgId`).
 
-Fallbacks when no wire identity is stored (legacy SQLite rows), in order:
+When `ChatMessage::id` equals the client id, the wire server id is used for
+`gMsgID` even if the wire client id is missing (a merged row that kept its bare
+cliMsgId as `id`).
+
+Fallbacks when an id is not available from wire identity (legacy SQLite rows, or a
+row that has only one of the two wire ids), in order:
 
 - `gMsgID`: `ChatMessage::id` (empty for local `out_`/`local_` rows), as before.
 - `cMsgID`: `ChatMessage::id` when numeric, then `ts`, then the current time.
   Before this change `ts` came first. `id` is tried first as a best effort: it
   may be the `cliMsgId` or the server `msgId` (see above), so it is not a
   guaranteed client id, but it is an id; `ts` is a time and only matches when the
-  sender happened to use it as `cliMsgId`. Rows with wire identity never reach
-  this fallback.
+  sender happened to use it as `cliMsgId`. A row whose wire client id is
+  missing or not numeric can still reach this fallback.
 
 Request shape, host, cipher, signing and cookies are
 unchanged; only the values of the two existing fields differ. This matches the
