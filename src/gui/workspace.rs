@@ -7295,31 +7295,7 @@ impl ZaloGuiApp {
                                         && (url.starts_with("http://") || url.starts_with("https://"))
                                     {
                                         self.show_toast("⏳ Đang tải video để phát…");
-                                        let url_clone = url.clone();
-                                        let target_path = temp_path;
-                                        std::thread::spawn(move || {
-                                            let rt = tokio::runtime::Builder::new_current_thread()
-                                                .enable_all()
-                                                .build();
-                                            if let Ok(rt) = rt {
-                                                rt.block_on(async {
-                                                    let client = reqwest::Client::builder()
-                                                        .timeout(std::time::Duration::from_secs(60))
-                                                        .build();
-                                                    if let Ok(client) = client {
-                                                        if let Ok(resp) = client.get(&url_clone).send().await {
-                                                            if resp.status().is_success() {
-                                                                if let Ok(bytes) = resp.bytes().await {
-                                                                    if !bytes.is_empty() {
-                                                                        let _ = std::fs::write(&target_path, &bytes);
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        });
+                                        spawn_video_download(url.clone());
                                     }
                                 }
                                 BubbleAction::DownloadFile { url, file_name } => {
@@ -10502,4 +10478,54 @@ mod quote_navigation_tests {
         assert_eq!(new_draft, "Nhắc @Anh Tuấn về báo cáo");
         assert_eq!(next_cursor, "Nhắc @Anh Tuấn".chars().count());
     }
+}
+
+/// Download failures by video URL, reported to the open video player (see
+/// [`take_video_download_error`]). The player otherwise only polls for the file.
+static VIDEO_DOWNLOAD_ERRORS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Fetch `url` into [`crate::data_dir::video_cache_path`] on a background thread.
+/// Any failure (network, HTTP status, empty body, unwritable folder) is recorded so
+/// the player can stop waiting and offer a retry.
+pub(super) fn spawn_video_download(url: String) {
+    if let Ok(mut errors) = VIDEO_DOWNLOAD_ERRORS.lock() {
+        errors.remove(&url);
+    }
+    std::thread::spawn(move || {
+        let target = crate::data_dir::video_cache_path(&url);
+        let result: Result<(), String> = (|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let bytes = rt.block_on(async {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    return Err(format!("máy chủ trả về {}", resp.status()));
+                }
+                resp.bytes().await.map_err(|e| e.to_string())
+            })?;
+            if bytes.is_empty() {
+                return Err("tệp video rỗng".into());
+            }
+            crate::data_dir::save_video_file(&target, &bytes)
+                .map_err(|e| format!("không ghi được vào {}: {e}", target.display()))
+        })();
+        if let Err(e) = result {
+            if let Ok(mut errors) = VIDEO_DOWNLOAD_ERRORS.lock() {
+                errors.insert(url, e);
+            }
+        }
+    });
+}
+
+/// Take (and clear) the recorded download failure for `url`, if any.
+pub(super) fn take_video_download_error(url: &str) -> Option<String> {
+    VIDEO_DOWNLOAD_ERRORS.lock().ok()?.remove(url)
 }
