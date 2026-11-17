@@ -341,6 +341,7 @@ async fn main() -> Result<()> {
         );
 
         let app_session = s;
+        reactions::mark_session_start();
         let res = eframe::run_native(
             "ctdozlite",
             native_options,

@@ -3406,7 +3406,7 @@ impl ZaloGuiApp {
                         self.settings.enable_notifications && self.settings.play_notification_sound;
                     let now_ts_react = crate::login::unix_now();
                     for ev in &accepted {
-                        if ev.r_type < 0 || ev.historical {
+                        if ev.r_type < 0 || ev.historical || crate::reactions::before_session(ev) {
                             continue;
                         }
                         if ev.sender_id.is_empty() || ev.sender_id == my_uid {
@@ -3450,7 +3450,7 @@ impl ZaloGuiApp {
                     let is_focused_now = ctx.input(|i| i.focused);
                     let my_uid_count = self.user_uin.clone();
                     for ev in &accepted {
-                        if ev.r_type < 0 || ev.historical {
+                        if ev.r_type < 0 || ev.historical || crate::reactions::before_session(ev) {
                             continue;
                         }
                         if ev.sender_id.is_empty() || ev.sender_id == my_uid_count {
