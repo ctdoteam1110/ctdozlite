@@ -7342,8 +7342,8 @@ impl ZaloGuiApp {
                                     time,
                                     thumb_key,
                                 } => {
+                                    // Creates the folder (or falls back to the temp folder).
                                     let temp_path = crate::data_dir::video_cache_path(&url);
-                                    let _ = std::fs::create_dir_all(crate::data_dir::video_cache_dir());
                                     let is_cached = temp_path.exists()
                                         && std::fs::metadata(&temp_path).map(|m| m.len() > 0).unwrap_or(false);
                                     let cached_path = if is_cached { Some(temp_path.clone()) } else { None };

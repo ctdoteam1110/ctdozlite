@@ -397,20 +397,34 @@ pub fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
 /// hidden folders like `~/.cache`, so a file there fails with "No such file".
 /// Other platforms keep the system temp folder.
 pub fn video_cache_dir() -> PathBuf {
+    // Fall back to the temp folder when the preferred folder cannot be created (e.g. a
+    // read-only Videos folder), so the download still has somewhere to land.
+    match preferred_video_dir() {
+        Some(dir) if std::fs::create_dir_all(&dir).is_ok() => dir,
+        _ => std::env::temp_dir(),
+    }
+}
+
+/// `<XDG videos dir>/ctdozlite` on Linux; `None` elsewhere or without `HOME`.
+fn preferred_video_dir() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            let config = std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".config"));
-            let videos = std::fs::read_to_string(config.join("user-dirs.dirs"))
-                .ok()
-                .and_then(|text| xdg_user_dir(&text, "XDG_VIDEOS_DIR", &home))
-                .unwrap_or_else(|| home.join("Videos"));
-            return videos.join("ctdozlite");
-        }
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        // XDG: an empty or relative XDG_CONFIG_HOME is ignored in favour of the default.
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| home.join(".config"));
+        let videos = std::fs::read_to_string(config.join("user-dirs.dirs"))
+            .ok()
+            .and_then(|text| xdg_user_dir(&text, "XDG_VIDEOS_DIR", &home))
+            .unwrap_or_else(|| home.join("Videos"));
+        Some(videos.join("ctdozlite"))
     }
-    std::env::temp_dir()
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// File path for the video at `url` inside [`video_cache_dir`] (stable per URL).
@@ -426,7 +440,26 @@ fn xdg_user_dir(text: &str, key: &str, home: &Path) -> Option<PathBuf> {
         .lines()
         .map(str::trim)
         .find(|l| l.strip_prefix(key).is_some_and(|rest| rest.trim_start().starts_with('=')))?;
-    let value = line.split_once('=')?.1.trim().trim_matches('"');
+    let raw = line.split_once('=')?.1.trim().trim_matches('"');
+    // xdg-user-dirs-update shell-escapes `\`, `"`, `$` and `` ` `` with a backslash; keep the
+    // leading `$HOME` literal and unescape the rest (no shell expansion).
+    let (home_prefix, rest) = match raw.strip_prefix("$HOME") {
+        Some(rest) => ("$HOME", rest),
+        None => ("", raw),
+    };
+    let mut unescaped = String::with_capacity(rest.len());
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                unescaped.push(next);
+            }
+        } else {
+            unescaped.push(c);
+        }
+    }
+    let value = format!("{home_prefix}{unescaped}");
+    let value = value.as_str();
     let path = match value.strip_prefix("$HOME") {
         Some(rest) => home.join(rest.trim_start_matches('/')),
         None if value.starts_with('/') => PathBuf::from(value),
@@ -775,6 +808,10 @@ mod tests {
         assert_eq!(xdg_user_dir("XDG_VIDEOS_DIR=\"$HOME/\"", "XDG_VIDEOS_DIR", home), None);
         assert_eq!(xdg_user_dir("XDG_VIDEOS_DIR=\"/media/v\"", "XDG_VIDEOS_DIR", home), Some(PathBuf::from("/media/v")));
         assert_eq!(xdg_user_dir(text, "XDG_MUSIC_DIR", home), None);
+        assert_eq!(
+            xdg_user_dir(r#"XDG_VIDEOS_DIR="$HOME/Videos\$archive""#, "XDG_VIDEOS_DIR", home),
+            Some(PathBuf::from("/home/u/Videos$archive"))
+        );
         assert!(video_cache_path("https://x/a.mp4").ends_with(format!(
             "zlite_video_{}.mp4",
             crate::crypto::md5_hex("https://x/a.mp4")
