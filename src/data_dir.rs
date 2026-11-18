@@ -427,21 +427,59 @@ fn preferred_video_dir() -> Option<PathBuf> {
     }
 }
 
-/// Write a downloaded video atomically: a uniquely named `.part` file next to `target`,
-/// then rename, so the player never opens a half-written file and two concurrent saves
-/// of the same video cannot share (and corrupt) one temp file. Fails if the folder is
-/// not writable.
+/// Write a downloaded video atomically: a freshly created `.part` file next to
+/// `target`, then rename, so the player never opens a half-written file and two saves
+/// of the same video cannot share (and corrupt) one temp file. The temp file is created
+/// exclusively (`create_new`): an existing file or symlink at that name, e.g. in a shared
+/// temp folder, is never truncated or followed; another name is tried instead. Fails if
+/// the folder is not writable.
 pub fn save_video_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let part = target.with_extension(format!(
-        "mp4.{}-{}.part",
-        std::process::id(),
-        NEXT_FILE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = std::fs::write(&part, bytes).and_then(|()| std::fs::rename(&part, target));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&part);
+    save_video_file_with(target, bytes, || {
+        format!(
+            "{}-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed),
+            crate::param_cipher::random_hex(6)
+        )
+    })
+}
+
+/// [`save_video_file`] with an injectable temp-name generator (for tests).
+fn save_video_file_with(
+    target: &Path,
+    bytes: &[u8],
+    mut next_name: impl FnMut() -> String,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    const ATTEMPTS: usize = 16;
+    for _ in 0..ATTEMPTS {
+        let part = target.with_extension(format!("mp4.{}.part", next_name()));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        // From here the temp file is ours; remove only it on failure.
+        let result = file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| {
+                drop(file);
+                std::fs::rename(&part, target)
+            });
+        if result.is_err() {
+            let _ = std::fs::remove_file(&part);
+        }
+        return result;
     }
-    result
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "không tạo được tệp tạm mới cho video",
+    ))
 }
 
 /// File path for the video at `url` inside [`video_cache_dir`] (stable per URL).
@@ -857,6 +895,20 @@ mod tests {
         });
         let got = std::fs::read(&target).unwrap();
         assert!(got == a || got == b, "never a mix of two writes");
+
+        // Name collision: an existing file and a symlink at the temp name are left alone
+        // and a fresh name is used instead.
+        let taken = dir.join("v.mp4.taken.part");
+        std::fs::write(&taken, b"keep").unwrap();
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("v.mp4.link.part")).unwrap();
+        let mut names = ["taken", "link", "free"].into_iter();
+        save_video_file_with(&target, b"new", || names.next().unwrap().to_string()).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert_eq!(std::fs::read(&taken).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        assert!(!dir.join("v.mp4.free.part").exists());
 
         let ro = dir.join("ro");
         std::fs::create_dir(&ro).unwrap();
