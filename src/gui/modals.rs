@@ -2702,6 +2702,7 @@ impl ZaloGuiApp {
                                                                 "segoe_ui" | "segoe" => "Segoe UI",
                                                                 "arial" => "Arial",
                                                                 "tahoma" => "Tahoma",
+                                                                "open_sans" => "Open Sans (giống Telegram)",
                                                                 _ => "Mặc định (Be Vietnam Pro)",
                                                             };
                                                             egui::ComboBox::from_id_salt("appearance_font_family_combo")
@@ -2709,6 +2710,9 @@ impl ZaloGuiApp {
                                                                 .width(190.0)
                                                                 .show_ui(ui, |ui| {
                                                                     if ui.selectable_value(&mut self.settings.font_family, "default".into(), "Mặc định (Be Vietnam Pro)").changed() {
+                                                                        font_changed = true;
+                                                                    }
+                                                                    if ui.selectable_value(&mut self.settings.font_family, "open_sans".into(), "Open Sans (giống Telegram)").changed() {
                                                                         font_changed = true;
                                                                     }
                                                                     if ui.selectable_value(&mut self.settings.font_family, "segoe_ui".into(), "Segoe UI").changed() {
