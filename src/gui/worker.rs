@@ -403,7 +403,8 @@ pub enum WorkerCmd {
     SendAttachments {
         to_id: String,
         is_group: bool,
-        paths: Vec<std::path::PathBuf>,
+        /// `(upload_id, path)`: the id ties progress events to the UI placeholder.
+        items: Vec<(u64, std::path::PathBuf)>,
         caption: String,
         original_hd: bool,
     },
@@ -3764,7 +3765,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         WorkerCmd::SendAttachments {
                             to_id,
                             is_group,
-                            paths,
+                            items,
                             caption,
                             original_hd,
                         } => {
@@ -3772,6 +3773,18 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
+                                // Upload ids by path (a path may be queued twice).
+                                let mut ids_by_path: std::collections::HashMap<
+                                    std::path::PathBuf,
+                                    std::collections::VecDeque<u64>,
+                                > = std::collections::HashMap::new();
+                                let paths: Vec<std::path::PathBuf> = items
+                                    .into_iter()
+                                    .map(|(id, p)| {
+                                        ids_by_path.entry(p.clone()).or_default().push_back(id);
+                                        p
+                                    })
+                                    .collect();
                                 let paths = super::attachments::album_send_order(paths);
                                 let total = paths.len();
                                 // Two or more still photos go out as one album; GIFs, videos
@@ -3800,6 +3813,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     } else {
                                         String::new()
                                     };
+                                    let upload_id = ids_by_path
+                                        .get_mut(&path)
+                                        .and_then(|q| q.pop_front())
+                                        .unwrap_or(0);
+                                    let _ = gui_tx_clone.send(GuiEvent::UploadStarted { upload_id });
                                     let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                         "⏳ Đang tải lên và gửi '{fname}'{progress}…"
                                     )));
@@ -3827,10 +3845,16 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 thread_id: to_id.clone(),
                                                 msg: cm,
                                             });
+                                            let _ = gui_tx_clone
+                                                .send(GuiEvent::UploadDone { upload_id, error: None });
                                         }
                                         Err(e) => {
                                             let err_s = e.to_string();
                                             crate::logger::log_error("gui::send_attachment", &err_s);
+                                            let _ = gui_tx_clone.send(GuiEvent::UploadDone {
+                                                upload_id,
+                                                error: Some(err_s.clone()),
+                                            });
                                             let _ = gui_tx_clone.send(GuiEvent::SendFailed {
                                                 thread_id: to_id.clone(),
                                                 text: item_caption.to_string(),
