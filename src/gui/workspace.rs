@@ -6796,9 +6796,16 @@ impl ZaloGuiApp {
                                             let view_rect = ui.clip_rect();
                                             let view_margin = view_rect.height() * 1.5;
                                             let row_width_bucket = (ui.available_width() / 8.0).round() as u32;
-                                            if self.chat_row_heights.len() > 20_000 {
-                                                self.chat_row_heights.clear();
-                                            }
+                                            // Over the cap, keep only this list's rows (collected
+                                            // below) so the open conversation keeps its layout.
+                                            let evict_row_heights = self.chat_row_heights.len() > 20_000;
+                                            let mut live_row_keys: Vec<u64> = Vec::new();
+                                            // A quote jump stays pending while rows above its
+                                            // target are still being measured, so the target is
+                                            // scrolled to again once their real heights are known.
+                                            let mut jump_row_seen = false;
+                                            let mut jump_row_drawn = false;
+                                            let mut rows_above_jump_changed = false;
                                             for (pos, &idx) in visible_indices.iter().enumerate() {
                                                 // Later photos of an album are drawn inside the first one's grid.
                                                 let run_len = album_runs[pos];
@@ -6826,7 +6833,21 @@ impl ZaloGuiApp {
                                                 // area is replaced by a spacer of its last measured
                                                 // height (or an estimate), so a frame lays out tens of
                                                 // bubbles instead of every loaded message.
-                                                let row_key = chat_row_key(msg, run_len, row_width_bucket);
+                                                // The divider and cluster flags depend on neighbours,
+                                                // which change under search or the starred filter.
+                                                let context = RowContext {
+                                                    time_divider: should_show_time_divider(prev_msg, msg),
+                                                    prev_same_sender: prev_msg
+                                                        .is_some_and(|pm| same_message_cluster(pm, msg)),
+                                                    next_same_sender: next_msg
+                                                        .is_some_and(|nm| same_message_cluster(msg, nm)),
+                                                    latest_outgoing: last_outgoing_idx
+                                                        .is_some_and(|l| visible_indices[pos..pos + run_len].contains(&l)),
+                                                };
+                                                let row_key = chat_row_key(msg, run_len, row_width_bucket, context);
+                                                if evict_row_heights {
+                                                    live_row_keys.push(row_key);
+                                                }
                                                 let row_top = ui.cursor().top();
                                                 let known_h = self.chat_row_heights.get(&row_key).copied();
                                                 let guess_h = known_h.unwrap_or(CHAT_ROW_ESTIMATE_H);
@@ -6835,6 +6856,7 @@ impl ZaloGuiApp {
                                                 let is_jump_row = jump_index.is_some_and(|j| {
                                                     visible_indices[pos..pos + run_len].contains(&j)
                                                 });
+                                                jump_row_seen |= is_jump_row;
                                                 if !near_view && !is_jump_row {
                                                     ui.allocate_space(Vec2::new(ui.available_width(), guess_h));
                                                     continue;
@@ -6949,13 +6971,21 @@ impl ZaloGuiApp {
                                                         jump_scroll_pending,
                                                         pal.primary,
                                                     );
-                                                    jump_scrolled |= jump_scroll_pending;
+                                                    jump_row_drawn = true;
                                                 }
                                                 let measured = (ui.cursor().top() - row_top).max(0.0);
                                                 if known_h.map_or(true, |h| (h - measured).abs() > 0.5) {
+                                                    rows_above_jump_changed |= !jump_row_seen;
                                                     self.chat_row_heights.insert(row_key, measured);
                                                 }
                                             }
+                                            if evict_row_heights {
+                                                let live: std::collections::HashSet<u64> = live_row_keys.into_iter().collect();
+                                                self.chat_row_heights.retain(|k, _| live.contains(k));
+                                            }
+                                            jump_scrolled |= jump_scroll_pending
+                                                && jump_row_drawn
+                                                && !rows_above_jump_changed;
                                             let (bottom_rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 1.0), Sense::hover());
                                             if self.force_scroll_to_bottom {
                                                 ui.scroll_to_rect(bottom_rect, Some(Align::BOTTOM));
@@ -10537,7 +10567,12 @@ const CHAT_ROW_ESTIMATE_H: f32 = 72.0;
 
 /// Cache key of a chat row's measured height: the message identity plus what changes its
 /// height (text, attachments, reactions, translation, album size) and the width bucket.
-fn chat_row_key(msg: &crate::chat::ChatMessage, run_len: usize, width_bucket: u32) -> u64 {
+fn chat_row_key(
+    msg: &crate::chat::ChatMessage,
+    run_len: usize,
+    width_bucket: u32,
+    context: RowContext,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     msg.id.hash(&mut h);
@@ -10550,5 +10585,16 @@ fn chat_row_key(msg: &crate::chat::ChatMessage, run_len: usize, width_bucket: u3
     msg.translation.as_deref().map(str::len).hash(&mut h);
     run_len.hash(&mut h);
     width_bucket.hash(&mut h);
+    context.hash(&mut h);
     h.finish()
+}
+
+/// Neighbour-derived decorations of a chat row (date divider, sender heading, timestamp,
+/// trailing spacing, seen status); part of [`chat_row_key`].
+#[derive(Clone, Copy, Hash)]
+struct RowContext {
+    time_divider: bool,
+    prev_same_sender: bool,
+    next_same_sender: bool,
+    latest_outgoing: bool,
 }
