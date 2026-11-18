@@ -1079,6 +1079,22 @@ struct ImageViewerModal {
     time: String,
     zoom: f32,
     pan: Vec2,
+    /// Every photo of the open conversation, oldest first, for prev/next browsing.
+    /// Filled lazily by the viewer on its first frame (empty = not built yet).
+    gallery: Vec<GalleryPhoto>,
+    /// Position of the shown photo in `gallery`.
+    gallery_index: usize,
+}
+
+/// One photo the image viewer can step to.
+#[derive(Debug, Clone)]
+struct GalleryPhoto {
+    tex_key: String,
+    thumb_url: String,
+    full_url: String,
+    title: String,
+    sender: String,
+    time: String,
 }
 
 #[derive(Debug, Clone)]

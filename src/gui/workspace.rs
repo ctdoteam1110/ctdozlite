@@ -4342,6 +4342,8 @@ impl ZaloGuiApp {
                                                                     time: String::new(),
                                                                     zoom: 1.0,
                                                                     pan: Vec2::ZERO,
+                                                                    gallery: Vec::new(),
+                                                                    gallery_index: 0,
                                                                 });
                                                         }
                                                     }
@@ -7261,6 +7263,8 @@ impl ZaloGuiApp {
                                         time,
                                         zoom: 1.0,
                                         pan: Vec2::ZERO,
+                                        gallery: Vec::new(),
+                                        gallery_index: 0,
                                     });
                                 }
                                 BubbleAction::OpenVideoPlayer {
