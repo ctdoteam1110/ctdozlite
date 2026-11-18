@@ -11,9 +11,10 @@
 use anyhow::Result;
 use session::Session;
 pub use zalo_rust::{
-    account_manager, agent, api_mcp, auth, audio, call, chat, clock, crypto, data_dir, endpoints, feed,
-    gui, history_sync, llm, logger, login, media, media_resources, message_model, param_cipher,
-    qr, reactions, scheduler, session, socket, store, tg_bridge, tui, ui, unread, updater, voip_log,
+    account_manager, agent, api_mcp, audio, auth, call, chat, clock, crypto, data_dir, endpoints,
+    feed, gui, history_sync, llm, logger, login, media, media_resources, message_model,
+    param_cipher, qr, reactions, scheduler, session, single_instance, socket, store, tg_bridge,
+    tui, ui, unread, updater, voip_log,
 };
 
 pub const POLL_SECS: u64 = 4;
@@ -187,6 +188,36 @@ async fn main() -> Result<()> {
                 .find_map(|a| a.strip_prefix("--proxy=").map(str::to_string))
         });
 
+    // Mirrors the GUI branch below once the earlier modes have returned. Checked before
+    // `--logout` so a second launch cannot delete the running GUI's session.
+    let launches_gui = force_gui
+        || !(force_tui
+            || force_qr
+            || force_logout
+            || force_mcp
+            || agent_mode
+            || tg_bridge
+            || args
+                .iter()
+                .any(|a| a == "--api-only" || a.starts_with("--phone")));
+    // Held until exit; the kernel releases the lock when this process ends.
+    let mut instance_guard = None;
+    if launches_gui {
+        let here = std::path::Path::new(".");
+        match single_instance::acquire(here) {
+            Ok(single_instance::Acquired::Primary(guard)) => instance_guard = Some(guard),
+            Ok(single_instance::Acquired::AlreadyRunning) => {
+                if let Err(err) = single_instance::notify_running(here) {
+                    logger::log_error("main::single_instance", &err.to_string());
+                }
+                println!("ℹ️ ctdozlite đang chạy, đã mở lại cửa sổ hiện có.");
+                return Ok(());
+            }
+            // Fail open: a broken lock file must not keep the app from starting.
+            Err(err) => logger::log_error("main::single_instance", &err.to_string()),
+        }
+    }
+
     if force_logout {
         let _ = std::fs::remove_file("session.json");
         let _ = std::fs::remove_file("threads_cache.json");
@@ -341,10 +372,16 @@ async fn main() -> Result<()> {
         );
 
         let app_session = s;
+        // Borrowed, not moved: the guard (and its lock) must outlive the creator closure.
+        let show_target = instance_guard.as_mut();
         let res = eframe::run_native(
             "ctdozlite",
             native_options,
             Box::new(move |cc| {
+                if let Some(guard) = show_target {
+                    let ctx = cc.egui_ctx.clone();
+                    guard.spawn_show_listener(move || single_instance::show_window(&ctx));
+                }
                 Ok(Box::new(gui::ZaloGuiApp::new(
                     cc,
                     app_session,

@@ -22,6 +22,8 @@ pub mod poll;
 pub mod qr;
 pub mod reactions;
 pub mod session;
+/// One GUI process per data folder: instance lock and "show window" requests.
+pub mod single_instance;
 pub mod socket;
 pub mod store;
 pub mod group_llm;

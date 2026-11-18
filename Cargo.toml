@@ -55,6 +55,10 @@ rhai = "1"
 # StatusNotifierItem tray icon (GNOME AppIndicator extension, KDE, XFCE); pure-Rust D-Bus via zbus.
 ksni = "0.3"
 
+[target.'cfg(unix)'.dependencies]
+# `flock` for the single-instance GUI lock (already in the tree via other crates).
+libc = "0.2"
+
 [lib]
 name = "zalo_rust"
 path = "src/lib.rs"
