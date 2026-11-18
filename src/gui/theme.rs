@@ -1497,6 +1497,21 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
                 }
             }
         }
+        "open_sans" => {
+            // Bundled Open Sans (OFL), the face Telegram Desktop uses; covers Vietnamese.
+            const OPEN_SANS: &[u8] = include_bytes!("../assets/fonts/OpenSans-Regular.ttf");
+            const OPEN_SANS_SEMIBOLD: &[u8] =
+                include_bytes!("../assets/fonts/OpenSans-SemiBold.ttf");
+            fonts.font_data.insert(
+                "selected_font".to_owned(),
+                egui::FontData::from_static(OPEN_SANS),
+            );
+            fonts.font_data.insert(
+                "selected_font_semibold".to_owned(),
+                egui::FontData::from_static(OPEN_SANS_SEMIBOLD),
+            );
+            selected_font_loaded = true;
+        }
         "default" | "" => {
             // Uses bundled_sans directly at priority index 0
         }
@@ -1596,6 +1611,9 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
     mono.push("lucide_font".to_owned());
 
     let semibold = fonts.families.entry(font_family_semibold()).or_default();
+    if fonts.font_data.contains_key("selected_font_semibold") {
+        semibold.push("selected_font_semibold".to_owned());
+    }
     if selected_font_loaded {
         semibold.push("selected_font".to_owned());
     }
