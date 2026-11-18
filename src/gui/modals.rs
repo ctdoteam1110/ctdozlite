@@ -1881,7 +1881,10 @@ impl ZaloGuiApp {
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new("Khởi động Zalo khi mở máy").color(pal.text_primary).size(13.2));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            render_toggle_switch(ui, &mut self.settings.autostart_on_boot, pal);
+                                                            if render_toggle_switch(ui, &mut self.settings.autostart_on_boot, pal).changed() {
+                                                                super::sync_autostart(self.settings.autostart_on_boot);
+                                                                self.settings.save();
+                                                            }
                                                         });
                                                     });
                                                     ui.add_space(8.0);

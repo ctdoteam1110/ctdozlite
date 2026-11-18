@@ -1,5 +1,6 @@
 pub mod account_manager;
 pub mod audio;
+pub mod autostart;
 pub mod background_accounts;
 pub mod call;
 pub mod chat;

@@ -1802,6 +1802,8 @@ impl ZaloGuiApp {
         initial_threads: Vec<Thread>,
     ) -> Self {
         let mut loaded_settings = AppSettings::load();
+        // Keep the OS login item in line with the setting (file I/O off the UI thread).
+        sync_autostart(loaded_settings.autostart_on_boot);
         setup_custom_fonts_with_choice(&cc.egui_ctx, &loaded_settings.font_family);
         let safe_scale = loaded_settings.normalized_font_scale();
         cc.egui_ctx.set_zoom_factor(safe_scale);
@@ -6762,4 +6764,13 @@ impl ZaloGuiApp {
             false
         }
     }
+}
+
+/// Apply the "start with the OS" setting on a background thread; failures are logged.
+pub(crate) fn sync_autostart(enabled: bool) {
+    std::thread::spawn(move || {
+        if let Err(e) = crate::autostart::apply(enabled) {
+            crate::logger::log_error("autostart", &format!("{e}"));
+        }
+    });
 }
