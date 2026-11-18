@@ -6928,6 +6928,7 @@ impl ZaloGuiApp {
                                                     jump_scrolled |= jump_scroll_pending;
                                                 }
                                             }
+                                            self.render_outgoing_uploads(ui, &thread_id, pal);
                                             let (bottom_rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 1.0), Sense::hover());
                                             if self.force_scroll_to_bottom {
                                                 ui.scroll_to_rect(bottom_rect, Some(Align::BOTTOM));
@@ -8547,11 +8548,27 @@ impl ZaloGuiApp {
                                     } else if (send_clicked || enter_pressed)
                                         && !self.pending_attachments.is_empty()
                                     {
-                                        let paths: Vec<std::path::PathBuf> = self
-                                            .pending_attachments
-                                            .drain(..)
-                                            .map(|a| a.path)
-                                            .collect();
+                                        // Show each file right away as a placeholder bubble.
+                                        let mut items: Vec<(u64, std::path::PathBuf)> = Vec::new();
+                                        for a in self.pending_attachments.drain(..) {
+                                            let id = self.next_upload_id;
+                                            self.next_upload_id += 1;
+                                            self.outgoing_uploads.push(crate::gui::OutgoingUpload {
+                                                id,
+                                                thread_id: thread_id.clone(),
+                                                file_name: a
+                                                    .path
+                                                    .file_name()
+                                                    .and_then(|n| n.to_str())
+                                                    .unwrap_or("tập tin")
+                                                    .to_string(),
+                                                dims: a.dims,
+                                                thumb: a.thumb.clone(),
+                                                state: crate::gui::UploadState::Queued,
+                                            });
+                                            items.push((id, a.path));
+                                        }
+                                        self.force_scroll_to_bottom = true;
                                         let cap = self.input_message.trim().to_string();
                                         self.input_message.clear();
                                         self.dismissed_sticker_suggest_for.clear();
@@ -8561,7 +8578,7 @@ impl ZaloGuiApp {
                                             let _ = tx.send(WorkerCmd::SendAttachments {
                                                 to_id: thread_id.clone(),
                                                 is_group,
-                                                paths,
+                                                items,
                                                 caption: cap,
                                                 original_hd: self.send_hd_original,
                                             });
@@ -10501,5 +10518,106 @@ mod quote_navigation_tests {
                 .expect("should replace active mention");
         assert_eq!(new_draft, "Nhắc @Anh Tuấn về báo cáo");
         assert_eq!(next_cursor, "Nhắc @Anh Tuấn".chars().count());
+    }
+}
+
+impl ZaloGuiApp {
+    /// Placeholder bubbles for this thread's attachments that are still uploading (or
+    /// failed), right-aligned like outgoing messages, below the last real message.
+    fn render_outgoing_uploads(&mut self, ui: &mut egui::Ui, thread_id: &str, pal: &ThemePalette) {
+        let mut dismiss: Option<u64> = None;
+        for up in self.outgoing_uploads.iter().filter(|u| u.thread_id == thread_id) {
+            ui.add_space(6.0);
+            ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                ui.add_space(8.0);
+                egui::Frame::none()
+                    .fill(pal.bubble_out_bg)
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(Margin::same(8.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(320.0);
+                        ui.horizontal(|ui| {
+                            let side = 56.0;
+                            let (r, _) = ui.allocate_exact_size(Vec2::splat(side), Sense::hover());
+                            match &up.thumb {
+                                Some(t) => {
+                                    // Centre-crop to a square, dimmed while uploading.
+                                    let [tw, th] = t.size();
+                                    let (tw, th) = (tw.max(1) as f32, th.max(1) as f32);
+                                    let uv = if tw > th {
+                                        let d = (1.0 - th / tw) * 0.5;
+                                        Rect::from_min_max(Pos2::new(d, 0.0), Pos2::new(1.0 - d, 1.0))
+                                    } else {
+                                        let d = (1.0 - tw / th) * 0.5;
+                                        Rect::from_min_max(Pos2::new(0.0, d), Pos2::new(1.0, 1.0 - d))
+                                    };
+                                    ui.painter().image(t.id(), r, uv, Color32::from_white_alpha(170));
+                                }
+                                None => {
+                                    ui.painter().rect_filled(r, Rounding::same(8.0), pal.bg_elevated);
+                                    draw_lucide_icon(ui.painter(), r.center(), lucide::PAPERCLIP, 20.0, pal.text_secondary);
+                                }
+                            }
+                            ui.vertical(|ui| {
+                                ui.set_max_width(240.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&up.file_name)
+                                            .size(13.0)
+                                            .color(pal.bubble_out_text),
+                                    )
+                                    .truncate(),
+                                );
+                                if let Some((w, h)) = up.dims {
+                                    ui.label(RichText::new(format!("{w}×{h}")).size(11.0).color(pal.bubble_out_meta));
+                                }
+                                match &up.state {
+                                    UploadState::Queued | UploadState::Uploading => {
+                                        ui.horizontal(|ui| {
+                                            ui.add(egui::Spinner::new().size(12.0).color(pal.primary));
+                                            ui.label(
+                                                RichText::new(if up.state == UploadState::Queued {
+                                                    "Đang chờ gửi…"
+                                                } else {
+                                                    "Đang tải lên…"
+                                                })
+                                                .size(11.5)
+                                                .color(pal.bubble_out_meta),
+                                            );
+                                        });
+                                    }
+                                    UploadState::Failed(err) => {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(format!("Gửi lỗi: {err}"))
+                                                    .size(11.5)
+                                                    .color(pal.danger_text),
+                                            )
+                                            .truncate(),
+                                        );
+                                        if ui
+                                            .small_button("Bỏ qua")
+                                            .on_hover_text("Ẩn thông báo lỗi này")
+                                            .clicked()
+                                        {
+                                            dismiss = Some(up.id);
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                    });
+            });
+        }
+        if let Some(id) = dismiss {
+            self.outgoing_uploads.retain(|u| u.id != id);
+        }
+        if self
+            .outgoing_uploads
+            .iter()
+            .any(|u| u.thread_id == thread_id && matches!(u.state, UploadState::Queued | UploadState::Uploading))
+        {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
     }
 }
