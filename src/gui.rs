@@ -1384,6 +1384,8 @@ struct QuoteJump {
     reference: String,
     highlight_until: std::time::Instant,
     scroll_pending: bool,
+    /// Where the target row was last laid out, in content coordinates.
+    target_y: Option<f32>,
 }
 
 impl QuoteJump {
@@ -1392,6 +1394,18 @@ impl QuoteJump {
             return None;
         }
         crate::message_navigation::unique_reference_index(messages, &self.reference)
+    }
+
+    /// Record where the target row was laid out this frame (content coordinates). The
+    /// first scroll request is spent once the target is drawn; afterwards a move of the
+    /// target, because rows above it got their real heights, asks for the scroll again.
+    fn observe_target(&mut self, content_y: f32) {
+        if self.scroll_pending {
+            self.scroll_pending = false;
+        } else if self.target_y.is_some_and(|y| (y - content_y).abs() > 0.5) {
+            self.scroll_pending = true;
+        }
+        self.target_y = Some(content_y);
     }
 }
 
@@ -2401,6 +2415,7 @@ impl ZaloGuiApp {
                 reference,
                 highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(5),
                 scroll_pending: true,
+                target_y: None,
             });
         } else {
             self.show_toast("Chưa tải tin nhắn gốc — hãy tải thêm lịch sử rồi thử lại.");

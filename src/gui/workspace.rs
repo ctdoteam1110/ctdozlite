@@ -4201,6 +4201,7 @@ impl ZaloGuiApp {
                                         highlight_until: std::time::Instant::now()
                                             + std::time::Duration::from_secs(3),
                                         scroll_pending: true,
+                                        target_y: None,
                                     });
                                     ctx.request_repaint();
                                 } else {
@@ -6583,7 +6584,7 @@ impl ZaloGuiApp {
                         .as_ref()
                         .map(|jump| jump.scroll_pending)
                         .unwrap_or(false);
-                    let mut jump_scrolled = false;
+                    let mut jump_target_y: Option<f32> = None;
                     if let Some(index) = jump_index {
                         let count = self
                             .threads
@@ -6800,12 +6801,8 @@ impl ZaloGuiApp {
                                             // below) so the open conversation keeps its layout.
                                             let evict_row_heights = self.chat_row_heights.len() > 20_000;
                                             let mut live_row_keys: Vec<u64> = Vec::new();
-                                            // A quote jump stays pending while rows above its
-                                            // target are still being measured, so the target is
-                                            // scrolled to again once their real heights are known.
-                                            let mut jump_row_seen = false;
-                                            let mut jump_row_drawn = false;
-                                            let mut rows_above_jump_changed = false;
+                                            // Content origin, for the quote-jump target position.
+                                            let content_top = ui.min_rect().top();
                                             for (pos, &idx) in visible_indices.iter().enumerate() {
                                                 // Later photos of an album are drawn inside the first one's grid.
                                                 let run_len = album_runs[pos];
@@ -6837,6 +6834,7 @@ impl ZaloGuiApp {
                                                 // which change under search or the starred filter.
                                                 let context = RowContext {
                                                     time_divider: should_show_time_divider(prev_msg, msg),
+                                                    leading_row: pos == 0,
                                                     prev_same_sender: prev_msg
                                                         .is_some_and(|pm| same_message_cluster(pm, msg)),
                                                     next_same_sender: next_msg
@@ -6856,7 +6854,6 @@ impl ZaloGuiApp {
                                                 let is_jump_row = jump_index.is_some_and(|j| {
                                                     visible_indices[pos..pos + run_len].contains(&j)
                                                 });
-                                                jump_row_seen |= is_jump_row;
                                                 if !near_view && !is_jump_row {
                                                     ui.allocate_space(Vec2::new(ui.available_width(), guess_h));
                                                     continue;
@@ -6964,18 +6961,19 @@ impl ZaloGuiApp {
                                                     };
                                                     ui.add_space(space);
                                                 });
-                                                if jump_index == Some(idx) {
+                                                // `is_jump_row` also covers a target that is a later
+                                                // photo of an album drawn in this row.
+                                                if is_jump_row {
                                                     render_quote_target(
                                                         ui,
                                                         row.response.rect,
                                                         jump_scroll_pending,
                                                         pal.primary,
                                                     );
-                                                    jump_row_drawn = true;
+                                                    jump_target_y = Some(row.response.rect.top() - content_top);
                                                 }
                                                 let measured = (ui.cursor().top() - row_top).max(0.0);
                                                 if !known_h.is_some_and(|h| (h - measured).abs() <= 0.5) {
-                                                    rows_above_jump_changed |= !jump_row_seen;
                                                     self.chat_row_heights.insert(row_key, measured);
                                                 }
                                             }
@@ -6983,9 +6981,6 @@ impl ZaloGuiApp {
                                                 let live: std::collections::HashSet<u64> = live_row_keys.into_iter().collect();
                                                 self.chat_row_heights.retain(|k, _| live.contains(k));
                                             }
-                                            jump_scrolled |= jump_scroll_pending
-                                                && jump_row_drawn
-                                                && !rows_above_jump_changed;
                                             let (bottom_rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 1.0), Sense::hover());
                                             if self.force_scroll_to_bottom {
                                                 ui.scroll_to_rect(bottom_rect, Some(Align::BOTTOM));
@@ -7042,9 +7037,10 @@ impl ZaloGuiApp {
                                     });
                             });
                     }
-                    if jump_scrolled {
-                        if let Some(jump) = &mut self.quote_jump {
-                            jump.scroll_pending = false;
+                    if let (Some(y), Some(jump)) = (jump_target_y, &mut self.quote_jump) {
+                        jump.observe_target(y);
+                        if jump.scroll_pending {
+                            ctx.request_repaint();
                         }
                     }
                     if widen_window {
@@ -7102,6 +7098,7 @@ impl ZaloGuiApp {
                                             reference,
                                             highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(3),
                                             scroll_pending: true,
+                                            target_y: None,
                                         });
                                         ctx.request_repaint();
                                     } else {
@@ -10449,11 +10446,63 @@ mod quote_navigation_tests {
             reference: "original".into(),
             highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(3),
             scroll_pending: true,
+            target_y: None,
         };
         assert_eq!(jump.target_index("thread-1", &messages), Some(0));
         assert_eq!(jump.target_index("thread-2", &messages), None);
         jump.highlight_until = std::time::Instant::now();
         assert_eq!(jump.target_index("thread-1", &messages), None);
+    }
+
+    #[test]
+    fn quote_jump_rescrolls_when_rows_above_the_target_get_measured() {
+        let mut jump = QuoteJump {
+            thread_id: "t".into(),
+            reference: "r".into(),
+            highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(3),
+            scroll_pending: true,
+            target_y: None,
+        };
+        // Frame 1: the target is drawn and scrolled to; the request is spent.
+        jump.observe_target(4_000.0);
+        assert!(!jump.scroll_pending);
+        // Same position next frame: nothing to do (one-shot behaviour unchanged).
+        jump.observe_target(4_000.0);
+        assert!(!jump.scroll_pending);
+        // Rows above, laid out with the 72px estimate, are measured taller: the
+        // target moves down in content space and must be scrolled to again.
+        jump.observe_target(4_380.0);
+        assert!(jump.scroll_pending);
+        jump.observe_target(4_380.0);
+        assert!(!jump.scroll_pending);
+    }
+
+    #[test]
+    fn row_key_tracks_neighbour_decorations() {
+        let msg = ChatMessage {
+            id: "m".into(),
+            text: "hi".into(),
+            ..Default::default()
+        };
+        let base = RowContext {
+            time_divider: true,
+            leading_row: false,
+            prev_same_sender: false,
+            next_same_sender: false,
+            latest_outgoing: false,
+        };
+        let key = |c: RowContext| chat_row_key(&msg, 1, 40, c);
+        let mut variants = [base; 5];
+        // A divider row that becomes the first filtered row loses its 10px leading gap.
+        variants[0].leading_row = true;
+        variants[1].time_divider = false;
+        variants[2].prev_same_sender = true;
+        variants[3].next_same_sender = true;
+        variants[4].latest_outgoing = true;
+        for variant in variants {
+            assert_ne!(key(base), key(variant));
+        }
+        assert_eq!(key(base), key(base));
     }
 
     #[test]
@@ -10594,6 +10643,8 @@ fn chat_row_key(
 #[derive(Clone, Copy, Hash)]
 struct RowContext {
     time_divider: bool,
+    /// First row of the list: its divider has no leading gap.
+    leading_row: bool,
     prev_same_sender: bool,
     next_same_sender: bool,
     latest_outgoing: bool,

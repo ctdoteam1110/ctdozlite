@@ -5507,6 +5507,7 @@ impl ZaloGuiApp {
                 reference: mid,
                 highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(3),
                 scroll_pending: true,
+                target_y: None,
             });
             self.saved_modal_open = false;
             ctx.request_repaint();
