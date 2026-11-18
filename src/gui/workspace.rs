@@ -6848,6 +6848,12 @@ impl ZaloGuiApp {
 
                                             let vanish_now_ms =
                                                 crate::login::unix_now().saturating_mul(1000);
+                                            let view_rect = ui.clip_rect();
+                                            let view_margin = view_rect.height() * 1.5;
+                                            let row_width_bucket = (ui.available_width() / 8.0).round() as u32;
+                                            if self.chat_row_heights.len() > 20_000 {
+                                                self.chat_row_heights.clear();
+                                            }
                                             for (pos, &idx) in visible_indices.iter().enumerate() {
                                                 // Later photos of an album are drawn inside the first one's grid.
                                                 let run_len = album_runs[pos];
@@ -6870,6 +6876,24 @@ impl ZaloGuiApp {
                                                 let next_msg = visible_indices
                                                     .get(pos + run_len)
                                                     .map(|&ni| &thread.messages[ni]);
+
+                                                // Viewport-only rendering: a row far from the visible
+                                                // area is replaced by a spacer of its last measured
+                                                // height (or an estimate), so a frame lays out tens of
+                                                // bubbles instead of every loaded message.
+                                                let row_key = chat_row_key(msg, run_len, row_width_bucket);
+                                                let row_top = ui.cursor().top();
+                                                let known_h = self.chat_row_heights.get(&row_key).copied();
+                                                let guess_h = known_h.unwrap_or(CHAT_ROW_ESTIMATE_H);
+                                                let near_view = row_top + guess_h >= view_rect.top() - view_margin
+                                                    && row_top <= view_rect.bottom() + view_margin;
+                                                let is_jump_row = jump_index.is_some_and(|j| {
+                                                    visible_indices[pos..pos + run_len].contains(&j)
+                                                });
+                                                if !near_view && !is_jump_row {
+                                                    ui.allocate_space(Vec2::new(ui.available_width(), guess_h));
+                                                    continue;
+                                                }
 
                                                 if should_show_time_divider(prev_msg, msg) {
                                                     if pos > 0 {
@@ -6995,6 +7019,10 @@ impl ZaloGuiApp {
                                                         pal.primary,
                                                     );
                                                     jump_scrolled |= jump_scroll_pending;
+                                                }
+                                                let measured = (ui.cursor().top() - row_top).max(0.0);
+                                                if known_h.map_or(true, |h| (h - measured).abs() > 0.5) {
+                                                    self.chat_row_heights.insert(row_key, measured);
                                                 }
                                             }
                                             let (bottom_rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 1.0), Sense::hover());
@@ -10600,4 +10628,25 @@ fn truncate_to_width(ui: &egui::Ui, text: &str, font: FontId, max_w: f32) -> Str
         }
     }
     chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
+}
+
+/// Height used for a chat row that has not been laid out yet (viewport-only rendering).
+const CHAT_ROW_ESTIMATE_H: f32 = 72.0;
+
+/// Cache key of a chat row's measured height: the message identity plus what changes its
+/// height (text, attachments, reactions, translation, album size) and the width bucket.
+fn chat_row_key(msg: &crate::chat::ChatMessage, run_len: usize, width_bucket: u32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    msg.id.hash(&mut h);
+    msg.ts.hash(&mut h);
+    msg.text.len().hash(&mut h);
+    msg.link_title.as_deref().map(str::len).hash(&mut h);
+    msg.link_thumb.is_some().hash(&mut h);
+    msg.reactions.len().hash(&mut h);
+    msg.reaction_summaries.len().hash(&mut h);
+    msg.translation.as_deref().map(str::len).hash(&mut h);
+    run_len.hash(&mut h);
+    width_bucket.hash(&mut h);
+    h.finish()
 }

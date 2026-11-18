@@ -1598,6 +1598,8 @@ pub struct ZaloGuiApp {
     /// Composer attachment queue (paste, drop, pickers, screenshots), capped at
     /// [`attachments::MAX_PENDING_ATTACHMENTS`].
     pending_attachments: Vec<attachments::PendingAttachment>,
+    /// Last measured height of each chat row (see `chat_row_key`), for viewport-only rendering.
+    chat_row_heights: HashMap<u64, f32>,
     unread_counts: HashMap<String, usize>,
     reaction_unread_counts: HashMap<String, usize>,
     /// Message IDs that have already triggered an unread bump/notification in this session (#146).
@@ -1992,6 +1994,7 @@ impl ZaloGuiApp {
             dismissed_mention_suggest_for: String::new(),
             composer_focus_pending: false,
             pending_attachments: Vec::new(),
+            chat_row_heights: HashMap::new(),
             unread_counts: HashMap::new(),
             reaction_unread_counts: HashMap::new(),
             notified_msg_ids: HashSet::new(),
