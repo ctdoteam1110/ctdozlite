@@ -6,10 +6,27 @@
 
 use eframe::egui;
 use ksni::TrayMethods;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
 /// Pixel sizes offered to the tray host; it picks the closest one to its panel height.
 const ICON_SIZES: [u32; 3] = [22, 32, 64];
+
+/// Set by the tray's "Thoát" item; the UI then quits instead of hiding to the tray.
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Whether a tray host (StatusNotifierWatcher) currently shows our icon. Closing the
+/// window only hides it while this is true, so the user can always get it back.
+static HOST_ONLINE: AtomicBool = AtomicBool::new(false);
+
+/// Take (and clear) a pending "Thoát" request from the tray menu.
+pub fn take_quit_request() -> bool {
+    QUIT_REQUESTED.swap(false, Ordering::AcqRel)
+}
+
+/// `true` while the tray icon is shown by a host.
+pub fn host_online() -> bool {
+    HOST_ONLINE.load(Ordering::Acquire)
+}
 
 /// UI-side handle; dropping it shuts the tray thread down.
 pub struct TrayHandle {
@@ -50,7 +67,11 @@ pub fn spawn(ctx: egui::Context) -> Option<TrayHandle> {
                 // `assume_sni_available` keeps the service alive when the tray host (e.g. the
                 // GNOME AppIndicator extension) starts after us or is restarted.
                 let handle = match tray.assume_sni_available(true).spawn().await {
-                    Ok(handle) => handle,
+                    Ok(handle) => {
+                        // `watcher_offline` flips this back when no host is running.
+                        HOST_ONLINE.store(true, Ordering::Release);
+                        handle
+                    }
                     Err(err) => {
                         crate::logger::log_error("gui::tray::spawn", &err.to_string());
                         return;
@@ -155,6 +176,7 @@ impl ksni::Tray for AppTray {
                 label: "Thoát".into(),
                 icon_name: "application-exit".into(),
                 activate: Box::new(|t: &mut Self| {
+                    QUIT_REQUESTED.store(true, Ordering::Release);
                     t.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     t.ctx.request_repaint();
                 }),
@@ -164,7 +186,15 @@ impl ksni::Tray for AppTray {
         ]
     }
 
+    fn watcher_online(&self) {
+        HOST_ONLINE.store(true, Ordering::Release);
+    }
+
     fn watcher_offline(&self, _reason: ksni::OfflineReason) -> bool {
+        // No host shows the icon: closing the window must quit again, or the user could
+        // not bring it back. If the window is hidden right now, show it.
+        HOST_ONLINE.store(false, Ordering::Release);
+        self.show_window();
         // Keep running: the host may come back (extension reload, shell restart).
         true
     }
