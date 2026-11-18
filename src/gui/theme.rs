@@ -917,6 +917,7 @@ pub mod lucide {
     pub const PAINTBRUSH: &str = "\u{e2e7}";
     pub const SLIDERS: &str = "\u{e29a}";
     pub const FOLDER_OPEN: &str = "\u{e247}";
+    pub const CHEVRON_LEFT: &str = "\u{e06e}";
     pub const CHEVRON_RIGHT: &str = "\u{e06f}";
     pub const CHEVRON_DOWN: &str = "\u{e06d}";
     pub const USER: &str = "\u{e19f}";

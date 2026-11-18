@@ -8151,6 +8151,65 @@ impl ZaloGuiApp {
             return;
         }
 
+        // First frame: collect the conversation's photos so the user can browse them.
+        if viewer.gallery.is_empty() {
+            let gallery = self.build_photo_gallery();
+            match gallery.iter().position(|g| g.tex_key == viewer.tex_key) {
+                Some(i) => {
+                    viewer.gallery = gallery;
+                    viewer.gallery_index = i;
+                    self.prefetch_gallery_neighbours(&viewer);
+                }
+                // Opened from elsewhere (feed, media drawer…): browse just this photo.
+                None => {
+                    viewer.gallery = vec![GalleryPhoto {
+                        tex_key: viewer.tex_key.clone(),
+                        thumb_url: String::new(),
+                        full_url: viewer.full_url.clone(),
+                        title: viewer.title.clone(),
+                        sender: viewer.sender.clone(),
+                        time: viewer.time.clone(),
+                    }];
+                    viewer.gallery_index = 0;
+                }
+            }
+        }
+        let gallery_len = viewer.gallery.len();
+        let mut go_to: Option<usize> = None;
+        if gallery_len > 1 {
+            let (left, right) =
+                ctx.input(|i| (i.key_pressed(Key::ArrowLeft), i.key_pressed(Key::ArrowRight)));
+            if left && viewer.gallery_index > 0 {
+                go_to = Some(viewer.gallery_index - 1);
+            } else if right && viewer.gallery_index + 1 < gallery_len {
+                go_to = Some(viewer.gallery_index + 1);
+            }
+        }
+        // Thumbnail strip: up to 11 photos centred on the current one.
+        let strip: Vec<(usize, Option<egui::TextureHandle>)> = if gallery_len > 1 {
+            let half = 5usize;
+            let start = viewer
+                .gallery_index
+                .saturating_sub(half)
+                .min(gallery_len.saturating_sub(half * 2 + 1));
+            let end = (start + half * 2 + 1).min(gallery_len);
+            (start..end)
+                .map(|i| (i, self.sticker_textures.get(&viewer.gallery[i].tex_key).cloned()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let strip_missing: Vec<(String, String)> = strip
+            .iter()
+            .filter(|(_, t)| t.is_none())
+            .map(|(i, _)| &viewer.gallery[*i])
+            .filter(|g| !g.thumb_url.is_empty())
+            .map(|g| (g.tex_key.clone(), g.thumb_url.clone()))
+            .collect();
+        for (key, url) in strip_missing {
+            self.request_sticker_image(key, url);
+        }
+
         let screen_rect = ctx.screen_rect();
         // Start below the 32px custom frameless title bar so window controls stay accessible
         let viewer_top = (screen_rect.top() + 32.0).min(screen_rect.bottom());
@@ -8288,6 +8347,126 @@ impl ZaloGuiApp {
                     );
                     if bg_resp.clicked() {
                         should_close = true;
+                    }
+                }
+
+                // Floating close button (top-right of the stage), always visible.
+                let close_r = Rect::from_center_size(
+                    Pos2::new(bg_rect.right() - 30.0, bg_rect.top() + 30.0),
+                    Vec2::splat(36.0),
+                );
+                let close_resp = ui
+                    .interact(close_r, Id::new("img_viewer_float_close"), Sense::click())
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text("Đóng (Esc)");
+                painter.circle_filled(
+                    close_r.center(),
+                    18.0,
+                    Color32::from_black_alpha(if close_resp.hovered() { 200 } else { 130 }),
+                );
+                draw_lucide_icon(&painter, close_r.center(), lucide::X, 16.0, Color32::WHITE);
+                if close_resp.clicked() {
+                    should_close = true;
+                }
+
+                if gallery_len > 1 {
+                    // Counter pill (top centre).
+                    let counter = format!("{} / {}", viewer.gallery_index + 1, gallery_len);
+                    let pill = Rect::from_center_size(
+                        Pos2::new(bg_rect.center().x, bg_rect.top() + 26.0),
+                        Vec2::new(72.0, 26.0),
+                    );
+                    painter.rect_filled(pill, Rounding::same(13.0), Color32::from_black_alpha(150));
+                    painter.text(
+                        pill.center(),
+                        egui::Align2::CENTER_CENTER,
+                        counter,
+                        FontId::proportional(12.5),
+                        Color32::WHITE,
+                    );
+
+                    // Prev / next arrows (vertically centred on the stage).
+                    let strip_h = 72.0;
+                    let mid_y = (bg_rect.top() + bg_rect.bottom() - strip_h) * 0.5;
+                    for (dir, x, icon, tip) in [
+                        (-1i32, bg_rect.left() + 40.0, lucide::CHEVRON_LEFT, "Ảnh trước (←)"),
+                        (1i32, bg_rect.right() - 40.0, lucide::CHEVRON_RIGHT, "Ảnh sau (→)"),
+                    ] {
+                        let target = viewer.gallery_index as i64 + dir as i64;
+                        if target < 0 || target >= gallery_len as i64 {
+                            continue;
+                        }
+                        let r = Rect::from_center_size(Pos2::new(x, mid_y), Vec2::splat(46.0));
+                        let resp = ui
+                            .interact(r, Id::new(("img_viewer_nav", dir)), Sense::click())
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text(tip);
+                        painter.circle_filled(
+                            r.center(),
+                            23.0,
+                            Color32::from_black_alpha(if resp.hovered() { 200 } else { 120 }),
+                        );
+                        draw_lucide_icon(&painter, r.center(), icon, 22.0, Color32::WHITE);
+                        if resp.clicked() {
+                            go_to = Some(target as usize);
+                        }
+                    }
+
+                    // Thumbnail strip (bottom centre).
+                    let cell = 52.0_f32;
+                    let gap = 6.0_f32;
+                    let total_w = strip.len() as f32 * (cell + gap) - gap;
+                    let strip_rect = Rect::from_center_size(
+                        Pos2::new(bg_rect.center().x, bg_rect.bottom() - strip_h * 0.5),
+                        Vec2::new(total_w + 16.0, cell + 12.0),
+                    );
+                    painter.rect_filled(strip_rect, Rounding::same(10.0), Color32::from_black_alpha(140));
+                    let mut x = strip_rect.left() + 8.0;
+                    for (i, tex) in &strip {
+                        let r = Rect::from_min_size(
+                            Pos2::new(x, strip_rect.top() + 6.0),
+                            Vec2::splat(cell),
+                        );
+                        x += cell + gap;
+                        let resp = ui
+                            .interact(r, Id::new(("img_viewer_thumb", *i)), Sense::click())
+                            .on_hover_cursor(CursorIcon::PointingHand);
+                        match tex {
+                            Some(t) => {
+                                // Centre-crop to a square.
+                                let [tw, th] = t.size();
+                                let (tw, th) = (tw.max(1) as f32, th.max(1) as f32);
+                                let uv = if tw > th {
+                                    let d = (1.0 - th / tw) * 0.5;
+                                    Rect::from_min_max(Pos2::new(d, 0.0), Pos2::new(1.0 - d, 1.0))
+                                } else {
+                                    let d = (1.0 - tw / th) * 0.5;
+                                    Rect::from_min_max(Pos2::new(0.0, d), Pos2::new(1.0, 1.0 - d))
+                                };
+                                painter.image(t.id(), r, uv, Color32::WHITE);
+                            }
+                            None => {
+                                painter.rect_filled(r, Rounding::same(4.0), pal.bg_elevated);
+                            }
+                        }
+                        let current = *i == viewer.gallery_index;
+                        painter.rect_stroke(
+                            r,
+                            Rounding::same(4.0),
+                            if current {
+                                Stroke::new(2.5_f32, pal.primary)
+                            } else if resp.hovered() {
+                                Stroke::new(1.5_f32, Color32::WHITE)
+                            } else {
+                                Stroke::new(1.0_f32, Color32::from_white_alpha(40))
+                            },
+                        );
+                        if !current {
+                            painter.rect_filled(r, Rounding::same(4.0), Color32::from_black_alpha(70));
+                        }
+                        if resp.clicked() && !current {
+                            go_to = Some(*i);
+                        }
                     }
                 }
             });
@@ -8509,10 +8688,69 @@ impl ZaloGuiApp {
                     });
             });
 
+        if let Some(idx) = go_to.filter(|_| !should_close) {
+            self.show_gallery_photo(&mut viewer, idx);
+        }
         if should_close {
             self.image_viewer = None;
         } else {
             self.image_viewer = Some(viewer);
+        }
+    }
+
+    /// Photos of the open conversation in display order, as gallery entries.
+    fn build_photo_gallery(&self) -> Vec<GalleryPhoto> {
+        let Some(thread) = self.threads.get(self.selected_thread_index) else {
+            return Vec::new();
+        };
+        thread
+            .messages
+            .iter()
+            .filter(|m| m.text.trim() != crate::chat::VANISH_EXPIRED_TEXT)
+            .filter(|m| is_zalo_photo_message(m))
+            .filter_map(|m| {
+                let thumb = photo_primary_url(m)?;
+                Some(GalleryPhoto {
+                    tex_key: format!("thumb_{}", crate::crypto::md5_hex(thumb)),
+                    thumb_url: thumb.to_string(),
+                    full_url: photo_open_target(m, thumb),
+                    title: m.link_title.clone().unwrap_or_else(|| "Hình ảnh".to_string()),
+                    sender: if m.is_outgoing { "Bạn".to_string() } else { m.sender.clone() },
+                    time: m.time.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Switch the viewer to gallery entry `idx` (reset zoom, load HD, prefetch neighbours).
+    fn show_gallery_photo(&mut self, viewer: &mut ImageViewerModal, idx: usize) {
+        let Some(photo) = viewer.gallery.get(idx).cloned() else {
+            return;
+        };
+        viewer.gallery_index = idx;
+        viewer.tex_key = photo.tex_key.clone();
+        viewer.full_url = photo.full_url.clone();
+        viewer.title = photo.title;
+        viewer.sender = photo.sender;
+        viewer.time = photo.time;
+        viewer.zoom = 1.0;
+        viewer.pan = Vec2::ZERO;
+        if !photo.thumb_url.is_empty() {
+            self.request_sticker_image(photo.tex_key, photo.thumb_url);
+        }
+        viewer.hd_tex_key = self.request_hd_texture(&photo.full_url);
+        self.prefetch_gallery_neighbours(viewer);
+    }
+
+    /// Start loading the previous and next photos so stepping feels instant.
+    fn prefetch_gallery_neighbours(&mut self, viewer: &ImageViewerModal) {
+        let i = viewer.gallery_index;
+        for n in [i.checked_sub(1), i.checked_add(1)].into_iter().flatten() {
+            if let Some(g) = viewer.gallery.get(n) {
+                if !g.thumb_url.is_empty() {
+                    self.request_sticker_image(g.tex_key.clone(), g.thumb_url.clone());
+                }
+            }
         }
     }
 
@@ -10168,6 +10406,8 @@ impl ZaloGuiApp {
                                     time: String::new(),
                                     zoom: 1.0,
                                     pan: Vec2::ZERO,
+                                    gallery: Vec::new(),
+                                    gallery_index: 0,
                                 });
                             }
                             ui.add_space(12.0);
@@ -10623,6 +10863,8 @@ impl ZaloGuiApp {
                 time: String::new(),
                 zoom: 1.0,
                 pan: Vec2::ZERO,
+                gallery: Vec::new(),
+                gallery_index: 0,
             });
         }
     }
@@ -10696,6 +10938,8 @@ impl ZaloGuiApp {
                                 time: String::new(),
                                 zoom: 1.0,
                                 pan: Vec2::ZERO,
+                                gallery: Vec::new(),
+                                gallery_index: 0,
                             });
                         }
                     }
