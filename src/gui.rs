@@ -27,6 +27,8 @@ mod modals;
 mod reactions_dialog;
 mod stickers;
 mod theme;
+#[cfg(target_os = "linux")]
+mod tray;
 mod worker;
 mod workspace;
 
@@ -1696,6 +1698,9 @@ pub struct ZaloGuiApp {
     pub(crate) folder_modal_open: bool,
     last_typing_sent_at: Option<(String, std::time::Instant)>,
     last_synced_icon_unread: Option<usize>,
+    /// System-tray icon with an unread dot; `None` when the tray thread could not start.
+    #[cfg(target_os = "linux")]
+    tray: Option<tray::TrayHandle>,
     // Background channels
     event_rx: Receiver<GuiEvent>,
     #[allow(dead_code)]
@@ -2044,6 +2049,8 @@ impl ZaloGuiApp {
             folder_modal_open: false,
             last_typing_sent_at: None,
             last_synced_icon_unread: None,
+            #[cfg(target_os = "linux")]
+            tray: tray::spawn(cc.egui_ctx.clone()),
             event_rx: rx,
             event_tx: tx.clone(),
             chat_render_window: (String::new(), CHAT_RENDER_STEP),
@@ -4624,14 +4631,27 @@ impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_windows_frameless_subclass(ctx);
 
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
-            || ctx.input(|i| i.viewport().close_requested())
-        {
+        // Ctrl+Q and the tray's "Thoát" quit; closing the window only hides it to the
+        // tray while a tray icon is shown, so the app keeps receiving messages.
+        let quit_now = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
+            || self.take_tray_quit_request();
+        if quit_now {
+            self.allow_quit = true;
+        }
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested && !self.allow_quit && self.hides_to_tray() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        } else if quit_now || close_requested {
             self.allow_quit = true;
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::EndCall);
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(tray) = self.tray.as_mut() {
+            tray.set_unread(self.unread_counts.values().sum());
         }
         if ctx.input(|i| {
             (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::P)
@@ -5252,13 +5272,22 @@ impl ZaloGuiApp {
                             [Pos2::new(cc.x + d, cc.y - d), Pos2::new(cc.x - d, cc.y + d)],
                             Stroke::new(1.4_f32, close_fg),
                         );
-                        let close_resp = close_resp.on_hover_text("Đóng ứng dụng (Ctrl+Q)");
+                        let to_tray = self.hides_to_tray();
+                        let close_resp = close_resp.on_hover_text(if to_tray {
+                            "Ẩn xuống khay hệ thống (thoát: menu icon khay hoặc Ctrl+Q)"
+                        } else {
+                            "Đóng ứng dụng (Ctrl+Q)"
+                        });
                         if close_resp.clicked() {
-                            self.allow_quit = true;
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::EndCall);
+                            if to_tray {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                            } else {
+                                self.allow_quit = true;
+                                if let Some(tx) = WORKER_TX.get() {
+                                    let _ = tx.send(WorkerCmd::EndCall);
+                                }
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
 
                         // Maximize / Restore Button (46x32)
@@ -6459,5 +6488,31 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&custom).unwrap()).unwrap();
         assert!(!roundtrip.animations_enabled);
         assert!((roundtrip.animation_speed - 0.1).abs() < 1e-4);
+    }
+}
+
+impl ZaloGuiApp {
+    /// Closing the window hides it to the tray instead of quitting (Linux, tray shown).
+    fn hides_to_tray(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.tray.is_some() && tray::host_online()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// A pending "Thoát" from the tray menu.
+    fn take_tray_quit_request(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            tray::take_quit_request()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
     }
 }
