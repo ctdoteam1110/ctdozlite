@@ -1138,6 +1138,7 @@ dependencies = [
  "generic-array",
  "getrandom 0.3.4",
  "image",
+ "libc",
  "lzma-rs",
  "md-5",
  "opus",
