@@ -202,6 +202,139 @@ pub fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     result
 }
 
+/// Folder for videos downloaded to be opened in the system player.
+///
+/// On Linux this is `<XDG videos dir>/ctdozlite` (usually `~/Videos/ctdozlite`):
+/// sandboxed players such as snap/flatpak VLC have a private `/tmp` and cannot read
+/// hidden folders like `~/.cache`, so a file there fails with "No such file".
+/// Other platforms keep the system temp folder.
+pub fn video_cache_dir() -> PathBuf {
+    // Fall back to the temp folder when the preferred folder cannot be created (e.g. a
+    // read-only Videos folder), so the download still has somewhere to land.
+    match preferred_video_dir() {
+        Some(dir) if std::fs::create_dir_all(&dir).is_ok() => dir,
+        _ => std::env::temp_dir(),
+    }
+}
+
+/// `<XDG videos dir>/ctdozlite` on Linux; `None` elsewhere or without `HOME`.
+fn preferred_video_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        // XDG: an empty or relative XDG_CONFIG_HOME is ignored in favour of the default.
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| home.join(".config"));
+        let videos = std::fs::read_to_string(config.join("user-dirs.dirs"))
+            .ok()
+            .and_then(|text| xdg_user_dir(&text, "XDG_VIDEOS_DIR", &home))
+            .unwrap_or_else(|| home.join("Videos"));
+        Some(videos.join("ctdozlite"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Write a downloaded video atomically: a freshly created `.part` file next to
+/// `target`, then rename, so the player never opens a half-written file and two saves
+/// of the same video cannot share (and corrupt) one temp file. The temp file is created
+/// exclusively (`create_new`): an existing file or symlink at that name, e.g. in a shared
+/// temp folder, is never truncated or followed; another name is tried instead. Fails if
+/// the folder is not writable.
+pub fn save_video_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    save_video_file_with(target, bytes, || {
+        format!(
+            "{}-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed),
+            crate::param_cipher::random_hex(6)
+        )
+    })
+}
+
+/// [`save_video_file`] with an injectable temp-name generator (for tests).
+fn save_video_file_with(
+    target: &Path,
+    bytes: &[u8],
+    mut next_name: impl FnMut() -> String,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    const ATTEMPTS: usize = 16;
+    for _ in 0..ATTEMPTS {
+        let part = target.with_extension(format!("mp4.{}.part", next_name()));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        // From here the temp file is ours; remove only it on failure.
+        let result = file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| {
+                drop(file);
+                std::fs::rename(&part, target)
+            });
+        if result.is_err() {
+            let _ = std::fs::remove_file(&part);
+        }
+        return result;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "không tạo được tệp tạm mới cho video",
+    ))
+}
+
+/// File path for the video at `url` inside [`video_cache_dir`] (stable per URL).
+pub fn video_cache_path(url: &str) -> PathBuf {
+    video_cache_dir().join(format!("zlite_video_{}.mp4", crate::crypto::md5_hex(url)))
+}
+
+/// Parse one `KEY="$HOME/…"` line of `user-dirs.dirs`. Ignores values equal to `$HOME`
+/// itself (the spec's way of saying "disabled").
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn xdg_user_dir(text: &str, key: &str, home: &Path) -> Option<PathBuf> {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.strip_prefix(key).is_some_and(|rest| rest.trim_start().starts_with('=')))?;
+    let raw = line.split_once('=')?.1.trim().trim_matches('"');
+    // xdg-user-dirs-update shell-escapes `\`, `"`, `$` and `` ` `` with a backslash; keep the
+    // leading `$HOME` literal and unescape the rest (no shell expansion).
+    let (home_prefix, rest) = match raw.strip_prefix("$HOME") {
+        Some(rest) => ("$HOME", rest),
+        None => ("", raw),
+    };
+    let mut unescaped = String::with_capacity(rest.len());
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                unescaped.push(next);
+            }
+        } else {
+            unescaped.push(c);
+        }
+    }
+    let value = format!("{home_prefix}{unescaped}");
+    let value = value.as_str();
+    let path = match value.strip_prefix("$HOME") {
+        Some(rest) => home.join(rest.trim_start_matches('/')),
+        None if value.starts_with('/') => PathBuf::from(value),
+        None => return None,
+    };
+    (path != home).then_some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +536,76 @@ mod tests {
         assert!(write_private_atomic(&root.join("missing/session.json"), b"fixture").is_err());
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn xdg_videos_dir_is_parsed_and_home_means_disabled() {
+        let home = Path::new("/home/u");
+        let text = "# comment\nXDG_DOWNLOAD_DIR=\"$HOME/Tải về\"\nXDG_VIDEOS_DIR=\"$HOME/Video\"\n";
+        assert_eq!(
+            xdg_user_dir(text, "XDG_VIDEOS_DIR", home),
+            Some(PathBuf::from("/home/u/Video"))
+        );
+        assert_eq!(xdg_user_dir("XDG_VIDEOS_DIR=\"$HOME/\"", "XDG_VIDEOS_DIR", home), None);
+        assert_eq!(xdg_user_dir("XDG_VIDEOS_DIR=\"/media/v\"", "XDG_VIDEOS_DIR", home), Some(PathBuf::from("/media/v")));
+        assert_eq!(xdg_user_dir(text, "XDG_MUSIC_DIR", home), None);
+        assert_eq!(
+            xdg_user_dir(r#"XDG_VIDEOS_DIR="$HOME/Videos\$archive""#, "XDG_VIDEOS_DIR", home),
+            Some(PathBuf::from("/home/u/Videos$archive"))
+        );
+        assert!(video_cache_path("https://x/a.mp4").ends_with(format!(
+            "zlite_video_{}.mp4",
+            crate::crypto::md5_hex("https://x/a.mp4")
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_video_file_reports_a_read_only_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fixture();
+        let target = dir.join("v.mp4");
+        save_video_file(&target, b"ok").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"ok");
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+            .count();
+        assert_eq!(leftovers, 0, "temp file renamed away");
+        // Two saves of the same target use distinct temp files and both publish whole files.
+        let (a, b) = (vec![1u8; 4096], vec![2u8; 4096]);
+        std::thread::scope(|s| {
+            s.spawn(|| save_video_file(&target, &a).unwrap());
+            s.spawn(|| save_video_file(&target, &b).unwrap());
+        });
+        let got = std::fs::read(&target).unwrap();
+        assert!(got == a || got == b, "never a mix of two writes");
+
+        // Name collision: an existing file and a symlink at the temp name are left alone
+        // and a fresh name is used instead.
+        let taken = dir.join("v.mp4.taken.part");
+        std::fs::write(&taken, b"keep").unwrap();
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("v.mp4.link.part")).unwrap();
+        let mut names = ["taken", "link", "free"].into_iter();
+        save_video_file_with(&target, b"new", || names.next().unwrap().to_string()).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert_eq!(std::fs::read(&taken).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        assert!(!dir.join("v.mp4.free.part").exists());
+
+        let ro = dir.join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores directory permissions; the check only means something otherwise.
+        let writable_anyway = std::fs::write(ro.join("probe"), b"").is_ok();
+        if !writable_anyway {
+            assert!(save_video_file(&ro.join("v.mp4"), b"x").is_err());
+            assert!(!ro.join("v.mp4").exists());
+        }
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
