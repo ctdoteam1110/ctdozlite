@@ -117,7 +117,10 @@ fn apply_extend_tweaks(extend_str: String) -> String {
     };
     let mut applied: Vec<String> = Vec::new();
 
-    if let Some(raw) = std::env::var("ZCALL_NUMSERVERS").ok().filter(|s| !s.is_empty()) {
+    if let Some(raw) = std::env::var("ZCALL_NUMSERVERS")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         let n: usize = if raw.eq_ignore_ascii_case("auto") {
             obj.get("serverResult")
                 .and_then(Value::as_array)
@@ -135,8 +138,12 @@ fn apply_extend_tweaks(extend_str: String) -> String {
         applied.push(format!("numServers={n}"));
     }
 
-    let recv = std::env::var("ZCALL_RECV").ok().and_then(|v| v.trim().parse::<i64>().ok());
-    let rtt = std::env::var("ZCALL_RTT").ok().and_then(|v| v.trim().parse::<i64>().ok());
+    let recv = std::env::var("ZCALL_RECV")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok());
+    let rtt = std::env::var("ZCALL_RTT")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok());
     if recv.is_some() || rtt.is_some() {
         let mut n = 0usize;
         if let Some(arr) = obj.get_mut("serverResult").and_then(Value::as_array_mut) {
@@ -155,7 +162,10 @@ fn apply_extend_tweaks(extend_str: String) -> String {
         applied.push(format!("serverResult[*{n}].recv={recv:?} rtt={rtt:?}"));
     }
 
-    if let Some(raw) = std::env::var("ZCALL_P2P_PUBLIC").ok().filter(|s| !s.is_empty()) {
+    if let Some(raw) = std::env::var("ZCALL_P2P_PUBLIC")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         // Accept `ip:port`, `ip,port` or `ip port`; a bare `ip` reuses the port already
         // published by the first private `p2p` entry (that is how the official client ships
         // its public candidate: same socket, second address).
@@ -169,10 +179,11 @@ fn apply_extend_tweaks(extend_str: String) -> String {
             .rsplit_once(':')
             .or_else(|| raw.rsplit_once(','))
             .or_else(|| raw.rsplit_once(' '));
-        let parsed = match split.and_then(|(ip, p)| p.trim().parse::<u16>().ok().map(|p| (ip.trim(), p))) {
-            Some((ip, port)) => Some((ip.to_string(), port)),
-            None => private_port.map(|p| (raw.trim().to_string(), p as u16)),
-        };
+        let parsed =
+            match split.and_then(|(ip, p)| p.trim().parse::<u16>().ok().map(|p| (ip.trim(), p))) {
+                Some((ip, port)) => Some((ip.to_string(), port)),
+                None => private_port.map(|p| (raw.trim().to_string(), p as u16)),
+            };
         match parsed {
             Some((ip, port)) => {
                 let entry = json!({ "ip": ip, "port": port, "type": 1 });
@@ -192,7 +203,10 @@ fn apply_extend_tweaks(extend_str: String) -> String {
         }
     }
 
-    if std::env::var("ZCALL_P2P_DROP_PRIVATE").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("ZCALL_P2P_DROP_PRIVATE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         let mut dropped = 0usize;
         if let Some(o) = obj.as_object_mut() {
             if let Some(arr) = o.get_mut("p2p").and_then(Value::as_array_mut) {
@@ -212,9 +226,23 @@ fn apply_extend_tweaks(extend_str: String) -> String {
     format!("{obj}\n")
 }
 
+/// Dispatch camera helper mode before loading the authenticated session used
+/// by the interactive diagnostics.
+///
+/// # Errors
+/// Returns an error if helper startup, session loading, argument selection,
+/// or the selected diagnostic operation fails.
+///
+/// # Panics
+/// An out-of-range or non-finite duration can panic when WebSocket watch or
+/// callee auto-answer converts it to a timer delay.
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let arguments: Vec<String> = std::env::args().collect();
+    if zalo_rust::video::camera::run_helper_if_requested(&arguments)? {
+        return Ok(());
+    }
+    let args: Vec<String> = arguments.into_iter().skip(1).collect();
     let mode = args.first().cloned().unwrap_or_else(|| "info".into());
     let s = load_session()?;
     let li = s.login.as_ref().expect("login checked");
@@ -225,7 +253,10 @@ async fn main() -> Result<()> {
             println!("cwd:             {}", std::env::current_dir()?.display());
             println!("uin:             {}", li.uin);
             println!("display_name:    {}", li.display_name);
-            println!("imei:            {}", zalo_rust::session::redact_secret(&s.imei));
+            println!(
+                "imei:            {}",
+                zalo_rust::session::redact_secret(&s.imei)
+            );
             println!("voice_call:      {}", s.domains.voice_call);
             println!("lp_control:      {}", s.domains.lp_control);
             trace_line("PROBE", "info");
@@ -246,10 +277,7 @@ async fn main() -> Result<()> {
             }
         }
         "watch" => {
-            let secs: f64 = args
-                .get(1)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(120.0);
+            let secs: f64 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(120.0);
             watch(&s, secs).await?;
         }
         // `friendreq <UID> [MSG]` - the desktop account refuses calls from non-friends with
@@ -317,6 +345,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Poll the control cursor and log each event with its elapsed time. Return an
+/// empty batch after a polling error so the diagnostic loop can continue.
 async fn poll_once(s: &Session, st: &mut CtrlPollState, t0: Instant) -> Vec<Value> {
     match poll_voip_controls(s, st).await {
         Ok(events) => {
@@ -335,19 +365,24 @@ async fn poll_once(s: &Session, st: &mut CtrlPollState, t0: Instant) -> Vec<Valu
             events
         }
         Err(e) => {
-            println!(
-                "[{:>7.2}s] poll error: {e}",
-                t0.elapsed().as_secs_f64()
-            );
+            println!("[{:>7.2}s] poll error: {e}", t0.elapsed().as_secs_f64());
             Vec::new()
         }
     }
 }
 
+/// Observe VoIP control events through HTTP polling for the requested time.
+/// The initial poll advances the cursor before the steady polling loop.
+///
+/// # Errors
+/// Returns an error if the current directory cannot be read for the banner.
 async fn watch(s: &Session, secs: f64) -> Result<()> {
     let t0 = Instant::now();
     let mut st = CtrlPollState::default();
-    println!("watching VoIP control events for {secs:.0}s (cwd = {:?})", std::env::current_dir()?);
+    println!(
+        "watching VoIP control events for {secs:.0}s (cwd = {:?})",
+        std::env::current_dir()?
+    );
     // First poll only syncs the cursor; historical replay is discarded.
     let _ = poll_once(s, &mut st, t0).await;
     while t0.elapsed().as_secs_f64() < secs {
@@ -414,6 +449,12 @@ async fn ws_watch(s: &Session, secs: f64) -> Result<()> {
     Ok(())
 }
 
+/// Place a diagnostic call and observe control events for the allocated call,
+/// acknowledging a successful answer.
+///
+/// # Errors
+/// Returns an error if a required signaling request fails or the server
+/// rejects the initial call allocation.
 async fn call(s: &Session, uid: &str, video: bool, zrtp: bool, secs: f64) -> Result<()> {
     let t0 = Instant::now();
     let call_type = CallType::from_flags(video, false) as u8;
@@ -448,7 +489,10 @@ async fn call(s: &Session, uid: &str, video: bool, zrtp: bool, secs: f64) -> Res
     println!("401 (bare) resp:\n{}", pretty(&resp_401));
     let st_401 = val_i64(&resp_401, &["status"]);
     if st_401 != 0 {
-        bail!("401 refused: status={st_401} msg={}", val_str(&resp_401, &["msg"]));
+        bail!(
+            "401 refused: status={st_401} msg={}",
+            val_str(&resp_401, &["msg"])
+        );
     }
     let real_call_id = resp_401
         .get("id")
@@ -467,7 +511,10 @@ async fn call(s: &Session, uid: &str, video: bool, zrtp: bool, secs: f64) -> Res
     let from_uid = resp_401
         .get("fromId")
         .or_else(|| resp_401.get("callerId"))
-        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|x| x.parse().ok())))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|x| x.parse().ok()))
+        })
         .map(|v| v as u32)
         .unwrap_or_else(|| {
             s.zpw_sek
@@ -475,18 +522,16 @@ async fn call(s: &Session, uid: &str, video: bool, zrtp: bool, secs: f64) -> Res
                 .and_then(|sek| sek.split('.').nth(1))
                 .and_then(|x| x.parse::<u32>().ok())
                 .unwrap_or_else(|| {
-                    uid_str_to_u32(
-                        &s.login
-                            .as_ref()
-                            .map(|l| l.uin.clone())
-                            .unwrap_or_default(),
-                    )
+                    uid_str_to_u32(&s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default())
                 })
         });
     let partner_uid = resp_401
         .get("toId")
         .or_else(|| resp_401.get("calleeId"))
-        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|x| x.parse().ok())))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|x| x.parse().ok()))
+        })
         .map(|v| v as u32)
         .unwrap_or_else(|| uid_str_to_u32(uid));
     let sess_id_raw = val_str(&resp_401, &["sessId", "session"]);
@@ -626,7 +671,10 @@ async fn call(s: &Session, uid: &str, video: bool, zrtp: bool, secs: f64) -> Res
                     println!("408 answerack -> {r:?}");
                 }
             }
-            if matches!(act, "end_call" | "cancel" | "group_end_call" | "group_cancel") {
+            if matches!(
+                act,
+                "end_call" | "cancel" | "group_end_call" | "group_cancel"
+            ) {
                 println!(">>> CALL ENDED by peer (act={act})");
             }
         }
@@ -635,6 +683,15 @@ async fn call(s: &Session, uid: &str, video: bool, zrtp: bool, secs: f64) -> Res
     Ok(())
 }
 
+/// Observe incoming call events from WebSocket and HTTP polling, filtering
+/// stale replays and optionally sending one answer sequence per call ID.
+///
+/// # Errors
+/// Signaling failures are logged during the probe and the listener returns
+/// success when the observation window ends.
+///
+/// # Panics
+/// Panics if the clamped auto-answer delay exceeds the supported timer range.
 async fn serve(
     s: &Session,
     auto_answer: Option<f64>,
@@ -777,8 +834,7 @@ async fn serve(
             // Media handshake for the *invite* is nested as a JSON string in `data.params`
             // (`sessId`, `rtpIP`, `codec`, `extendData`, ...), not in the outer event.
             let media = event_media_params(&data);
-            let is_video = val_i64(&data, &["callType"]) == 3
-                || val_i64(&data, &["callType"]) == 6;
+            let is_video = val_i64(&data, &["callType"]) == 3 || val_i64(&data, &["callType"]) == 6;
             let sess_id_raw = {
                 let from_media = val_str(&media, &["sessId", "session"]);
                 if from_media.is_empty() {
@@ -791,7 +847,12 @@ async fn serve(
             let self_u32 = s
                 .login
                 .as_ref()
-                .and_then(|l| l.zpw_sek.split('.').nth(1).and_then(|x| x.parse::<u32>().ok()))
+                .and_then(|l| {
+                    l.zpw_sek
+                        .split('.')
+                        .nth(1)
+                        .and_then(|x| x.parse::<u32>().ok())
+                })
                 .unwrap_or(0);
             let from_uid = self_u32;
             let partner_uid = val_i64(&data, &["uidFrom", "fromId", "callerId"]) as u32;
@@ -935,7 +996,13 @@ async fn serve(
                 ),
                 (
                     "callerId as number".to_string(),
-                    mk(caller_num.clone(), json!(1), &sess_id_raw, &rtp_ip, &rtcp_ip),
+                    mk(
+                        caller_num.clone(),
+                        json!(1),
+                        &sess_id_raw,
+                        &rtp_ip,
+                        &rtcp_ip,
+                    ),
                 ),
                 (
                     "session empty".to_string(),
@@ -951,19 +1018,28 @@ async fn serve(
                 ),
                 (
                     "rtp 0.0.0.0:0".to_string(),
-                    mk(base_cid.clone(), json!(1), &sess_id_raw, "0.0.0.0:0", "0.0.0.0:0"),
+                    mk(
+                        base_cid.clone(),
+                        json!(1),
+                        &sess_id_raw,
+                        "0.0.0.0:0",
+                        "0.0.0.0:0",
+                    ),
                 ),
-                (
-                    "codec empty".to_string(),
-                    {
-                        let mut v = mk(base_cid.clone(), json!(1), &sess_id_raw, &rtp_ip, &rtcp_ip);
-                        v["codec"] = json!("");
-                        v
-                    },
-                ),
+                ("codec empty".to_string(), {
+                    let mut v = mk(base_cid.clone(), json!(1), &sess_id_raw, &rtp_ip, &rtcp_ip);
+                    v["codec"] = json!("");
+                    v
+                }),
                 (
                     "callerId uid32".to_string(),
-                    mk(json!(caller_id.clone()), json!(1), &sess_id_raw, &rtp_ip, &rtcp_ip),
+                    mk(
+                        json!(caller_id.clone()),
+                        json!(1),
+                        &sess_id_raw,
+                        &rtp_ip,
+                        &rtcp_ip,
+                    ),
                 ),
                 (
                     "callerId uid32 as str".to_string(),
@@ -987,7 +1063,13 @@ async fn serve(
                 ),
                 (
                     "callerId uidN as number".to_string(),
-                    mk(caller_num.clone(), json!(1), &sess_id_raw, &rtp_ip, &rtcp_ip),
+                    mk(
+                        caller_num.clone(),
+                        json!(1),
+                        &sess_id_raw,
+                        &rtp_ip,
+                        &rtcp_ip,
+                    ),
                 ),
             ];
             // The two optional extras the official builder attaches only when the callee has
@@ -1039,13 +1121,20 @@ async fn serve(
             // `ZCALL_CALLEE_EXTEND=<file>` injects a *foreign* `extendData` (the caller writes its
             // own to `invite_extend.json`). This answers the open question: does `402` need the
             // caller's media blob verbatim, or can the callee publish its own?
-            if let Some(path) = std::env::var("ZCALL_CALLEE_EXTEND").ok().filter(|p| !p.is_empty()) {
+            if let Some(path) = std::env::var("ZCALL_CALLEE_EXTEND")
+                .ok()
+                .filter(|p| !p.is_empty())
+            {
                 match std::fs::read_to_string(&path) {
                     Ok(raw) if !raw.trim().is_empty() => {
                         let blob = raw.trim().to_string();
                         println!("  injected extendData from {path} ({} bytes)", blob.len());
-                        for (label, with_sub) in [("+callerExtendData", false), ("+callerExtendData+subCommand3", true)] {
-                            let mut v = mk(base_cid.clone(), json!(1), &sess_id_raw, &rtp_ip, &rtcp_ip);
+                        for (label, with_sub) in [
+                            ("+callerExtendData", false),
+                            ("+callerExtendData+subCommand3", true),
+                        ] {
+                            let mut v =
+                                mk(base_cid.clone(), json!(1), &sess_id_raw, &rtp_ip, &rtcp_ip);
                             v["extendData"] = json!(blob.clone());
                             if with_sub {
                                 v["subCommand"] = json!(3);
@@ -1054,7 +1143,9 @@ async fn serve(
                         }
                     }
                     Ok(_) => println!("WARN: ZCALL_CALLEE_EXTEND={path} is empty; ignored"),
-                    Err(e) => println!("WARN: ZCALL_CALLEE_EXTEND={path} unreadable ({e}); ignored"),
+                    Err(e) => {
+                        println!("WARN: ZCALL_CALLEE_EXTEND={path} unreadable ({e}); ignored")
+                    }
                 }
             }
 

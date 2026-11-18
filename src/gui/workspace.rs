@@ -73,6 +73,11 @@ impl ZaloGuiApp {
         Some(hk)
     }
 
+    /// Lay out navigation, conversation search and the active chat at the current
+    /// viewport width, then apply input from those panels.
+    ///
+    /// # Panics
+    /// Panics if a cached row index used during rendering is outside its backing list.
     pub(super) fn render_chat_workspace(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         // Responsive breakpoints based on live viewport width
         // -------------------------------------------------------------------
@@ -1269,7 +1274,7 @@ impl ZaloGuiApp {
                     SetMute(String, bool, Option<i64>, String),
                     ToggleHide(String, bool, bool),
                     OpenSchedule(usize),
-                    DeleteConv(usize, String, String, bool, String),
+                    DeleteConv(String, String, bool, String),
                     LeaveGroup(usize, String, String),
                     ReportConv(String),
                     /// Gán/bỏ thread vào Chat Folder (WaveA3).
@@ -2015,7 +2020,6 @@ impl ZaloGuiApp {
                                     .clicked()
                                 {
                                     pending_ctx_action = Some(ThreadCtxAction::DeleteConv(
-                                        i,
                                         tid_cl.clone(),
                                         tname_cl.clone(),
                                         tgroup_cl,
@@ -2385,9 +2389,8 @@ impl ZaloGuiApp {
                             self.selected_thread_index = idx;
                             self.schedule_modal_open = true;
                         }
-                        ThreadCtxAction::DeleteConv(idx, tid, tname, is_group, last_msg_id) => {
-                            self.pending_delete_thread =
-                                Some((idx, tid, tname, is_group, last_msg_id));
+                        ThreadCtxAction::DeleteConv(tid, tname, is_group, last_msg_id) => {
+                            self.pending_delete_thread = Some((tid, tname, is_group, last_msg_id));
                         }
                         ThreadCtxAction::LeaveGroup(idx, tid, tname) => {
                             self.pending_leave_group = Some((idx, tid, tname));
@@ -5611,14 +5614,9 @@ impl ZaloGuiApp {
                                         })
                                         .clicked()
                                     {
-                                        let ff_ok = crate::media::is_ffmpeg_available();
                                         let (_, cams) = crate::media::list_media_devices(false);
-                                        let can_cam = ff_ok && !cams.is_empty();
-                                        if !ff_ok {
-                                            self.show_toast(
-                                                "⚠️ Không tìm thấy ffmpeg trong PATH để bật Camera (cài bằng: winget install Gyan.FFmpeg)",
-                                            );
-                                        } else if cams.is_empty() {
+                                        let can_cam = !self.media_devices_ready || !cams.is_empty();
+                                        if !can_cam {
                                             self.show_toast(
                                                 "⚠️ Không phát hiện thiết bị Camera trên máy — đang gọi không hình",
                                             );
@@ -7807,10 +7805,15 @@ impl ZaloGuiApp {
                                 });
                             });
                         if let Some(cid) = cancel_sched_id {
-                            let db = crate::store::db_path_for_account(&self.user_uin);
-                            let _ = crate::scheduler::cancel_scheduled_message(&db, cid);
-                            self.refresh_scheduled_items();
-                            self.show_toast("Đã hủy tin nhắn hẹn giờ");
+                            if !WORKER_TX.get().is_some_and(|tx| {
+                                tx.send(WorkerCmd::CancelScheduledMessage {
+                                    uin: self.user_uin.clone(),
+                                    id: cid,
+                                })
+                                .is_ok()
+                            }) {
+                                self.show_toast("Không thể hủy tin nhắn hẹn giờ.");
+                            }
                         }
                         if open_sched_mgr {
                             self.schedule_modal_open = true;
@@ -8720,7 +8723,7 @@ impl ZaloGuiApp {
         self.render_folder_modal(ctx, pal);
         self.render_settings_modal(ctx, pal);
 
-        if let Some((del_idx, del_tid, del_name, del_is_group, del_last_id)) =
+        if let Some((del_tid, del_name, del_is_group, del_last_id)) =
             self.pending_delete_thread.clone()
         {
             let mut close_confirm = false;
@@ -8793,26 +8796,15 @@ impl ZaloGuiApp {
                     });
                 });
             if confirmed_delete {
-                let uin = self.user_uin.clone();
-                let tid_bg = del_tid.clone();
-                std::thread::spawn(move || {
-                    let db = crate::store::db_path_for_account(&uin);
-                    if let Ok(mut store) = crate::store::MessageStore::open(&db) {
-                        let _ = store.delete_thread(&tid_bg);
-                    }
-                });
-                if let Some(pos) = self.threads.iter().position(|t| t.id == del_tid).or_else(|| {
-                    if del_idx < self.threads.len() {
-                        Some(del_idx)
-                    } else {
-                        None
-                    }
-                }) {
+                if let Some(pos) = self.threads.iter().position(|t| t.id == del_tid) {
                     self.threads.remove(pos);
-                    if self.selected_thread_index >= self.threads.len() && !self.threads.is_empty()
-                    {
-                        self.selected_thread_index = self.threads.len() - 1;
+                    if self.selected_thread_index >= self.threads.len() {
+                        self.selected_thread_index = self.threads.len().saturating_sub(1);
                     }
+                    self.unread_counts.remove(&del_tid);
+                    self.reaction_unread_counts.remove(&del_tid);
+                    self.settings.pinned_threads.retain(|id| id != &del_tid);
+                    self.settings.save();
                 }
                 if let Some(tx) = WORKER_TX.get() {
                     let _ = tx.send(WorkerCmd::DeleteThread {

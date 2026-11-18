@@ -84,7 +84,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake pkg-config \
+          sudo apt-get install -y build-essential cmake pkg-config clang libclang-dev nasm \
             libasound2-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxkbcommon-dev libssl-dev \
             libgtk-3-dev
@@ -107,7 +107,7 @@ jobs:
       - name: Install build & packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake pkg-config \
+          sudo apt-get install -y build-essential cmake pkg-config clang libclang-dev nasm \
             libasound2-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxkbcommon-dev libssl-dev \
             libgtk-3-dev rpm file desktop-file-utils libfuse2
@@ -131,7 +131,7 @@ jobs:
           Priority: optional
           Architecture: amd64
           Depends: libc6, libasound2 | libasound2t64, libx11-6, libxcb1, libxkbcommon0, libgl1
-          Recommends: ffmpeg, zenity, xclip, wl-clipboard, fonts-noto-core
+          Recommends: zenity, xclip, wl-clipboard, fonts-noto-core
           Maintainer: TIPC1110 <tienichpc1110@gmail.com>
           Description: Lightweight native Zalo PC client written in Rust
           EOF
@@ -226,7 +226,7 @@ jobs:
         run: |
           sed -i '/bullseye-security/d' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
           apt-get update
-          apt-get install -y --no-upgrade build-essential cmake pkg-config \
+          apt-get install -y --no-upgrade build-essential cmake pkg-config clang libclang-dev nasm \
             libasound2-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxkbcommon-dev libssl-dev \
             libgtk-3-dev
@@ -251,7 +251,7 @@ jobs:
           Priority: optional
           Architecture: amd64
           Depends: libc6 (>= 2.31), libasound2 | libasound2t64
-          Recommends: ffmpeg, zenity, xclip, wl-clipboard, fonts-noto-core
+          Recommends: zenity, xclip, wl-clipboard, fonts-noto-core
           Maintainer: TIPC1110 <tienichpc1110@gmail.com>
           Description: Lightweight native Zalo PC client written in Rust (glibc 2.31+ compatible)
           EOF

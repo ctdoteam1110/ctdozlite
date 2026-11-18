@@ -47,10 +47,10 @@
 ## 🛠️ 从源码编译
 
 ### 前置环境
-- **Rust 工具链:** Stable Rust (推荐 1.80+，可通过 `rustup` 安装)。
+- **Rust 工具链:** Rust 1.97+（原生同步的 Wasmtime 依赖要求，可通过 `rustup` 安装）。
 - **系统依赖项:**
-  - **Linux:** `libasound2-dev`, `libfontconfig1-dev`, `libx11-dev`, `libxcursor-dev`, `libxi-dev`, `libgl1-mesa-dev`, `ffmpeg`.
-  - **Windows / macOS:** 标准 C 编译器环境及 `ffmpeg` (用于音视频通话编解码)。
+  - **Linux:** `libasound2-dev`, `libfontconfig1-dev`, `libx11-dev`, `libxcursor-dev`, `libxi-dev`, `libgl1-mesa-dev`, `clang`, `libclang-dev`, `cmake`, `pkg-config`.
+  - **Windows / macOS:** 标准 C/C++ 编译器环境及 CMake。摄像头使用原生接口，视频使用内置 OpenH264。
 
 ```bash
 # 克隆仓库

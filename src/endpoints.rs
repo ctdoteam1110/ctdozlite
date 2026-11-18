@@ -46,6 +46,8 @@ pub const FRIEND_BOARD: &str = "https://friendboard-wpa.chat.zalo.me";
 
 /// Legacy board host (`apiBoardDomain`); kept as a fallback for `/api/board/pin`.
 pub const BOARD: &str = "https://board-wpa.chat.zalo.me";
+/// Existing mobile backup numeric-to-web identity mapping service.
+pub const ZNOISE: &str = "https://zwid.api.zalo.me";
 
 /// Look up a service domain by key.
 pub fn service(key: &str) -> Option<&'static str> {

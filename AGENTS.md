@@ -7,7 +7,7 @@ Operating guide for AI agents and humans working in this repository.
 `ctdozlite` (`zalo-rust`) is a native Zalo desktop client written in Rust: `egui` GUI, `ratatui` TUI, a Tokio worker for network I/O, and a local SQLite message store. No Node.js, no Electron, no Chromium.
 
 - Repository: <https://github.com/ctdoteam1110/ctdozlite>
-- Rust 1.75+ / edition 2021
+- Rust 1.97+ / edition 2021
 - Product docs are Vietnamese (`docs/`, `README.md`); engineering standards are English (`docs/standards/`)
 
 ## Commands

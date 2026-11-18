@@ -189,6 +189,32 @@ pub(crate) fn compute_call_per_page(stage_w: f32) -> usize {
 }
 
 impl ZaloGuiApp {
+    /// Queue a coalesced account-list refresh. A deletion invalidates the current
+    /// request so its late response cannot overwrite the updated profiles.
+    fn request_saved_accounts(&mut self, delete: Option<String>) {
+        if delete.is_some() {
+            self.saved_accounts.invalidate();
+        }
+        let Some(request_id) = self.saved_accounts.request() else {
+            return;
+        };
+        let command = match delete {
+            Some(target_uin) => WorkerCmd::DeleteSavedAccount {
+                request_id,
+                target_uin,
+            },
+            None => WorkerCmd::RefreshSavedAccounts { request_id },
+        };
+        if !WORKER_TX.get().is_some_and(|tx| tx.send(command).is_ok()) {
+            self.saved_accounts.finish(
+                request_id,
+                Err("Không thể kết nối tác vụ tài khoản. Hãy thử lại.".into()),
+            );
+        }
+    }
+
+    /// Show the active profile and saved-account shortcuts, and route account switches,
+    /// account addition and destructive actions from the navigation rail.
     pub(super) fn render_profile_popover(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.profile_menu_open {
             return;
@@ -531,7 +557,7 @@ impl ZaloGuiApp {
                                 .rounding(Rounding::same(7.0)),
                             )
                             .on_hover_text(
-                                "Xoá zalo_history.db và threads_cache.json. Phiên đăng nhập giữ nguyên.",
+                                "Xoá lịch sử và bộ nhớ đệm của tài khoản hiện tại. Phiên đăng nhập giữ nguyên.",
                             )
                             .on_hover_cursor(CursorIcon::PointingHand)
                             .clicked()
@@ -1421,6 +1447,8 @@ impl ZaloGuiApp {
             self.phone_modal_open = false;
         }
     }
+    /// Show preferences and account management while the dialog is open, releasing the
+    /// backdrop texture when it closes.
     pub(super) fn render_settings_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.settings_modal_open {
             self.settings_blur_tex = None;
@@ -1978,6 +2006,7 @@ impl ZaloGuiApp {
                                                         }
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                                             if ui.small_button(format!("{} Quét lại thiết bị", lucide::REFRESH)).clicked() {
+                                                                self.media_devices_ready = false;
                                                                 let _ = crate::media::list_media_devices(true);
                                                             }
                                                         });
@@ -2120,7 +2149,16 @@ impl ZaloGuiApp {
                                             );
                                             ui.add_space(10.0);
 
-                                            let saved = crate::account_manager::list_saved_accounts(&self.user_uin);
+                                            self.request_saved_accounts(None);
+                                            if ui.button("Làm mới danh sách tài khoản").clicked() {
+                                                self.saved_accounts.invalidate();
+                                                self.request_saved_accounts(None);
+                                            }
+                                            if self.saved_accounts.loading() { ui.label("Đang tải tài khoản…"); }
+                                            if let Some(error) = &self.saved_accounts.error {
+                                                ui.colored_label(pal.danger, error);
+                                            }
+                                            let saved = self.saved_accounts.profiles.clone();
                                             let mut delete_target: Option<String> = None;
 
                                             for acc in &saved {
@@ -2178,7 +2216,7 @@ impl ZaloGuiApp {
                                             }
 
                                             if let Some(target) = delete_target {
-                                                let _ = crate::account_manager::delete_saved_account(&target);
+                                                self.request_saved_accounts(Some(target));
                                             }
 
                                             ui.add_space(14.0);
@@ -2450,8 +2488,28 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::symmetric(14.0, 12.0))
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Tải lịch sử tin nhắn nhóm và Cloud của tôi từ máy chủ Zalo (tối đa 1.000 tin nhắn mỗi cuộc trò chuyện).").color(pal.text_primary).size(13.0));
-                                                        ui.add_space(6.0);
+                                                        ui.label(RichText::new("Tải lịch sử cũ của các nhóm và Cloud của tôi từ máy chủ Zalo về lịch sử của tài khoản hiện tại, mỗi lần tối đa 1.000 tin/hội thoại; bấm lần nữa để lùi xa hơn.").color(pal.text_primary).size(13.0));
+                                                        ui.add_space(4.0);
+                                                        if ui
+                                                            .add(
+                                                                egui::Label::new(
+                                                                    RichText::new(format!(
+                                                                        "Tìm hiểu chi tiết cơ chế đồng bộ trong docs/TINH_NANG.md {}",
+                                                                        lucide::EXTERNAL_LINK
+                                                                    ))
+                                                                    .size(11.8)
+                                                                    .color(pal.primary_hover),
+                                                                )
+                                                                .sense(Sense::click()),
+                                                            )
+                                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                                            .clicked()
+                                                        {
+                                                            if let Err(error) = open_external_url("https://github.com/ctdoteam1110/ctdozlite/blob/main/docs/TINH_NANG.md") {
+                                                                self.show_toast(error);
+                                                            }
+                                                        }
+                                                        ui.add_space(4.0);
                                                         let total_msgs: usize = self.threads.iter().map(|t| t.messages.len()).sum();
                                                         ui.label(RichText::new(format!("Đã lưu {} cuộc trò chuyện ({} tin nhắn) trên máy.", self.threads.len(), total_msgs)).color(pal.text_secondary).size(12.2));
                                                         ui.add_space(10.0);
@@ -2475,7 +2533,8 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::symmetric(14.0, 12.0))
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Nhập dữ liệu tin nhắn từ file sao lưu (.db, .sqlite, .json) hoặc thư mục dữ liệu Zalo mà không làm mất tin nhắn hiện có.").color(pal.text_secondary).size(12.2));
+                                                        ui.label(RichText::new("Nhập lịch sử tin nhắn từ tệp sao lưu SQLite (.db, .sqlite), JSON hoặc thư mục dữ liệu Zalo vào tài khoản hiện tại mà không làm mất tin nhắn đang có.").color(pal.text_secondary).size(12.2));
+                                                        ui.label(RichText::new("Sau khi nâng cấp, nếu thiếu lịch sử cũ, hãy chọn zalo_history.db trong thư mục dữ liệu tại đây. Ứng dụng không tự nhập lịch sử chưa xác định chủ sở hữu; chỉ chọn file của chính tài khoản đang đăng nhập.").color(pal.text_secondary).size(12.2));
                                                         ui.add_space(8.0);
                                                         if ui.button(RichText::new("Chọn file sao lưu để nhập…").size(12.8).strong()).clicked() {
                                                             pick_migrate_file = true;
@@ -4105,6 +4164,23 @@ impl ZaloGuiApp {
                                                         });
                                                     }
                                                 });
+                                            ui.add_space(10.0);
+                                            egui::CollapsingHeader::new("Giấy phép thư viện video")
+                                                .id_salt("native_video_license_notices")
+                                                .default_open(false)
+                                                .show(ui, |ui| {
+                                                    egui::ScrollArea::vertical()
+                                                        .id_salt("native_video_license_scroll")
+                                                        .max_height(200.0)
+                                                        .show(ui, |ui| {
+                                                            ui.add(egui::Label::new(
+                                                                RichText::new(crate::video::license_notices())
+                                                                    .monospace()
+                                                                    .size(11.0)
+                                                                    .color(pal.text_secondary),
+                                                            ).wrap().selectable(true));
+                                                        });
+                                                });
                                         }
                                             }
                                         });
@@ -4233,53 +4309,31 @@ impl ZaloGuiApp {
             }
         }
 
-        if pick_migrate_file {
-            if let Some(src_path) = super::attachments::pick_single_file() {
-                match crate::store::import_history_from_path(&src_path, "zalo_history.db") {
-                    Ok(summary) => {
-                        let t_cnt = summary.threads_imported;
-                        let m_cnt = summary.messages_imported;
-                        crate::store::load_history_into_threads(
-                            "zalo_history.db",
-                            &mut self.threads,
-                            crate::store::MessageStore::PRELOAD_MSGS,
-                        );
-                        self.persist_threads_async();
-                        self.show_toast(format!(
-                            "✅ Đã nhập {m_cnt} tin nhắn từ {t_cnt} hội thoại vào zalo_history.db"
-                        ));
-                    }
-                    Err(e) => {
-                        self.show_toast(format!("⚠️ Lỗi nhập lịch sử: {e}"));
-                    }
-                }
-            }
-        }
-
-        if pick_migrate_dir {
+        let import_path = if pick_migrate_file {
+            super::attachments::pick_single_file()
+        } else if pick_migrate_dir {
             match pick_native_folder_dialog_result("Chọn thư mục dữ liệu Zalo để nhập") {
-                FolderPick::Picked(src_dir) => {
-                    match crate::store::import_history_from_path(&src_dir, "zalo_history.db") {
-                        Ok(summary) => {
-                            let t_cnt = summary.threads_imported;
-                            let m_cnt = summary.messages_imported;
-                            crate::store::load_history_into_threads(
-                                "zalo_history.db",
-                                &mut self.threads,
-                                crate::store::MessageStore::PRELOAD_MSGS,
-                            );
-                            self.persist_threads_async();
-                            self.show_toast(format!(
-                                "✅ Đã nhập {m_cnt} tin nhắn từ {t_cnt} hội thoại vào zalo_history.db"
-                            ));
-                        }
-                        Err(e) => {
-                            self.show_toast(format!("⚠️ Lỗi nhập lịch sử: {e}"));
-                        }
-                    }
+                FolderPick::Picked(src_dir) => Some(src_dir),
+                FolderPick::LaunchFailed(e) => {
+                    self.show_toast(format!("⚠️ {e}"));
+                    None
                 }
-                FolderPick::LaunchFailed(e) => self.show_toast(format!("⚠️ {e}")),
-                FolderPick::Cancelled => {}
+                FolderPick::Cancelled => None,
+            }
+        } else {
+            None
+        };
+        if let Some(path) = import_path {
+            if WORKER_TX.get().is_some_and(|tx| {
+                tx.send(WorkerCmd::ImportHistory {
+                    uin: self.user_uin.clone(),
+                    path,
+                })
+                .is_ok()
+            }) {
+                self.show_toast("Đang nhập lịch sử vào tài khoản hiện tại…");
+            } else {
+                self.show_toast("Không thể bắt đầu nhập lịch sử.");
             }
         }
         if export_theme_tpl {
@@ -4709,6 +4763,7 @@ impl ZaloGuiApp {
         }
     }
 
+    /// Edit the composer's delivery time or manage pending sends for the displayed account.
     pub(super) fn render_schedule_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.schedule_modal_open {
             return;
@@ -5081,7 +5136,7 @@ impl ZaloGuiApp {
             } else if let Some((tid, tname, is_group)) = cur_thread {
                 if let Some(edit_id) = self.schedule_editing_id.take() {
                     match crate::scheduler::update_scheduled_message(
-                        "zalo_history.db",
+                        &crate::store::db_path_for_account(&self.user_uin),
                         edit_id,
                         &text,
                         target_ts,
@@ -5100,7 +5155,7 @@ impl ZaloGuiApp {
                     }
                 } else {
                     match crate::scheduler::schedule_message(
-                        "zalo_history.db",
+                        &crate::store::db_path_for_account(&self.user_uin),
                         &tid,
                         &tname,
                         is_group,
@@ -5124,9 +5179,19 @@ impl ZaloGuiApp {
             }
         }
         if let Some(id) = action_cancel {
-            let _ = crate::scheduler::cancel_scheduled_message("zalo_history.db", id);
-            self.refresh_scheduled_items();
-            self.show_toast("Đã hủy tin nhắn hẹn giờ");
+            if let Some(tx) = WORKER_TX.get() {
+                if tx
+                    .send(WorkerCmd::CancelScheduledMessage {
+                        uin: self.user_uin.clone(),
+                        id,
+                    })
+                    .is_err()
+                {
+                    self.show_toast("Không thể hủy lịch hẹn: tác vụ nền đã dừng.");
+                }
+            } else {
+                self.show_toast("Không thể hủy lịch hẹn: tác vụ nền chưa sẵn sàng.");
+            }
         }
         if let Some(item) = action_edit {
             self.input_message = item.text;
@@ -5134,16 +5199,19 @@ impl ZaloGuiApp {
             self.schedule_custom_input = crate::scheduler::format_schedule_time(item.deliver_at);
         }
         if let Some(item) = action_send_now {
-            let _ = crate::scheduler::cancel_scheduled_message("zalo_history.db", item.id);
-            self.refresh_scheduled_items();
             if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::SendMessage {
-                    to_id: item.thread_id,
-                    text: item.text,
-                    is_group: item.is_group,
-                });
+                if tx
+                    .send(WorkerCmd::SendScheduledMessageNow {
+                        uin: self.user_uin.clone(),
+                        id: item.id,
+                    })
+                    .is_err()
+                {
+                    self.show_toast("Không thể gửi lịch hẹn: tác vụ nền đã dừng.");
+                }
+            } else {
+                self.show_toast("Không thể gửi lịch hẹn: tác vụ nền chưa sẵn sàng.");
             }
-            self.show_toast("Đang gửi ngay tin nhắn hẹn giờ…");
         }
         if !open {
             self.schedule_modal_open = false;
@@ -5516,6 +5584,8 @@ impl ZaloGuiApp {
         }
     }
 
+    /// Render the current call's controls and participant video, scheduling repaints
+    /// while the call is visible so elapsed time and textures stay current.
     pub(super) fn render_call_overlay(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         let Some(mut call) = self.active_call.clone() else {
             return;
@@ -5945,7 +6015,8 @@ impl ZaloGuiApp {
                             .on_hover_text("Quét lại danh sách Mic & Camera")
                             .clicked()
                         {
-                            let _ = crate::media::list_media_devices(true);
+                            self.media_devices_ready = false;
+                                                                let _ = crate::media::list_media_devices(true);
                         }
                     });
                 });
@@ -6526,11 +6597,7 @@ impl ZaloGuiApp {
                                         .clicked()
                                     {
                                         if !call.cam_enabled {
-                                            if !crate::media::is_ffmpeg_available() {
-                                                self.show_toast(
-                                                    "⚠️ Cần cài đặt ffmpeg trong PATH để bật Camera (winget install Gyan.FFmpeg)",
-                                                );
-                                            } else if crate::media::list_media_devices(false).1.is_empty() {
+                                            if self.media_devices_ready && crate::media::list_media_devices(false).1.is_empty() {
                                                 self.show_toast(
                                                     "⚠️ Không tìm thấy thiết bị Camera nào trên máy",
                                                 );
@@ -7708,6 +7775,7 @@ impl ZaloGuiApp {
         out.into_iter().rev().collect()
     }
 
+    /// Require explicit confirmation before queuing a wipe of the account's local history.
     pub(super) fn render_wipe_confirm(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.wipe_confirm_open {
             return;
@@ -7732,7 +7800,7 @@ impl ZaloGuiApp {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(
-                                    "Xoá zalo_history.db và threads_cache.json trên máy này. \
+                                    "Xoá lịch sử và bộ nhớ đệm của tài khoản hiện tại trên máy này. \
                                      Không thể hoàn tác, và tin nhắn cũ chỉ tải lại được từ đám mây Zalo.",
                                 )
                                 .size(12.5)
@@ -7796,6 +7864,8 @@ impl ZaloGuiApp {
         }
     }
 
+    /// On confirmed logout, save the current profile for quick sign-in, clear the
+    /// displayed session and ask the worker to log out.
     pub(super) fn render_logout_confirm(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.logout_confirm_open {
             return;
@@ -7905,7 +7975,6 @@ impl ZaloGuiApp {
             self.status_msg = "Đã đăng xuất".into();
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::Logout);
-                let _ = tx.send(WorkerCmd::RequestQr);
             }
         } else if cancel || !open {
             self.logout_confirm_open = false;

@@ -1471,20 +1471,6 @@ pub fn merge_thread_into(
     target.messages.retain(|m| m.text != "sendBubbleMessage");
     target.messages.sort_by_key(|m| m.ts);
 
-    let mut latest_incoming_ts = 0i64;
-    for m in target.messages.iter() {
-        if !m.is_outgoing && m.ts > latest_incoming_ts {
-            latest_incoming_ts = m.ts;
-        }
-    }
-    if latest_incoming_ts > 0 {
-        for m in target.messages.iter_mut() {
-            if m.is_outgoing && m.ts > 0 && m.ts <= latest_incoming_ts {
-                m.delivery = crate::message_model::DeliveryState::Read;
-            }
-        }
-    }
-
     if let Some(newest) = target.messages.last() {
         if !newest.text.is_empty() {
             target.preview = newest.text.replace('\n', " ");
@@ -1595,20 +1581,26 @@ fn active_uin_from_session() -> Option<String> {
 /// Load locally cached conversations and message history scoped to active account.
 pub fn load_threads_cache() -> Vec<Thread> {
     if let Some(uin) = active_uin_from_session() {
-        let acc_path = format!("accounts/{uin}_threads.json");
-        if let Ok(text) = std::fs::read_to_string(&acc_path) {
-            if let Ok(mut threads) = serde_json::from_str::<Vec<Thread>>(&text) {
-                deduplicate_threads(&mut threads, None);
-                return threads;
-            }
-        }
+        return load_threads_cache_for_account(&uin);
     }
-    if std::path::Path::new("session.json").exists() {
-        if let Ok(text) = std::fs::read_to_string("threads_cache.json") {
-            if let Ok(mut threads) = serde_json::from_str::<Vec<Thread>>(&text) {
-                deduplicate_threads(&mut threads, None);
-                return threads;
-            }
+    Vec::new()
+}
+
+/// Load only the captured account's cache, without consulting the active session or shared cache.
+pub fn load_threads_cache_for_account(uin: &str) -> Vec<Thread> {
+    load_threads_cache_for_account_in(std::path::Path::new("."), uin)
+}
+
+/// Read and deduplicate one account's first-paint cache, with an empty fallback for invalid data.
+fn load_threads_cache_for_account_in(root: &std::path::Path, uin: &str) -> Vec<Thread> {
+    if crate::account_manager::validate_uin(uin).is_err() {
+        return Vec::new();
+    }
+    let path = root.join("accounts").join(format!("{uin}_threads.json"));
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(mut threads) = serde_json::from_str::<Vec<Thread>>(&text) {
+            deduplicate_threads(&mut threads, None);
+            return threads;
         }
     }
     Vec::new()
@@ -1618,6 +1610,29 @@ pub fn load_threads_cache() -> Vec<Thread> {
 /// `PRELOAD_MSGS` messages per thread are kept: full history lives in SQLite, and
 /// rewriting every message as pretty JSON on each change cost more than the SQLite write.
 pub fn save_threads_cache(threads: &[Thread]) {
+    if let Some(uin) = active_uin_from_session() {
+        save_threads_cache_for_account(&uin, threads);
+    }
+}
+
+/// Save a captured account's bounded snapshot without writing the shared active cache.
+/// Failures are logged because this best-effort cache is not the authoritative message store.
+pub fn save_threads_cache_for_account(uin: &str, threads: &[Thread]) {
+    if let Err(error) = save_threads_cache_for_account_in(std::path::Path::new("."), uin, threads) {
+        crate::logger::log_error("chat::save_threads_cache_for_account", &error.to_string());
+    }
+}
+
+/// Atomically replace the account's private thread cache with a bounded preview per conversation.
+///
+/// # Errors
+/// Returns an error if the account ID is invalid, serialization fails, or the cache cannot be written.
+fn save_threads_cache_for_account_in(
+    root: &std::path::Path,
+    uin: &str,
+    threads: &[Thread],
+) -> Result<()> {
+    crate::account_manager::validate_uin(uin)?;
     let keep = crate::store::MessageStore::PRELOAD_MSGS;
     let slim: Vec<Thread> = threads
         .iter()
@@ -1634,13 +1649,13 @@ pub fn save_threads_cache(threads: &[Thread]) {
             vanish: t.vanish.clone(),
         })
         .collect();
-    if let Ok(text) = serde_json::to_string(&slim) {
-        let _ = std::fs::write("threads_cache.json", &text);
-        if let Some(uin) = active_uin_from_session() {
-            let _ = std::fs::create_dir_all("accounts");
-            let _ = std::fs::write(format!("accounts/{uin}_threads.json"), text);
-        }
-    }
+    let text = serde_json::to_string(&slim)?;
+    let accounts = root.join("accounts");
+    std::fs::create_dir_all(&accounts)?;
+    crate::data_dir::write_private_atomic(
+        &accounts.join(format!("{uin}_threads.json")),
+        text.as_bytes(),
+    )
 }
 
 /// `/api/social/friend/getfriends` — the friend list.
@@ -5964,7 +5979,7 @@ pub async fn get_chat_from_polling(s: &Session, state: &mut PollState) -> Result
 
 /// Poll both `getChatFromPolling` (`lp_chat`) and `get-last-msgs` (`convers_api`),
 /// merge all incoming/outgoing/group messages into `threads`, resolve unknown names,
-/// and persist to `zalo_history.db` and `threads_cache.json`.
+/// and persist to the captured account's history store and cache snapshot.
 pub async fn poll_new_messages(
     s: &Session,
     state: &mut PollState,
@@ -6039,17 +6054,15 @@ pub async fn poll_new_messages(
     resolve_thread_names(s, threads).await;
     threads.retain(|t| !t.messages.is_empty() || !t.name.starts_with("Người dùng "));
     deduplicate_threads(threads, None);
-    let uin = s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or_default();
-    let acc_db = crate::store::db_path_for_account(uin);
-    if let Ok(mut store) = crate::store::MessageStore::open(&acc_db) {
+    let uin = s
+        .login
+        .as_ref()
+        .map(|login| login.uin.as_str())
+        .unwrap_or_default();
+    if let Ok(mut store) = crate::store::MessageStore::open_account(uin) {
         let _ = crate::store::persist_threads(&mut store, threads);
     }
-    if acc_db != "zalo_history.db" {
-        if let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") {
-            let _ = crate::store::persist_threads(&mut store, threads);
-        }
-    }
-    save_threads_cache(threads);
+    save_threads_cache_for_account(uin, threads);
     Ok(())
 }
 
@@ -7286,8 +7299,6 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 if thread_is_group {
                     t.is_group = true;
                 }
-                let is_incoming = !parsed.is_outgoing;
-                let parsed_ts = parsed.ts;
                 if let Some(row) = identities.find(&t.messages, &parsed) {
                     let existing = &mut t.messages[row];
                     identities.remove(existing, row);
@@ -7349,13 +7360,6 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 } else {
                     identities.insert(&parsed, t.messages.len());
                     t.messages.push(parsed);
-                }
-                if is_incoming {
-                    for em in t.messages.iter_mut() {
-                        if em.is_outgoing && em.ts > 0 && (em.ts <= parsed_ts || parsed_ts == 0) {
-                            em.delivery = crate::message_model::DeliveryState::Read;
-                        }
-                    }
                 }
             } else {
                 // New thread detected from incoming message!
@@ -9707,6 +9711,60 @@ mod tests {
             .expect("extMsgProp is JSON");
         assert_eq!(ext, json!({ "groupMediaMsg": { "groupLayoutId": "1731100000000" } }));
         assert_eq!(params["photoId"], json!(42));
+    }
+
+    #[test]
+    fn account_cache_keeps_late_account_a_write_out_of_account_b_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-cache-test-{}-{}",
+            std::process::id(),
+            crate::param_cipher::random_hex(8)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let thread_a = Thread {
+            id: "thread-a".into(),
+            ..Default::default()
+        };
+        let thread_b = Thread {
+            id: "thread-b".into(),
+            ..Default::default()
+        };
+        save_threads_cache_for_account_in(&root, "account-b", &[thread_b]).unwrap();
+        std::fs::write(
+            root.join("session.json"),
+            r#"{"login":{"uin":"account-b"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("threads_cache.json"), "active-b-snapshot").unwrap();
+
+        save_threads_cache_for_account_in(&root, "account-a", &[thread_a]).unwrap();
+
+        assert_eq!(
+            load_threads_cache_for_account_in(&root, "account-a")[0].id,
+            "thread-a"
+        );
+        assert_eq!(
+            load_threads_cache_for_account_in(&root, "account-b")[0].id,
+            "thread-b"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("threads_cache.json")).unwrap(),
+            "active-b-snapshot"
+        );
+        assert!(load_threads_cache_for_account_in(&root, "account-c").is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn account_cache_rejects_paths_that_escape_account_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-cache-test-{}-{}",
+            std::process::id(),
+            crate::param_cipher::random_hex(8)
+        ));
+        assert!(save_threads_cache_for_account_in(&root, "../escaped", &[]).is_err());
+        assert!(load_threads_cache_for_account_in(&root, "../escaped").is_empty());
+        assert!(!root.exists());
     }
 
     #[test]
