@@ -658,7 +658,9 @@ impl ZaloGuiApp {
                 const POPUP_TITLE: &str = "ctdozlite — Tin nhắn mới";
                 ctx.request_repaint_after(Duration::from_millis(40));
                 let popup_w = 376.0_f32;
-                let popup_h = 148.0_f32;
+                // Fits header + one-line name + two-line preview + quick reply; the preview is
+                // capped at two lines below so long messages cannot push the reply bar out.
+                let popup_h = 164.0_f32;
                 let corner_pos = get_desktop_bottom_right_pos(ctx, popup_w, popup_h);
                 let vp_id = egui::ViewportId::from_hash_of("zalo_corner_notification_popup");
                 let builder = egui::ViewportBuilder::default()
@@ -860,24 +862,25 @@ impl ZaloGuiApp {
                                     ui.add_space(8.0);
                                     ui.vertical(|ui| {
                                         ui.set_max_width(popup_w - 86.0);
-                                        let s_short: String = if s_name.chars().count() > 36 {
-                                            let t: String = s_name.chars().take(36).collect();
-                                            format!("{t}…")
-                                        } else {
-                                            s_name.clone()
-                                        };
-                                        ui.label(
-                                            RichText::new(s_short)
-                                                .size(13.5)
-                                                .color(pal.text_primary)
-                                                .strong(),
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&s_name)
+                                                    .size(13.5)
+                                                    .color(pal.text_primary)
+                                                    .strong(),
+                                            )
+                                            .truncate(),
                                         );
                                         ui.add_space(2.0);
-                                        ui.label(
-                                            RichText::new(&p_text)
-                                                .size(12.0)
-                                                .color(pal.text_secondary),
+                                        // At most two lines, ending in "…" when longer.
+                                        let mut job = egui::text::LayoutJob::simple(
+                                            p_text.clone(),
+                                            FontId::proportional(12.0),
+                                            pal.text_secondary,
+                                            ui.available_width(),
                                         );
+                                        job.wrap.max_rows = 2;
+                                        ui.add(egui::Label::new(job).selectable(false));
                                     });
                                 })
                                 .response;
