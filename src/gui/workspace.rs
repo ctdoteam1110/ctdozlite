@@ -6974,7 +6974,7 @@ impl ZaloGuiApp {
                                                     jump_row_drawn = true;
                                                 }
                                                 let measured = (ui.cursor().top() - row_top).max(0.0);
-                                                if known_h.map_or(true, |h| (h - measured).abs() > 0.5) {
+                                                if !known_h.is_some_and(|h| (h - measured).abs() <= 0.5) {
                                                     rows_above_jump_changed |= !jump_row_seen;
                                                     self.chat_row_heights.insert(row_key, measured);
                                                 }
