@@ -151,6 +151,7 @@ Bảng màu xám xanh lạnh, một nhấn xanh dương, màu trạng thái dị
 
 **Font chính:** Be Vietnam Pro (`BeVietnamPro-Regular.ttf` + `BeVietnamPro-SemiBold.ttf` đóng gói sẵn, bảo đảm đủ dấu tiếng Việt và phân cấp đậm/nhạt rõ ràng)
 **Font biểu tượng:** Lucide (`lucide.ttf` đóng gói sẵn, dùng cho toàn bộ icon UI dạng glyph)
+**Emoji:** ảnh màu Twemoji v17.0.3 (`src/assets/emoji/twemoji72.pack`, đồ hoạ © Twitter, Inc. và các cộng tác viên, giấy phép CC-BY 4.0, xem `TWEMOJI-LICENSE-GRAPHICS.txt`) vẽ đè lên glyph emoji; Noto Emoji (`NotoEmoji-Regular.ttf`, OFL) là glyph đơn sắc giữ chỗ và dự phòng.
 **Dự phòng:** font hệ thống cho CJK (YaHei, SimSun, Malgun, YuGothic, PingFang, Noto CJK), chỉ nạp khi cần.
 
 **Character:** Sans hình học, gọn, đọc tốt ở cỡ nhỏ và với dấu tiếng Việt chồng. Không dùng font thứ hai cho chữ; icon luôn là Lucide hoặc ảnh emoji đóng gói.
