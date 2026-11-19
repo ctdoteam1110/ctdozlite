@@ -10529,6 +10529,9 @@ mod quote_navigation_tests {
                         .max_height(200.0)
                         .stick_to_bottom(jump.is_none())
                         .show(ui, |ui| {
+                            // As in the chat view: no gap between rows, so a cached
+                            // height is the whole slot a spacer must replace.
+                            ui.spacing_mut().item_spacing.y = 0.0;
                             let culler = RowCuller::new(ui);
                             let content_top = ui.min_rect().top();
                             for i in 0..1000 {
