@@ -592,7 +592,10 @@ pub enum WorkerCmd {
     SendSeen {
         thread_id: String,
         is_group: bool,
-        last_msg_id: String,
+        /// Server `msgId` of the newest incoming message.
+        gmi: String,
+        /// Client `cliMsgId` of the same message.
+        cmi: String,
     },
     SwitchAccount {
         target_uin: String,
@@ -4726,12 +4729,20 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         WorkerCmd::SendSeen {
                             thread_id,
                             is_group,
-                            last_msg_id,
+                            gmi,
+                            cmi,
                         } => {
                             let session_clone = session.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                let _ = crate::chat::send_seen_v2(&s, &thread_id, is_group, &last_msg_id).await;
+                                if let Err(err) =
+                                    crate::chat::send_seen_v2(&s, &thread_id, is_group, &gmi, &cmi).await
+                                {
+                                    crate::logger::log_error(
+                                        "gui::worker::send_seen",
+                                        &format!("group={is_group}: {err:#}"),
+                                    );
+                                }
                             });
                         }
                     }
