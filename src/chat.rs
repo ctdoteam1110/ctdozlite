@@ -9083,13 +9083,37 @@ pub async fn send_typing_indicator(s: &Session, thread_id: &str, is_group: bool)
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
+/// Ids naming `msg` in a seen receipt: (`gmi` server `msgId`, `cmi` client `cliMsgId`).
+///
+/// `ChatMessage::id` holds either id depending on the source (see
+/// `re-notes/35_exact_message_identity.md`), so the wire identity is preferred. `None`
+/// for a local row the server has never acknowledged. When the client id is unknown the
+/// server id is used for both, which is what every receipt sent before this change did.
+pub fn seen_target_ids(msg: &ChatMessage) -> Option<(String, String)> {
+    if msg.id.starts_with("local_") {
+        return None;
+    }
+    let id_is_client = !msg.client_message_id.is_empty() && msg.id == msg.client_message_id;
+    let server = if id_is_client {
+        wire_identity(msg.wire_ref.server_id.as_ref()).or_else(|| server_message_id(msg))
+    } else {
+        server_message_id(msg)
+    }?;
+    let client = client_message_id(msg).unwrap_or_else(|| server.clone());
+    Some((server, client))
+}
+
 /// Send a "seen" receipt (`cmd 12118` `/api/message/seenv2` or `cmd 12124` `/api/group/seenv2`),
-/// unless blocked by `block_seen`.
+/// unless blocked by `block_seen`. `gmi`/`cmi` come from [`seen_target_ids`].
+///
+/// # Errors
+/// Returns an error when the request fails or the server answers a non-zero `error_code`.
 pub async fn send_seen_v2(
     s: &Session,
     thread_id: &str,
     is_group: bool,
-    last_msg_id: &str,
+    gmi: &str,
+    cmi: &str,
 ) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
@@ -9103,7 +9127,7 @@ pub async fn send_seen_v2(
         .trim_start_matches('G')
         .trim_start_matches('u')
         .trim();
-    if clean.is_empty() || last_msg_id.trim().is_empty() {
+    if clean.is_empty() || gmi.trim().is_empty() {
         return Ok(json!({"error_code": 0, "data": {}}));
     }
     let (endpoint, path_and_q, body) = if is_group {
@@ -9112,7 +9136,7 @@ pub async fn send_seen_v2(
             format!("/api/group/seenv2?{}", s.common_params()),
             json!({
                 "msgInfos": json!({
-                    "data": [{ "gmi": last_msg_id, "cmi": last_msg_id }],
+                    "data": [{ "gmi": gmi, "cmi": cmi }],
                     "grid": clean,
                 }).to_string(),
                 "imei": s.imei,
@@ -9124,7 +9148,7 @@ pub async fn send_seen_v2(
             format!("/api/message/seenv2?{}", s.common_params()),
             json!({
                 "msgInfos": json!({
-                    "data": [{ "gmi": last_msg_id, "cmi": last_msg_id }],
+                    "data": [{ "gmi": gmi, "cmi": cmi }],
                     "senderId": clean,
                 }).to_string(),
                 "imei": s.imei,
@@ -9135,7 +9159,20 @@ pub async fn send_seen_v2(
     let resp = s
         .post_endpoint_form(endpoint, &path_and_q, format!("params={params}"))
         .await?;
-    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    let code = resp.get("error_code").and_then(Value::as_i64).unwrap_or(0);
+    if code != 0 {
+        let message = resp
+            .get("error_message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        // Path only: the query string carries session parameters.
+        let path = path_and_q.split('?').next().unwrap_or_default();
+        return Err(crate::session::SessionError::new(code, message)
+            .at(path)
+            .into());
+    }
+    Ok(resp)
 }
 
 /// Request mobile message sync (`pullMobileMsg` @ `app.asar`, cmd `12000`, `file` endpoint, #68, #73).
@@ -10041,6 +10078,44 @@ mod tests {
             ..group_row
         };
         assert_eq!(quote_target(&peer, "me", "u42", false).owner, "u42");
+    }
+
+    #[test]
+    fn seen_target_ids_prefer_wire_server_and_client_ids() {
+        let wire = |raw: Value| crate::message_model::WireMessageRef::from_raw(&raw);
+        // `id` holds the server id; the client id comes from the wire.
+        let msg = ChatMessage {
+            id: "7001".into(),
+            wire_ref: wire(json!({"msgId": "7001", "cliMsgId": "1700000000123"})),
+            ..Default::default()
+        };
+        assert_eq!(
+            seen_target_ids(&msg),
+            Some(("7001".into(), "1700000000123".into()))
+        );
+        // `id` holds the client id: the server id is taken from the wire.
+        let msg = ChatMessage {
+            id: "1700000000123".into(),
+            client_message_id: "1700000000123".into(),
+            wire_ref: wire(json!({"msgId": "7001", "cliMsgId": "1700000000123"})),
+            ..Default::default()
+        };
+        assert_eq!(
+            seen_target_ids(&msg),
+            Some(("7001".into(), "1700000000123".into()))
+        );
+        // No wire data (legacy row): the single id is used for both, as before.
+        let msg = ChatMessage {
+            id: "7001".into(),
+            ..Default::default()
+        };
+        assert_eq!(seen_target_ids(&msg), Some(("7001".into(), "7001".into())));
+        // A local row the server never acknowledged is not reported.
+        let msg = ChatMessage {
+            id: "local_1".into(),
+            ..Default::default()
+        };
+        assert_eq!(seen_target_ids(&msg), None);
     }
 
     #[test]

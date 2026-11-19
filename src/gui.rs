@@ -1604,6 +1604,8 @@ pub struct ZaloGuiApp {
     notified_msg_ids: HashSet<String>,
     /// `(uin, banner progress)`: persisted so replayed reactions do not re-banner.
     reaction_banner_mark: (String, crate::reactions::BannerMark),
+    /// Last `gmi` sent in a seen receipt per thread, so a repaint never resends it.
+    seen_receipts_sent: HashMap<String, String>,
     link_metadata_cache: HashMap<String, crate::chat::LinkMetadata>,
     loading_link_previews: HashSet<String>,
     /// Tin đang chờ dịch (translate_request_key) → disable menu Dịch.
@@ -1996,6 +1998,7 @@ impl ZaloGuiApp {
             reaction_unread_counts: HashMap::new(),
             notified_msg_ids: HashSet::new(),
             reaction_banner_mark: (String::new(), Default::default()),
+            seen_receipts_sent: HashMap::new(),
             link_metadata_cache: HashMap::new(),
             loading_link_previews: HashSet::new(),
             translate_pending: HashSet::new(),
@@ -2641,6 +2644,7 @@ impl ZaloGuiApp {
                 }
             });
         }
+        send_seen_receipt(t, self.settings.block_seen, &mut self.seen_receipts_sent);
         let total_unread: usize = self.unread_counts.values().sum();
         let title = if total_unread > 0 {
             format!("({total_unread}) ctdozlite")
@@ -3035,6 +3039,17 @@ impl ZaloGuiApp {
                                     }
                                 }
                                 self.threads.push(nt);
+                            }
+                        }
+                        // The open conversation is on screen: report it read up to its newest
+                        // incoming message, whatever the unread bookkeeping above decided.
+                        if is_focused && update_ids.contains(&active_tid) {
+                            if let Some(t) = self.threads.iter().find(|t| t.id == active_tid) {
+                                send_seen_receipt(
+                                    t,
+                                    self.settings.block_seen,
+                                    &mut self.seen_receipts_sent,
+                                );
                             }
                         }
                         // Group Workspace: bắn toast khớp keyword sau merge (ưu tiên, sau cùng thắng).
@@ -6269,6 +6284,49 @@ fn detect_windows_os_dark_mode() -> Option<bool> {
     }
 }
 
+/// Tell Zalo the thread is read up to its newest incoming message, so the phone and other
+/// devices clear their unread badge. Skipped when "Ẩn trạng thái đã xem" (`block_seen`) is
+/// on, when there is no incoming message, or when that message was already reported.
+pub(crate) fn send_seen_receipt(
+    thread: &Thread,
+    block_seen: bool,
+    sent: &mut HashMap<String, String>,
+) {
+    if block_seen {
+        return;
+    }
+    let Some((gmi, cmi)) = seen_receipt_target(thread) else {
+        return;
+    };
+    if sent.get(&thread.id) == Some(&gmi) {
+        return;
+    }
+    let Some(tx) = WORKER_TX.get() else {
+        return;
+    };
+    if tx
+        .send(WorkerCmd::SendSeen {
+            thread_id: thread.id.clone(),
+            is_group: thread.is_group,
+            gmi: gmi.clone(),
+            cmi,
+        })
+        .is_ok()
+    {
+        sent.insert(thread.id.clone(), gmi);
+    }
+}
+
+/// (`gmi`, `cmi`) of the newest incoming, non-system message of `thread`.
+fn seen_receipt_target(thread: &Thread) -> Option<(String, String)> {
+    thread
+        .messages
+        .iter()
+        .rev()
+        .find(|m| !m.is_outgoing && !crate::gui::messages::is_system_notice_message(m))
+        .and_then(crate::chat::seen_target_ids)
+}
+
 /// Advance a thread's local read-point monotonically using visible numeric IDs,
 /// falling back to the last non-empty message ID when no numeric ID exists.
 pub(crate) fn advance_thread_read_point(thread: &mut Thread) -> Option<String> {
@@ -6386,6 +6444,18 @@ mod tests {
             });
         }
         thread
+    }
+
+    #[test]
+    fn seen_receipt_targets_newest_incoming_message() {
+        let thread = unread_fixture(None, &[("100", false), ("200", false), ("300", true)]);
+        // The outgoing tail is skipped: the receipt names the newest incoming message.
+        assert_eq!(
+            super::seen_receipt_target(&thread),
+            Some(("200".to_string(), "200".to_string()))
+        );
+        let outgoing_only = unread_fixture(None, &[("300", true)]);
+        assert_eq!(super::seen_receipt_target(&outgoing_only), None);
     }
 
     #[test]
