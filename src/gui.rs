@@ -22,6 +22,7 @@ use crate::qr::QrLogin;
 use crate::session::Session;
 
 mod attachments;
+mod color_emoji;
 pub(crate) mod messages;
 mod modals;
 mod reactions_dialog;
@@ -1703,6 +1704,8 @@ pub struct ZaloGuiApp {
     /// (thread id, number of newest bubbles rendered) — see `CHAT_RENDER_STEP`.
     chat_render_window: (String, usize),
     quote_jump: Option<QuoteJump>,
+    /// Twemoji textures painted over emoji glyphs at the end of each frame.
+    color_emoji: color_emoji::ColorEmoji,
     ime_active: bool,
     ime_just_committed: bool,
     history_reached_start: HashSet<String>,
@@ -2048,6 +2051,7 @@ impl ZaloGuiApp {
             event_tx: tx.clone(),
             chat_render_window: (String::new(), CHAT_RENDER_STEP),
             quote_jump: None,
+            color_emoji: Default::default(),
             ime_active: false,
             ime_just_committed: false,
             history_reached_start: HashSet::new(),
@@ -4621,7 +4625,19 @@ fn reveal_in_file_manager(path: &str) {
 // ---------------------------------------------------------------------------
 
 impl eframe::App for ZaloGuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.update_frame(ctx, frame);
+        self.color_emoji.paint(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = self.settings.save();
+        std::process::exit(0);
+    }
+}
+
+impl ZaloGuiApp {
+    fn update_frame(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_windows_frameless_subclass(ctx);
 
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
@@ -4865,11 +4881,6 @@ impl eframe::App for ZaloGuiApp {
                 Stroke::new(1.0_f32, pal.border),
             );
         }
-    }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let _ = self.settings.save();
-        std::process::exit(0);
     }
 }
 
