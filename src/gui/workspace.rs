@@ -2201,22 +2201,13 @@ impl ZaloGuiApp {
                             });
                         }
                     }
-                    if !self.settings.block_seen {
-                        let last_mid = self
-                            .threads
-                            .get(resolved_idx)
-                            .and_then(|t| t.messages.last())
-                            .map(|m| m.id.clone())
-                            .unwrap_or_default();
-                        if !last_mid.is_empty() {
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::SendSeen {
-                                    thread_id: tid.clone(),
-                                    is_group,
-                                    last_msg_id: last_mid,
-                                });
-                            }
-                        }
+                    if let Some(t) = self.threads.get(resolved_idx) {
+                        crate::gui::send_seen_receipt(
+                            t,
+                            self.settings.block_seen,
+                            &self.user_uin,
+                            &mut self.seen_receipts,
+                        );
                     }
                     let is_cloud = self
                         .threads

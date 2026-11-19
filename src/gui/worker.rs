@@ -590,9 +590,14 @@ pub enum WorkerCmd {
         url: String,
     },
     SendSeen {
+        /// Account the GUI recorded the receipt under, echoed back on failure.
+        account: String,
         thread_id: String,
         is_group: bool,
-        last_msg_id: String,
+        /// Server `msgId` of the newest incoming message.
+        gmi: String,
+        /// Client `cliMsgId` of the same message.
+        cmi: String,
     },
     SwitchAccount {
         target_uin: String,
@@ -4724,14 +4729,30 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::SendSeen {
+                            account,
                             thread_id,
                             is_group,
-                            last_msg_id,
+                            gmi,
+                            cmi,
                         } => {
                             let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                let _ = crate::chat::send_seen_v2(&s, &thread_id, is_group, &last_msg_id).await;
+                                if let Err(err) =
+                                    crate::chat::send_seen_v2(&s, &thread_id, is_group, &gmi, &cmi).await
+                                {
+                                    crate::logger::log_error(
+                                        "gui::worker::send_seen",
+                                        &format!("group={is_group}: {err:#}"),
+                                    );
+                                    // The next read of this thread sends the receipt again.
+                                    let _ = gui_tx_clone.send(GuiEvent::SeenReceiptFailed {
+                                        account,
+                                        thread_id,
+                                        gmi,
+                                    });
+                                }
                             });
                         }
                     }
