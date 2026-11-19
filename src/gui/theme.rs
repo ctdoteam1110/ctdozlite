@@ -1441,6 +1441,7 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
         "bundled_sans_semibold".to_owned(),
         egui::FontData::from_static(BUNDLED_SANS_SEMIBOLD),
     );
+    use_bundled_emoji_font(&mut fonts);
 
     // 3. Optional user-selected system or custom font family (Requirement R2)
     let mut selected_font_loaded = false;
@@ -1601,6 +1602,7 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
     }
     semibold.push("bundled_sans_semibold".to_owned());
     semibold.push("bundled_sans".to_owned());
+    semibold.push(EMOJI_FONT.to_owned());
     if fonts.font_data.contains_key("vietnamese_font") {
         semibold.push("vietnamese_font".to_owned());
     }
@@ -1612,9 +1614,52 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
     ctx.set_fonts(fonts);
 }
 
+const EMOJI_FONT: &str = "noto_emoji";
+
+/// Replace egui's built-in emoji fallback with the bundled Noto Emoji 3.002.
+///
+/// The built-in copy stops around Unicode 8, so newer emoji such as 🤣 drew as `◻`.
+/// The bundled font also maps the U+FE0F variation selector to an empty glyph;
+/// before, every "❤️" sent from a phone ended in a `◻`.
+fn use_bundled_emoji_font(fonts: &mut egui::FontDefinitions) {
+    // Static Regular instance of google/fonts `ofl/notoemoji/NotoEmoji[wght].ttf`,
+    // with the layout tables dropped because egui does no shaping.
+    const NOTO_EMOJI: &[u8] = include_bytes!("../assets/fonts/NotoEmoji-Regular.ttf");
+    const BUILTIN_EMOJI: &str = "NotoEmoji-Regular";
+    fonts.font_data.remove(BUILTIN_EMOJI);
+    fonts.font_data.insert(
+        EMOJI_FONT.to_owned(),
+        egui::FontData::from_static(NOTO_EMOJI),
+    );
+    for family in fonts.families.values_mut() {
+        for name in family.iter_mut().filter(|name| *name == BUILTIN_EMOJI) {
+            *name = EMOJI_FONT.to_owned();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_emoji_font_covers_new_emoji_and_hides_variation_selector() {
+        let ctx = egui::Context::default();
+        build_fonts(&ctx, "default", false);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        for family in [
+            egui::FontFamily::Proportional,
+            egui::FontFamily::Monospace,
+            font_family_semibold(),
+        ] {
+            let font = egui::FontId::new(14.0, family);
+            ctx.fonts(|f| {
+                // 🤣 (Unicode 9) and 🫠 (Unicode 14) were missing from egui's copy.
+                assert!(f.has_glyphs(&font, "🤣🫠❤\u{fe0f}"), "{font:?}");
+                assert_eq!(f.glyph_width(&font, '\u{fe0f}'), 0.0, "{font:?}");
+            });
+        }
+    }
 
     #[test]
     fn test_parse_and_format_hex_color() {
