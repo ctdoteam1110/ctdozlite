@@ -42,12 +42,22 @@ Two problems, both on the client side:
   `error_code`, and the worker logs it (`gui::worker::send_seen`, path only,
   no query string). Before, the result was dropped.
 
+Review follow-up:
+
+- A receipt is sent only while the conversation is on screen. Contacts and Feed replace
+  the chat view but keep the selected thread, so a focused window alone is not enough.
+- The worker reports a failed `seenv2` request back to the GUI (`SeenReceiptFailed`),
+  which forgets that receipt; the next read of the thread sends it again.
+- The record of sent receipts belongs to one account and is cleared when another account
+  becomes active, so a group shared by two accounts gets a receipt from each.
+
 No other part of the request changed: the endpoints, `msgInfos` shape, `grid` /
 `senderId` and `imei` are the same.
 
 ## Verification
 
 - Unit tests:
+  - `seen_receipts_dedupe_per_account_and_retry_after_failure` (`src/gui.rs`);
   - `seen_target_ids_prefer_wire_server_and_client_ids` (`src/chat.rs`);
   - `seen_receipt_targets_newest_incoming_message` (`src/gui.rs`).
 - Manual, on a real account:
