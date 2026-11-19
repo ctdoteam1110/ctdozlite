@@ -607,6 +607,8 @@ pub enum WorkerCmd {
         url: String,
     },
     SendSeen {
+        /// Account the GUI recorded the receipt under, echoed back on failure.
+        account: String,
         thread_id: String,
         is_group: bool,
         /// Server `msgId` of the newest incoming message.
@@ -4814,12 +4816,14 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::SendSeen {
+                            account,
                             thread_id,
                             is_group,
                             gmi,
                             cmi,
                         } => {
                             let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
                                 if let Err(err) =
@@ -4829,6 +4833,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         "gui::worker::send_seen",
                                         &format!("group={is_group}: {err:#}"),
                                     );
+                                    // The next read of this thread sends the receipt again.
+                                    let _ = gui_tx_clone.send(GuiEvent::SeenReceiptFailed {
+                                        account,
+                                        thread_id,
+                                        gmi,
+                                    });
                                 }
                             });
                         }

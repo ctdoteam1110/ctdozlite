@@ -729,6 +729,12 @@ pub enum GuiEvent {
     StickerImageFailed {
         key: String,
     },
+    /// A seen receipt request failed; it may be sent again.
+    SeenReceiptFailed {
+        account: String,
+        thread_id: String,
+        gmi: String,
+    },
     StickerStoreLoaded(Vec<crate::chat::StickerPackInfo>),
     StickerPackItemsLoaded {
         cate_id: u64,
@@ -1604,8 +1610,8 @@ pub struct ZaloGuiApp {
     notified_msg_ids: HashSet<String>,
     /// `(uin, banner progress)`: persisted so replayed reactions do not re-banner.
     reaction_banner_mark: (String, crate::reactions::BannerMark),
-    /// Last `gmi` sent in a seen receipt per thread, so a repaint never resends it.
-    seen_receipts_sent: HashMap<String, String>,
+    /// Seen receipts already sent, so a repaint never resends one.
+    seen_receipts: SeenReceipts,
     link_metadata_cache: HashMap<String, crate::chat::LinkMetadata>,
     loading_link_previews: HashSet<String>,
     /// Tin đang chờ dịch (translate_request_key) → disable menu Dịch.
@@ -1998,7 +2004,7 @@ impl ZaloGuiApp {
             reaction_unread_counts: HashMap::new(),
             notified_msg_ids: HashSet::new(),
             reaction_banner_mark: (String::new(), Default::default()),
-            seen_receipts_sent: HashMap::new(),
+            seen_receipts: SeenReceipts::default(),
             link_metadata_cache: HashMap::new(),
             loading_link_previews: HashSet::new(),
             translate_pending: HashSet::new(),
@@ -2616,9 +2622,15 @@ impl ZaloGuiApp {
         }
     }
 
+    /// The selected conversation is on screen: Contacts and Feed replace it but keep
+    /// `selected_thread_index`.
+    fn chat_view_visible(&self) -> bool {
+        !self.contacts_view_open && !self.feed_modal_open
+    }
+
     /// Clear active thread's unread badge and advance its read-point when focused (#146).
     fn mark_active_thread_read_if_focused(&mut self, ctx: &egui::Context) {
-        if !ctx.input(|i| i.focused) {
+        if !ctx.input(|i| i.focused) || !self.chat_view_visible() {
             return;
         }
         let Some(t) = self.threads.get_mut(self.selected_thread_index) else {
@@ -2644,7 +2656,12 @@ impl ZaloGuiApp {
                 }
             });
         }
-        send_seen_receipt(t, self.settings.block_seen, &mut self.seen_receipts_sent);
+        send_seen_receipt(
+            t,
+            self.settings.block_seen,
+            &self.user_uin,
+            &mut self.seen_receipts,
+        );
         let total_unread: usize = self.unread_counts.values().sum();
         let title = if total_unread > 0 {
             format!("({total_unread}) ctdozlite")
@@ -3043,12 +3060,16 @@ impl ZaloGuiApp {
                         }
                         // The open conversation is on screen: report it read up to its newest
                         // incoming message, whatever the unread bookkeeping above decided.
-                        if is_focused && update_ids.contains(&active_tid) {
+                        if is_focused
+                            && self.chat_view_visible()
+                            && update_ids.contains(&active_tid)
+                        {
                             if let Some(t) = self.threads.iter().find(|t| t.id == active_tid) {
                                 send_seen_receipt(
                                     t,
                                     self.settings.block_seen,
-                                    &mut self.seen_receipts_sent,
+                                    &self.user_uin,
+                                    &mut self.seen_receipts,
                                 );
                             }
                         }
@@ -3850,6 +3871,13 @@ impl ZaloGuiApp {
                     };
                     let tex = ctx.load_texture(&key, image, options);
                     self.sticker_textures.insert(key, tex);
+                }
+                GuiEvent::SeenReceiptFailed {
+                    account,
+                    thread_id,
+                    gmi,
+                } => {
+                    self.seen_receipts.forget_failed(&account, &thread_id, &gmi);
                 }
                 GuiEvent::StickerImageFailed { key } => {
                     self.loading_stickers.remove(&key);
@@ -6284,13 +6312,47 @@ fn detect_windows_os_dark_mode() -> Option<bool> {
     }
 }
 
+/// Seen receipts already sent: the last `gmi` per thread, for one account.
+#[derive(Default)]
+pub(crate) struct SeenReceipts {
+    account: String,
+    sent: HashMap<String, String>,
+}
+
+impl SeenReceipts {
+    /// Record a receipt for `account` unless it was already sent. Returns `false` for a
+    /// duplicate. Entries of a previous account are dropped, so a shared group still gets
+    /// a receipt from the account that is active now.
+    fn record(&mut self, account: &str, thread_id: &str, gmi: &str) -> bool {
+        if self.account != account {
+            self.account = account.to_string();
+            self.sent.clear();
+        }
+        if self.sent.get(thread_id).map(String::as_str) == Some(gmi) {
+            return false;
+        }
+        self.sent.insert(thread_id.to_string(), gmi.to_string());
+        true
+    }
+
+    /// Make a receipt whose request failed eligible to be sent again.
+    pub(crate) fn forget_failed(&mut self, account: &str, thread_id: &str, gmi: &str) {
+        if self.account == account && self.sent.get(thread_id).map(String::as_str) == Some(gmi) {
+            self.sent.remove(thread_id);
+        }
+    }
+}
+
 /// Tell Zalo the thread is read up to its newest incoming message, so the phone and other
 /// devices clear their unread badge. Skipped when "Ẩn trạng thái đã xem" (`block_seen`) is
 /// on, when there is no incoming message, or when that message was already reported.
+/// The worker reports a failed request with `GuiEvent::SeenReceiptFailed`, which makes
+/// the receipt eligible again.
 pub(crate) fn send_seen_receipt(
     thread: &Thread,
     block_seen: bool,
-    sent: &mut HashMap<String, String>,
+    account: &str,
+    receipts: &mut SeenReceipts,
 ) {
     if block_seen {
         return;
@@ -6298,22 +6360,21 @@ pub(crate) fn send_seen_receipt(
     let Some((gmi, cmi)) = seen_receipt_target(thread) else {
         return;
     };
-    if sent.get(&thread.id) == Some(&gmi) {
-        return;
-    }
     let Some(tx) = WORKER_TX.get() else {
         return;
     };
-    if tx
-        .send(WorkerCmd::SendSeen {
-            thread_id: thread.id.clone(),
-            is_group: thread.is_group,
-            gmi: gmi.clone(),
-            cmi,
-        })
-        .is_ok()
-    {
-        sent.insert(thread.id.clone(), gmi);
+    if !receipts.record(account, &thread.id, &gmi) {
+        return;
+    }
+    let cmd = WorkerCmd::SendSeen {
+        account: account.to_string(),
+        thread_id: thread.id.clone(),
+        is_group: thread.is_group,
+        gmi: gmi.clone(),
+        cmi,
+    };
+    if tx.send(cmd).is_err() {
+        receipts.forget_failed(account, &thread.id, &gmi);
     }
 }
 
@@ -6444,6 +6505,33 @@ mod tests {
             });
         }
         thread
+    }
+
+    #[test]
+    fn seen_receipts_dedupe_per_account_and_retry_after_failure() {
+        let mut receipts = crate::gui::SeenReceipts::default();
+        assert!(receipts.record("acc1", "g1", "7001"));
+        assert!(
+            !receipts.record("acc1", "g1", "7001"),
+            "repaint must not resend"
+        );
+        assert!(
+            receipts.record("acc1", "g1", "7002"),
+            "newer message is reported"
+        );
+
+        // A failed request makes the same receipt eligible again.
+        receipts.forget_failed("acc1", "g1", "7002");
+        assert!(receipts.record("acc1", "g1", "7002"));
+        // A stale failure for an older message does not drop the newer entry.
+        receipts.forget_failed("acc1", "g1", "7001");
+        assert!(!receipts.record("acc1", "g1", "7002"));
+
+        // Another account reports a shared group even for the same message.
+        assert!(receipts.record("acc2", "g1", "7002"));
+        // A failure reported for the previous account is ignored.
+        receipts.forget_failed("acc1", "g1", "7002");
+        assert!(!receipts.record("acc2", "g1", "7002"));
     }
 
     #[test]

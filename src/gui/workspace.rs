@@ -2224,7 +2224,8 @@ impl ZaloGuiApp {
                         crate::gui::send_seen_receipt(
                             t,
                             self.settings.block_seen,
-                            &mut self.seen_receipts_sent,
+                            &self.user_uin,
+                            &mut self.seen_receipts,
                         );
                     }
                     let is_cloud = self
