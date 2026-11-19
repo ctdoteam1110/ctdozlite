@@ -6849,8 +6849,7 @@ impl ZaloGuiApp {
 
                                             let vanish_now_ms =
                                                 crate::login::unix_now().saturating_mul(1000);
-                                            let view_rect = ui.clip_rect();
-                                            let view_margin = view_rect.height() * 1.5;
+                                            let culler = RowCuller::new(ui);
                                             let row_width_bucket = (ui.available_width() / 8.0).round() as u32;
                                             // Over the cap, keep only this list's rows (collected
                                             // below) so the open conversation keeps its layout.
@@ -6901,18 +6900,14 @@ impl ZaloGuiApp {
                                                 if evict_row_heights {
                                                     live_row_keys.push(row_key);
                                                 }
-                                                let row_top = ui.cursor().top();
-                                                let known_h = self.chat_row_heights.get(&row_key).copied();
-                                                let guess_h = known_h.unwrap_or(CHAT_ROW_ESTIMATE_H);
-                                                let near_view = row_top + guess_h >= view_rect.top() - view_margin
-                                                    && row_top <= view_rect.bottom() + view_margin;
                                                 let is_jump_row = jump_index.is_some_and(|j| {
                                                     visible_indices[pos..pos + run_len].contains(&j)
                                                 });
-                                                if !near_view && !is_jump_row {
-                                                    ui.allocate_space(Vec2::new(ui.available_width(), guess_h));
+                                                let Some(slot) =
+                                                    culler.begin(ui, &self.chat_row_heights, row_key, is_jump_row)
+                                                else {
                                                     continue;
-                                                }
+                                                };
 
                                                 if should_show_time_divider(prev_msg, msg) {
                                                     if pos > 0 {
@@ -7041,10 +7036,7 @@ impl ZaloGuiApp {
                                                     );
                                                     jump_target_y = Some(row.response.rect.top() - content_top);
                                                 }
-                                                let measured = (ui.cursor().top() - row_top).max(0.0);
-                                                if !known_h.is_some_and(|h| (h - measured).abs() <= 0.5) {
-                                                    self.chat_row_heights.insert(row_key, measured);
-                                                }
+                                                RowCuller::finish(ui, &mut self.chat_row_heights, slot);
                                             }
                                             if evict_row_heights {
                                                 let live: std::collections::HashSet<u64> = live_row_keys.into_iter().collect();
@@ -10580,6 +10572,141 @@ mod quote_navigation_tests {
         assert_eq!(key(base), key(base));
     }
 
+    /// Height of row `i` in the culling tests: between 40 and 196 px, never the estimate.
+    fn culling_row_height(i: usize) -> f32 {
+        40.0 + ((i * 37) % 157) as f32
+    }
+
+    /// One frame of a 1 000-row list laid out through [`RowCuller`], like the chat view.
+    /// Returns the target row's content-space top and whether it ended up on screen.
+    fn culling_frame(
+        ctx: &egui::Context,
+        frame: usize,
+        heights: &mut HashMap<u64, f32>,
+        jump: Option<&QuoteJump>,
+        target: usize,
+    ) -> (Option<f32>, bool) {
+        let mut target_y = None;
+        let mut visible = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                time: Some(frame as f64 * 0.5),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(400.0, 300.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("culling_jump_test")
+                        .max_height(200.0)
+                        .stick_to_bottom(jump.is_none())
+                        .show(ui, |ui| {
+                            let culler = RowCuller::new(ui);
+                            let content_top = ui.min_rect().top();
+                            for i in 0..1000 {
+                                let is_target = jump.is_some() && i == target;
+                                let Some(slot) = culler.begin(ui, heights, i as u64, is_target)
+                                else {
+                                    continue;
+                                };
+                                let (rect, _) = ui.allocate_exact_size(
+                                    Vec2::new(200.0, culling_row_height(i)),
+                                    Sense::hover(),
+                                );
+                                if let (true, Some(jump)) = (is_target, jump) {
+                                    render_quote_target(
+                                        ui,
+                                        rect,
+                                        jump.scroll_pending,
+                                        Color32::from_rgb(1, 2, 3),
+                                    );
+                                    target_y = Some(rect.top() - content_top);
+                                    visible = ui.clip_rect().contains(rect.center());
+                                }
+                                RowCuller::finish(ui, heights, slot);
+                            }
+                        });
+                });
+            },
+        );
+        (target_y, visible)
+    }
+
+    fn culling_jump(target: &str) -> QuoteJump {
+        QuoteJump {
+            thread_id: "t".into(),
+            reference: target.into(),
+            highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            scroll_pending: true,
+            target_y: None,
+        }
+    }
+
+    #[test]
+    fn distant_quote_jump_stays_in_view_while_culled_rows_get_measured() {
+        let ctx = egui::Context::default();
+        let mut heights = HashMap::new();
+        let target = 120;
+        // Settle at the bottom: only rows near the end get measured.
+        for frame in 0..3 {
+            culling_frame(&ctx, frame, &mut heights, None, target);
+        }
+        assert!(
+            !heights.contains_key(&(target as u64)),
+            "the target starts culled and unmeasured"
+        );
+
+        let mut jump = culling_jump("target");
+        let mut rescrolls = 0;
+        let mut visible = false;
+        for frame in 3..20 {
+            let (y, on_screen) = culling_frame(&ctx, frame, &mut heights, Some(&jump), target);
+            let y = y.expect("the jump target is always laid out");
+            let was_pending = jump.scroll_pending;
+            jump.observe_target(y);
+            if !was_pending && jump.scroll_pending {
+                rescrolls += 1;
+            }
+            visible = on_screen;
+        }
+        assert!(
+            rescrolls >= 1,
+            "rows above the target got real heights, so the target moved and was re-scrolled"
+        );
+        assert!(
+            !jump.scroll_pending,
+            "the jump settles once heights stop changing"
+        );
+        assert!(visible, "the target must end on screen");
+    }
+
+    #[test]
+    fn quote_jump_scrolls_once_when_row_heights_are_already_known() {
+        let ctx = egui::Context::default();
+        let target = 120;
+        // Every row already measured: nothing above the target can move.
+        let mut heights: HashMap<u64, f32> = (0..1000)
+            .map(|i| (i as u64, culling_row_height(i)))
+            .collect();
+        culling_frame(&ctx, 0, &mut heights, None, target);
+
+        let mut jump = culling_jump("target");
+        let mut visible = false;
+        for frame in 1..12 {
+            let (y, on_screen) = culling_frame(&ctx, frame, &mut heights, Some(&jump), target);
+            jump.observe_target(y.expect("the jump target is always laid out"));
+            assert!(
+                !jump.scroll_pending,
+                "frame {frame}: one-shot scroll, never re-armed"
+            );
+            visible = on_screen;
+        }
+        assert!(visible, "the target must end on screen");
+    }
+
     #[test]
     fn quote_navigation_keeps_animated_jump_visible_after_highlight_expires() {
         for (count, target) in [(1000, 12), (1000, 900), (150, 12)] {
@@ -10711,6 +10838,61 @@ fn truncate_to_width(ui: &egui::Ui, text: &str, font: FontId, max_w: f32) -> Str
 
 /// Height used for a chat row that has not been laid out yet (viewport-only rendering).
 const CHAT_ROW_ESTIMATE_H: f32 = 72.0;
+
+/// Viewport-only layout of the chat list: a row far from the visible area is replaced by
+/// a spacer of its last measured height (or [`CHAT_ROW_ESTIMATE_H`]), so a frame lays out
+/// tens of bubbles instead of every loaded message.
+struct RowCuller {
+    view: egui::Rect,
+    margin: f32,
+}
+
+/// A row [`RowCuller::begin`] decided to draw; hand it back to [`RowCuller::finish`].
+struct RowSlot {
+    key: u64,
+    top: f32,
+    known_h: Option<f32>,
+}
+
+impl RowCuller {
+    /// Rows within 1.5 viewport heights of the visible area are drawn.
+    fn new(ui: &egui::Ui) -> Self {
+        let view = ui.clip_rect();
+        Self {
+            view,
+            margin: view.height() * 1.5,
+        }
+    }
+
+    /// Leave a spacer and return `None` for a row far from the viewport, unless `force`
+    /// (a quote-jump target is always drawn); otherwise return the slot to draw into.
+    fn begin(
+        &self,
+        ui: &mut egui::Ui,
+        heights: &HashMap<u64, f32>,
+        key: u64,
+        force: bool,
+    ) -> Option<RowSlot> {
+        let top = ui.cursor().top();
+        let known_h = heights.get(&key).copied();
+        let guess_h = known_h.unwrap_or(CHAT_ROW_ESTIMATE_H);
+        let near_view = top + guess_h >= self.view.top() - self.margin
+            && top <= self.view.bottom() + self.margin;
+        if !near_view && !force {
+            ui.allocate_space(Vec2::new(ui.available_width(), guess_h));
+            return None;
+        }
+        Some(RowSlot { key, top, known_h })
+    }
+
+    /// Record the height the drawn row actually took.
+    fn finish(ui: &egui::Ui, heights: &mut HashMap<u64, f32>, slot: RowSlot) {
+        let measured = (ui.cursor().top() - slot.top).max(0.0);
+        if !slot.known_h.is_some_and(|h| (h - measured).abs() <= 0.5) {
+            heights.insert(slot.key, measured);
+        }
+    }
+}
 
 /// Cache key of a chat row's measured height: the message identity plus what changes its
 /// height (text, attachments, reactions, translation, album size) and the width bucket.
