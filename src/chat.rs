@@ -4317,6 +4317,45 @@ pub async fn send_quote_message(
         .await
 }
 
+/// Wire identity of a quoted message, as the quote endpoints expect it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuoteTarget {
+    /// `qmsgOwner`: uid of the quoted message's sender.
+    pub owner: String,
+    /// `qmsgId`: server `msgId`.
+    pub msg_id: Option<String>,
+    /// `qmsgCliId`: sender's `cliMsgId`.
+    pub cli_msg_id: Option<String>,
+}
+
+/// Resolve `qmsgOwner` / `qmsgId` / `qmsgCliId` from wire identity.
+///
+/// `ChatMessage::sender` is a display name for many group rows, and `ChatMessage::id`
+/// may hold the `cliMsgId` (`35_exact_message_identity.md`), so neither is used directly.
+pub(crate) fn quote_target(
+    quoted: &ChatMessage,
+    my_uid: &str,
+    to_id: &str,
+    is_group: bool,
+) -> QuoteTarget {
+    let owner = if quoted.is_outgoing {
+        my_uid.to_string()
+    } else if let Some(uid) = sidebar_sender_id(quoted) {
+        uid
+    } else if !quoted.sender.is_empty() && quoted.sender.bytes().all(|b| b.is_ascii_digit()) {
+        quoted.sender.clone()
+    } else if !is_group {
+        to_id.to_string()
+    } else {
+        "0".to_string()
+    };
+    QuoteTarget {
+        owner,
+        msg_id: server_message_id(quoted),
+        cli_msg_id: client_message_id(quoted),
+    }
+}
+
 /// Preserve the request client ID for reconciliation with a later server echo.
 pub(crate) async fn send_quote_message_with_client_id(
     s: &Session,
@@ -4336,28 +4375,27 @@ pub(crate) async fn send_quote_message_with_client_id(
         .map(|l| l.uin.clone())
         .unwrap_or_else(|| "0".into());
 
-    let qmsg_owner = if quoted.is_outgoing {
-        my_uid.as_str()
-    } else if !quoted.sender.is_empty() && quoted.sender.chars().all(|c| c.is_ascii_digit()) {
-        quoted.sender.as_str()
-    } else if !is_group {
-        to_id
-    } else {
-        "0"
-    };
-
-    let qmsg_id_num = quoted.id.parse::<u64>().unwrap_or(now.saturating_sub(1000));
+    let target = quote_target(quoted, &my_uid, to_id, is_group);
+    let qmsg_owner = target.owner.as_str();
+    let qmsg_id_num = target
+        .msg_id
+        .as_deref()
+        .and_then(|id| id.parse::<u64>().ok())
+        .unwrap_or(0);
+    let qmsg_cli_id = target
+        .cli_msg_id
+        .as_deref()
+        .and_then(|id| id.parse::<u64>().ok())
+        .unwrap_or(qmsg_id_num);
     let qmsg_ts = if quoted.ts > 0 {
         quoted.ts as u64
     } else {
         now.saturating_sub(1000)
     };
-    let qmsg_cli_id = qmsg_ts;
 
     let quote_res: Result<Value> = async {
-        if quoted.id.starts_with("out_") || quoted.id.starts_with("local_") || quoted.id.is_empty()
-        {
-            anyhow::bail!("local quote id");
+        if quoted.id.starts_with("local_") || qmsg_id_num == 0 {
+            anyhow::bail!("quoted message has no server id");
         }
         if is_group {
             let clean_grid = to_id
@@ -4390,7 +4428,12 @@ pub(crate) async fn send_quote_message_with_client_id(
             let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
             if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
                 if code != 0 {
-                    anyhow::bail!("quote error {code}");
+                    anyhow::bail!(
+                        "quote error {code}: {}",
+                        resp.get("error_message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                    );
                 }
             }
             Ok(resp)
@@ -4427,7 +4470,12 @@ pub(crate) async fn send_quote_message_with_client_id(
             let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
             if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
                 if code != 0 {
-                    anyhow::bail!("quote error {code}");
+                    anyhow::bail!(
+                        "quote error {code}: {}",
+                        resp.get("error_message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                    );
                 }
             }
             Ok(resp)
@@ -4437,7 +4485,12 @@ pub(crate) async fn send_quote_message_with_client_id(
 
     match quote_res {
         Ok(r) => Ok(r),
-        Err(_) => {
+        Err(err) => {
+            // The plain message still goes out, but the reply link is lost; leave a trace.
+            crate::logger::log_error(
+                "chat::send_quote",
+                &format!("quote failed, sending without reply link: {err}"),
+            );
             if is_group {
                 send_group_message_with_client_id(s, to_id, text, now).await
             } else {
@@ -9670,6 +9723,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quote_target_uses_wire_sender_and_message_ids() {
+        // Group row as stored from a live push: display name in `sender`, uid on the wire.
+        let group_row = ChatMessage {
+            id: "8506658781118".into(),
+            sender: "Vũ Thái Học".into(),
+            client_message_id: "1795077587420".into(),
+            ts: 1795077587922,
+            wire_ref: crate::message_model::WireMessageRef {
+                server_id: Some(json!("8506658781118")),
+                client_id: Some(json!("1795077587420")),
+                sender: Some(json!("2526995101091055705")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            quote_target(&group_row, "me", "g1", true),
+            QuoteTarget {
+                owner: "2526995101091055705".into(),
+                msg_id: Some("8506658781118".into()),
+                cli_msg_id: Some("1795077587420".into()),
+            }
+        );
+
+        // `id` holding the cliMsgId must not be sent as qmsgId.
+        let by_client_id = ChatMessage {
+            id: "1795077587420".into(),
+            ..group_row.clone()
+        };
+        assert_eq!(
+            quote_target(&by_client_id, "me", "g1", true)
+                .msg_id
+                .as_deref(),
+            Some("8506658781118")
+        );
+
+        // Own message: owner is our uid even though the wire sender is "0".
+        let own = ChatMessage {
+            is_outgoing: true,
+            wire_ref: crate::message_model::WireMessageRef {
+                sender: Some(json!("0")),
+                ..group_row.wire_ref.clone()
+            },
+            ..group_row.clone()
+        };
+        assert_eq!(quote_target(&own, "me", "g1", true).owner, "me");
+
+        // 1-1 without any uid falls back to the peer.
+        let peer = ChatMessage {
+            sender: "An".into(),
+            wire_ref: Default::default(),
+            ..group_row
+        };
+        assert_eq!(quote_target(&peer, "me", "u42", false).owner, "u42");
+    }
+
+    #[test]
     fn media_group_layout_reads_incoming_params() {
         let content = json!({
             "href": "https://b-f17-zpcloud.zdn.vn/1/a.jpg",
@@ -10719,7 +10829,8 @@ mod send_identity_tests {
             "contact-1",
             "Text",
             &ChatMessage {
-                id: "server-quote".into(),
+                // A numeric server id, so the quote request is attempted (and fails over).
+                id: "8506658781118".into(),
                 ..Default::default()
             },
             false,
