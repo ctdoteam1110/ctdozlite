@@ -2031,6 +2031,7 @@ impl MessageStore {
                 let mut link_thumb = None;
                 let mut link_src = None;
                 let mut media_group: Option<crate::chat::MediaGroupLayout> = None;
+                let mut media_size: Option<[u32; 2]> = None;
                 if !sm.raw_json.is_empty() {
                     // Expiry tombstone (`{"vanished":true}`): authoritative —
                     // keep the tombstone text, restore NO metadata, and never
@@ -2164,6 +2165,9 @@ impl MessageStore {
                         media_group = val
                             .get("media_group")
                             .and_then(|v| serde_json::from_value(v.clone()).ok());
+                        media_size = val
+                            .get("media_size")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok());
                     }
                 }
                 let is_video_url = link_url.as_deref().is_some_and(|u| {
@@ -2244,6 +2248,7 @@ impl MessageStore {
                     link_thumb,
                     link_src,
                     media_group,
+                    media_size,
 
                     ..Default::default()
                 };
@@ -2399,6 +2404,9 @@ impl From<&ChatMessage> for StoredMessage {
         }
         if let Some(group) = &m.media_group {
             meta.insert("media_group".into(), serde_json::json!(group));
+        }
+        if let Some(size) = &m.media_size {
+            meta.insert("media_size".into(), serde_json::json!(size));
         }
         let raw_json = if meta.is_empty() {
             String::new()
@@ -3869,6 +3877,47 @@ mod tests {
             expired.text.trim() == crate::chat::VANISH_EXPIRED_TEXT
                 || expired.raw_json.trim() == crate::store::VANISH_TOMBSTONE_JSON
         );
+    }
+
+    #[test]
+    fn photo_declared_size_survives_store_and_hydrate() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let photo = ChatMessage {
+            id: "m_photo".into(),
+            sender: "Alice".into(),
+            text: "[Hình ảnh]".into(),
+            ts: 1000,
+            link_url: Some("https://f60-zpg-r.zdn.vn/photo.jpg".into()),
+            link_src: Some("Hình ảnh Zalo".into()),
+            media_size: Some([1280, 960]),
+            ..Default::default()
+        };
+        let mut row = StoredMessage::from(&photo);
+        row.thread_id = "t1".into();
+        store.upsert_message(&row).unwrap();
+        store
+            .upsert_thread(&StoredThread {
+                thread_id: "t1".into(),
+                name: "Alice".into(),
+                is_group: false,
+                last_ts: 1000,
+                vanish_duration_sec: 0,
+                vanish_started_at_sec: 0,
+                last_read_msg_id: String::new(),
+            })
+            .unwrap();
+        let mut threads = Vec::new();
+        store.hydrate_threads(&mut threads, 10).unwrap();
+        let t = threads
+            .iter()
+            .find(|t| t.id == "t1")
+            .expect("thread hydrated");
+        let m = t
+            .messages
+            .iter()
+            .find(|m| m.id == "m_photo")
+            .expect("msg hydrated");
+        assert_eq!(m.media_size, Some([1280, 960]));
     }
 
     #[test]
