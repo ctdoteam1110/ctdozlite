@@ -2288,6 +2288,16 @@ fn content_params(content: &Value) -> Option<Value> {
 /// Read a photo's declared pixel size from `content.params` (`width`, `height`), as numbers
 /// or numeric strings. Returns `None` unless both are positive.
 pub(crate) fn photo_size_from_content(content: &Value) -> Option<[u32; 2]> {
+    params_size(content, "width", "height")
+}
+
+/// Read a video's declared pixel size from `content.params` (`video_width`, `video_height`,
+/// the fields Zalo's web client reads for `MSG_VIDEO`).
+pub(crate) fn video_size_from_content(content: &Value) -> Option<[u32; 2]> {
+    params_size(content, "video_width", "video_height")
+}
+
+fn params_size(content: &Value, width_key: &str, height_key: &str) -> Option<[u32; 2]> {
     let params = content_params(content)?;
     let dim = |key: &str| -> Option<u32> {
         let v = params.get(key)?;
@@ -2297,7 +2307,7 @@ pub(crate) fn photo_size_from_content(content: &Value) -> Option<[u32; 2]> {
             .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))?;
         u32::try_from(n).ok().filter(|&n| n > 0)
     };
-    Some([dim("width")?, dim("height")?])
+    Some([dim(width_key)?, dim(height_key)?])
 }
 
 impl MediaGroupLayout {
@@ -7054,6 +7064,8 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         },
         media_size: if is_photo_msg {
             raw_content_val.and_then(photo_size_from_content)
+        } else if is_video_msg {
+            raw_content_val.and_then(video_size_from_content)
         } else {
             None
         },
@@ -9742,6 +9754,10 @@ mod tests {
             );
         }
         assert_eq!(photo_size_from_content(&json!({ "href": "x" })), None);
+        let video =
+            json!({ "params": "{\"duration\":5000,\"video_width\":720,\"video_height\":1280}" });
+        assert_eq!(video_size_from_content(&video), Some([720, 1280]));
+        assert_eq!(photo_size_from_content(&video), None);
     }
 
     #[test]

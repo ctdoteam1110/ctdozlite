@@ -65,6 +65,10 @@ pub(super) fn render_sticker_widget(
     if let Some(tex) = sticker_textures.get(&key) {
         ui.image((tex.id(), Vec2::new(116.0, 116.0)));
         true
+    } else if !failed_stickers.contains_key(&key) {
+        // Still loading: hold the sticker's space so the row does not grow when it arrives.
+        ui.allocate_exact_size(Vec2::new(116.0, 116.0), Sense::hover());
+        true
     } else {
         false
     }
@@ -2052,7 +2056,7 @@ pub(super) fn render_message_body(
                         let _ = open_external_url(&open_target);
                     }
                 } else {
-                    let src = photo_source_size(msg, Some([tw, th])).unwrap_or(Vec2::splat(1.0));
+                    let src = media_source_size(msg, Some([tw, th])).unwrap_or(Vec2::splat(1.0));
                     let disp = photo_display_size(src, max_text_width);
                     let img = egui::Image::new(tex)
                         .fit_to_exact_size(disp)
@@ -2109,7 +2113,7 @@ pub(super) fn render_message_body(
             } else {
                 // Loading placeholder. With a declared size it takes the space the loaded photo
                 // will take, so the list does not jump when the thumbnail arrives.
-                let disp = photo_source_size(msg, None)
+                let disp = media_source_size(msg, None)
                     .map(|src| photo_display_size(src, max_text_width))
                     .unwrap_or(Vec2::new(max_text_width.clamp(110.0, 280.0), 150.0));
                 let (rect, resp) = ui.allocate_exact_size(disp, Sense::click());
@@ -2315,7 +2319,8 @@ pub(super) fn render_message_body(
     // 2. Optional compact thumbnail directly inside the bubble (no nested card box)
     if let Some(thumb_url) = msg.link_thumb.as_deref().filter(|u| !u.is_empty()) {
         let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
-        if thumb_url.starts_with("http://") || thumb_url.starts_with("https://") {
+        let is_remote = thumb_url.starts_with("http://") || thumb_url.starts_with("https://");
+        if is_remote {
             crate::gui::queue_sticker_fetch(
                 sticker_textures,
                 loading_stickers,
@@ -2324,17 +2329,15 @@ pub(super) fn render_message_body(
                 thumb_url.to_string(),
             );
         }
+        // Fixed-size box (the thumbnail is center-cropped into it), reserved while the
+        // thumbnail loads, so the row keeps one height.
+        let box_size = link_thumb_box_size(max_text_width);
         if let Some(tex) = sticker_textures.get(&key) {
             let [tw, th] = tex.size();
-            let aspect = if tw > 0 && th > 0 {
-                (th as f32 / tw as f32).clamp(0.45, 0.85)
-            } else {
-                0.56
-            };
-            let thumb_w = max_text_width.min(260.0);
-            let img_h = (thumb_w * aspect).min(132.0);
             let img = egui::Image::new(tex)
-                .fit_to_exact_size(Vec2::new(thumb_w, img_h))
+                .uv(cover_uv_for(tw as f32, th as f32, box_size.x / box_size.y))
+                .fit_to_exact_size(box_size)
+                .maintain_aspect_ratio(false)
                 .rounding(Rounding::same(6.0))
                 .sense(Sense::click());
             if ui
@@ -2345,6 +2348,11 @@ pub(super) fn render_message_body(
             {
                 let _ = open_external_url(&url);
             }
+            ui.add_space(5.0);
+        } else if is_remote && !failed_stickers.contains_key(&key) {
+            let (rect, _) = ui.allocate_exact_size(box_size, Sense::hover());
+            ui.painter()
+                .rect_filled(rect, Rounding::same(6.0), text_col.linear_multiply(0.06));
             ui.add_space(5.0);
         }
     }
@@ -2611,10 +2619,16 @@ fn render_image_file_card(
             key.clone(),
             url.to_string(),
         );
-        if let Some(tex) = sticker_textures.get(&key) {
-            let [tw, th] = tex.size();
-            if tw > 2 && th > 2 {
-                let (thumb_w, thumb_h) = compute_video_thumb_size(tw, th, max_text_width);
+        let tex = sticker_textures.get(&key).filter(|t| {
+            let [tw, th] = t.size();
+            tw > 2 && th > 2
+        });
+        // While the preview loads, draw the card with an empty box of the same size.
+        let loading = !sticker_textures.contains_key(&key) && !failed_stickers.contains_key(&key);
+        {
+            if tex.is_some() || loading {
+                // Fixed-size preview (center-cropped), so loading does not change the row height.
+                let (thumb_w, thumb_h) = image_file_preview_size(max_text_width);
                 let full_url = msg
                     .link_url
                     .as_deref()
@@ -2630,12 +2644,35 @@ fn render_image_file_card(
                         if left_offset > 0.0 {
                             ui.add_space(left_offset);
                         }
-                        ui.add(
-                            egui::Image::new(tex)
-                                .fit_to_exact_size(Vec2::new(thumb_w, thumb_h))
-                                .rounding(Rounding::same(8.0))
-                                .sense(Sense::click()),
-                        )
+                        let size = Vec2::new(thumb_w, thumb_h);
+                        match tex {
+                            Some(tex) => {
+                                let [tw, th] = tex.size();
+                                ui.add(
+                                    egui::Image::new(tex)
+                                        .uv(cover_uv_for(tw as f32, th as f32, thumb_w / thumb_h))
+                                        .fit_to_exact_size(size)
+                                        .maintain_aspect_ratio(false)
+                                        .rounding(Rounding::same(8.0))
+                                        .sense(Sense::click()),
+                                )
+                            }
+                            None => {
+                                let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                                ui.painter().rect_filled(
+                                    rect,
+                                    Rounding::same(8.0),
+                                    text_col.linear_multiply(0.06),
+                                );
+                                draw_icon_image(
+                                    ui.painter(),
+                                    rect.center(),
+                                    22.0,
+                                    text_col.linear_multiply(0.4),
+                                );
+                                resp
+                            }
+                        }
                     })
                     .inner
                     .on_hover_cursor(CursorIcon::PointingHand)
@@ -2776,29 +2813,41 @@ pub(crate) fn compute_video_thumb_size(tw: usize, th: usize, max_text_width: f32
     }
 }
 
+/// Video thumbnail with a play overlay and the title below. With `tex` `None` it draws an
+/// empty box of the declared video size, holding the space until the thumbnail loads.
 fn render_video_thumb_block(
     ui: &mut egui::Ui,
-    tex: &TextureHandle,
+    tex: Option<&TextureHandle>,
     key: &str,
     msg: &ChatMessage,
     title_str: &str,
     text_col: Color32,
     max_text_width: f32,
 ) -> Option<BubbleAction> {
-    let [tw, th] = tex.size();
-    if tw <= 2 || th <= 2 {
+    let tex_size = tex.map(|t| t.size());
+    if tex_size.is_some_and(|[tw, th]| tw <= 2 || th <= 2) {
         return None;
     }
-    let (thumb_w, img_h) = compute_video_thumb_size(tw, th, max_text_width);
-    let img_resp = ui
-        .add(
+    let src = media_source_size(msg, tex_size)?;
+    let (thumb_w, img_h) = compute_video_thumb_size(src.x as usize, src.y as usize, max_text_width);
+    let size = Vec2::new(thumb_w, img_h);
+    let img_resp = match tex {
+        Some(tex) => ui.add(
             egui::Image::new(tex)
-                .fit_to_exact_size(Vec2::new(thumb_w, img_h))
+                .fit_to_exact_size(size)
+                .maintain_aspect_ratio(false)
                 .rounding(Rounding::same(8.0))
                 .sense(Sense::click()),
-        )
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_text("Bấm để xem video");
+        ),
+        None => {
+            let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+            ui.painter()
+                .rect_filled(rect, Rounding::same(8.0), text_col.linear_multiply(0.06));
+            resp
+        }
+    }
+    .on_hover_cursor(CursorIcon::PointingHand)
+    .on_hover_text("Bấm để xem video");
     let pill_r = egui::Rect::from_center_size(img_resp.rect.center(), Vec2::new(46.0, 46.0));
     ui.painter()
         .circle_filled(pill_r.center(), 23.0, Color32::from_black_alpha(140));
@@ -2874,8 +2923,10 @@ fn render_video_card(
             key.clone(),
             thumb_url.to_string(),
         );
-        if let Some(tex) = sticker_textures.get(&key) {
-            if let Some(action) = render_video_thumb_block(
+        let tex = sticker_textures.get(&key);
+        // A thumbnail still loading draws a box of the declared size, when there is one.
+        if tex.is_some() || (msg.media_size.is_some() && !failed_stickers.contains_key(&key)) {
+            return render_video_thumb_block(
                 ui,
                 tex,
                 &key,
@@ -2883,10 +2934,7 @@ fn render_video_card(
                 &title_str,
                 text_col,
                 max_text_width,
-            ) {
-                return Some(action);
-            }
-            return None;
+            );
         }
     }
     if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
@@ -2899,8 +2947,9 @@ fn render_video_card(
                 });
             }
         }
-        if let Some(tex) = sticker_textures.get(&key) {
-            if let Some(action) = render_video_thumb_block(
+        let tex = sticker_textures.get(&key);
+        if tex.is_some() || (msg.media_size.is_some() && loading_stickers.contains(&key)) {
+            return render_video_thumb_block(
                 ui,
                 tex,
                 &key,
@@ -2908,10 +2957,7 @@ fn render_video_card(
                 &title_str,
                 text_col,
                 max_text_width,
-            ) {
-                return Some(action);
-            }
-            return None;
+            );
         }
     }
     render_video_fallback_card(ui, msg, &title_str, file_name, text_col, pal)
@@ -3426,11 +3472,11 @@ fn photo_display_size(src: Vec2, max_text_width: f32) -> Vec2 {
     )
 }
 
-/// Source size to lay out a single photo with. The sender's declared size wins, so the loading
-/// placeholder and the loaded photo take the same space. Once the thumbnail (`texture` pixels)
+/// Source size to lay out a single photo or video with. The sender's declared size wins, so the
+/// loading placeholder and the loaded thumbnail take the same space. Once the thumbnail (`texture` pixels)
 /// is loaded, the declared size is kept only if its aspect ratio matches the thumbnail's, so a
 /// wrong or rotated declaration never stretches the image. `None` when neither is known.
-fn photo_source_size(msg: &ChatMessage, texture: Option<[usize; 2]>) -> Option<Vec2> {
+fn media_source_size(msg: &ChatMessage, texture: Option<[usize; 2]>) -> Option<Vec2> {
     let declared = msg
         .media_size
         .filter(|&[w, h]| w > 0 && h > 0)
@@ -3470,19 +3516,37 @@ fn album_columns(count: usize) -> usize {
 
 /// UV sub-rectangle that center-crops a `tw`×`th` texture to a square tile ("cover").
 fn cover_uv(tw: f32, th: f32) -> Rect {
-    if tw <= 0.0 || th <= 0.0 {
+    cover_uv_for(tw, th, 1.0)
+}
+
+/// UV sub-rectangle that center-crops a `tw`×`th` texture to a box of aspect ratio `target`
+/// (width / height), so it fills the box without stretching.
+fn cover_uv_for(tw: f32, th: f32, target: f32) -> Rect {
+    if tw <= 0.0 || th <= 0.0 || target <= 0.0 || !target.is_finite() {
         return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
     }
-    let aspect = tw / th;
-    if aspect > 1.0 {
-        let span = 1.0 / aspect;
+    let ratio = (tw / th) / target;
+    if ratio > 1.0 {
+        let span = 1.0 / ratio;
         let start = (1.0 - span) / 2.0;
         Rect::from_min_max(Pos2::new(start, 0.0), Pos2::new(start + span, 1.0))
     } else {
-        let span = aspect;
+        let span = ratio;
         let start = (1.0 - span) / 2.0;
         Rect::from_min_max(Pos2::new(0.0, start), Pos2::new(1.0, start + span))
     }
+}
+
+/// Size of a link preview's thumbnail box. Zalo sends no size for these, so the box is fixed
+/// and the thumbnail is center-cropped into it.
+fn link_thumb_box_size(max_text_width: f32) -> Vec2 {
+    let w = max_text_width.min(260.0);
+    Vec2::new(w, (w * 0.56).min(132.0).round())
+}
+
+/// Size of an image file's preview: a fixed 4:3 box, since files carry no image size.
+fn image_file_preview_size(max_text_width: f32) -> (f32, f32) {
+    compute_video_thumb_size(4, 3, max_text_width)
 }
 
 /// Draw an album as a grid of square, center-cropped thumbnails; clicking a tile opens it.
@@ -3796,10 +3860,10 @@ pub(super) fn render_chat_bubble(
             if tw <= 2 || th <= 2 {
                 max_text_width.min(260.0).max(110.0)
             } else {
-                let src = photo_source_size(msg, Some([tw, th])).unwrap_or(Vec2::splat(1.0));
+                let src = media_source_size(msg, Some([tw, th])).unwrap_or(Vec2::splat(1.0));
                 photo_display_size(src, max_text_width).x
             }
-        } else if let Some(src) = photo_source_size(msg, None) {
+        } else if let Some(src) = media_source_size(msg, None) {
             photo_display_size(src, max_text_width).x
         } else {
             max_text_width.min(280.0).max(110.0)
@@ -3850,10 +3914,26 @@ pub(super) fn render_chat_bubble(
                         .filter(|u| !u.is_empty())
                         .map(video_thumb_key)
                 });
-            key.and_then(|k| sticker_textures.get(&k)).map(|tex| {
-                let [tw, th] = tex.size();
-                compute_video_thumb_size(tw, th, max_text_width)
-            })
+            // Mirrors the card renderers: an image file always gets its fixed preview box, a
+            // video its declared size; both also while the thumbnail is still loading.
+            let tex_size = key
+                .as_ref()
+                .and_then(|k| sticker_textures.get(k))
+                .map(|t| t.size());
+            let failed = key
+                .as_ref()
+                .is_some_and(|k| failed_stickers.contains_key(k));
+            if att_kind == Some(AttachmentKind::Image) {
+                let loaded = tex_size.is_some_and(|[tw, th]| tw > 2 && th > 2);
+                let loading = key.is_some() && tex_size.is_none() && !failed;
+                (loaded || loading).then(|| image_file_preview_size(max_text_width))
+            } else if tex_size.is_none() && failed {
+                None
+            } else {
+                media_source_size(msg, tex_size).map(|src| {
+                    compute_video_thumb_size(src.x as usize, src.y as usize, max_text_width)
+                })
+            }
         } else {
             None
         };
@@ -3865,13 +3945,20 @@ pub(super) fn render_chat_bubble(
             };
             vw.max(min_att_w).min(max_text_width)
         } else {
-            let has_loaded_thumb = msg
+            // A thumbnail that is loaded or still loading takes its fixed box, so the bubble
+            // width does not change when it arrives.
+            let has_thumb_box = msg
                 .link_thumb
                 .as_deref()
                 .filter(|u| !u.is_empty())
-                .map(|u| sticker_textures.contains_key(&format!("thumb_{}", crate::crypto::md5_hex(u))))
+                .map(|u| {
+                    let key = format!("thumb_{}", crate::crypto::md5_hex(u));
+                    let is_remote = u.starts_with("http://") || u.starts_with("https://");
+                    sticker_textures.contains_key(&key)
+                        || (is_remote && !failed_stickers.contains_key(&key))
+                })
                 .unwrap_or(false);
-            if has_loaded_thumb {
+            if has_thumb_box {
                 max_text_width.min(260.0)
             } else {
                 let (cap, url, dom) = extract_message_link_view(msg).unwrap_or_default();
@@ -5688,10 +5775,10 @@ mod album_grid_tests {
         msg.media_size = Some([1280, 960]);
         let max_text_width = 420.0;
         let placeholder =
-            photo_display_size(photo_source_size(&msg, None).unwrap(), max_text_width);
+            photo_display_size(media_source_size(&msg, None).unwrap(), max_text_width);
         // The thumbnail is smaller than the original but has the same aspect ratio.
         let loaded = photo_display_size(
-            photo_source_size(&msg, Some([480, 360])).unwrap(),
+            media_source_size(&msg, Some([480, 360])).unwrap(),
             max_text_width,
         );
         assert_eq!(placeholder, loaded);
@@ -5700,17 +5787,104 @@ mod album_grid_tests {
         // A declaration whose aspect ratio disagrees with the thumbnail must not stretch it.
         msg.media_size = Some([960, 1280]);
         assert_eq!(
-            photo_source_size(&msg, Some([480, 360])),
+            media_source_size(&msg, Some([480, 360])),
             Some(Vec2::new(480.0, 360.0))
         );
 
         // Without a declaration the placeholder has no size and the texture decides.
         msg.media_size = None;
-        assert_eq!(photo_source_size(&msg, None), None);
+        assert_eq!(media_source_size(&msg, None), None);
         assert_eq!(
-            photo_source_size(&msg, Some([480, 360])),
+            media_source_size(&msg, Some([480, 360])),
             Some(Vec2::new(480.0, 360.0))
         );
+    }
+
+    #[test]
+    fn cover_uv_for_crops_to_the_target_aspect() {
+        let wide = cover_uv_for(200.0, 100.0, 1.0);
+        assert!((wide.width() - 0.5).abs() < 1e-6 && (wide.min.x - 0.25).abs() < 1e-6);
+        assert_eq!(
+            cover_uv_for(200.0, 100.0, 2.0),
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
+        );
+        let tall = cover_uv_for(100.0, 200.0, 4.0 / 3.0);
+        assert!((tall.height() - 0.375).abs() < 1e-6 && tall.width() == 1.0);
+        assert_eq!(
+            cover_uv_for(0.0, 100.0, 1.0),
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
+        );
+    }
+
+    /// Height a closure takes when laid out in a fresh top-down `Ui`.
+    fn laid_out_height(add: impl FnOnce(&mut egui::Ui)) -> f32 {
+        let ctx = egui::Context::default();
+        let mut height = 0.0;
+        let mut add = Some(add);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                let top = ui.cursor().top();
+                (add.take().unwrap())(ui);
+                height = ui.cursor().top() - top;
+            });
+        });
+        height
+    }
+
+    #[test]
+    fn loading_sticker_and_video_hold_their_final_size() {
+        let sticker = ChatMessage {
+            id: "s".into(),
+            text: "[Nhãn dán]".into(),
+            sticker_id: Some(18663),
+            sticker_cate_id: Some(10130),
+            ..Default::default()
+        };
+        let textures = HashMap::new();
+        let mut failed = HashMap::new();
+        let mut drawn = false;
+        let h = laid_out_height(|ui| {
+            drawn = render_sticker_widget(ui, &sticker, &textures, &mut HashSet::new(), &failed);
+        });
+        assert!(
+            drawn,
+            "a loading sticker keeps its box instead of the text fallback"
+        );
+        assert_eq!(h, 116.0);
+        failed.insert(
+            "stk_10130_18663".to_string(),
+            (3, std::time::Instant::now()),
+        );
+        let mut drawn_failed = true;
+        let _ = laid_out_height(|ui| {
+            drawn_failed =
+                render_sticker_widget(ui, &sticker, &textures, &mut HashSet::new(), &failed);
+        });
+        assert!(!drawn_failed, "a failed sticker falls back to its text");
+
+        let video = ChatMessage {
+            id: "v".into(),
+            media_size: Some([720, 1280]),
+            ..Default::default()
+        };
+        let (_, expected_h) = compute_video_thumb_size(720, 1280, 300.0);
+        let h = laid_out_height(|ui| {
+            let _ = render_video_thumb_block(ui, None, "k", &video, "Video", Color32::WHITE, 300.0);
+        });
+        assert!(
+            h >= expected_h,
+            "placeholder {h} shorter than the video box {expected_h}"
+        );
+        let no_size = ChatMessage {
+            id: "v2".into(),
+            ..Default::default()
+        };
+        let h = laid_out_height(|ui| {
+            let _ =
+                render_video_thumb_block(ui, None, "k", &no_size, "Video", Color32::WHITE, 300.0);
+        });
+        assert_eq!(h, 0.0, "without a declared size nothing is reserved");
     }
 
     #[test]
