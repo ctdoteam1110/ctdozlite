@@ -2482,10 +2482,12 @@ pub(super) fn classify_attachment(msg: &crate::chat::ChatMessage) -> Option<Atta
     if ext.is_empty() || ext == name.to_ascii_lowercase() {
         return Some(AttachmentKind::GenericFile);
     }
+    if crate::chat::is_video_file_extension(&ext) {
+        return Some(AttachmentKind::Video);
+    }
     Some(match ext.as_str() {
         "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "ico" | "jfif" | "tif" | "tiff"
         | "tga" | "qoi" | "pnm" | "avif" | "heic" | "heif" | "jxl" => AttachmentKind::Image,
-        "mp4" | "mov" | "mkv" | "avi" | "webm" => AttachmentKind::Video,
         "amr" | "awb" | "opus" => AttachmentKind::Voice,
         "mp3" | "m4a" | "wav" | "ogg" | "flac" | "aac" => AttachmentKind::Audio,
         "pdf" => AttachmentKind::Pdf,
@@ -5843,6 +5845,16 @@ mod attachment_card_tests {
             "https://f16-zpc.zdn.vn/renewMedia?p=jkl",
         );
         assert_eq!(classify_attachment(&pptx), Some(AttachmentKind::PowerPoint));
+    }
+
+    #[test]
+    fn classifies_audio_from_filename_when_url_is_opaque() {
+        let audio = file_msg(
+            "[Tập tin] opaque-token.mp3",
+            Some("opaque-token.mp3"),
+            "https://files.example/download/opaque-token",
+        );
+        assert_eq!(classify_attachment(&audio), Some(AttachmentKind::Audio));
     }
 
     #[test]
