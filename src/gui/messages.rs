@@ -2052,15 +2052,10 @@ pub(super) fn render_message_body(
                         let _ = open_external_url(&open_target);
                     }
                 } else {
-                    let tw_f = tw as f32;
-                    let th_f = th as f32;
-                    let max_w = max_text_width.min(360.0).max(110.0);
-                    let max_h = 340.0_f32;
-                    let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
-                    let disp_w = (tw_f * scale).clamp(max_w.min(140.0), max_w);
-                    let disp_h = (th_f * scale).clamp(90.0, max_h);
+                    let src = photo_source_size(msg, Some([tw, th])).unwrap_or(Vec2::splat(1.0));
+                    let disp = photo_display_size(src, max_text_width);
                     let img = egui::Image::new(tex)
-                        .fit_to_exact_size(Vec2::new(disp_w, disp_h))
+                        .fit_to_exact_size(disp)
                         .maintain_aspect_ratio(false)
                         .rounding(Rounding::same(12.0))
                         .sense(Sense::click());
@@ -2112,11 +2107,12 @@ pub(super) fn render_message_body(
                     }
                 }
             } else {
-                // Loading / Placeholder frame with visual image icon and loading feedback
-                let disp_w = max_text_width.min(280.0).max(110.0);
-                let disp_h = 150.0_f32;
-                let (rect, resp) =
-                    ui.allocate_exact_size(Vec2::new(disp_w, disp_h), Sense::click());
+                // Loading placeholder. With a declared size it takes the space the loaded photo
+                // will take, so the list does not jump when the thumbnail arrives.
+                let disp = photo_source_size(msg, None)
+                    .map(|src| photo_display_size(src, max_text_width))
+                    .unwrap_or(Vec2::new(max_text_width.clamp(110.0, 280.0), 150.0));
+                let (rect, resp) = ui.allocate_exact_size(disp, Sense::click());
                 let is_hover = resp.hovered();
                 let bg_col = if is_hover {
                     text_col.linear_multiply(0.09)
@@ -3416,6 +3412,39 @@ pub(super) fn album_run_lengths(msgs: &[&ChatMessage]) -> Vec<usize> {
     out
 }
 
+/// On-screen size of a single photo whose source is `src` pixels: at most 360 pt wide (never
+/// past the text area) and 340 pt tall, never upscaled, with floors so small images stay easy
+/// to click.
+fn photo_display_size(src: Vec2, max_text_width: f32) -> Vec2 {
+    let max_w = max_text_width.clamp(110.0, 360.0);
+    let max_h = 340.0_f32;
+    let (w, h) = (src.x.max(1.0), src.y.max(1.0));
+    let scale = (max_w / w).min(max_h / h).min(1.0);
+    Vec2::new(
+        (w * scale).clamp(max_w.min(140.0), max_w).ceil(),
+        (h * scale).clamp(90.0, max_h).ceil(),
+    )
+}
+
+/// Source size to lay out a single photo with. The sender's declared size wins, so the loading
+/// placeholder and the loaded photo take the same space. Once the thumbnail (`texture` pixels)
+/// is loaded, the declared size is kept only if its aspect ratio matches the thumbnail's, so a
+/// wrong or rotated declaration never stretches the image. `None` when neither is known.
+fn photo_source_size(msg: &ChatMessage, texture: Option<[usize; 2]>) -> Option<Vec2> {
+    let declared = msg
+        .media_size
+        .filter(|&[w, h]| w > 0 && h > 0)
+        .map(|[w, h]| Vec2::new(w as f32, h as f32));
+    let texture = texture
+        .filter(|&[tw, th]| tw > 0 && th > 0)
+        .map(|[tw, th]| Vec2::new(tw as f32, th as f32));
+    match (declared, texture) {
+        (Some(d), Some(t)) if ((d.x / d.y) / (t.x / t.y) - 1.0).abs() > 0.03 => Some(t),
+        (Some(d), _) => Some(d),
+        (None, t) => t,
+    }
+}
+
 /// Width of an album grid: up to 360 pt, never wider than the bubble's text area.
 fn album_grid_width(max_text_width: f32) -> f32 {
     max_text_width.min(360.0).floor()
@@ -3767,13 +3796,11 @@ pub(super) fn render_chat_bubble(
             if tw <= 2 || th <= 2 {
                 max_text_width.min(260.0).max(110.0)
             } else {
-                let tw_f = tw as f32;
-                let th_f = th as f32;
-                let max_w = max_text_width.min(360.0).max(110.0);
-                let max_h = 340.0_f32;
-                let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
-                (tw_f * scale).clamp(max_w.min(140.0), max_w).ceil()
+                let src = photo_source_size(msg, Some([tw, th])).unwrap_or(Vec2::splat(1.0));
+                photo_display_size(src, max_text_width).x
             }
+        } else if let Some(src) = photo_source_size(msg, None) {
+            photo_display_size(src, max_text_width).x
         } else {
             max_text_width.min(280.0).max(110.0)
         };
@@ -5653,6 +5680,37 @@ mod album_grid_tests {
             media_group: group.map(|(g, i)| crate::chat::MediaGroupLayout::new(g, i, 3)),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn declared_photo_size_keeps_placeholder_and_loaded_photo_the_same_size() {
+        let mut msg = album_photo("p", None, false);
+        msg.media_size = Some([1280, 960]);
+        let max_text_width = 420.0;
+        let placeholder =
+            photo_display_size(photo_source_size(&msg, None).unwrap(), max_text_width);
+        // The thumbnail is smaller than the original but has the same aspect ratio.
+        let loaded = photo_display_size(
+            photo_source_size(&msg, Some([480, 360])).unwrap(),
+            max_text_width,
+        );
+        assert_eq!(placeholder, loaded);
+        assert_eq!(placeholder, Vec2::new(360.0, 270.0));
+
+        // A declaration whose aspect ratio disagrees with the thumbnail must not stretch it.
+        msg.media_size = Some([960, 1280]);
+        assert_eq!(
+            photo_source_size(&msg, Some([480, 360])),
+            Some(Vec2::new(480.0, 360.0))
+        );
+
+        // Without a declaration the placeholder has no size and the texture decides.
+        msg.media_size = None;
+        assert_eq!(photo_source_size(&msg, None), None);
+        assert_eq!(
+            photo_source_size(&msg, Some([480, 360])),
+            Some(Vec2::new(480.0, 360.0))
+        );
     }
 
     #[test]
