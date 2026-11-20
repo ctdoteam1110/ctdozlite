@@ -1,35 +1,60 @@
-# Photo placeholder size (`content.params.width` / `height`)
+# Media placeholder sizes (`content.params` width / height)
 
 ## Symptom
 
-Opening a chat with many photos made the message list jump. Each photo drew a fixed
-280×150 placeholder, then took its real size (up to 360×340) when the thumbnail
-loaded, pushing every row below it.
+Opening a chat with many photos or videos made the message list jump. A row that
+waits for a thumbnail drew a small placeholder, then grew when the thumbnail loaded,
+pushing every row below it. A temporary log of row heights on a real account
+(2026-11-20) found 83 rows that changed height while loading:
+
+| Kind | Rows | Height before → after |
+| :--- | :--- | :--- |
+| Video | 48 | 99 → 264 |
+| File with an image preview | 20 | 144 → 406 |
+| Link with a preview thumbnail | 12 | ~155 → ~347 |
+| Sticker | 3 | 38 → 136 |
+
+Single photos jumped too: a fixed 280×150 placeholder became up to 360×340.
 
 ## Data
 
-A photo message's `content.params` is a JSON string carrying the sender's pixel size,
-next to the album fields read in `38_photo_album_group_layout.md`:
+A media message's `content.params` is a JSON string. For a photo it carries the
+sender's pixel size next to the album fields read in `38_photo_album_group_layout.md`:
 
 ```json
 {"width":1280,"height":960,"group_layout_id":"…","is_group_layout":1,…}
 ```
 
-Our own `photo_original/send` sends the same `width` / `height` fields.
+For a video, Zalo's web client reads `video_width` / `video_height` (the `MSG_VIDEO`
+case in `web-bundle/default-embed-render.js`):
+
+```json
+{"duration":5000,"video_width":720,"video_height":1280,…}
+```
+
+Our own `photo_original/send` sends `width` / `height`. Files and link previews carry
+no image size.
 
 ## Change
 
-- `ChatMessage::media_size` keeps the declared size. It comes from
-  `chat::photo_size_from_content` for incoming photos, or from the uploaded image for
-  our own. It is saved in the `raw_json` metadata of the SQLite row, like
+- `ChatMessage::media_size` keeps the declared size: `chat::photo_size_from_content`
+  for photos, `chat::video_size_from_content` for videos, the uploaded image for our
+  own photos. It is saved in the `raw_json` metadata of the SQLite row, like
   `media_group`, and in the thread cache.
-- `photo_display_size` (`src/gui/messages.rs`) computes the on-screen size. The
-  placeholder, the loaded photo and the bubble width pre-measure all use it, so the
-  row keeps one height from the first frame.
-- Once the thumbnail is loaded, the declared size is used only if its aspect ratio
-  is within 3% of the thumbnail's. If it is not, the thumbnail's own size wins, so a
-  wrong or rotated declaration never stretches the photo.
-- Photos without a declared size (older stored rows) keep the old placeholder.
+- Photos: `photo_display_size` (`src/gui/messages.rs`) sizes the placeholder, the
+  loaded photo and the bubble width pre-measure from that size.
+- Videos: with a declared size, a loading thumbnail draws an empty box of the final
+  size (`render_video_thumb_block` with no texture), and the bubble width uses it too.
+  Videos without a declared size keep the plain card.
+- In both cases, once the thumbnail is loaded the declared size is kept only if its
+  aspect ratio is within 3% of the thumbnail's (`media_source_size`). Otherwise the
+  thumbnail's own size wins, so a wrong or rotated declaration never stretches it.
+- Image files and link previews: the preview is a fixed box (4:3 for files, up to
+  260×132 for links), with the thumbnail center-cropped into it (`cover_uv_for`). The
+  box is reserved while the thumbnail loads. If the fetch fails, the row falls back as
+  before.
+- Stickers: a loading sticker holds its 116×116 box instead of the "[Nhãn dán]" text;
+  a failed one still falls back to the text.
 
 No request, signing or frame behaviour changes; this only reads fields already
 received.
@@ -38,7 +63,13 @@ received.
 
 - Unit tests:
   - `photo_size_reads_declared_params_dimensions` (`src/chat.rs`)
-  - `declared_photo_size_keeps_placeholder_and_loaded_photo_the_same_size`
-    (`src/gui/messages.rs`)
+  - `declared_photo_size_keeps_placeholder_and_loaded_photo_the_same_size`,
+    `cover_uv_for_crops_to_the_target_aspect` and
+    `loading_sticker_and_video_hold_their_final_size` (`src/gui/messages.rs`)
   - `photo_declared_size_survives_store_and_hydrate` (`src/store.rs`)
-- Manual check on a real account: pending.
+- Manual checks on a real account (2026-11-20), each with a temporary log:
+  - Of about 200 photo messages loaded at startup, all but two carried `width` and
+    `height`. Of 135 video messages, all but one carried `video_width` and
+    `video_height`.
+  - With the change, the per-row height log recorded no row changing height while
+    the same chats loaded and scrolled (it recorded 83 before).
