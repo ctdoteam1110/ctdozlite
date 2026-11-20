@@ -7950,6 +7950,44 @@ pub async fn find_user_by_phone(s: &Session, raw_phone: &str) -> Result<PhoneLoo
         friendship,
     })
 }
+/// Fetch a group poll (`GET group_poll /api/poll/detail`, cmd `12081`).
+///
+/// # Errors
+/// Fails when logged out, on transport errors, or when the server rejects the poll
+/// (see [`crate::poll::parse_poll_detail`]).
+pub async fn get_poll_detail(s: &Session, poll_id: &str) -> Result<crate::poll::PollDetail> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let params = s.encoded_params(&crate::poll::detail_params(poll_id, &s.imei))?;
+    let path = format!("/api/poll/detail?{}&params={params}", s.common_params());
+    let resp = s.get_endpoint("group_poll", &path).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    crate::poll::parse_poll_detail(&resp)
+}
+
+/// Vote, change or clear a vote in a group poll (`GET group_poll /api/poll/vote`, cmd `12084`).
+/// `option_ids` is the full new selection. Returns the options from the reply.
+///
+/// # Errors
+/// Fails when logged out, on transport errors, or when the server rejects the vote
+/// (code `166`: poll closed or locked).
+pub async fn vote_poll(
+    s: &Session,
+    poll_id: &str,
+    option_ids: &[i64],
+) -> Result<Vec<crate::poll::PollOption>> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let params = s.encoded_params(&crate::poll::vote_params(poll_id, option_ids, &s.imei))?;
+    let path = format!("/api/poll/vote?{}&params={params}", s.common_params());
+    let resp = s.get_endpoint("group_poll", &path).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    let data = crate::poll::poll_response_data(&resp)?;
+    Ok(crate::poll::parse_options(&data).unwrap_or_default())
+}
+
 /// Board topic type for a pinned chat message (`MSG_TOPIC` = 2 in Zalo's topic enum:
 /// `TEXT_TOPIC=0`, `LINK_TOPIC=1`, `MSG_TOPIC=2`, `POLL_TOPIC=3`, `REMINDER_TOPIC=4`).
 pub const MSG_TOPIC: i32 = 2;

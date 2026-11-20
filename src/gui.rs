@@ -24,6 +24,7 @@ use crate::session::Session;
 mod attachments;
 pub(crate) mod messages;
 mod modals;
+mod poll_card;
 mod reactions_dialog;
 mod stickers;
 mod theme;
@@ -31,6 +32,7 @@ mod worker;
 mod workspace;
 
 use messages::*;
+use poll_card::*;
 use stickers::*;
 use theme::*;
 pub use theme::{emoji_to_tex_key, load_app_icon, lucide, REACTION_LIST};
@@ -898,6 +900,16 @@ pub enum GuiEvent {
         topic_id: String,
         error: Option<String>,
     },
+    /// Detail of one group poll, or why it could not be read.
+    PollDetailLoaded {
+        poll_id: String,
+        result: Result<crate::poll::PollDetail, String>,
+    },
+    /// Outcome of `WorkerCmd::VotePoll`: the reply's options, or the error.
+    PollVoted {
+        poll_id: String,
+        result: Result<Vec<crate::poll::PollOption>, String>,
+    },
     /// Server-side pinned board items for one conversation.
     BoardPinsUpdated {
         thread_id: String,
@@ -1610,6 +1622,8 @@ pub struct ZaloGuiApp {
     pending_delete_thread: Option<(usize, String, String, bool, String)>,
     /// Pending confirmation before leaving a group (`(idx, group_id, group_name)`).
     pub(crate) pending_leave_group: Option<(usize, String, String)>,
+    /// Group poll cards (session-only), keyed by poll id.
+    polls: HashMap<String, PollCardState>,
     /// Xem trước tài liệu (session-only): msg_id → text đã trích.
     doc_previews: HashMap<String, String>,
     /// msg_id đang tải xem trước (tránh gửi trùng mỗi frame).
@@ -1972,6 +1986,7 @@ impl ZaloGuiApp {
             script_output: String::new(),
             pending_delete_thread: None,
             pending_leave_group: None,
+            polls: HashMap::new(),
             doc_previews: HashMap::new(),
             doc_preview_loading: HashSet::new(),
             doc_preview_errors: HashMap::new(),
@@ -4433,6 +4448,36 @@ impl ZaloGuiApp {
                         }
                         self.persist_threads_async();
                     }
+                }
+                GuiEvent::PollDetailLoaded { poll_id, result } => {
+                    let st = self.polls.entry(poll_id).or_default();
+                    st.loading = false;
+                    match result {
+                        Ok(detail) => {
+                            st.detail = Some(detail);
+                            st.error = None;
+                        }
+                        // A failed refresh keeps the last good detail on screen.
+                        Err(e) if st.detail.is_none() => st.error = Some(e),
+                        Err(_) => {}
+                    }
+                }
+                GuiEvent::PollVoted { poll_id, result } => {
+                    let st = self.polls.entry(poll_id).or_default();
+                    st.voting = false;
+                    let toast = match result {
+                        Ok(options) => {
+                            st.draft = None;
+                            if let Some(d) = st.detail.as_mut() {
+                                d.apply_vote_reply(options);
+                            }
+                            // The worker re-reads the poll right after a vote.
+                            st.loading = true;
+                            "Đã lưu bình chọn".to_string()
+                        }
+                        Err(e) => format!("Có lỗi xảy ra trong quá trình bình chọn: {e}"),
+                    };
+                    self.show_toast(toast);
                 }
                 GuiEvent::BoardPinsUpdated {
                     thread_id,
