@@ -99,6 +99,14 @@ impl ChatMessage {
         if incoming.kind != crate::message_model::MessageKind::Unknown {
             self.kind = incoming.kind;
         }
+        // A system notice's text is built by the parser (e.g. poll votes); a stale label
+        // such as "[Hình ảnh]" saved by an older build must not survive the merge.
+        let notice_text_changed = incoming.kind == crate::message_model::MessageKind::System
+            && !incoming.text.is_empty()
+            && self.text != incoming.text;
+        if notice_text_changed {
+            self.text = incoming.text.clone();
+        }
         if !incoming.wire_ref.fields.is_empty() {
             let mut fields = self.wire_ref.fields.clone();
             fields.extend(incoming.wire_ref.fields.clone());
@@ -118,6 +126,7 @@ impl ChatMessage {
         }
         self.delivery = self.delivery.merge(incoming.delivery);
         gained_media_group
+            || notice_text_changed
             || previous_mentions != self.resolved_mention_uids
             || before
                 != (
@@ -1599,6 +1608,7 @@ pub fn load_threads_cache() -> Vec<Thread> {
         if let Ok(text) = std::fs::read_to_string(&acc_path) {
             if let Ok(mut threads) = serde_json::from_str::<Vec<Thread>>(&text) {
                 deduplicate_threads(&mut threads, None);
+                repair_poll_notices(&mut threads);
                 return threads;
             }
         }
@@ -1607,11 +1617,80 @@ pub fn load_threads_cache() -> Vec<Thread> {
         if let Ok(text) = std::fs::read_to_string("threads_cache.json") {
             if let Ok(mut threads) = serde_json::from_str::<Vec<Thread>>(&text) {
                 deduplicate_threads(&mut threads, None);
+                repair_poll_notices(&mut threads);
                 return threads;
             }
         }
     }
     Vec::new()
+}
+
+/// Notice text for a `group.poll` event, from the localized template Zalo sends in
+/// `content.params.msg.vi` (`%1$s` = member name, `%2$s` = poll question). Without a
+/// template it falls back to a generic Vietnamese line. `None` if params are unreadable.
+pub(crate) fn poll_notice_text(content: &Value, actor: &str) -> Option<String> {
+    let parse_json = |v: &Value| -> Option<Value> {
+        match v {
+            Value::String(s) if s.trim_start().starts_with('{') => serde_json::from_str(s).ok(),
+            Value::Object(_) => Some(v.clone()),
+            _ => None,
+        }
+    };
+    let params = parse_json(content)?.get("params").and_then(parse_json)?;
+    let name = params
+        .get("dName")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(actor)
+        .trim();
+    let name = if name.is_empty() {
+        "Thành viên"
+    } else {
+        name
+    };
+    let question = params
+        .get("question")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let template = params
+        .get("msg")
+        .and_then(|m| m.get("vi"))
+        .and_then(Value::as_str)
+        .filter(|t| t.contains("%1$s"));
+    Some(match template {
+        Some(t) => t.replace("%1$s", name).replace("%2$s", question),
+        None if question.is_empty() => format!("{name} đã cập nhật một cuộc bình chọn"),
+        None => format!("{name} đã cập nhật cuộc bình chọn: {question}"),
+    })
+}
+
+/// Cached threads saved before poll events were parsed hold them as "[Hình ảnh]" text.
+/// Rebuild the notice from the raw wire content kept in `wire_ref`.
+fn repair_poll_notices(threads: &mut [Thread]) {
+    for msg in threads.iter_mut().flat_map(|t| t.messages.iter_mut()) {
+        let is_poll =
+            msg.wire_ref.original_type.as_ref().and_then(Value::as_str) == Some("group.poll");
+        if !is_poll {
+            continue;
+        }
+        let actor = msg
+            .wire_ref
+            .fields
+            .get("dName")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Some(notice) = msg
+            .wire_ref
+            .fields
+            .get("content")
+            .and_then(|c| poll_notice_text(c, &actor))
+        {
+            msg.text = notice;
+            msg.kind = crate::message_model::MessageKind::System;
+        }
+    }
 }
 
 /// Snapshot of the thread list for an instant first paint. Only the newest
@@ -6728,6 +6807,16 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         }
     }
 
+    // Poll events ("X voted in the poll: …") carry an empty href/thumb and no text, and
+    // used to fall through to the "[Hình ảnh]" label below.
+    let is_poll_event = msg_type == "group.poll";
+    if is_poll_event {
+        let actor = it.get("dName").and_then(Value::as_str).unwrap_or_default();
+        if let Some(notice) = raw_content_val.and_then(|c| poll_notice_text(c, actor)) {
+            content = notice;
+        }
+    }
+
     if content.is_empty() {
         content = match msg_type.as_str() {
             "chat.sticker" | "sticker" | "4" | "5" | "13" => "[Nhãn dán]".to_string(),
@@ -6747,7 +6836,11 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
                         || o.get("id").is_some()
                     {
                         "[Nhãn dán]".to_string()
-                    } else if o.get("href").is_some() || o.get("thumb").is_some() {
+                    } else if [o.get("href"), o.get("thumb")]
+                        .into_iter()
+                        .flatten()
+                        .any(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()))
+                    {
                         "[Hình ảnh]".to_string()
                     } else if o.is_object() {
                         "[Tin nhắn]".to_string()
@@ -6967,7 +7060,9 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         }
     }
 
-    let msg_kind = if sticker_meta.is_some() {
+    let msg_kind = if is_poll_event {
+        crate::message_model::MessageKind::System
+    } else if sticker_meta.is_some() {
         crate::message_model::MessageKind::Sticker
     } else if is_voice_msg {
         crate::message_model::MessageKind::Voice
@@ -7855,6 +7950,44 @@ pub async fn find_user_by_phone(s: &Session, raw_phone: &str) -> Result<PhoneLoo
         friendship,
     })
 }
+/// Fetch a group poll (`GET group_poll /api/poll/detail`, cmd `12081`).
+///
+/// # Errors
+/// Fails when logged out, on transport errors, or when the server rejects the poll
+/// (see [`crate::poll::parse_poll_detail`]).
+pub async fn get_poll_detail(s: &Session, poll_id: &str) -> Result<crate::poll::PollDetail> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let params = s.encoded_params(&crate::poll::detail_params(poll_id, &s.imei))?;
+    let path = format!("/api/poll/detail?{}&params={params}", s.common_params());
+    let resp = s.get_endpoint("group_poll", &path).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    crate::poll::parse_poll_detail(&resp)
+}
+
+/// Vote, change or clear a vote in a group poll (`GET group_poll /api/poll/vote`, cmd `12084`).
+/// `option_ids` is the full new selection. Returns the options from the reply.
+///
+/// # Errors
+/// Fails when logged out, on transport errors, or when the server rejects the vote
+/// (code `166`: poll closed or locked).
+pub async fn vote_poll(
+    s: &Session,
+    poll_id: &str,
+    option_ids: &[i64],
+) -> Result<Vec<crate::poll::PollOption>> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let params = s.encoded_params(&crate::poll::vote_params(poll_id, option_ids, &s.imei))?;
+    let path = format!("/api/poll/vote?{}&params={params}", s.common_params());
+    let resp = s.get_endpoint("group_poll", &path).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    let data = crate::poll::poll_response_data(&resp)?;
+    Ok(crate::poll::parse_options(&data).unwrap_or_default())
+}
+
 /// Board topic type for a pinned chat message (`MSG_TOPIC` = 2 in Zalo's topic enum:
 /// `TEXT_TOPIC=0`, `LINK_TOPIC=1`, `MSG_TOPIC=2`, `POLL_TOPIC=3`, `REMINDER_TOPIC=4`).
 pub const MSG_TOPIC: i32 = 2;
@@ -11614,6 +11747,99 @@ mod send_identity_tests {
         assert_eq!(parsed.text, "[Video]");
         assert_eq!(parsed.link_src.as_deref(), Some("Video Zalo"));
         assert_eq!(parsed.link_title.as_deref(), Some("Video"));
+    }
+
+    /// A `group.poll` vote as it arrives on the wire (shape from a real group; ids and names are made up).
+    fn poll_vote_payload() -> Value {
+        json!({
+            "msgId": "9000000000001",
+            "cliMsgId": "1700000000001",
+            "msgType": "group.poll",
+            "uidFrom": "1000000000000000001",
+            "idTo": "2000000000000000002",
+            "dName": "Lan",
+            "ts": "1700000000001",
+            "content": {
+                "action": "vote",
+                "childnumber": 0,
+                "description": "",
+                "href": "",
+                "thumb": "",
+                "title": "",
+                "type": "",
+                "params": "{\"msg\":{\"vi\":\"%1$s tham gia cuộc bình chọn: %2$s\",\"en\":\"%1$s voted in the poll: %2$s\"},\"isAnonymous\":false,\"question\":\"Họp lớp tối nay?\",\"pollId\":42,\"dName\":\"Lan\"}"
+            }
+        })
+    }
+
+    #[test]
+    fn poll_vote_is_a_system_notice_not_a_photo() {
+        let cm = parse_chat_message(&poll_vote_payload()).expect("poll vote parses");
+        assert_eq!(cm.text, "Lan tham gia cuộc bình chọn: Họp lớp tối nay?");
+        assert_eq!(cm.kind, crate::message_model::MessageKind::System);
+        assert!(cm.link_src.is_none());
+    }
+
+    #[test]
+    fn poll_notice_falls_back_without_a_template() {
+        let content = json!({ "params": "{\"question\":\"Đi đâu?\"}" });
+        assert_eq!(
+            poll_notice_text(&content, "An").as_deref(),
+            Some("An đã cập nhật cuộc bình chọn: Đi đâu?")
+        );
+        assert_eq!(poll_notice_text(&json!({ "href": "" }), "An"), None);
+    }
+
+    #[test]
+    fn cached_poll_votes_labelled_as_photos_are_repaired() {
+        let raw = poll_vote_payload();
+        let mut stale = parse_chat_message(&raw).expect("poll vote parses");
+        // What older builds stored: the photo label on a plain text row.
+        stale.text = "[Hình ảnh]".into();
+        stale.kind = crate::message_model::MessageKind::Text;
+        let mut threads = vec![Thread {
+            id: "2000000000000000002".into(),
+            messages: vec![stale],
+            ..Default::default()
+        }];
+        repair_poll_notices(&mut threads);
+        let msg = &threads[0].messages[0];
+        assert_eq!(msg.text, "Lan tham gia cuộc bình chọn: Họp lớp tối nay?");
+        assert_eq!(msg.kind, crate::message_model::MessageKind::System);
+    }
+
+    #[test]
+    fn merging_a_parsed_poll_notice_replaces_the_stale_photo_label() {
+        let fresh = parse_chat_message(&poll_vote_payload()).expect("poll vote parses");
+        let mut stale = fresh.clone();
+        stale.text = "[Hình ảnh]".into();
+        stale.kind = crate::message_model::MessageKind::Text;
+        assert!(stale.merge_reaction_metadata(&fresh));
+        assert_eq!(stale.text, fresh.text);
+        assert_eq!(stale.kind, crate::message_model::MessageKind::System);
+        // Already repaired rows are also rebuilt from wire content on load.
+        let mut threads = vec![Thread {
+            messages: vec![ChatMessage {
+                text: "[Hình ảnh]".into(),
+                ..fresh.clone()
+            }],
+            ..Default::default()
+        }];
+        repair_poll_notices(&mut threads);
+        assert_eq!(threads[0].messages[0].text, fresh.text);
+    }
+
+    #[test]
+    fn empty_href_and_thumb_do_not_make_a_photo_label() {
+        let msg = json!({
+            "msgId": "1",
+            "msgType": "group.unknownevent",
+            "uidFrom": "u1",
+            "ts": "1700000000000",
+            "content": { "href": "", "thumb": "", "title": "" }
+        });
+        let cm = parse_chat_message(&msg).expect("parses");
+        assert_ne!(cm.text, "[Hình ảnh]");
     }
 
     #[test]

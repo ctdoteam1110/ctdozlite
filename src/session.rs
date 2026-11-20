@@ -301,6 +301,12 @@ impl Domains {
                 self.conversation = v;
             }
         }
+        // `group_poll` has no dedicated slot: its hosts are only failover candidates.
+        let poll_urls = map.get("group_poll").map(all_urls).unwrap_or_default();
+        if !poll_urls.is_empty() {
+            self.service_map_candidates
+                .insert("group_poll".into(), poll_urls);
+        }
     }
 
     /// Primary slot value for a named endpoint key.
@@ -359,6 +365,11 @@ impl Domains {
         }
         if canonical == "friend" {
             push_unique_host(&mut list, &self.profile);
+        }
+        // Zalo Web resolves polls through `getGroupPollDomain()` (service key `group_poll`,
+        // re-notes/44_group_poll.md). A session without that entry tries the group host.
+        if canonical == "group_poll" {
+            push_unique_host(&mut list, &self.group);
         }
         list
     }
@@ -1916,6 +1927,29 @@ mod tests {
                 "{msg} must not expire the session"
             );
         }
+    }
+
+    #[test]
+    fn group_poll_candidates_come_from_service_map_then_group_host() {
+        let mut domains = Domains::default();
+        domains.heal_from_verified();
+        domains.apply_service_map(&serde_json::json!({
+            "group_poll": ["https://poll-1.example.test/"]
+        }));
+        let list = domains.candidates("group_poll");
+        assert_eq!(
+            list.first().map(String::as_str),
+            Some("https://poll-1.example.test")
+        );
+        assert!(list.contains(&domains.group.trim_end_matches('/').to_string()));
+    }
+
+    #[test]
+    fn group_poll_candidates_fall_back_to_group_host_without_service_map() {
+        let mut domains = Domains::default();
+        domains.heal_from_verified();
+        let list = domains.candidates("group_poll");
+        assert_eq!(list, vec![domains.group.trim_end_matches('/').to_string()]);
     }
 
     #[test]

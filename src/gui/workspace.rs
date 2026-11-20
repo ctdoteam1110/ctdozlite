@@ -6563,6 +6563,8 @@ impl ZaloGuiApp {
                             + (if has_sched_banner { 36.0 } else { 0.0 })
                     };
                     let mut pending_action: Option<(usize, BubbleAction)> = None;
+                    let mut poll_actions: Vec<(String, PollCardAction)> = Vec::new();
+                    let mut poll_fetches: Vec<(String, i64)> = Vec::new();
                     let mut load_older_clicked = false;
                     let mut custom_toast: Option<String> = None;
                     // each frame, so a 2 000-message group re-laid out 2 000 galleys per repaint.
@@ -6790,6 +6792,38 @@ impl ZaloGuiApp {
                                                 .map(|&i| &thread.messages[i])
                                                 .collect();
                                             let album_runs = album_run_lengths(&visible_msgs);
+                                            // Each poll's card sits under its newest visible event
+                                            // (Zalo Web `getLastMessagePoll`); index -> (poll id, question, ts).
+                                            let mut poll_card_at: HashMap<usize, (String, String, i64)> =
+                                                HashMap::new();
+                                            if is_group {
+                                                let mut newest: HashMap<String, (usize, String, i64)> =
+                                                    HashMap::new();
+                                                for &i in &visible_indices {
+                                                    let m = &thread.messages[i];
+                                                    if m.kind != crate::message_model::MessageKind::System {
+                                                        continue;
+                                                    }
+                                                    if let Some(r) = crate::poll::poll_ref(m) {
+                                                        let ts = crate::clock::normalize_ts_ms(m.ts);
+                                                        let question = match newest.get(&r.poll_id) {
+                                                            Some((_, q, _)) if r.question.is_empty() => q.clone(),
+                                                            _ => r.question,
+                                                        };
+                                                        newest.insert(r.poll_id, (i, question, ts));
+                                                    }
+                                                }
+                                                for (poll_id, (i, question, ts)) in newest {
+                                                    let fetch = match self.polls.get(&poll_id) {
+                                                        Some(st) => st.needs_fetch(ts),
+                                                        None => true,
+                                                    };
+                                                    if fetch {
+                                                        poll_fetches.push((poll_id.clone(), ts));
+                                                    }
+                                                    poll_card_at.insert(i, (poll_id, question, ts));
+                                                }
+                                            }
 
                                             let vanish_now_ms =
                                                 crate::login::unix_now().saturating_mul(1000);
@@ -6828,6 +6862,20 @@ impl ZaloGuiApp {
                                                     if is_system_notice_message(msg) {
                                                         render_system_notice_pill(ui, msg, pal);
                                                         ui.add_space(6.0);
+                                                        if let Some((poll_id, question, _)) = poll_card_at.get(&idx) {
+                                                            if let Some(a) = render_poll_card(
+                                                                ui,
+                                                                question,
+                                                                self.polls.get(poll_id),
+                                                                &self.user_uin,
+                                                                &member_name_by_uid,
+                                                                pal,
+                                                                vanish_now_ms,
+                                                            ) {
+                                                                poll_actions.push((poll_id.clone(), a));
+                                                            }
+                                                            ui.add_space(10.0);
+                                                        }
                                                         return;
                                                     }
 
@@ -6992,6 +7040,7 @@ impl ZaloGuiApp {
                     if widen_window {
                         self.chat_render_window.1 += CHAT_RENDER_STEP;
                     }
+                    self.apply_poll_ui(poll_fetches, poll_actions);
                     if let Some(msg) = custom_toast {
                         self.show_toast(msg);
                     } else if load_older_clicked {

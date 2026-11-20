@@ -513,6 +513,16 @@ pub enum WorkerCmd {
         thread_id: String,
         is_group: bool,
     },
+    /// Fetch one group poll (`/api/poll/detail`); answered by `GuiEvent::PollDetailLoaded`.
+    FetchPoll {
+        poll_id: String,
+    },
+    /// Submit the full new selection for a poll, then re-read it. Answered by
+    /// `GuiEvent::PollVoted`, followed by `GuiEvent::PollDetailLoaded` when the vote succeeded.
+    VotePoll {
+        poll_id: String,
+        option_ids: Vec<i64>,
+    },
     /// Pin/unpin a single chat message through the group-board API (#119 follow-up).
     PinMessage {
         thread_id: String,
@@ -1539,6 +1549,62 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     topics,
                                     error,
                                 });
+                            });
+                        }
+                        WorkerCmd::FetchPoll { poll_id } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let result = tokio::time::timeout(
+                                    Duration::from_secs(20),
+                                    crate::chat::get_poll_detail(&s, &poll_id),
+                                )
+                                .await
+                                .unwrap_or_else(|_| Err(anyhow::anyhow!("hết thời gian chờ")))
+                                .map_err(|e| e.to_string());
+                                let _ =
+                                    gui_tx_clone.send(GuiEvent::PollDetailLoaded { poll_id, result });
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::VotePoll {
+                            poll_id,
+                            option_ids,
+                        } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                // A vote is not retried: resending after a timeout could
+                                // apply a selection the user has since changed.
+                                let result = tokio::time::timeout(
+                                    Duration::from_secs(20),
+                                    crate::chat::vote_poll(&s, &poll_id, &option_ids),
+                                )
+                                .await
+                                .unwrap_or_else(|_| Err(anyhow::anyhow!("hết thời gian chờ")))
+                                .map_err(|e| e.to_string());
+                                let voted = result.is_ok();
+                                let _ = gui_tx_clone.send(GuiEvent::PollVoted {
+                                    poll_id: poll_id.clone(),
+                                    result,
+                                });
+                                ctx.request_repaint();
+                                if voted {
+                                    let result = tokio::time::timeout(
+                                        Duration::from_secs(20),
+                                        crate::chat::get_poll_detail(&s, &poll_id),
+                                    )
+                                    .await
+                                    .unwrap_or_else(|_| Err(anyhow::anyhow!("hết thời gian chờ")))
+                                    .map_err(|e| e.to_string());
+                                    let _ = gui_tx_clone
+                                        .send(GuiEvent::PollDetailLoaded { poll_id, result });
+                                    ctx.request_repaint();
+                                }
                             });
                         }
                         WorkerCmd::PinMessage {
