@@ -32,6 +32,9 @@ A vote arrives as a normal message (seen with `cmd` 511, 521 and 122):
 - Without a template it falls back to "<name> đã cập nhật cuộc bình chọn: <question>".
 - The last fallback labels a message "[Hình ảnh]" only when `href` or `thumb` is
   non-empty.
+- When a parsed system notice is merged into an existing row
+  (`merge_message_metadata`), its text replaces the stored one, so a row re-fetched
+  from the server drops an old "[Hình ảnh]" label.
 - `load_threads_cache` repairs cached rows saved by older builds: when
   `wire_ref.original_type` is `group.poll`, it rebuilds the notice from the stored raw
   `content`. Older rows that exist only in SQLite keep their text, because SQLite does
@@ -46,4 +49,8 @@ No request, signing or frame behaviour changes.
   - `poll_notice_falls_back_without_a_template`
   - `cached_poll_votes_labelled_as_photos_are_repaired`
   - `empty_href_and_thumb_do_not_make_a_photo_label`
-- The payload shape is from 8 cached vote events in a real group (2026-11-20).
+  - `merging_a_parsed_poll_notice_replaces_the_stale_photo_label`
+- The payload shape is from cached vote events in a real group (2026-11-20).
+- Manual, debug build on the same account: every create and vote event in that group
+  shows as a centred notice. A first run left five re-fetched rows reading
+  "[Hình ảnh]", which led to the merge change above.

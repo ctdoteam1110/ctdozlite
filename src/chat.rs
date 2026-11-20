@@ -99,6 +99,14 @@ impl ChatMessage {
         if incoming.kind != crate::message_model::MessageKind::Unknown {
             self.kind = incoming.kind;
         }
+        // A system notice's text is built by the parser (e.g. poll votes); a stale label
+        // such as "[Hình ảnh]" saved by an older build must not survive the merge.
+        let notice_text_changed = incoming.kind == crate::message_model::MessageKind::System
+            && !incoming.text.is_empty()
+            && self.text != incoming.text;
+        if notice_text_changed {
+            self.text = incoming.text.clone();
+        }
         if !incoming.wire_ref.fields.is_empty() {
             let mut fields = self.wire_ref.fields.clone();
             fields.extend(incoming.wire_ref.fields.clone());
@@ -118,6 +126,7 @@ impl ChatMessage {
         }
         self.delivery = self.delivery.merge(incoming.delivery);
         gained_media_group
+            || notice_text_changed
             || previous_mentions != self.resolved_mention_uids
             || before
                 != (
@@ -1662,7 +1671,7 @@ fn repair_poll_notices(threads: &mut [Thread]) {
     for msg in threads.iter_mut().flat_map(|t| t.messages.iter_mut()) {
         let is_poll =
             msg.wire_ref.original_type.as_ref().and_then(Value::as_str) == Some("group.poll");
-        if !is_poll || msg.kind == crate::message_model::MessageKind::System {
+        if !is_poll {
             continue;
         }
         let actor = msg
@@ -11759,6 +11768,27 @@ mod send_identity_tests {
         let msg = &threads[0].messages[0];
         assert_eq!(msg.text, "Lan tham gia cuộc bình chọn: Họp lớp tối nay?");
         assert_eq!(msg.kind, crate::message_model::MessageKind::System);
+    }
+
+    #[test]
+    fn merging_a_parsed_poll_notice_replaces_the_stale_photo_label() {
+        let fresh = parse_chat_message(&poll_vote_payload()).expect("poll vote parses");
+        let mut stale = fresh.clone();
+        stale.text = "[Hình ảnh]".into();
+        stale.kind = crate::message_model::MessageKind::Text;
+        assert!(stale.merge_reaction_metadata(&fresh));
+        assert_eq!(stale.text, fresh.text);
+        assert_eq!(stale.kind, crate::message_model::MessageKind::System);
+        // Already repaired rows are also rebuilt from wire content on load.
+        let mut threads = vec![Thread {
+            messages: vec![ChatMessage {
+                text: "[Hình ảnh]".into(),
+                ..fresh.clone()
+            }],
+            ..Default::default()
+        }];
+        repair_poll_notices(&mut threads);
+        assert_eq!(threads[0].messages[0].text, fresh.text);
     }
 
     #[test]
