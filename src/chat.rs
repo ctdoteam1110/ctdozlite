@@ -75,6 +75,10 @@ pub struct ChatMessage {
     /// Photo album membership (`group_layout_id`); consecutive photos sharing it render as one grid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_group: Option<MediaGroupLayout>,
+    /// Pixel size the sender declared for a photo (`params.width`/`height`). Lets the chat
+    /// reserve the final size before the thumbnail loads, so the list does not jump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_size: Option<[u32; 2]>,
     /// Bản dịch hiển thị dưới tin gốc (session-only, không persist).
     #[serde(skip)]
     pub translation: Option<String>,
@@ -124,9 +128,14 @@ impl ChatMessage {
         if gained_media_group {
             self.media_group = incoming.media_group.clone();
         }
+        let gained_media_size = self.media_size.is_none() && incoming.media_size.is_some();
+        if gained_media_size {
+            self.media_size = incoming.media_size;
+        }
         self.delivery = self.delivery.merge(incoming.delivery);
         gained_media_group
             || notice_text_changed
+            || gained_media_size
             || previous_mentions != self.resolved_mention_uids
             || before
                 != (
@@ -2342,6 +2351,34 @@ pub struct MediaGroupLayout {
     pub total: u32,
 }
 
+/// Parse `params` from a message `content`; both may arrive as an object or a JSON string.
+fn content_params(content: &Value) -> Option<Value> {
+    let parse_json = |v: &Value| -> Option<Value> {
+        match v {
+            Value::String(s) if s.trim_start().starts_with('{') => serde_json::from_str(s).ok(),
+            Value::Object(_) => Some(v.clone()),
+            _ => None,
+        }
+    };
+    let content = parse_json(content)?;
+    content.get("params").and_then(parse_json)
+}
+
+/// Read a photo's declared pixel size from `content.params` (`width`, `height`), as numbers
+/// or numeric strings. Returns `None` unless both are positive.
+pub(crate) fn photo_size_from_content(content: &Value) -> Option<[u32; 2]> {
+    let params = content_params(content)?;
+    let dim = |key: &str| -> Option<u32> {
+        let v = params.get(key)?;
+        let n = v
+            .as_u64()
+            .or_else(|| v.as_f64().map(|f| f.round() as u64))
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))?;
+        u32::try_from(n).ok().filter(|&n| n > 0)
+    };
+    Some([dim("width")?, dim("height")?])
+}
+
 impl MediaGroupLayout {
     /// Build the layout for photo `index` of `total`, all sharing `id`.
     pub fn new(id: impl Into<String>, index: u32, total: u32) -> Self {
@@ -2356,15 +2393,7 @@ impl MediaGroupLayout {
     /// `params` carries `group_layout_id`, `is_group_layout` and `id_in_group`. Returns `None`
     /// for photos sent on their own.
     pub fn from_content(content: &Value) -> Option<Self> {
-        let parse_json = |v: &Value| -> Option<Value> {
-            match v {
-                Value::String(s) if s.trim_start().starts_with('{') => serde_json::from_str(s).ok(),
-                Value::Object(_) => Some(v.clone()),
-                _ => None,
-            }
-        };
-        let content = parse_json(content)?;
-        let params = content.get("params").and_then(parse_json)?;
+        let params = content_params(content)?;
         let as_u64 = |key_snake: &str, key_camel: &str| -> Option<u64> {
             let v = params.get(key_snake).or_else(|| params.get(key_camel))?;
             v.as_u64()
@@ -2685,6 +2714,7 @@ pub async fn send_attachment_in_layout(
             link_thumb: Some(final_thumb),
             link_src: Some("Hình ảnh Zalo".into()),
             media_group: layout.filter(|_| joined_album).cloned(),
+            media_size: Some([width, height]).filter(|&[w, h]| w > 0 && h > 0),
             ..Default::default()
         };
         return Ok((send_resp, cm));
@@ -7301,6 +7331,11 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         } else {
             None
         },
+        media_size: if is_photo_msg {
+            raw_content_val.and_then(photo_size_from_content)
+        } else {
+            None
+        },
         history_source,
 
         ..Default::default()
@@ -10058,6 +10093,29 @@ mod tests {
             MediaGroupLayout::from_content(&as_string),
             Some(MediaGroupLayout::new("1731100000000", 2, 4))
         );
+    }
+
+    #[test]
+    fn photo_size_reads_declared_params_dimensions() {
+        let content = json!({
+            "href": "https://b-f17-zpcloud.zdn.vn/1/a.jpg",
+            "params": "{\"width\":1280,\"height\":\"960\",\"rawUrl\":\"x\"}"
+        });
+        assert_eq!(photo_size_from_content(&content), Some([1280, 960]));
+        let as_string = Value::String(content.to_string());
+        assert_eq!(photo_size_from_content(&as_string), Some([1280, 960]));
+        for params in [
+            "{\"width\":1280}",
+            "{\"width\":0,\"height\":960}",
+            "{\"width\":-5,\"height\":960}",
+        ] {
+            assert_eq!(
+                photo_size_from_content(&json!({ "params": params })),
+                None,
+                "{params}"
+            );
+        }
+        assert_eq!(photo_size_from_content(&json!({ "href": "x" })), None);
     }
 
     #[test]
