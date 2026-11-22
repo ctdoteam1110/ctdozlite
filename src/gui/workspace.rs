@@ -7342,8 +7342,8 @@ impl ZaloGuiApp {
                                     time,
                                     thumb_key,
                                 } => {
-                                    let hash = crate::crypto::md5_hex(&url);
-                                    let temp_path = std::env::temp_dir().join(format!("zlite_video_{hash}.mp4"));
+                                    // Creates the folder (or falls back to the temp folder).
+                                    let temp_path = crate::data_dir::video_cache_path(&url);
                                     let is_cached = temp_path.exists()
                                         && std::fs::metadata(&temp_path).map(|m| m.len() > 0).unwrap_or(false);
                                     let cached_path = if is_cached { Some(temp_path.clone()) } else { None };
@@ -7358,40 +7358,20 @@ impl ZaloGuiApp {
                                         is_downloading: !is_cached,
                                         play_on_download: !is_cached,
                                         cached_path,
+                                        download: None,
                                     });
 
                                     if is_cached {
                                         let _ = open_external_url(temp_path.to_str().unwrap_or(&url));
-                                        self.show_toast("🎬 Đang phát video bằng Windows Media Player…");
+                                        self.show_toast("🎬 Đang mở video bằng trình phát của máy…");
                                     } else if !url.is_empty()
                                         && (url.starts_with("http://") || url.starts_with("https://"))
                                     {
                                         self.show_toast("⏳ Đang tải video để phát…");
-                                        let url_clone = url.clone();
-                                        let target_path = temp_path;
-                                        std::thread::spawn(move || {
-                                            let rt = tokio::runtime::Builder::new_current_thread()
-                                                .enable_all()
-                                                .build();
-                                            if let Ok(rt) = rt {
-                                                rt.block_on(async {
-                                                    let client = reqwest::Client::builder()
-                                                        .timeout(std::time::Duration::from_secs(60))
-                                                        .build();
-                                                    if let Ok(client) = client {
-                                                        if let Ok(resp) = client.get(&url_clone).send().await {
-                                                            if resp.status().is_success() {
-                                                                if let Ok(bytes) = resp.bytes().await {
-                                                                    if !bytes.is_empty() {
-                                                                        let _ = std::fs::write(&target_path, &bytes);
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        });
+                                        let download = spawn_video_download(url.clone());
+                                        if let Some(viewer) = self.video_player.as_mut() {
+                                            viewer.download = Some(download);
+                                        }
                                     }
                                 }
                                 BubbleAction::DownloadFile { url, file_name } => {
@@ -10600,4 +10580,63 @@ fn truncate_to_width(ui: &egui::Ui, text: &str, font: FontId, max_w: f32) -> Str
         }
     }
     chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
+}
+
+/// Download failures by attempt id, reported to the video player that started that
+/// attempt (see [`take_video_download_error`]). Keyed per attempt so a stale attempt
+/// for the same URL cannot cancel a newer one.
+static VIDEO_DOWNLOAD_ERRORS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, String>>,
+> = std::sync::LazyLock::new(Default::default);
+static NEXT_VIDEO_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// One running video download: its attempt id and the file it will create.
+#[derive(Debug, Clone)]
+pub(crate) struct VideoDownload {
+    pub attempt: u64,
+    pub target: std::path::PathBuf,
+}
+
+/// Fetch `url` on a background thread into a target resolved once, here, and returned
+/// so the player polls exactly that file. Any failure (network, HTTP status, empty
+/// body, unwritable folder) is recorded for this attempt so the player can retry.
+pub(super) fn spawn_video_download(url: String) -> VideoDownload {
+    let attempt = NEXT_VIDEO_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let target = crate::data_dir::video_cache_path(&url);
+    let download = VideoDownload { attempt, target: target.clone() };
+    std::thread::spawn(move || {
+        let result: Result<(), String> = (|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let bytes = rt.block_on(async {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    return Err(format!("máy chủ trả về {}", resp.status()));
+                }
+                resp.bytes().await.map_err(|e| e.to_string())
+            })?;
+            if bytes.is_empty() {
+                return Err("tệp video rỗng".into());
+            }
+            crate::data_dir::save_video_file(&target, &bytes)
+                .map_err(|e| format!("không ghi được vào {}: {e}", target.display()))
+        })();
+        if let Err(e) = result {
+            if let Ok(mut errors) = VIDEO_DOWNLOAD_ERRORS.lock() {
+                errors.insert(attempt, e);
+            }
+        }
+    });
+    download
+}
+
+/// Take (and clear) the recorded failure of download `attempt`, if any.
+pub(super) fn take_video_download_error(attempt: u64) -> Option<String> {
+    VIDEO_DOWNLOAD_ERRORS.lock().ok()?.remove(&attempt)
 }

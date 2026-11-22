@@ -1136,6 +1136,8 @@ pub(crate) struct VideoPlayerModal {
     pub is_downloading: bool,
     pub play_on_download: bool,
     pub cached_path: Option<std::path::PathBuf>,
+    /// The download this player waits for (attempt id + exact target file).
+    pub download: Option<workspace::VideoDownload>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FeedModalTab {
