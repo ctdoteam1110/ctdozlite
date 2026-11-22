@@ -720,6 +720,10 @@ pub enum GuiEvent {
         thread_id: String,
         msg: ChatMessage,
     },
+    /// An attachment of `SendAttachments` started uploading (its placeholder bubble).
+    UploadStarted { upload_id: u64 },
+    /// An attachment finished: `error` is `None` once its message is in the thread.
+    UploadDone { upload_id: u64, error: Option<String> },
     /// Files resolved by a picker, paste or drop, ready to join the composer queue.
     AttachmentsPrepared(attachments::PreparedBatch),
     StickerImageReady {
@@ -1598,6 +1602,9 @@ pub struct ZaloGuiApp {
     /// Composer attachment queue (paste, drop, pickers, screenshots), capped at
     /// [`attachments::MAX_PENDING_ATTACHMENTS`].
     pending_attachments: Vec<attachments::PendingAttachment>,
+    /// Attachments sent but not yet in the thread, shown as placeholder bubbles.
+    outgoing_uploads: Vec<OutgoingUpload>,
+    next_upload_id: u64,
     unread_counts: HashMap<String, usize>,
     reaction_unread_counts: HashMap<String, usize>,
     /// Message IDs that have already triggered an unread bump/notification in this session (#146).
@@ -1992,6 +1999,8 @@ impl ZaloGuiApp {
             dismissed_mention_suggest_for: String::new(),
             composer_focus_pending: false,
             pending_attachments: Vec::new(),
+            outgoing_uploads: Vec::new(),
+            next_upload_id: 1,
             unread_counts: HashMap::new(),
             reaction_unread_counts: HashMap::new(),
             notified_msg_ids: HashSet::new(),
@@ -3341,6 +3350,20 @@ impl ZaloGuiApp {
                     }
                     self.status_msg = format!("Đã gửi đính kèm lúc {}", crate::ui::clock());
                 }
+                GuiEvent::UploadStarted { upload_id } => {
+                    if let Some(u) = self.outgoing_uploads.iter_mut().find(|u| u.id == upload_id) {
+                        u.state = UploadState::Uploading;
+                    }
+                }
+                GuiEvent::UploadDone { upload_id, error } => match error {
+                    // The real message was merged by `AttachmentSent` just before.
+                    None => self.outgoing_uploads.retain(|u| u.id != upload_id),
+                    Some(e) => {
+                        if let Some(u) = self.outgoing_uploads.iter_mut().find(|u| u.id == upload_id) {
+                            u.state = UploadState::Failed(e);
+                        }
+                    }
+                },
                 GuiEvent::QuoteSent {
                     client_message_id,
                     thread_id,
@@ -6762,4 +6785,22 @@ impl ZaloGuiApp {
             false
         }
     }
+}
+
+/// A sent attachment shown as a placeholder bubble until its real message arrives.
+pub(crate) struct OutgoingUpload {
+    pub id: u64,
+    pub thread_id: String,
+    pub file_name: String,
+    /// Pixel size for images (shown under the name).
+    pub dims: Option<(u32, u32)>,
+    pub thumb: Option<egui::TextureHandle>,
+    pub state: UploadState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UploadState {
+    Queued,
+    Uploading,
+    Failed(String),
 }
