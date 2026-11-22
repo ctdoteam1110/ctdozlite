@@ -2809,7 +2809,8 @@ pub(crate) fn compute_video_thumb_size(tw: usize, th: usize, max_text_width: f32
         let max_h = 260.0_f32;
         let max_w = max_text_width.min(220.0);
         let scale = (max_w / tw_f).min(max_h / th_f);
-        let w = (tw_f * scale).clamp(140.0, max_w).ceil();
+        // Narrow bubbles can make `max_w` smaller than the floor; never invert the range.
+        let w = (tw_f * scale).clamp(140.0_f32.min(max_w), max_w).ceil();
         let h = (th_f * scale).clamp(160.0, max_h).ceil();
         (w, h)
     } else {
@@ -2817,7 +2818,7 @@ pub(crate) fn compute_video_thumb_size(tw: usize, th: usize, max_text_width: f32
         let max_w = max_text_width.min(280.0);
         let max_h = 180.0_f32;
         let scale = (max_w / tw_f).min(max_h / th_f);
-        let w = (tw_f * scale).clamp(160.0, max_w).ceil();
+        let w = (tw_f * scale).clamp(160.0_f32.min(max_w), max_w).ceil();
         let h = (th_f * scale).clamp(100.0, max_h).ceil();
         (w, h)
     }
@@ -6039,6 +6040,18 @@ mod album_grid_tests {
             media_source_size(&msg, Some([480, 360])),
             Some(Vec2::new(480.0, 360.0))
         );
+    }
+
+    #[test]
+    fn narrow_bubbles_do_not_invert_media_size_clamps() {
+        for max_text_width in [90.0, 120.0, 150.0] {
+            let (w, h) = image_file_preview_size(max_text_width);
+            assert!(w <= max_text_width && h > 0.0, "{max_text_width}: {w}x{h}");
+            let (w, _) = compute_video_thumb_size(720, 1280, max_text_width);
+            assert!(w <= max_text_width);
+        }
+        // Wide bubbles keep their previous sizes.
+        assert_eq!(image_file_preview_size(420.0), (240.0, 180.0));
     }
 
     #[test]

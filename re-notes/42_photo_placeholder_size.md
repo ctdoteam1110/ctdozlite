@@ -56,6 +56,17 @@ no image size.
 - Stickers: a loading sticker holds its 116×116 box instead of the "[Nhãn dán]" text;
   a failed one still falls back to the text.
 
+Review follow-up (PR #192):
+
+- `compute_video_thumb_size` caps each width floor (140 / 160) at `max_w`, so a chat
+  pane narrower than the floor no longer inverts the `clamp` range and panics. Image
+  file previews now call it too.
+- `apply_vanish_expiry` also clears `media_size` and `media_group`. Otherwise an
+  expired photo serialized non-empty `raw_json`, the store did not write the vanish
+  tombstone, and a later upsert could restore the content.
+- Hydrating from SQLite copies `media_size` into a message already in RAM that has
+  none, so the stored size is neither ignored nor dropped on the next save.
+
 No request, signing or frame behaviour changes; this only reads fields already
 received.
 
@@ -66,7 +77,9 @@ received.
   - `declared_photo_size_keeps_placeholder_and_loaded_photo_the_same_size`,
     `cover_uv_for_crops_to_the_target_aspect` and
     `loading_sticker_and_video_hold_their_final_size` (`src/gui/messages.rs`)
-  - `photo_declared_size_survives_store_and_hydrate` (`src/store.rs`)
+  - `photo_declared_size_survives_store_and_hydrate` (`src/store.rs`; also covers
+    hydrating over a message in RAM and the expired-photo tombstone)
+  - `narrow_bubbles_do_not_invert_media_size_clamps` (`src/gui/messages.rs`)
 - Manual checks on a real account (2026-11-20), each with a temporary log:
   - Of about 200 photo messages loaded at startup, all but two carried `width` and
     `height`. Of 135 video messages, all but one carried `video_width` and

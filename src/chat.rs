@@ -654,6 +654,10 @@ pub fn apply_vanish_expiry(msg: &mut ChatMessage) -> bool {
     msg.sticker_id = None;
     msg.sticker_cate_id = None;
     msg.sticker_type = None;
+    // Any leftover media metadata would make the expired row serialize non-empty
+    // `raw_json`, so the store would not write it as a tombstone.
+    msg.media_group = None;
+    msg.media_size = None;
     true
 }
 

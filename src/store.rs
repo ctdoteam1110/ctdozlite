@@ -2325,6 +2325,9 @@ impl MessageStore {
                     existing.is_pinned = existing.is_pinned || cm.is_pinned;
                     existing.is_starred = existing.is_starred || cm.is_starred;
                     existing.edited = existing.edited || cm.edited;
+                    if existing.media_size.is_none() {
+                        existing.media_size = cm.media_size;
+                    }
                 } else {
                     t.messages.push(cm);
                     loaded_count += 1;
@@ -3918,6 +3921,26 @@ mod tests {
             .find(|m| m.id == "m_photo")
             .expect("msg hydrated");
         assert_eq!(m.media_size, Some([1280, 960]));
+
+        // Hydrating over the same message already in RAM without a size keeps the stored one.
+        let mut threads = vec![Thread {
+            id: "t1".into(),
+            name: "Alice".into(),
+            messages: vec![ChatMessage {
+                media_size: None,
+                ..photo.clone()
+            }],
+            ..Default::default()
+        }];
+        store.hydrate_threads(&mut threads, 10).unwrap();
+        assert_eq!(threads[0].messages[0].media_size, Some([1280, 960]));
+        assert_eq!(threads[0].messages.len(), 1);
+
+        // An expired photo serializes no metadata, so the store writes a tombstone.
+        let mut expired = photo.clone();
+        assert!(crate::chat::apply_vanish_expiry(&mut expired));
+        assert_eq!(expired.media_size, None);
+        assert!(StoredMessage::from(&expired).raw_json.is_empty());
     }
 
     #[test]
