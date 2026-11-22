@@ -2411,7 +2411,9 @@ impl From<&ChatMessage> for StoredMessage {
         if let Some(size) = &m.media_size {
             meta.insert("media_size".into(), serde_json::json!(size));
         }
-        let raw_json = if meta.is_empty() {
+        // An expired message is stored as a tombstone: empty `raw_json` is what
+        // `upsert_message` keys on, whatever metadata (reactions, links) is left on it.
+        let raw_json = if meta.is_empty() || crate::chat::is_vanished_message(m) {
             String::new()
         } else {
             serde_json::Value::Object(meta).to_string()
@@ -3941,6 +3943,40 @@ mod tests {
         assert!(crate::chat::apply_vanish_expiry(&mut expired));
         assert_eq!(expired.media_size, None);
         assert!(StoredMessage::from(&expired).raw_json.is_empty());
+    }
+
+    #[test]
+    fn expired_message_with_reactions_stays_a_tombstone() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let photo = ChatMessage {
+            id: "m_photo".into(),
+            sender: "Alice".into(),
+            text: "[Hình ảnh]".into(),
+            ts: 1000,
+            link_url: Some("https://f60-zpg-r.zdn.vn/photo.jpg".into()),
+            link_src: Some("Hình ảnh Zalo".into()),
+            reactions: vec!["❤️".into()],
+            ..Default::default()
+        };
+        let row = |m: &ChatMessage| StoredMessage {
+            thread_id: "t1".into(),
+            ..StoredMessage::from(m)
+        };
+        store.upsert_message(&row(&photo)).unwrap();
+        let mut expired = photo.clone();
+        assert!(crate::chat::apply_vanish_expiry(&mut expired));
+        assert!(
+            !expired.reactions.is_empty(),
+            "fixture keeps leftover metadata"
+        );
+        assert!(row(&expired).raw_json.is_empty());
+        store.upsert_message(&row(&expired)).unwrap();
+        // A later sync of the original must not bring the content back.
+        store.upsert_message(&row(&photo)).unwrap();
+        let rows = store.messages_for("t1", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, crate::chat::VANISH_EXPIRED_TEXT);
+        assert_eq!(rows[0].raw_json, VANISH_TOMBSTONE_JSON);
     }
 
     #[test]

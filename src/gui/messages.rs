@@ -6055,6 +6055,43 @@ mod album_grid_tests {
     }
 
     #[test]
+    fn loading_image_file_preview_renders_in_a_narrow_bubble() {
+        let msg = ChatMessage {
+            id: "f".into(),
+            text: "[Tập tin] scan.jpg".into(),
+            link_url: Some("https://f1.example.invalid/scan.jpg".into()),
+            link_title: Some("scan.jpg".into()),
+            ..Default::default()
+        };
+        let textures = HashMap::new();
+        let failed = HashMap::new();
+        for max_text_width in [90.0, 120.0, 150.0] {
+            let (_, box_h) = image_file_preview_size(max_text_width);
+            let h = laid_out_height(|ui| {
+                let _ = render_image_file_card(
+                    ui,
+                    &msg,
+                    "scan.jpg",
+                    Color32::WHITE,
+                    &ThemePalette::light(),
+                    max_text_width,
+                    &textures,
+                    &mut HashSet::new(),
+                    &failed,
+                    None,
+                    false,
+                    None,
+                );
+            });
+            // The loading card holds the preview box, not the plain document card.
+            assert!(
+                h >= box_h,
+                "{max_text_width}: card {h} shorter than box {box_h}"
+            );
+        }
+    }
+
+    #[test]
     fn cover_uv_for_crops_to_the_target_aspect() {
         let wide = cover_uv_for(200.0, 100.0, 1.0);
         assert!((wide.width() - 0.5).abs() < 1e-6 && (wide.min.x - 0.25).abs() < 1e-6);

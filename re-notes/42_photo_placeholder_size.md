@@ -66,6 +66,8 @@ Review follow-up (PR #192):
   tombstone, and a later upsert could restore the content.
 - Hydrating from SQLite copies `media_size` into a message already in RAM that has
   none, so the stored size is neither ignored nor dropped on the next save.
+- `StoredMessage::from` writes empty `raw_json` for any expired message, so the store
+  keeps it as a tombstone even when leftover metadata such as reactions remains.
 
 No request, signing or frame behaviour changes; this only reads fields already
 received.
@@ -79,7 +81,9 @@ received.
     `loading_sticker_and_video_hold_their_final_size` (`src/gui/messages.rs`)
   - `photo_declared_size_survives_store_and_hydrate` (`src/store.rs`; also covers
     hydrating over a message in RAM and the expired-photo tombstone)
-  - `narrow_bubbles_do_not_invert_media_size_clamps` (`src/gui/messages.rs`)
+  - `narrow_bubbles_do_not_invert_media_size_clamps` and
+    `loading_image_file_preview_renders_in_a_narrow_bubble` (`src/gui/messages.rs`)
+  - `expired_message_with_reactions_stays_a_tombstone` (`src/store.rs`)
 - Manual checks on a real account (2026-11-20), each with a temporary log:
   - Of about 200 photo messages loaded at startup, all but two carried `width` and
     `height`. Of 135 video messages, all but one carried `video_width` and
