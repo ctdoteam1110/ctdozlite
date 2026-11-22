@@ -2640,6 +2640,15 @@ impl ZaloGuiApp {
         let had_unread = self.unread_counts.remove(&tid).is_some();
         let had_react = self.reaction_unread_counts.remove(&tid).is_some();
         if !had_unread && !had_react {
+            if let Some(mid) = report_unreported_arrival(
+                t,
+                self.settings.block_seen,
+                &self.user_uin,
+                &mut self.seen_receipts,
+                WORKER_TX.get(),
+            ) {
+                persist_thread_read(self.user_uin.clone(), tid, mid);
+            }
             return;
         }
         for m in &t.messages {
@@ -2648,13 +2657,7 @@ impl ZaloGuiApp {
             }
         }
         if let Some(mid) = advance_thread_read_point(t) {
-            let uin_c = self.user_uin.clone();
-            std::thread::spawn(move || {
-                let db = crate::store::db_path_for_account(&uin_c);
-                if let Ok(mut store) = crate::store::MessageStore::open(&db) {
-                    let _ = store.set_thread_read(&tid, &mid);
-                }
-            });
+            persist_thread_read(self.user_uin.clone(), tid, mid);
         }
         send_seen_receipt(
             t,
@@ -6343,28 +6346,66 @@ impl SeenReceipts {
     }
 }
 
+/// The open chat has no unread entry, but a message may have arrived while Contacts or
+/// Feed hid it: it was neither counted unread nor reported. Report it and return the new
+/// read point to persist. `SeenReceipts` makes this a no-op on every later frame, so the
+/// read point only moves when a new receipt goes out.
+fn report_unreported_arrival(
+    thread: &mut Thread,
+    block_seen: bool,
+    account: &str,
+    receipts: &mut SeenReceipts,
+    tx: Option<&tokio::sync::mpsc::UnboundedSender<WorkerCmd>>,
+) -> Option<String> {
+    if !queue_seen_receipt(thread, block_seen, account, receipts, tx) {
+        return None;
+    }
+    advance_thread_read_point(thread)
+}
+
+/// Save a thread's read point to the account's SQLite store off the UI thread.
+fn persist_thread_read(uin: String, thread_id: String, msg_id: String) {
+    std::thread::spawn(move || {
+        let db = crate::store::db_path_for_account(&uin);
+        if let Ok(mut store) = crate::store::MessageStore::open(&db) {
+            let _ = store.set_thread_read(&thread_id, &msg_id);
+        }
+    });
+}
+
 /// Tell Zalo the thread is read up to its newest incoming message, so the phone and other
 /// devices clear their unread badge. Skipped when "Ẩn trạng thái đã xem" (`block_seen`) is
 /// on, when there is no incoming message, or when that message was already reported.
 /// The worker reports a failed request with `GuiEvent::SeenReceiptFailed`, which makes
-/// the receipt eligible again.
+/// the receipt eligible again. Returns `true` when a new receipt was queued.
 pub(crate) fn send_seen_receipt(
     thread: &Thread,
     block_seen: bool,
     account: &str,
     receipts: &mut SeenReceipts,
-) {
+) -> bool {
+    queue_seen_receipt(thread, block_seen, account, receipts, WORKER_TX.get())
+}
+
+/// [`send_seen_receipt`] with the worker channel passed in, so tests can observe it.
+fn queue_seen_receipt(
+    thread: &Thread,
+    block_seen: bool,
+    account: &str,
+    receipts: &mut SeenReceipts,
+    tx: Option<&tokio::sync::mpsc::UnboundedSender<WorkerCmd>>,
+) -> bool {
     if block_seen {
-        return;
+        return false;
     }
     let Some((gmi, cmi)) = seen_receipt_target(thread) else {
-        return;
+        return false;
     };
-    let Some(tx) = WORKER_TX.get() else {
-        return;
+    let Some(tx) = tx else {
+        return false;
     };
     if !receipts.record(account, &thread.id, &gmi) {
-        return;
+        return false;
     }
     let cmd = WorkerCmd::SendSeen {
         account: account.to_string(),
@@ -6375,7 +6416,9 @@ pub(crate) fn send_seen_receipt(
     };
     if tx.send(cmd).is_err() {
         receipts.forget_failed(account, &thread.id, &gmi);
+        return false;
     }
+    true
 }
 
 /// (`gmi`, `cmi`) of the newest incoming, non-system message of `thread`.
@@ -6384,8 +6427,15 @@ fn seen_receipt_target(thread: &Thread) -> Option<(String, String)> {
         .messages
         .iter()
         .rev()
-        .find(|m| !m.is_outgoing && !crate::gui::messages::is_system_notice_message(m))
+        .find(|m| !m.is_outgoing && !is_protocol_system_message(m))
         .and_then(crate::chat::seen_target_ids)
+}
+
+/// A system event by its parsed kind or a local `sys_` id. Unlike
+/// `messages::is_system_notice_message`, this never matches ordinary text that happens to
+/// contain a notice phrase ("Tôi đã đổi tên nhóm rồi").
+fn is_protocol_system_message(m: &crate::chat::ChatMessage) -> bool {
+    m.kind == crate::message_model::MessageKind::System || m.id.starts_with("sys_")
 }
 
 /// Advance a thread's local read-point monotonically using visible numeric IDs,
@@ -6532,6 +6582,54 @@ mod tests {
         // A failure reported for the previous account is ignored.
         receipts.forget_failed("acc1", "g1", "7002");
         assert!(!receipts.record("acc2", "g1", "7002"));
+    }
+
+    #[test]
+    fn seen_receipt_skips_only_protocol_system_messages() {
+        let mut thread = unread_fixture(None, &[("100", false), ("200", false)]);
+        // Ordinary text that contains a notice phrase is still a message to report.
+        thread.messages[1].text = "Tôi đã đổi tên nhóm rồi".into();
+        assert_eq!(
+            super::seen_receipt_target(&thread).map(|(gmi, _)| gmi),
+            Some("200".to_string())
+        );
+        // A parsed system event is skipped.
+        thread.messages[1].kind = crate::message_model::MessageKind::System;
+        assert_eq!(
+            super::seen_receipt_target(&thread).map(|(gmi, _)| gmi),
+            Some("100".to_string())
+        );
+    }
+
+    #[test]
+    fn message_that_arrived_while_chat_was_hidden_is_reported_once() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut receipts = crate::gui::SeenReceipts::default();
+        // Read up to 100; 200 arrived while Contacts was open and was not counted unread.
+        let mut thread = unread_fixture(Some("100"), &[("100", false), ("200", false)]);
+        let moved =
+            super::report_unreported_arrival(&mut thread, false, "acc", &mut receipts, Some(&tx));
+        assert_eq!(moved.as_deref(), Some("200"));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(super::WorkerCmd::SendSeen { gmi, .. }) if gmi == "200"
+        ));
+        // Later frames do nothing.
+        let again =
+            super::report_unreported_arrival(&mut thread, false, "acc", &mut receipts, Some(&tx));
+        assert_eq!(again, None);
+        assert!(rx.try_recv().is_err());
+        // "Ẩn trạng thái đã xem" sends nothing.
+        let mut hidden = unread_fixture(Some("100"), &[("100", false), ("300", false)]);
+        let none = super::report_unreported_arrival(
+            &mut hidden,
+            true,
+            "acc",
+            &mut crate::gui::SeenReceipts::default(),
+            Some(&tx),
+        );
+        assert_eq!(none, None);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

@@ -51,6 +51,16 @@ Review follow-up:
 - The record of sent receipts belongs to one account and is cleared when another account
   becomes active, so a group shared by two accounts gets a receipt from each.
 
+Second review (after the rebase):
+
+- The receipt target skips only protocol system messages (`MessageKind::System` or a
+  local `sys_` id). The text-based `is_system_notice_message` matched ordinary text
+  such as "Tôi đã đổi tên nhóm rồi", so the newest message could go unreported.
+- A message that arrives in the selected chat while Contacts or Feed hides it is not
+  counted unread. When the chat is shown again, `mark_active_thread_read_if_focused`
+  now reports it and advances the read point, even with no unread entry
+  (`report_unreported_arrival`). `SeenReceipts` keeps later frames from resending.
+
 No other part of the request changed: the endpoints, `msgInfos` shape, `grid` /
 `senderId` and `imei` are the same.
 
@@ -59,7 +69,9 @@ No other part of the request changed: the endpoints, `msgInfos` shape, `grid` /
 - Unit tests:
   - `seen_receipts_dedupe_per_account_and_retry_after_failure` (`src/gui.rs`);
   - `seen_target_ids_prefer_wire_server_and_client_ids` (`src/chat.rs`);
-  - `seen_receipt_targets_newest_incoming_message` (`src/gui.rs`).
+  - `seen_receipt_targets_newest_incoming_message`,
+    `seen_receipt_skips_only_protocol_system_messages` and
+    `message_that_arrived_while_chat_was_hidden_is_reported_once` (`src/gui.rs`).
 - Manual, on a real account:
   1. Keep a 1-1 conversation and a group open in the desktop client.
   2. Send a message to each from another account.
