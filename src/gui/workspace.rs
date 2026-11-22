@@ -4220,6 +4220,7 @@ impl ZaloGuiApp {
                                         highlight_until: std::time::Instant::now()
                                             + std::time::Duration::from_secs(3),
                                         scroll_pending: true,
+                                        target_y: None,
                                     });
                                     ctx.request_repaint();
                                 } else {
@@ -6606,7 +6607,7 @@ impl ZaloGuiApp {
                         .as_ref()
                         .map(|jump| jump.scroll_pending)
                         .unwrap_or(false);
-                    let mut jump_scrolled = false;
+                    let mut jump_target_y: Option<f32> = None;
                     if let Some(index) = jump_index {
                         let count = self
                             .threads
@@ -6848,6 +6849,14 @@ impl ZaloGuiApp {
 
                                             let vanish_now_ms =
                                                 crate::login::unix_now().saturating_mul(1000);
+                                            let culler = RowCuller::new(ui);
+                                            let row_width_bucket = (ui.available_width() / 8.0).round() as u32;
+                                            // Over the cap, keep only this list's rows (collected
+                                            // below) so the open conversation keeps its layout.
+                                            let evict_row_heights = self.chat_row_heights.len() > 20_000;
+                                            let mut live_row_keys: Vec<u64> = Vec::new();
+                                            // Content origin, for the quote-jump target position.
+                                            let content_top = ui.min_rect().top();
                                             for (pos, &idx) in visible_indices.iter().enumerate() {
                                                 // Later photos of an album are drawn inside the first one's grid.
                                                 let run_len = album_runs[pos];
@@ -6870,6 +6879,35 @@ impl ZaloGuiApp {
                                                 let next_msg = visible_indices
                                                     .get(pos + run_len)
                                                     .map(|&ni| &thread.messages[ni]);
+
+                                                // Viewport-only rendering: a row far from the visible
+                                                // area is replaced by a spacer of its last measured
+                                                // height (or an estimate), so a frame lays out tens of
+                                                // bubbles instead of every loaded message.
+                                                // The divider and cluster flags depend on neighbours,
+                                                // which change under search or the starred filter.
+                                                let context = RowContext {
+                                                    time_divider: should_show_time_divider(prev_msg, msg),
+                                                    leading_row: pos == 0,
+                                                    prev_same_sender: prev_msg
+                                                        .is_some_and(|pm| same_message_cluster(pm, msg)),
+                                                    next_same_sender: next_msg
+                                                        .is_some_and(|nm| same_message_cluster(msg, nm)),
+                                                    latest_outgoing: last_outgoing_idx
+                                                        .is_some_and(|l| visible_indices[pos..pos + run_len].contains(&l)),
+                                                };
+                                                let row_key = chat_row_key(msg, run_len, row_width_bucket, context);
+                                                if evict_row_heights {
+                                                    live_row_keys.push(row_key);
+                                                }
+                                                let is_jump_row = jump_index.is_some_and(|j| {
+                                                    visible_indices[pos..pos + run_len].contains(&j)
+                                                });
+                                                let Some(slot) =
+                                                    culler.begin(ui, &self.chat_row_heights, row_key, is_jump_row)
+                                                else {
+                                                    continue;
+                                                };
 
                                                 if should_show_time_divider(prev_msg, msg) {
                                                     if pos > 0 {
@@ -6987,15 +7025,22 @@ impl ZaloGuiApp {
                                                     };
                                                     ui.add_space(space);
                                                 });
-                                                if jump_index == Some(idx) {
+                                                // `is_jump_row` also covers a target that is a later
+                                                // photo of an album drawn in this row.
+                                                if is_jump_row {
                                                     render_quote_target(
                                                         ui,
                                                         row.response.rect,
                                                         jump_scroll_pending,
                                                         pal.primary,
                                                     );
-                                                    jump_scrolled |= jump_scroll_pending;
+                                                    jump_target_y = Some(row.response.rect.top() - content_top);
                                                 }
+                                                RowCuller::finish(ui, &mut self.chat_row_heights, slot);
+                                            }
+                                            if evict_row_heights {
+                                                let live: std::collections::HashSet<u64> = live_row_keys.into_iter().collect();
+                                                self.chat_row_heights.retain(|k, _| live.contains(k));
                                             }
                                             let (bottom_rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 1.0), Sense::hover());
                                             if self.force_scroll_to_bottom {
@@ -7053,9 +7098,10 @@ impl ZaloGuiApp {
                                     });
                             });
                     }
-                    if jump_scrolled {
-                        if let Some(jump) = &mut self.quote_jump {
-                            jump.scroll_pending = false;
+                    if let (Some(y), Some(jump)) = (jump_target_y, &mut self.quote_jump) {
+                        jump.observe_target(y);
+                        if jump.scroll_pending {
+                            ctx.request_repaint();
                         }
                     }
                     if widen_window {
@@ -7114,6 +7160,7 @@ impl ZaloGuiApp {
                                             reference,
                                             highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(3),
                                             scroll_pending: true,
+                                            target_y: None,
                                         });
                                         ctx.request_repaint();
                                     } else {
@@ -10466,11 +10513,201 @@ mod quote_navigation_tests {
             reference: "original".into(),
             highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(3),
             scroll_pending: true,
+            target_y: None,
         };
         assert_eq!(jump.target_index("thread-1", &messages), Some(0));
         assert_eq!(jump.target_index("thread-2", &messages), None);
         jump.highlight_until = std::time::Instant::now();
         assert_eq!(jump.target_index("thread-1", &messages), None);
+    }
+
+    #[test]
+    fn quote_jump_rescrolls_when_rows_above_the_target_get_measured() {
+        let mut jump = QuoteJump {
+            thread_id: "t".into(),
+            reference: "r".into(),
+            highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(3),
+            scroll_pending: true,
+            target_y: None,
+        };
+        // Frame 1: the target is drawn and scrolled to; the request is spent.
+        jump.observe_target(4_000.0);
+        assert!(!jump.scroll_pending);
+        // Same position next frame: nothing to do (one-shot behaviour unchanged).
+        jump.observe_target(4_000.0);
+        assert!(!jump.scroll_pending);
+        // Rows above, laid out with the 72px estimate, are measured taller: the
+        // target moves down in content space and must be scrolled to again.
+        jump.observe_target(4_380.0);
+        assert!(jump.scroll_pending);
+        jump.observe_target(4_380.0);
+        assert!(!jump.scroll_pending);
+    }
+
+    #[test]
+    fn row_key_tracks_neighbour_decorations() {
+        let msg = ChatMessage {
+            id: "m".into(),
+            text: "hi".into(),
+            ..Default::default()
+        };
+        let base = RowContext {
+            time_divider: true,
+            leading_row: false,
+            prev_same_sender: false,
+            next_same_sender: false,
+            latest_outgoing: false,
+        };
+        let key = |c: RowContext| chat_row_key(&msg, 1, 40, c);
+        let mut variants = [base; 5];
+        // A divider row that becomes the first filtered row loses its 10px leading gap.
+        variants[0].leading_row = true;
+        variants[1].time_divider = false;
+        variants[2].prev_same_sender = true;
+        variants[3].next_same_sender = true;
+        variants[4].latest_outgoing = true;
+        for variant in variants {
+            assert_ne!(key(base), key(variant));
+        }
+        assert_eq!(key(base), key(base));
+    }
+
+    /// Height of row `i` in the culling tests: between 40 and 196 px, never the estimate.
+    fn culling_row_height(i: usize) -> f32 {
+        40.0 + ((i * 37) % 157) as f32
+    }
+
+    /// One frame of a 1 000-row list laid out through [`RowCuller`], like the chat view.
+    /// Returns the target row's content-space top and whether it ended up on screen.
+    fn culling_frame(
+        ctx: &egui::Context,
+        frame: usize,
+        heights: &mut HashMap<u64, f32>,
+        jump: Option<&QuoteJump>,
+        target: usize,
+    ) -> (Option<f32>, bool) {
+        let mut target_y = None;
+        let mut visible = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                time: Some(frame as f64 * 0.5),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(400.0, 300.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("culling_jump_test")
+                        .max_height(200.0)
+                        .stick_to_bottom(jump.is_none())
+                        .show(ui, |ui| {
+                            // As in the chat view: no gap between rows, so a cached
+                            // height is the whole slot a spacer must replace.
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let culler = RowCuller::new(ui);
+                            let content_top = ui.min_rect().top();
+                            for i in 0..1000 {
+                                let is_target = jump.is_some() && i == target;
+                                let Some(slot) = culler.begin(ui, heights, i as u64, is_target)
+                                else {
+                                    continue;
+                                };
+                                let (rect, _) = ui.allocate_exact_size(
+                                    Vec2::new(200.0, culling_row_height(i)),
+                                    Sense::hover(),
+                                );
+                                if let (true, Some(jump)) = (is_target, jump) {
+                                    render_quote_target(
+                                        ui,
+                                        rect,
+                                        jump.scroll_pending,
+                                        Color32::from_rgb(1, 2, 3),
+                                    );
+                                    target_y = Some(rect.top() - content_top);
+                                    visible = ui.clip_rect().contains(rect.center());
+                                }
+                                RowCuller::finish(ui, heights, slot);
+                            }
+                        });
+                });
+            },
+        );
+        (target_y, visible)
+    }
+
+    fn culling_jump(target: &str) -> QuoteJump {
+        QuoteJump {
+            thread_id: "t".into(),
+            reference: target.into(),
+            highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            scroll_pending: true,
+            target_y: None,
+        }
+    }
+
+    #[test]
+    fn distant_quote_jump_stays_in_view_while_culled_rows_get_measured() {
+        let ctx = egui::Context::default();
+        let mut heights = HashMap::new();
+        let target = 120;
+        // Settle at the bottom: only rows near the end get measured.
+        for frame in 0..3 {
+            culling_frame(&ctx, frame, &mut heights, None, target);
+        }
+        assert!(
+            !heights.contains_key(&(target as u64)),
+            "the target starts culled and unmeasured"
+        );
+
+        let mut jump = culling_jump("target");
+        let mut rescrolls = 0;
+        let mut visible = false;
+        for frame in 3..20 {
+            let (y, on_screen) = culling_frame(&ctx, frame, &mut heights, Some(&jump), target);
+            let y = y.expect("the jump target is always laid out");
+            let was_pending = jump.scroll_pending;
+            jump.observe_target(y);
+            if !was_pending && jump.scroll_pending {
+                rescrolls += 1;
+            }
+            visible = on_screen;
+        }
+        assert!(
+            rescrolls >= 1,
+            "rows above the target got real heights, so the target moved and was re-scrolled"
+        );
+        assert!(
+            !jump.scroll_pending,
+            "the jump settles once heights stop changing"
+        );
+        assert!(visible, "the target must end on screen");
+    }
+
+    #[test]
+    fn quote_jump_scrolls_once_when_row_heights_are_already_known() {
+        let ctx = egui::Context::default();
+        let target = 120;
+        // Every row already measured: nothing above the target can move.
+        let mut heights: HashMap<u64, f32> = (0..1000)
+            .map(|i| (i as u64, culling_row_height(i)))
+            .collect();
+        culling_frame(&ctx, 0, &mut heights, None, target);
+
+        let mut jump = culling_jump("target");
+        let mut visible = false;
+        for frame in 1..12 {
+            let (y, on_screen) = culling_frame(&ctx, frame, &mut heights, Some(&jump), target);
+            jump.observe_target(y.expect("the jump target is always laid out"));
+            assert!(
+                !jump.scroll_pending,
+                "frame {frame}: one-shot scroll, never re-armed"
+            );
+            visible = on_screen;
+        }
+        assert!(visible, "the target must end on screen");
     }
 
     #[test]
@@ -10600,4 +10837,98 @@ fn truncate_to_width(ui: &egui::Ui, text: &str, font: FontId, max_w: f32) -> Str
         }
     }
     chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
+}
+
+/// Height used for a chat row that has not been laid out yet (viewport-only rendering).
+const CHAT_ROW_ESTIMATE_H: f32 = 72.0;
+
+/// Viewport-only layout of the chat list: a row far from the visible area is replaced by
+/// a spacer of its last measured height (or [`CHAT_ROW_ESTIMATE_H`]), so a frame lays out
+/// tens of bubbles instead of every loaded message.
+struct RowCuller {
+    view: egui::Rect,
+    margin: f32,
+}
+
+/// A row [`RowCuller::begin`] decided to draw; hand it back to [`RowCuller::finish`].
+struct RowSlot {
+    key: u64,
+    top: f32,
+    known_h: Option<f32>,
+}
+
+impl RowCuller {
+    /// Rows within 1.5 viewport heights of the visible area are drawn.
+    fn new(ui: &egui::Ui) -> Self {
+        let view = ui.clip_rect();
+        Self {
+            view,
+            margin: view.height() * 1.5,
+        }
+    }
+
+    /// Leave a spacer and return `None` for a row far from the viewport, unless `force`
+    /// (a quote-jump target is always drawn); otherwise return the slot to draw into.
+    fn begin(
+        &self,
+        ui: &mut egui::Ui,
+        heights: &HashMap<u64, f32>,
+        key: u64,
+        force: bool,
+    ) -> Option<RowSlot> {
+        let top = ui.cursor().top();
+        let known_h = heights.get(&key).copied();
+        let guess_h = known_h.unwrap_or(CHAT_ROW_ESTIMATE_H);
+        let near_view = top + guess_h >= self.view.top() - self.margin
+            && top <= self.view.bottom() + self.margin;
+        if !near_view && !force {
+            ui.allocate_space(Vec2::new(ui.available_width(), guess_h));
+            return None;
+        }
+        Some(RowSlot { key, top, known_h })
+    }
+
+    /// Record the height the drawn row actually took.
+    fn finish(ui: &egui::Ui, heights: &mut HashMap<u64, f32>, slot: RowSlot) {
+        let measured = (ui.cursor().top() - slot.top).max(0.0);
+        if !slot.known_h.is_some_and(|h| (h - measured).abs() <= 0.5) {
+            heights.insert(slot.key, measured);
+        }
+    }
+}
+
+/// Cache key of a chat row's measured height: the message identity plus what changes its
+/// height (text, attachments, reactions, translation, album size) and the width bucket.
+fn chat_row_key(
+    msg: &crate::chat::ChatMessage,
+    run_len: usize,
+    width_bucket: u32,
+    context: RowContext,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    msg.id.hash(&mut h);
+    msg.ts.hash(&mut h);
+    msg.text.len().hash(&mut h);
+    msg.link_title.as_deref().map(str::len).hash(&mut h);
+    msg.link_thumb.is_some().hash(&mut h);
+    msg.reactions.len().hash(&mut h);
+    msg.reaction_summaries.len().hash(&mut h);
+    msg.translation.as_deref().map(str::len).hash(&mut h);
+    run_len.hash(&mut h);
+    width_bucket.hash(&mut h);
+    context.hash(&mut h);
+    h.finish()
+}
+
+/// Neighbour-derived decorations of a chat row (date divider, sender heading, timestamp,
+/// trailing spacing, seen status); part of [`chat_row_key`].
+#[derive(Clone, Copy, Hash)]
+struct RowContext {
+    time_divider: bool,
+    /// First row of the list: its divider has no leading gap.
+    leading_row: bool,
+    prev_same_sender: bool,
+    next_same_sender: bool,
+    latest_outgoing: bool,
 }
