@@ -1402,6 +1402,16 @@ impl MessageStore {
     /// original row — otherwise the sweep re-persists expiry every 2s tick and a
     /// restart restores the original content from the stale row (gui.rs:1908).
     pub fn upsert_message(&mut self, msg: &StoredMessage) -> Result<bool> {
+        let trimmed = msg.text.trim();
+        let is_tombstone =
+            msg.raw_json.is_empty() && trimmed == crate::chat::VANISH_EXPIRED_TEXT;
+        // A tombstone inserted as a fresh row (e.g. a JSON import into a new database)
+        // carries the marker too, or a later upsert of the original would overwrite it.
+        let insert_raw_json = if is_tombstone {
+            VANISH_TOMBSTONE_JSON
+        } else {
+            msg.raw_json.as_str()
+        };
         let rows = self.conn.execute(
             "INSERT OR IGNORE INTO messages (msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1414,12 +1424,9 @@ impl MessageStore {
                 msg.msg_type,
                 msg.ts,
                 if msg.is_outgoing { 1 } else { 0 },
-                msg.raw_json,
+                insert_raw_json,
             ],
         )?;
-        let trimmed = msg.text.trim();
-        let is_tombstone =
-            msg.raw_json.is_empty() && trimmed == crate::chat::VANISH_EXPIRED_TEXT;
         let is_incoming_undo = !is_tombstone
             && (trimmed == "[Tin nhắn đã thu hồi]"
                 || msg.msg_type == "chat.undo"
@@ -3943,6 +3950,36 @@ mod tests {
         assert!(crate::chat::apply_vanish_expiry(&mut expired));
         assert_eq!(expired.media_size, None);
         assert!(StoredMessage::from(&expired).raw_json.is_empty());
+    }
+
+    #[test]
+    fn expired_message_inserted_first_stays_a_tombstone() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let photo = ChatMessage {
+            id: "m_photo".into(),
+            sender: "Alice".into(),
+            text: "[Hình ảnh]".into(),
+            ts: 1000,
+            link_url: Some("https://f60-zpg-r.zdn.vn/photo.jpg".into()),
+            link_src: Some("Hình ảnh Zalo".into()),
+            ..Default::default()
+        };
+        let row = |m: &ChatMessage| StoredMessage {
+            thread_id: "t1".into(),
+            ..StoredMessage::from(m)
+        };
+        let mut expired = photo.clone();
+        assert!(crate::chat::apply_vanish_expiry(&mut expired));
+        // The expired copy is the first row, as in an import into a fresh database.
+        assert!(store.upsert_message(&row(&expired)).unwrap());
+        let rows = store.messages_for("t1", 10).unwrap();
+        assert_eq!(rows[0].raw_json, VANISH_TOMBSTONE_JSON);
+        // A later sync of the original must not bring the content back.
+        store.upsert_message(&row(&photo)).unwrap();
+        let rows = store.messages_for("t1", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, crate::chat::VANISH_EXPIRED_TEXT);
+        assert_eq!(rows[0].raw_json, VANISH_TOMBSTONE_JSON);
     }
 
     #[test]
