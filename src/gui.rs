@@ -6995,7 +6995,10 @@ impl ZaloGuiApp {
     fn hides_to_tray(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            self.tray.is_some() && tray::host_online()
+            // winit cannot hide a window on Wayland (set_visible is a no-op), so X must quit there.
+            self.tray.is_some()
+                && tray::host_online()
+                && std::env::var_os("WAYLAND_DISPLAY").is_none()
         }
         #[cfg(not(target_os = "linux"))]
         {
