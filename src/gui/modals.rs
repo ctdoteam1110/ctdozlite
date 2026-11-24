@@ -652,7 +652,11 @@ impl ZaloGuiApp {
         if let Some(ref mut popup) = self.incoming_popup {
             const POPUP_DURATION_MS: u64 = 6500;
             let elapsed_ms = popup.created_at.elapsed().as_millis() as u64;
-            if elapsed_ms >= POPUP_DURATION_MS || !self.settings.enable_notifications {
+            // Linux/macOS already get an OS banner (os_notify); the extra window lags on Wayland.
+            if elapsed_ms >= POPUP_DURATION_MS
+                || !self.settings.enable_notifications
+                || cfg!(not(target_os = "windows"))
+            {
                 close_popup = true;
             } else {
                 const POPUP_TITLE: &str = "ctdozlite — Tin nhắn mới";
