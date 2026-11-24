@@ -4930,12 +4930,11 @@ pub(super) fn render_chat_bubble(
                     && !modal_open
                     && !has_interactive_card
                     && !vanished
-                    && ui.input(|i| {
-                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                            && i.pointer.interact_pos().is_some_and(|p| {
-                                fr.response.rect.contains(p)
-                                    && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
-                            })
+                    && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary))
+                    && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| {
+                        // Outside the input closure: layer_id_at re-locks the context and would deadlock.
+                        fr.response.rect.contains(p)
+                            && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
                     })
                 {
                     return Some(BubbleAction::Reply);
@@ -5127,11 +5126,13 @@ pub(super) fn render_chat_bubble(
                     && !has_interactive_card
                     && !vanished
                     && ui.input(|i| {
-                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                            && i.pointer.interact_pos().is_some_and(|p| {
-                                fr.response.rect.contains(p)
-                                    && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
-                            })
+                        i.pointer
+                            .button_double_clicked(egui::PointerButton::Primary)
+                    })
+                    && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| {
+                        // Outside the input closure: layer_id_at re-locks the context and would deadlock.
+                        fr.response.rect.contains(p)
+                            && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
                     })
                 {
                     return Some(BubbleAction::Reply);
