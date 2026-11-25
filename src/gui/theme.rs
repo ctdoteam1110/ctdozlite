@@ -133,9 +133,9 @@ impl ThemePalette {
         #[cfg(target_os = "macos")]
         {
             if self.is_dark {
-                Color32::from_rgba_unmultiplied(18, 22, 30, 118)
+                Color32::from_rgba_unmultiplied(13, 20, 31, 212)
             } else {
-                Color32::from_rgba_unmultiplied(248, 251, 255, 130)
+                Color32::from_rgba_unmultiplied(222, 230, 241, 214)
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -148,9 +148,9 @@ impl ThemePalette {
         #[cfg(target_os = "macos")]
         {
             if self.is_dark {
-                Color32::from_rgba_unmultiplied(14, 18, 26, 112)
+                Color32::from_rgba_unmultiplied(13, 20, 31, 212)
             } else {
-                Color32::from_rgba_unmultiplied(240, 245, 255, 122)
+                Color32::from_rgba_unmultiplied(222, 230, 241, 214)
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -163,9 +163,24 @@ impl ThemePalette {
         #[cfg(target_os = "macos")]
         {
             if self.is_dark {
-                Color32::from_rgba_unmultiplied(22, 27, 36, 146)
+                Color32::from_rgba_unmultiplied(21, 31, 45, 232)
             } else {
-                Color32::from_rgba_unmultiplied(250, 252, 255, 158)
+                Color32::from_rgba_unmultiplied(255, 255, 255, 244)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_sidebar
+        }
+    }
+
+    pub(super) fn glass_bar(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(22, 33, 48, 236)
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 246)
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -178,9 +193,9 @@ impl ThemePalette {
         #[cfg(target_os = "macos")]
         {
             if self.is_dark {
-                Color32::from_rgba_unmultiplied(17, 21, 28, 174)
+                Color32::from_rgba_unmultiplied(13, 20, 31, 224)
             } else {
-                Color32::from_rgba_unmultiplied(238, 244, 252, 168)
+                Color32::from_rgba_unmultiplied(220, 229, 241, 218)
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -193,9 +208,9 @@ impl ThemePalette {
         #[cfg(target_os = "macos")]
         {
             if self.is_dark {
-                Color32::from_rgba_unmultiplied(32, 37, 47, 244)
+                Color32::from_rgba_unmultiplied(24, 35, 50, 246)
             } else {
-                Color32::from_rgba_unmultiplied(255, 255, 255, 246)
+                Color32::from_rgba_unmultiplied(255, 255, 255, 248)
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -208,9 +223,9 @@ impl ThemePalette {
         #[cfg(target_os = "macos")]
         {
             if self.is_dark {
-                Color32::from_rgba_unmultiplied(18, 22, 30, 158)
+                Color32::from_rgba_unmultiplied(30, 43, 60, 226)
             } else {
-                Color32::from_rgba_unmultiplied(255, 255, 255, 182)
+                Color32::from_rgba_unmultiplied(235, 240, 247, 235)
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -223,9 +238,19 @@ impl ThemePalette {
         #[cfg(target_os = "macos")]
         {
             if self.is_dark {
-                Color32::from_rgba_unmultiplied(37, 99, 235, 84)
+                Color32::from_rgba_unmultiplied(
+                    self.primary.r(),
+                    self.primary.g(),
+                    self.primary.b(),
+                    165,
+                )
             } else {
-                Color32::from_rgba_unmultiplied(0, 104, 255, 36)
+                Color32::from_rgba_unmultiplied(
+                    self.primary.r(),
+                    self.primary.g(),
+                    self.primary.b(),
+                    34,
+                )
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -238,7 +263,7 @@ impl ThemePalette {
         #[cfg(target_os = "macos")]
         {
             if self.is_dark {
-                Color32::from_rgba_unmultiplied(255, 255, 255, 28)
+                Color32::from_rgba_unmultiplied(38, 52, 72, 115)
             } else {
                 Color32::from_rgba_unmultiplied(15, 23, 42, 18)
             }
@@ -253,9 +278,9 @@ impl ThemePalette {
         #[cfg(target_os = "macos")]
         {
             if self.is_dark {
-                Color32::from_rgba_unmultiplied(255, 255, 255, 58)
+                Color32::from_rgba_unmultiplied(74, 96, 124, 110)
             } else {
-                Color32::from_rgba_unmultiplied(15, 23, 42, 46)
+                Color32::from_rgba_unmultiplied(15, 23, 42, 42)
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -268,9 +293,24 @@ impl ThemePalette {
         #[cfg(target_os = "macos")]
         {
             if self.is_dark {
-                Color32::from_rgba_unmultiplied(255, 255, 255, 32)
+                Color32::from_rgba_unmultiplied(56, 74, 98, 68)
             } else {
-                Color32::from_rgba_unmultiplied(15, 23, 42, 28)
+                Color32::from_rgba_unmultiplied(15, 23, 42, 30)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.border
+        }
+    }
+
+    pub(super) fn glass_control_border(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(74, 96, 124, 88)
+            } else {
+                Color32::from_rgba_unmultiplied(15, 23, 42, 42)
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -283,7 +323,7 @@ impl ThemePalette {
         #[cfg(target_os = "macos")]
         {
             if self.is_dark {
-                Color32::from_rgba_unmultiplied(255, 255, 255, 44)
+                Color32::from_rgba_unmultiplied(74, 96, 124, 82)
             } else {
                 Color32::from_rgba_unmultiplied(255, 255, 255, 215)
             }
@@ -298,9 +338,9 @@ impl ThemePalette {
         #[cfg(target_os = "macos")]
         {
             if self.is_dark {
-                Color32::from_rgba_unmultiplied(37, 99, 235, 152)
+                Color32::from_rgba_unmultiplied(29, 73, 130, 240)
             } else {
-                Color32::from_rgba_unmultiplied(219, 234, 254, 212)
+                Color32::from_rgba_unmultiplied(219, 234, 254, 240)
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -313,9 +353,9 @@ impl ThemePalette {
         #[cfg(target_os = "macos")]
         {
             if self.is_dark {
-                Color32::from_rgba_unmultiplied(44, 51, 63, 184)
+                Color32::from_rgba_unmultiplied(33, 46, 64, 246)
             } else {
-                Color32::from_rgba_unmultiplied(255, 255, 255, 210)
+                Color32::from_rgba_unmultiplied(255, 255, 255, 250)
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -383,7 +423,7 @@ impl ThemePalette {
 
         visuals.widgets.inactive.bg_fill = self.glass_elevated();
         visuals.widgets.inactive.weak_bg_fill = self.glass_elevated();
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.glass_border());
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.glass_control_border());
         visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, self.text_primary);
         visuals.widgets.inactive.rounding = r;
 
@@ -549,12 +589,22 @@ impl ThemePalette {
             if let Some(c) = parse_hex_color(hex).filter(|c| c.a() > 0) {
                 let effective = blend_over(c, self.bg_app);
                 self.primary = c;
-                self.primary_hover = Color32::from_rgba_unmultiplied(
-                    c.r().saturating_add(25),
-                    c.g().saturating_add(25),
-                    c.b().saturating_add(25),
-                    c.a(),
-                );
+                self.primary_hover = if self.is_dark {
+                    let lift = |v: u8| -> u8 {
+                        ((v as f32) + (255.0 - v as f32) * 0.42)
+                            .round()
+                            .clamp(0.0, 255.0) as u8
+                    };
+                    Color32::from_rgba_unmultiplied(lift(c.r()), lift(c.g()), lift(c.b()), c.a())
+                } else {
+                    Color32::from_rgba_unmultiplied(
+                        c.r().saturating_sub(14),
+                        c.g().saturating_sub(14),
+                        c.b().saturating_sub(14),
+                        c.a(),
+                    )
+                };
+                self.link_text = self.primary_hover;
                 self.primary_fg = if contrast_ratio(Color32::WHITE, effective)
                     >= contrast_ratio(Color32::from_rgb(15, 23, 42), effective)
                 {

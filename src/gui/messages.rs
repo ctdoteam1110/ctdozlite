@@ -1611,9 +1611,22 @@ fn append_md_run_to_job(
             0.0,
             egui::TextFormat {
                 font_id: FontId::proportional(base_size),
-                color: pal.link_text,
-                background: pal.primary.linear_multiply(0.14),
-                underline: Stroke::new(1.0_f32, pal.link_text.linear_multiply(0.6)),
+                color: pal.primary_hover,
+                background: Color32::from_rgba_unmultiplied(
+                    pal.primary_hover.r(),
+                    pal.primary_hover.g(),
+                    pal.primary_hover.b(),
+                    if pal.is_dark { 34 } else { 26 },
+                ),
+                underline: Stroke::new(
+                    1.0_f32,
+                    Color32::from_rgba_unmultiplied(
+                        pal.primary_hover.r(),
+                        pal.primary_hover.g(),
+                        pal.primary_hover.b(),
+                        140,
+                    ),
+                ),
                 ..Default::default()
             },
         ),
@@ -4812,7 +4825,11 @@ pub(super) fn render_chat_bubble(
                     };
                     Stroke::new(1.2_f32, border_col)
                 } else if cfg!(target_os = "macos") {
-                    Stroke::new(1.0_f32, pal.glass_specular())
+                    if pal.is_dark {
+                        Stroke::NONE
+                    } else {
+                        Stroke::new(1.0_f32, pal.glass_border())
+                    }
                 } else if !pal.is_dark {
                     Stroke::new(1.0_f32, Color32::from_rgb(199, 224, 255))
                 } else {
@@ -4989,7 +5006,21 @@ pub(super) fn render_chat_bubble(
             } else {
                 thread_name
             };
-            let sender_accent = avatar_color_for(display_sender, false);
+            let raw_sender_accent = avatar_color_for(display_sender, false);
+            let sender_accent = if pal.is_dark {
+                let lift = |v: u8| -> u8 {
+                    ((v as f32) + (255.0 - v as f32) * 0.44)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
+                Color32::from_rgb(
+                    lift(raw_sender_accent.r()),
+                    lift(raw_sender_accent.g()),
+                    lift(raw_sender_accent.b()),
+                )
+            } else {
+                raw_sender_accent
+            };
 
             // Sender Avatar (only on first message of a consecutive group)
             if !prev_same_sender {
@@ -5035,7 +5066,7 @@ pub(super) fn render_chat_bubble(
                 };
                 Stroke::new(1.2_f32, border_col)
             } else if cfg!(target_os = "macos") {
-                Stroke::new(1.0_f32, pal.glass_specular())
+                Stroke::new(if pal.is_dark { 0.8_f32 } else { 1.0_f32 }, pal.glass_border())
             } else {
                 Stroke::new(1.0_f32, pal.bubble_in_border)
             };

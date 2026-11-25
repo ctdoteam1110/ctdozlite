@@ -170,6 +170,24 @@ static BOOL ctdozlite_reopen_handler(id self, SEL _cmd, NSApplication *sender, B
     return YES;
 }
 
+void ctdozlite_macos_set_appearance(void *win_ptr, void *view_ptr, int dark_mode) {
+    @autoreleasepool {
+        NSAppearanceName name = dark_mode ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+        NSAppearance *appearance = [NSAppearance appearanceNamed:name];
+        if (appearance == nil) {
+            return;
+        }
+        if (win_ptr != NULL) {
+            NSWindow *win = (__bridge NSWindow *)win_ptr;
+            [win setAppearance:appearance];
+        }
+        if (view_ptr != NULL) {
+            NSView *view = (__bridge NSView *)view_ptr;
+            [view setAppearance:appearance];
+        }
+    }
+}
+
 void ctdozlite_macos_install_reopen_handler(void) {
     @autoreleasepool {
         static dispatch_once_t onceToken;

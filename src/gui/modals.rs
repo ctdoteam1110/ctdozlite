@@ -9601,12 +9601,25 @@ impl ZaloGuiApp {
         egui::SidePanel::left("contacts_left_sidebar")
             .resizable(false)
             .exact_width(300.0)
-            .frame(
+            .show_separator_line(false)
+            .frame(if cfg!(target_os = "macos") {
                 egui::Frame::none()
-                    .fill(pal.bg_sidebar)
+                    .fill(pal.glass_sidebar())
+                    .rounding(Rounding::same(14.0))
+                    .outer_margin(Margin {
+                        left: 2.0,
+                        right: 6.0,
+                        top: 8.0,
+                        bottom: 8.0,
+                    })
+                    .stroke(Stroke::new(1.0_f32, pal.glass_border()))
+                    .inner_margin(Margin::symmetric(12.0, 14.0))
+            } else {
+                egui::Frame::none()
+                    .fill(pal.glass_sidebar())
                     .stroke(Stroke::new(1.0_f32, pal.border))
-                    .inner_margin(Margin::symmetric(12.0, 14.0)),
-            )
+                    .inner_margin(Margin::symmetric(12.0, 14.0))
+            })
             .show(ctx, |ui| {
                 // Search bar + Add friend / Create group buttons (matching Chat Sidebar header)
                 ui.horizontal(|ui| {
@@ -9616,7 +9629,7 @@ impl ZaloGuiApp {
                         ui.allocate_exact_size(Vec2::new(sbox_w, 32.0), Sense::hover());
                     let has_q = !self.contacts_search_query.is_empty();
                     ui.painter()
-                        .rect_filled(sbox_rect, Rounding::same(8.0), pal.bg_input);
+                        .rect_filled(sbox_rect, Rounding::same(8.0), pal.glass_input());
                     ui.painter().rect_stroke(
                         sbox_rect,
                         Rounding::same(8.0),
@@ -9625,7 +9638,7 @@ impl ZaloGuiApp {
                             if has_q {
                                 pal.primary.linear_multiply(0.65)
                             } else {
-                                pal.border
+                                pal.glass_control_border()
                             },
                         ),
                     );
@@ -9797,7 +9810,11 @@ impl ZaloGuiApp {
 
         // 2. Main Central Directory Panel
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
+            .frame(egui::Frame::none().fill(if cfg!(target_os = "macos") {
+                Color32::TRANSPARENT
+            } else {
+                pal.glass_canvas()
+            }))
             .show(ctx, |ui| {
                 let (header_icon, header_title) = match self.contacts_sub_tab {
                     ContactsSubTab::Friends => (lucide::USER, "Danh sách bạn bè"),
@@ -9809,14 +9826,32 @@ impl ZaloGuiApp {
                 };
 
                 // Full-width Top Header Bar (stretches 100% across CentralPanel)
-                let (hdr_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 56.0), Sense::hover());
-                ui.painter()
-                    .rect_filled(hdr_rect, Rounding::ZERO, pal.bg_sidebar);
-                ui.painter().line_segment(
-                    [hdr_rect.left_bottom(), hdr_rect.right_bottom()],
-                    Stroke::new(1.0_f32, pal.border),
-                );
+                let (hdr_outer, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), if cfg!(target_os = "macos") { 64.0 } else { 56.0 }), Sense::hover());
+                let hdr_rect = if cfg!(target_os = "macos") {
+                    Rect::from_min_max(
+                        Pos2::new(hdr_outer.left() + 4.0, hdr_outer.top() + 8.0),
+                        Pos2::new(hdr_outer.right() - 10.0, hdr_outer.bottom() - 4.0),
+                    )
+                } else {
+                    hdr_outer
+                };
+                if cfg!(target_os = "macos") {
+                    ui.painter()
+                        .rect_filled(hdr_rect, Rounding::same(18.0), pal.glass_bar());
+                    ui.painter().rect_stroke(
+                        hdr_rect,
+                        Rounding::same(18.0),
+                        Stroke::new(1.0_f32, pal.glass_border()),
+                    );
+                } else {
+                    ui.painter()
+                        .rect_filled(hdr_rect, Rounding::ZERO, pal.glass_sidebar());
+                    ui.painter().line_segment(
+                        [hdr_rect.left_bottom(), hdr_rect.right_bottom()],
+                        Stroke::new(1.0_f32, pal.glass_border()),
+                    );
+                }
                 draw_lucide_icon(
                     ui.painter(),
                     Pos2::new(hdr_rect.left() + 30.0, hdr_rect.center().y),
@@ -10158,12 +10193,25 @@ impl ZaloGuiApp {
         egui::SidePanel::left("feed_friends_sidebar")
             .resizable(false)
             .exact_width(292.0)
-            .frame(
+            .show_separator_line(false)
+            .frame(if cfg!(target_os = "macos") {
                 egui::Frame::none()
-                    .fill(pal.bg_sidebar)
+                    .fill(pal.glass_sidebar())
+                    .rounding(Rounding::same(14.0))
+                    .outer_margin(Margin {
+                        left: 2.0,
+                        right: 6.0,
+                        top: 8.0,
+                        bottom: 8.0,
+                    })
+                    .stroke(Stroke::new(1.0_f32, pal.glass_border()))
+                    .inner_margin(Margin::symmetric(14.0, 14.0))
+            } else {
+                egui::Frame::none()
+                    .fill(pal.glass_sidebar())
                     .stroke(Stroke::new(1.0_f32, pal.border))
-                    .inner_margin(Margin::symmetric(14.0, 14.0)),
-            )
+                    .inner_margin(Margin::symmetric(14.0, 14.0))
+            })
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -10384,20 +10432,42 @@ impl ZaloGuiApp {
 
         // Main Central Panel — Social Timeline Stream
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
+            .frame(egui::Frame::none().fill(if cfg!(target_os = "macos") {
+                Color32::TRANSPARENT
+            } else {
+                pal.glass_canvas()
+            }))
             .show(ctx, |ui| {
                 // Full-width Top Header Bar (54px)
-                let (hdr_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 54.0), Sense::hover());
-                ui.painter()
-                    .rect_filled(hdr_rect, Rounding::ZERO, pal.bg_sidebar);
-                ui.painter().line_segment(
-                    [
-                        Pos2::new(hdr_rect.left(), hdr_rect.bottom()),
-                        Pos2::new(hdr_rect.right(), hdr_rect.bottom()),
-                    ],
-                    Stroke::new(1.0_f32, pal.border),
-                );
+                let (hdr_outer, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), if cfg!(target_os = "macos") { 62.0 } else { 54.0 }), Sense::hover());
+                let hdr_rect = if cfg!(target_os = "macos") {
+                    Rect::from_min_max(
+                        Pos2::new(hdr_outer.left() + 4.0, hdr_outer.top() + 8.0),
+                        Pos2::new(hdr_outer.right() - 10.0, hdr_outer.bottom() - 4.0),
+                    )
+                } else {
+                    hdr_outer
+                };
+                if cfg!(target_os = "macos") {
+                    ui.painter()
+                        .rect_filled(hdr_rect, Rounding::same(18.0), pal.glass_bar());
+                    ui.painter().rect_stroke(
+                        hdr_rect,
+                        Rounding::same(18.0),
+                        Stroke::new(1.0_f32, pal.glass_border()),
+                    );
+                } else {
+                    ui.painter()
+                        .rect_filled(hdr_rect, Rounding::ZERO, pal.glass_sidebar());
+                    ui.painter().line_segment(
+                        [
+                            Pos2::new(hdr_rect.left(), hdr_rect.bottom()),
+                            Pos2::new(hdr_rect.right(), hdr_rect.bottom()),
+                        ],
+                        Stroke::new(1.0_f32, pal.glass_border()),
+                    );
+                }
                 let tab_inner = Rect::from_min_max(
                     Pos2::new(hdr_rect.left() + 24.0, hdr_rect.top() + 10.0),
                     Pos2::new(hdr_rect.right() - 24.0, hdr_rect.bottom() - 10.0),

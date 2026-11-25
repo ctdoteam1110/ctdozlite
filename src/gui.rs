@@ -5330,6 +5330,34 @@ impl ZaloGuiApp {
         } else {
             self.mark_active_thread_read_if_focused(ctx);
             self.render_chat_workspace(ctx, &pal);
+            #[cfg(target_os = "macos")]
+            {
+                let screen = ctx.screen_rect();
+                let drag_zone = Rect::from_min_max(
+                    Pos2::new(screen.left() + 72.0, screen.top()),
+                    Pos2::new(screen.right(), screen.top() + 58.0),
+                );
+                let (want_drag, want_max) = ctx.input(|i| {
+                    let in_zone = i
+                        .pointer
+                        .press_origin()
+                        .or_else(|| i.pointer.interact_pos())
+                        .is_some_and(|p| drag_zone.contains(p));
+                    if !in_zone {
+                        return (false, false);
+                    }
+                    let dbl = i.pointer.button_double_clicked(egui::PointerButton::Primary);
+                    let drag = i.pointer.primary_down() && i.pointer.is_decidedly_dragging();
+                    (drag, dbl)
+                });
+                if !ctx.is_using_pointer() {
+                    if want_max {
+                        self.toggle_maximize(ctx);
+                    } else if want_drag {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                }
+            }
         }
 
         // Auto-notification modal for new GitHub Releases (works on both Login & Chat screens)
@@ -5659,6 +5687,10 @@ impl ZaloGuiApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(icon))));
             }
         }
+        #[cfg(target_os = "macos")]
+        if self.is_logged_in {
+            return;
+        }
 
         #[cfg(target_os = "macos")]
         let (title_bar_height, title_bar_frame) = {
@@ -5692,6 +5724,7 @@ impl ZaloGuiApp {
 
         egui::TopBottomPanel::top("custom_title_bar")
             .exact_height(title_bar_height)
+            .show_separator_line(false)
             .frame(title_bar_frame)
             .show(ctx, |ui| {
                 let bar_rect = ui.max_rect();

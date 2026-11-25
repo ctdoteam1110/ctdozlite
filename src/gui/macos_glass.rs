@@ -38,6 +38,7 @@ extern "C" {
 
 extern "C" {
     fn ctdozlite_macos_install_reopen_handler();
+    fn ctdozlite_macos_set_appearance(win_ptr: *mut c_void, view_ptr: *mut c_void, dark_mode: i32);
 }
 
 static VIBRANCY_WINDOW: AtomicUsize = AtomicUsize::new(0);
@@ -268,6 +269,7 @@ pub(super) fn install_vibrancy_if_needed(dark_mode: bool) {
         );
         msg0_void(effect, sel(b"release\0"));
 
+        ctdozlite_macos_set_appearance(target_win, effect, if dark_mode { 1 } else { 0 });
         ctdozlite_macos_install_reopen_handler();
         VIBRANCY_VIEW.store(effect as usize, Ordering::Relaxed);
         VIBRANCY_WINDOW.store(target_win as usize, Ordering::Relaxed);
@@ -276,6 +278,7 @@ pub(super) fn install_vibrancy_if_needed(dark_mode: bool) {
 
 /// Update the behind-window vibrancy material when switching between Dark and Light modes.
 pub(super) fn sync_vibrancy_theme(dark_mode: bool) {
+    let win = VIBRANCY_WINDOW.load(Ordering::Relaxed) as *mut c_void;
     let effect = VIBRANCY_VIEW.load(Ordering::Relaxed) as *mut c_void;
     if effect.is_null() {
         return;
@@ -283,5 +286,6 @@ pub(super) fn sync_vibrancy_theme(dark_mode: bool) {
     // SAFETY: Main GUI thread; `effect` stays retained by the window's theme-frame superview.
     unsafe {
         msg1_isize(effect, sel(b"setMaterial:\0"), material_for_theme(dark_mode));
+        ctdozlite_macos_set_appearance(win, effect, if dark_mode { 1 } else { 0 });
     }
 }
