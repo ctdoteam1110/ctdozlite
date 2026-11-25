@@ -208,11 +208,24 @@ impl ZaloGuiApp {
             .exact_width(left_rail_w)
             .frame(
                 egui::Frame::none()
-                    .fill(pal.bg_app)
+                    .fill(pal.glass_rail())
                     .inner_margin(Margin::symmetric(if is_narrow_w { 4.0 } else { 8.0 }, 14.0))
-                    .stroke(Stroke::new(1.0_f32, pal.border)),
+                    .stroke(if cfg!(target_os = "macos") {
+                        Stroke::NONE
+                    } else {
+                        Stroke::new(1.0_f32, pal.border)
+                    }),
             )
             .show(ctx, |ui| {
+                #[cfg(target_os = "macos")]
+                {
+                    let r = ui.clip_rect();
+                    let x = r.right() - 0.5;
+                    ui.painter().line_segment(
+                        [Pos2::new(x, r.top()), Pos2::new(x, r.bottom())],
+                        Stroke::new(1.0_f32, pal.glass_border()),
+                    );
+                }
                 ui.vertical_centered(|ui| {
                     // User Avatar Button with Cutout Online Status Dot
                     let (av_rect, av_resp) =
@@ -659,10 +672,23 @@ impl ZaloGuiApp {
             .width_range(sidebar_min_w..=sidebar_safe_max_w)
             .frame(
                 egui::Frame::none()
-                    .fill(pal.bg_sidebar)
-                    .stroke(Stroke::new(1.0_f32, pal.border)),
+                    .fill(pal.glass_sidebar())
+                    .stroke(if cfg!(target_os = "macos") {
+                        Stroke::NONE
+                    } else {
+                        Stroke::new(1.0_f32, pal.border)
+                    }),
             )
             .show(ctx, |ui| {
+                #[cfg(target_os = "macos")]
+                {
+                    let r = ui.clip_rect();
+                    let x = r.right() - 0.5;
+                    ui.painter().line_segment(
+                        [Pos2::new(x, r.top()), Pos2::new(x, r.bottom())],
+                        Stroke::new(1.0_f32, pal.glass_border()),
+                    );
+                }
                 ui.set_min_width(ui.available_width());
                 egui::Frame::none()
                     .inner_margin(Margin {
@@ -759,7 +785,7 @@ impl ZaloGuiApp {
                                 ui.painter().rect_filled(
                                     sbox_rect,
                                     Rounding::same(16.0),
-                                    pal.bg_input,
+                                    pal.glass_input(),
                                 );
                                 let edit_min_x = sbox_rect.left() + 30.0;
                                 let edit_max_x = (sbox_rect.right()
@@ -804,7 +830,7 @@ impl ZaloGuiApp {
                                                 0.65
                                             })
                                         } else {
-                                            pal.border
+                                            pal.glass_border()
                                         },
                                     ),
                                 );
@@ -917,7 +943,7 @@ impl ZaloGuiApp {
                                         if self.phone_modal_open || add_resp.hovered() {
                                             pal.primary
                                         } else {
-                                            pal.border
+                                            pal.glass_border()
                                         },
                                     ),
                                 );
@@ -1544,14 +1570,26 @@ impl ZaloGuiApp {
                             }
 
                             let bg = if is_selected {
-                                pal.bg_selected
+                                pal.glass_selected()
                             } else if row_resp.hovered() {
-                                pal.bg_hover
+                                pal.glass_hover()
                             } else {
                                 Color32::TRANSPARENT
                             };
-
-                            ui.painter().rect_filled(row_rect, Rounding::same(6.0), bg);
+                            let row_rounding = Rounding::same(if cfg!(target_os = "macos") {
+                                10.0
+                            } else {
+                                6.0
+                            });
+                            ui.painter().rect_filled(row_rect, row_rounding, bg);
+                            #[cfg(target_os = "macos")]
+                            if is_selected {
+                                ui.painter().rect_stroke(
+                                    row_rect,
+                                    row_rounding,
+                                    Stroke::new(1.0_f32, pal.glass_specular()),
+                                );
+                            }
                             if sidebar_is_rail && is_selected {
                                 let bar_rect = Rect::from_min_max(
                                     Pos2::new(row_rect.left() + 1.0, row_rect.top() + 8.0),
@@ -5435,8 +5473,8 @@ impl ZaloGuiApp {
                         .fixed_pos(Pos2::new(x_pos, top_offset))
                         .show(ctx, |ui| {
                             egui::Frame::none()
-                                .fill(pal.bg_sidebar)
-                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .fill(pal.glass_elevated())
+                                .stroke(Stroke::new(1.0_f32, pal.glass_specular()))
                                 .shadow(egui::epaint::Shadow {
                                     offset: Vec2::new(-4.0, 2.0),
                                     blur: 14.0,
@@ -5456,8 +5494,8 @@ impl ZaloGuiApp {
                         .exact_width(drawer_w)
                         .frame(
                             egui::Frame::none()
-                                .fill(pal.bg_sidebar)
-                                .stroke(Stroke::new(1.0_f32, pal.border)),
+                                .fill(pal.glass_sidebar())
+                                .stroke(Stroke::new(1.0_f32, pal.glass_border())),
                         )
                         .show(ctx, |ui| {
                             render_drawer_inner(ui, &mut close_drawer_requested);
@@ -5514,7 +5552,7 @@ impl ZaloGuiApp {
         // 4. CENTRAL CHAT AREA (Clean Header, Messages Stream, Icon Toolbar)
         // -------------------------------------------------------------------
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
+            .frame(egui::Frame::none().fill(pal.glass_canvas()))
             .show(ctx, |ui| {
                 let central_rect = ui.max_rect();
                 ui.set_clip_rect(central_rect);
@@ -5565,9 +5603,9 @@ impl ZaloGuiApp {
                     };
                     // 1. Clean Conversation Header Bar (No raw 19-digit ID, no bulky sync button)
                     egui::Frame::none()
-                        .fill(pal.bg_sidebar)
+                        .fill(pal.glass_sidebar())
                         .inner_margin(Margin::symmetric(if header_narrow { 10.0 } else { 18.0 }, 11.0))
-                        .stroke(Stroke::new(1.0_f32, pal.border))
+                        .stroke(Stroke::new(1.0_f32, pal.glass_border()))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 // Header Avatar (40x40) with Cutout Online Dot
@@ -8236,9 +8274,9 @@ impl ZaloGuiApp {
                     // 4. Bottom Message Composer Bar — Zalo PC 2-row style (Toolbar strip + Full-width Input & Send)
                     let comp_outer_w = ui.available_width();
                     let composer_frame = egui::Frame::none()
-                        .fill(pal.bg_sidebar)
+                        .fill(pal.glass_sidebar())
                         .inner_margin(Margin::symmetric(14.0, 10.0))
-                        .stroke(Stroke::new(1.0_f32, pal.border))
+                        .stroke(Stroke::new(1.0_f32, pal.glass_border()))
                         .show(ui, |ui| {
                             let comp_inner_w = (comp_outer_w - 28.0).max(140.0);
                             ui.set_width(comp_inner_w);
@@ -8751,14 +8789,18 @@ impl ZaloGuiApp {
 
                             // Row 2: Full-width Input Box + Right-locked Send Button
                             egui::Frame::none()
-                                .fill(pal.bg_input)
-                                .rounding(Rounding::same(10.0))
+                                .fill(pal.glass_input())
+                                .rounding(Rounding::same(if cfg!(target_os = "macos") {
+                                    14.0
+                                } else {
+                                    10.0
+                                }))
                                 .stroke(Stroke::new(
                                     1.0_f32,
                                     if composer_has_focus {
                                         pal.primary
                                     } else {
-                                        pal.border
+                                        pal.glass_border()
                                     },
                                 ))
                                 .inner_margin(Margin::symmetric(12.0, 5.0))

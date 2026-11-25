@@ -339,10 +339,23 @@ fn main() -> Result<()> {
         }
         let mut viewport = eframe::egui::ViewportBuilder::default()
             .with_app_id("ctdozlite")
-            .with_decorations(false)
             .with_inner_size([1020.0, 700.0])
             .with_min_inner_size([480.0, 360.0])
             .with_title("ctdozlite");
+        #[cfg(target_os = "macos")]
+        {
+            viewport = viewport
+                .with_decorations(true)
+                .with_transparent(true)
+                .with_title_shown(false)
+                .with_titlebar_shown(false)
+                .with_titlebar_buttons_shown(true)
+                .with_fullsize_content_view(true);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            viewport = viewport.with_decorations(false);
+        }
         if let Some(icon) = gui::load_app_icon() {
             viewport = viewport.with_icon(std::sync::Arc::new(icon));
         }

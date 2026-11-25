@@ -1430,7 +1430,7 @@ impl SyncV2InflightGuard {
 
 impl Drop for SyncV2InflightGuard {
     fn drop(&mut self) {
-        let _ = SYNC_V2_INFLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+        let _ = SYNC_V2_INFLIGHT.try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
             Some(v.saturating_sub(1))
         });
     }

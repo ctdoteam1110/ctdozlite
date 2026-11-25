@@ -4798,7 +4798,7 @@ pub(super) fn render_chat_bubble(
                         pal.bg_elevated
                     }
                 } else {
-                    pal.bubble_out_bg
+                    pal.glass_bubble_out()
                 };
                 let stroke = if has_sticker || is_frameless_photo {
                     Stroke::NONE
@@ -4811,12 +4811,18 @@ pub(super) fn render_chat_bubble(
                         Color32::from_rgb(34, 197, 94).linear_multiply(0.55)
                     };
                     Stroke::new(1.2_f32, border_col)
+                } else if cfg!(target_os = "macos") {
+                    Stroke::new(1.0_f32, pal.glass_specular())
                 } else if !pal.is_dark {
                     Stroke::new(1.0_f32, Color32::from_rgb(199, 224, 255))
                 } else {
                     Stroke::NONE
                 };
-                let rounding = Rounding::same(12.0);
+                let rounding = Rounding::same(if cfg!(target_os = "macos") {
+                    16.0
+                } else {
+                    12.0
+                });
 
                 let mut card_action = None;
                 let mut quote_action = None;
@@ -5015,7 +5021,7 @@ pub(super) fn render_chat_bubble(
                     pal.bg_elevated
                 }
             } else {
-                pal.bubble_in_bg
+                pal.glass_bubble_in()
             };
             let stroke = if has_sticker || is_frameless_photo {
                 Stroke::NONE
@@ -5028,10 +5034,16 @@ pub(super) fn render_chat_bubble(
                     Color32::from_rgb(34, 197, 94).linear_multiply(0.55)
                 };
                 Stroke::new(1.2_f32, border_col)
+            } else if cfg!(target_os = "macos") {
+                Stroke::new(1.0_f32, pal.glass_specular())
             } else {
                 Stroke::new(1.0_f32, pal.bubble_in_border)
             };
-            let rounding = Rounding::same(12.0);
+            let rounding = Rounding::same(if cfg!(target_os = "macos") {
+                16.0
+            } else {
+                12.0
+            });
 
             ui.vertical(|ui| {
                 ui.set_max_width(total_bubble_w);
@@ -5381,18 +5393,24 @@ pub(super) fn bubble_context_menu(
         .fixed_pos(pos)
         .show(ui.ctx(), |ui| {
             egui::Frame::none()
-                .fill(if pal.is_dark {
+                .fill(if cfg!(target_os = "macos") {
+                    pal.glass_elevated()
+                } else if pal.is_dark {
                     Color32::from_rgb(33, 37, 43)
                 } else {
                     Color32::WHITE
                 })
-                .stroke(Stroke::new(1.0_f32, pal.border))
-                .rounding(Rounding::same(8.0))
+                .stroke(Stroke::new(1.0_f32, pal.glass_popup_border()))
+                .rounding(Rounding::same(if cfg!(target_os = "macos") {
+                    12.0
+                } else {
+                    8.0
+                }))
                 .shadow(egui::epaint::Shadow {
-                    offset: Vec2::new(0.0, 4.0),
-                    blur: 16.0,
+                    offset: Vec2::new(0.0, 6.0),
+                    blur: 20.0,
                     spread: 0.0,
-                    color: Color32::from_black_alpha(if pal.is_dark { 130 } else { 45 }),
+                    color: Color32::from_black_alpha(if pal.is_dark { 155 } else { 52 }),
                 })
                 .inner_margin(Margin::symmetric(10.0, 10.0))
                 .show(ui, |ui| {

@@ -129,6 +129,201 @@ impl ThemePalette {
         }
     }
 
+    pub(super) fn glass_titlebar(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(18, 22, 30, 118)
+            } else {
+                Color32::from_rgba_unmultiplied(248, 251, 255, 130)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_app
+        }
+    }
+
+    pub(super) fn glass_rail(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(14, 18, 26, 112)
+            } else {
+                Color32::from_rgba_unmultiplied(240, 245, 255, 122)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_app
+        }
+    }
+
+    pub(super) fn glass_sidebar(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(22, 27, 36, 146)
+            } else {
+                Color32::from_rgba_unmultiplied(250, 252, 255, 158)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_sidebar
+        }
+    }
+
+    pub(super) fn glass_canvas(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(17, 21, 28, 174)
+            } else {
+                Color32::from_rgba_unmultiplied(238, 244, 252, 168)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_chat_canvas
+        }
+    }
+
+    pub(super) fn glass_elevated(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(32, 37, 47, 244)
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 246)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_elevated
+        }
+    }
+
+    pub(super) fn glass_input(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(18, 22, 30, 158)
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 182)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_input
+        }
+    }
+
+    pub(super) fn glass_selected(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(37, 99, 235, 84)
+            } else {
+                Color32::from_rgba_unmultiplied(0, 104, 255, 36)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_selected
+        }
+    }
+
+    pub(super) fn glass_hover(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 28)
+            } else {
+                Color32::from_rgba_unmultiplied(15, 23, 42, 18)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_hover
+        }
+    }
+
+    pub(super) fn glass_popup_border(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 58)
+            } else {
+                Color32::from_rgba_unmultiplied(15, 23, 42, 46)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.border
+        }
+    }
+
+    pub(super) fn glass_border(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 32)
+            } else {
+                Color32::from_rgba_unmultiplied(15, 23, 42, 28)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.border
+        }
+    }
+
+    pub(super) fn glass_specular(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 44)
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 215)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.border
+        }
+    }
+
+    pub(super) fn glass_bubble_out(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(37, 99, 235, 152)
+            } else {
+                Color32::from_rgba_unmultiplied(219, 234, 254, 212)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bubble_out_bg
+        }
+    }
+
+    pub(super) fn glass_bubble_in(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(44, 51, 63, 184)
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 210)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bubble_in_bg
+        }
+    }
+
     pub(super) fn apply_to_ctx_with_anim(
         &self,
         ctx: &egui::Context,
@@ -148,31 +343,52 @@ impl ThemePalette {
         };
         visuals.dark_mode = self.is_dark;
 
-        visuals.panel_fill = self.bg_app;
-        visuals.window_fill = self.bg_elevated;
-        visuals.extreme_bg_color = self.bg_input;
-        visuals.faint_bg_color = self.bg_hover;
+        visuals.panel_fill = self.glass_sidebar();
+        visuals.window_fill = self.glass_elevated();
+        #[cfg(target_os = "macos")]
+        {
+            visuals.window_rounding = Rounding::same(14.0);
+            visuals.window_stroke = Stroke::new(1.0_f32, self.glass_popup_border());
+            visuals.menu_rounding = Rounding::same(10.0);
+            visuals.popup_shadow = egui::epaint::Shadow {
+                offset: Vec2::new(0.0, 6.0),
+                blur: 20.0,
+                spread: 0.0,
+                color: Color32::from_black_alpha(if self.is_dark { 155 } else { 52 }),
+            };
+            visuals.window_shadow = egui::epaint::Shadow {
+                offset: Vec2::new(0.0, 10.0),
+                blur: 28.0,
+                spread: 0.0,
+                color: Color32::from_black_alpha(if self.is_dark { 175 } else { 62 }),
+            };
+        }
+        visuals.extreme_bg_color = self.glass_input();
+        visuals.faint_bg_color = self.glass_hover();
         visuals.override_text_color = Some(self.text_primary);
-        visuals.widgets.noninteractive.weak_bg_fill = self.bg_app;
+        visuals.widgets.noninteractive.weak_bg_fill = self.glass_sidebar();
         visuals.selection.bg_fill =
             self.primary
                 .linear_multiply(if self.is_dark { 0.45 } else { 0.22 });
         visuals.selection.stroke = Stroke::new(1.5_f32, self.primary);
 
+        #[cfg(target_os = "macos")]
+        let r = Rounding::same(10.0);
+        #[cfg(not(target_os = "macos"))]
         let r = Rounding::same(8.0);
-        visuals.widgets.noninteractive.bg_fill = self.bg_app;
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.border);
+        visuals.widgets.noninteractive.bg_fill = self.glass_sidebar();
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.glass_border());
         visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, self.text_primary);
         visuals.widgets.noninteractive.rounding = r;
 
-        visuals.widgets.inactive.bg_fill = self.bg_elevated;
-        visuals.widgets.inactive.weak_bg_fill = self.bg_elevated;
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.border);
+        visuals.widgets.inactive.bg_fill = self.glass_elevated();
+        visuals.widgets.inactive.weak_bg_fill = self.glass_elevated();
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.glass_border());
         visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, self.text_primary);
         visuals.widgets.inactive.rounding = r;
 
-        visuals.widgets.hovered.bg_fill = self.bg_hover;
-        visuals.widgets.hovered.weak_bg_fill = self.bg_hover;
+        visuals.widgets.hovered.bg_fill = self.glass_hover();
+        visuals.widgets.hovered.weak_bg_fill = self.glass_hover();
         visuals.widgets.hovered.bg_stroke = Stroke::new(1.2_f32, self.primary);
         visuals.widgets.hovered.fg_stroke = Stroke::new(1.2_f32, self.text_primary);
         visuals.widgets.hovered.rounding = r;
@@ -1832,17 +2048,23 @@ mod tests {
         assert_eq!(ctx.theme(), egui::Theme::Dark);
         let dark_style = ctx.style();
         assert!(dark_style.visuals.dark_mode);
-        assert_eq!(dark_style.visuals.extreme_bg_color, dark.bg_input);
-        assert_eq!(dark_style.visuals.widgets.inactive.weak_bg_fill, dark.bg_elevated);
-        assert_eq!(dark_style.visuals.panel_fill, dark.bg_app);
+        assert_eq!(dark_style.visuals.extreme_bg_color, dark.glass_input());
+        assert_eq!(
+            dark_style.visuals.widgets.inactive.weak_bg_fill,
+            dark.glass_elevated()
+        );
+        assert_eq!(dark_style.visuals.panel_fill, dark.glass_sidebar());
 
         let light = ThemePalette::light();
         light.apply_to_ctx_with_anim(&ctx, false, 1.0);
         assert_eq!(ctx.theme(), egui::Theme::Light);
         let light_style = ctx.style();
         assert!(!light_style.visuals.dark_mode);
-        assert_eq!(light_style.visuals.extreme_bg_color, light.bg_input);
-        assert_eq!(light_style.visuals.widgets.inactive.weak_bg_fill, light.bg_elevated);
-        assert_eq!(light_style.visuals.panel_fill, light.bg_app);
+        assert_eq!(light_style.visuals.extreme_bg_color, light.glass_input());
+        assert_eq!(
+            light_style.visuals.widgets.inactive.weak_bg_fill,
+            light.glass_elevated()
+        );
+        assert_eq!(light_style.visuals.panel_fill, light.glass_sidebar());
     }
 }

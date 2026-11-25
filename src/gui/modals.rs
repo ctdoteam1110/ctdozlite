@@ -650,7 +650,7 @@ impl ZaloGuiApp {
         let mut close_popup = false;
 
         if let Some(ref mut popup) = self.incoming_popup {
-            const POPUP_DURATION_MS: u64 = 6500;
+            const POPUP_DURATION_MS: u64 = 8000;
             let elapsed_ms = popup.created_at.elapsed().as_millis() as u64;
             if elapsed_ms >= POPUP_DURATION_MS || !self.settings.enable_notifications {
                 close_popup = true;
@@ -663,7 +663,7 @@ impl ZaloGuiApp {
                 let popup_h = 164.0_f32;
                 let corner_pos = get_desktop_bottom_right_pos(ctx, popup_w, popup_h);
                 let vp_id = egui::ViewportId::from_hash_of("zalo_corner_notification_popup");
-                let builder = egui::ViewportBuilder::default()
+                let mut builder = egui::ViewportBuilder::default()
                     .with_title(POPUP_TITLE)
                     .with_decorations(false)
                     .with_always_on_top()
@@ -671,6 +671,10 @@ impl ZaloGuiApp {
                     .with_resizable(false)
                     .with_position(corner_pos)
                     .with_inner_size([popup_w, popup_h]);
+                #[cfg(target_os = "macos")]
+                {
+                    builder = builder.with_transparent(true);
+                }
 
                 let tid_cl = popup.thread_id.clone();
                 let s_name = popup.sender_name.clone();
@@ -702,13 +706,19 @@ impl ZaloGuiApp {
                         close_popup = true;
                     }
 
-                    let card_bg = pal.bg_elevated;
+                    let card_bg = pal.glass_elevated();
+                    let card_border = pal.glass_popup_border();
+                    let card_rounding = Rounding::same(if cfg!(target_os = "macos") {
+                        16.0
+                    } else {
+                        12.0
+                    });
                     egui::CentralPanel::default()
                         .frame(
                             egui::Frame::none()
                                 .fill(card_bg)
-                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                .rounding(Rounding::same(12.0))
+                                .stroke(Stroke::new(1.0_f32, card_border))
+                                .rounding(card_rounding)
                                 .inner_margin(Margin::symmetric(14.0, 10.0)),
                         )
                         .show(vp_ctx, |ui| {
