@@ -122,6 +122,15 @@ pub async fn handle_mcp_request_bound(
         return None;
     }
     let req_id = id.unwrap_or(Value::Null);
+    let (context_session, context_path) = match account_api_context(session, db_path).await {
+        Ok(context) => context,
+        Err(error) => {
+            return Some(json!({"jsonrpc": "2.0", "id": req_id,
+            "error": {"code": -32603, "message": error.to_string()}}))
+        }
+    };
+    let session = &context_session;
+    let db_path = context_path.as_str();
 
     match method {
         "initialize" => Some(json!({
@@ -174,7 +183,14 @@ pub async fn handle_mcp_request_bound(
             let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
             let content = match uri {
                 "zalo://threads" => {
-                    let mut threads = chat::load_threads_cache();
+                    let uin = session
+                        .lock()
+                        .await
+                        .login
+                        .as_ref()
+                        .map(|login| login.uin.clone())
+                        .unwrap_or_default();
+                    let mut threads = chat::load_threads_cache_for_account(&uin);
                     store::load_history_into_threads(db_path, &mut threads, 20);
                     serde_json::to_string_pretty(&threads).unwrap_or_else(|_| "[]".into())
                 }
@@ -350,6 +366,31 @@ fn check_thread_bound(bound: &BoundThread, tool: &str, got: Option<&str>) -> Opt
     }
 }
 
+/// Bind each request to a session snapshot and resolve the default database for its owner.
+///
+/// # Errors
+/// Returns an error if the account store cannot be opened on the blocking pool.
+async fn account_api_context(
+    session: &Arc<Mutex<Session>>,
+    db_path: &str,
+) -> Result<(Arc<Mutex<Session>>, String)> {
+    let snapshot = session.lock().await.clone();
+    let path = if db_path == "zalo_history.db" {
+        if let Some(login) = &snapshot.login {
+            let uin = login.uin.clone();
+            tokio::task::spawn_blocking(move || MessageStore::open_account(&uin).map(|_| ()))
+                .await??;
+            crate::store::db_path_for_account(&login.uin)
+        } else {
+            ":memory:".to_string()
+        }
+    } else {
+        db_path.to_string()
+    };
+    Ok((Arc::new(Mutex::new(snapshot)), path))
+}
+
+/// Dispatch a tool against one account context and report failures through the MCP error flag.
 async fn execute_tool_call(
     session: &Arc<Mutex<Session>>,
     name: &str,
@@ -357,6 +398,27 @@ async fn execute_tool_call(
     db_path: &str,
     bound: &BoundThread,
 ) -> (bool, Value) {
+    // The GUI server survives account switches; bind both history and requests to
+    // one session snapshot instead of continuing to use its legacy startup path.
+    if matches!(db_path, "zalo_history.db" | ":memory:")
+        && name != "zalo_status"
+        && session.lock().await.login.is_none()
+    {
+        return (true, json!({"error": "Chưa đăng nhập phiên Zalo"}));
+    }
+    let (context_session, routed_path) = match account_api_context(session, db_path).await {
+        Ok(context) => context,
+        Err(error) => return (true, json!({"error": error.to_string()})),
+    };
+    let owner_uin = context_session
+        .lock()
+        .await
+        .login
+        .as_ref()
+        .map(|login| login.uin.clone())
+        .unwrap_or_default();
+    let session = &context_session;
+    let db_path = routed_path.as_str();
     match name {
         "zalo_status" => {
             let s = session.lock().await;
@@ -394,7 +456,7 @@ async fn execute_tool_call(
                 .and_then(Value::as_u64)
                 .unwrap_or(50)
                 .min(500) as usize;
-            let mut threads = chat::load_threads_cache();
+            let mut threads = chat::load_threads_cache_for_account(&owner_uin);
             store::load_history_into_threads(db_path, &mut threads, 5);
             let items: Vec<Value> = threads
                 .into_iter()
@@ -417,7 +479,10 @@ async fn execute_tool_call(
                 return reject;
             }
             let Some(tid) = args.get("thread_id").and_then(Value::as_str) else {
-                return (true, json!({ "error": "Missing required argument: thread_id" }));
+                return (
+                    true,
+                    json!({ "error": "Missing required argument: thread_id" }),
+                );
             };
             let limit = args
                 .get("limit")
@@ -459,7 +524,10 @@ async fn execute_tool_call(
             let Some(text) = args.get("text").and_then(Value::as_str) else {
                 return (true, json!({ "error": "Missing required argument: text" }));
             };
-            let is_group = args.get("is_group").and_then(Value::as_bool).unwrap_or(false);
+            let is_group = args
+                .get("is_group")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let s = session.lock().await.clone();
             let res = if is_group {
                 chat::send_group_message(&s, to_id, text).await
@@ -467,7 +535,10 @@ async fn execute_tool_call(
                 chat::send_message(&s, to_id, text).await
             };
             match res {
-                Ok(resp) => (false, json!({ "ok": true, "to_id": to_id, "response": resp })),
+                Ok(resp) => (
+                    false,
+                    json!({ "ok": true, "to_id": to_id, "response": resp }),
+                ),
                 Err(e) => (true, json!({ "error": e.to_string() })),
             }
         }
@@ -488,7 +559,10 @@ async fn execute_tool_call(
                 .get("thread_name")
                 .and_then(Value::as_str)
                 .unwrap_or(to_id);
-            let is_group = args.get("is_group").and_then(Value::as_bool).unwrap_or(false);
+            let is_group = args
+                .get("is_group")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let now_ts = crate::login::unix_now();
             let deliver_at = match when.parse::<i64>() {
                 Ok(ts) if ts > now_ts => ts,
@@ -596,7 +670,10 @@ async fn execute_tool_call(
                     }
                     (false, json!({ "ok": true, "rules": rules }))
                 }
-                _ => (true, json!({ "error": format!("Unsupported action: {action}") })),
+                _ => (
+                    true,
+                    json!({ "error": format!("Unsupported action: {action}") }),
+                ),
             }
         }
         _ => (true, json!({ "error": format!("Unknown tool: {name}") })),
@@ -656,6 +733,12 @@ pub async fn handle_rest_request(
     body: &str,
     db_path: &str,
 ) -> (u16, Value) {
+    let (context_session, context_path) = match account_api_context(session, db_path).await {
+        Ok(context) => context,
+        Err(error) => return (500, json!({"error": error.to_string()})),
+    };
+    let session = &context_session;
+    let db_path = context_path.as_str();
     let (path, query_str) = path_and_query
         .split_once('?')
         .unwrap_or((path_and_query, ""));
@@ -758,7 +841,9 @@ pub async fn handle_rest_request(
                 Err(e) => (500, json!({ "ok": false, "error": e.to_string() })),
             }
         }
-        ("GET", "/api/v1/autoreply") => (200, json!({ "ok": true, "rules": load_autoreply_rules() })),
+        ("GET", "/api/v1/autoreply") => {
+            (200, json!({ "ok": true, "rules": load_autoreply_rules() }))
+        }
         ("POST", "/api/v1/autoreply") => {
             let payload: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
             if let Some(arr) = payload.get("rules").and_then(Value::as_array) {
@@ -777,7 +862,14 @@ pub async fn handle_rest_request(
             }
         }
         ("GET", "/api/v1/export") => {
-            let mut threads = chat::load_threads_cache();
+            let uin = session
+                .lock()
+                .await
+                .login
+                .as_ref()
+                .map(|login| login.uin.clone())
+                .unwrap_or_default();
+            let mut threads = chat::load_threads_cache_for_account(&uin);
             store::load_history_into_threads(db_path, &mut threads, 1000);
             let scheduled = scheduler::list_pending_scheduled(db_path, None).unwrap_or_default();
             let autoreply = load_autoreply_rules();
@@ -892,8 +984,7 @@ pub async fn run_local_http_server(
                 }
             }
 
-            let (status, json_val) =
-                handle_rest_request(&sess, method, path, body_part, &db).await;
+            let (status, json_val) = handle_rest_request(&sess, method, path, body_part, &db).await;
             let status_text = match status {
                 200 => "200 OK",
                 202 => "202 Accepted",
@@ -941,6 +1032,40 @@ fn url_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn logged_out_api_does_not_read_legacy_account_history() {
+        let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
+        let (is_error, response) =
+            execute_tool_call(&session, "zalo_list_threads", &json!({}), "zalo_history.db", &None).await;
+        assert!(is_error);
+        assert_eq!(response["error"], "Chưa đăng nhập phiên Zalo");
+    }
+
+    #[tokio::test]
+    async fn logged_out_rest_and_mcp_cannot_schedule_into_a_discarded_database() {
+        let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
+        let args = json!({"to_id":"thread-1", "text":"Test", "when":"+30m"});
+        let (status, response) = handle_rest_request(
+            &session,
+            "POST",
+            "/api/v1/messages/schedule",
+            &args.to_string(),
+            "zalo_history.db",
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(response.get("error").is_some());
+        let response = handle_mcp_request(
+            &session,
+            &json!({"jsonrpc":"2.0", "id":1,
+            "method":"tools/call", "params":{"name":"zalo_schedule_message", "arguments":args}}),
+            "zalo_history.db",
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+    }
 
     #[test]
     fn autoreply_rules_match_contains_exact_prefix_and_scope() {
@@ -1037,14 +1162,8 @@ mod tests {
         assert!(tools.iter().any(|t| t["name"] == "zalo_schedule_message"));
 
         // 3. REST search
-        let (status, search_val) = handle_rest_request(
-            &session,
-            "GET",
-            "/api/v1/search?q=MCP",
-            "",
-            db_path,
-        )
-        .await;
+        let (status, search_val) =
+            handle_rest_request(&session, "GET", "/api/v1/search?q=MCP", "", db_path).await;
         assert_eq!(status, 200);
         assert_eq!(search_val["results"].as_array().unwrap().len(), 1);
 

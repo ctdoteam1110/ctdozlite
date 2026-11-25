@@ -1,8 +1,6 @@
 use super::*;
 
-// ---------------------------------------------------------------------------
 // Sticker Presets & State Types
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StickerTab {
@@ -933,7 +931,6 @@ impl ZaloGuiApp {
             .show(ui, |ui| {
                 ui.set_height(animated_h);
 
-                // 1. Top Pack & Store Navigation Bar
                 ui.horizontal_wrapped(|ui| {
                     let store_count_lbl = if !self.sticker_store_packs.is_empty() {
                         format!("{} Kho Nhãn Dán ({})", lucide::STORE, self.sticker_store_packs.len())
@@ -984,7 +981,6 @@ impl ZaloGuiApp {
 
                 ui.add_space(3.0);
 
-                // 1b. Pinned / Featured Pack Strip (10+ packs + any pack opened from the Store)
                 egui::ScrollArea::horizontal()
                     .id_salt("sticker_pack_tabs_scroll")
                     .show(ui, |ui| {
@@ -1038,7 +1034,6 @@ impl ZaloGuiApp {
 
                 ui.add_space(4.0);
 
-                // 2. Tab Body
                 match self.sticker_tab {
                     StickerTab::Store => {
                         let filter_w = (ui.available_width() - 140.0).clamp(130.0, 340.0);

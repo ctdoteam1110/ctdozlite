@@ -21,6 +21,7 @@ use crate::logger::{self, FindingLevel, LogEntry, ScanFinding};
 use crate::qr::QrLogin;
 use crate::session::Session;
 
+mod accounts;
 pub(crate) mod attachments;
 mod color_emoji;
 pub(crate) mod messages;
@@ -41,6 +42,14 @@ use theme::*;
 pub use theme::{emoji_to_tex_key, load_app_icon, lucide, REACTION_LIST};
 pub use worker::WorkerCmd;
 use worker::*;
+
+/// Queue native device discovery when the GUI worker is available.
+/// Returns false when no worker is running or its command receiver has closed.
+pub(crate) fn request_media_device_refresh() -> bool {
+    WORKER_TX
+        .get()
+        .is_some_and(|tx| tx.send(WorkerCmd::RefreshMediaDevices).is_ok())
+}
 
 fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
     crate::chat::merge_sent_message(thread, message);
@@ -680,6 +689,12 @@ fn find_reaction_target<'a>(
     None
 }
 pub enum GuiEvent {
+    /// Account-bound completion; queued results are checked again when consumed.
+    AccountScoped {
+        epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        generation: u64,
+        event: Box<GuiEvent>,
+    },
     /// Terminal response for a Settings authorization action.
     NotificationAuthorization {
         request_id: u64,
@@ -701,6 +716,12 @@ pub enum GuiEvent {
         avatar: Option<String>,
     },
     LoginFailed(String),
+    /// Authentication was restarted; cached history stays locally viewable.
+    AuthenticationRestarted,
+    /// A failed switch kept the previous identity, but cancelled its old work.
+    AccountSwitchFailed(String),
+    /// A failed wipe cancelled old work without removing the current identity.
+    LocalDataWipeFailed(String),
     ThreadsUpdated(Vec<Thread>),
     MessageSent {
         client_message_id: String,
@@ -725,6 +746,17 @@ pub enum GuiEvent {
     StickerImageReady {
         key: String,
         image: egui::ColorImage,
+    },
+    /// One wake-up for all pending native video frames.
+    VideoFramesReady(std::sync::Arc<VideoFrameMailbox>),
+    /// Terminal result of asynchronous microphone and camera discovery.
+    MediaDevicesRefreshed {
+        error: Option<String>,
+    },
+    /// Terminal account discovery/deletion result containing profile metadata only.
+    SavedAccountsLoaded {
+        request_id: u64,
+        result: Result<Vec<crate::account_manager::AccountProfile>, String>,
     },
     StickerImageFailed {
         key: String,
@@ -828,7 +860,7 @@ pub enum GuiEvent {
     SessionExpired(String),
     /// The server could not be reached: the session is intact, show it and retry (#21).
     SessionUnreachable(String),
-    /// `zalo_history.db` + `threads_cache.json` were removed on request (#21).
+    /// Account history was cleared while retaining credentials and migration metadata.
     LocalDataWiped,
     CallStateChanged(String),
     IncomingCall {
@@ -843,6 +875,9 @@ pub enum GuiEvent {
         reason: String,
     },
     StatusUpdate(String),
+    HistoryImportFinished(Result<String, String>),
+    ScheduleSendNowFinished(Result<bool, String>),
+    ScheduleCancelFinished(Result<bool, String>),
     RefreshFinished {
         threads: usize,
         messages: usize,
@@ -850,6 +885,10 @@ pub enum GuiEvent {
         manual: bool,
     },
     ScheduledListUpdated,
+    ScheduledItemsLoaded {
+        result: Result<Vec<crate::scheduler::ScheduledMessage>, String>,
+        notify_sent: bool,
+    },
     SyncFinished {
         added: usize,
         errors: Vec<String>,
@@ -937,7 +976,10 @@ pub enum GuiEvent {
         msg_id: String,
         err: String,
     },
-    LoggedOut,
+    /// A completed sign-out, with the saved account to return to during add-account login.
+    LoggedOut { previous_account: Option<String> },
+    /// The active account could not be saved before opening the add-account login screen.
+    AddAccountFailed(String),
     HistoryReachedStart(String),
     /// An account that is signed in but not shown received new messages.
     BackgroundAccountActivity(crate::background_accounts::BackgroundActivity),
@@ -1222,7 +1264,6 @@ pub(crate) struct EditingMessage {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct AppSettings {
-    // 1. Cài đặt chung
     show_all_contacts: bool,
     language: String,
     autostart_on_boot: bool,
@@ -1230,7 +1271,6 @@ pub(crate) struct AppSettings {
     download_dir: String,
     /// Mã ngôn ngữ đích cho dịch tin nhắn (vi/en/zh/ja/ko...). Mặc định vi.
     translate_target: String,
-    // 2. Quyền riêng tư
     show_birthday: String,
     show_online_status: bool,
     show_seen_status: bool,
@@ -1243,7 +1283,6 @@ pub(crate) struct AppSettings {
     friend_src_qr: bool,
     friend_src_group: bool,
     friend_src_card: bool,
-    // 3. Giao diện
     pub(crate) theme_mode: String, // "light" | "dark" | "system"
     pub(crate) use_avatar_as_wallpaper: bool,
     pub(crate) font_family: String,
@@ -1258,10 +1297,8 @@ pub(crate) struct AppSettings {
     pub(crate) custom_accent_color: Option<String>,
     pub(crate) custom_bubble_out_bg: Option<String>,
     pub(crate) custom_bubble_in_bg: Option<String>,
-    // 4. Thông báo
     enable_notifications: bool,
     play_notification_sound: bool,
-    // 5. Tin nhắn
     quick_messages_enabled: bool,
     quick_reply_enabled: bool,
     quick_reply_items: Vec<String>,
@@ -1277,16 +1314,13 @@ pub(crate) struct AppSettings {
     double_click_to_reply: bool,
     show_typing_indicator: bool,
     send_message_key: String, // "enter" | "cmd_enter"
-    // 6. Tiện ích
     suggest_stickers_while_typing: bool,
     suggest_mentions: bool,
     enable_gif_search: bool,
     enable_sticker_keyword_search: bool,
-    // 7. Thiết bị cuộc gọi (Mic & Camera)
     selected_mic_device: String,
     selected_camera_device: String,
     mic_gain_percent: u32,
-    // 8. Quản lý hội thoại (Context menu: Ghim, Phân loại, Tắt thông báo, Ẩn)
     pinned_threads: Vec<String>,
     muted_threads: HashMap<String, i64>,
     hidden_threads: HashSet<String>,
@@ -1298,10 +1332,8 @@ pub(crate) struct AppSettings {
     /// Folder đang active ("" = Tất cả). Lưu cùng settings.
     #[serde(default)]
     active_chat_folder: String,
-    // 9. Cập nhật tự động qua GitHub Releases API
     auto_check_updates: bool,
     skipped_update_version: String,
-    // 10. Proxy & Đa tài khoản (#64)
     proxy_url: String,
     multi_profile_name: String,
     /// LLM endpoint (OpenAI-compatible). Trống = resolve từ opencode.json / Ollama local.
@@ -1459,19 +1491,263 @@ const CHAT_RENDER_STEP: usize = 150;
 pub struct GuiTx {
     tx: Sender<GuiEvent>,
     ctx: egui::Context,
+    epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    generation: Option<u64>,
+    work_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    work_generation: Option<u64>,
+    video_frames: std::sync::Arc<VideoFrameMailbox>,
+}
+
+/// Bounded latest-frame storage shared by the media producers and UI.
+#[derive(Default)]
+pub struct VideoFrameMailbox {
+    // A short lock couples frame replacement and its single notification latch.
+    state: std::sync::Mutex<VideoFrameState>,
+}
+
+#[derive(Default)]
+struct VideoFrameState {
+    generation: u64,
+    active: bool,
+    notification_pending: bool,
+    clear_textures: bool,
+    frames: HashMap<String, egui::ColorImage>,
+    removed: HashSet<String>,
+}
+
+fn is_call_video_key(key: &str) -> bool {
+    matches!(
+        key,
+        "call_local_video"
+            | "call_remote_video"
+            | "call_remote_video_1"
+            | "call_remote_video_2"
+            | "call_remote_video_3"
+            | "call_remote_video_4"
+            | "call_remote_video_5"
+    )
+}
+
+impl VideoFrameMailbox {
+    fn take(&self) -> (bool, HashMap<String, egui::ColorImage>, HashSet<String>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.notification_pending = false;
+        let clear = std::mem::take(&mut state.clear_textures);
+        (
+            clear,
+            std::mem::take(&mut state.frames),
+            std::mem::take(&mut state.removed),
+        )
+    }
 }
 
 impl GuiTx {
     pub fn new(tx: Sender<GuiEvent>, ctx: egui::Context) -> Self {
-        Self { tx, ctx }
+        Self {
+            tx,
+            ctx,
+            epoch: Default::default(),
+            generation: None,
+            work_epoch: Default::default(),
+            work_generation: None,
+            video_frames: Default::default(),
+        }
+    }
+
+    /// Bind a task's completions to the account active when it starts.
+    pub(crate) fn scoped(&self) -> Self {
+        let mut scoped = self.clone();
+        scoped.generation = Some(self.epoch.load(std::sync::atomic::Ordering::SeqCst));
+        scoped.work_generation = Some(self.work_epoch.load(std::sync::atomic::Ordering::SeqCst));
+        scoped
+    }
+
+    /// Invalidate queued history work without changing the account or active call.
+    pub(crate) fn advance_work(&self) -> Self {
+        self.work_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.scoped()
+    }
+
+    /// Calls follow the account lifetime and survive a local-history wipe.
+    pub(crate) fn for_call(&self) -> Self {
+        let mut call = self.clone();
+        call.work_generation = None;
+        call
+    }
+
+    /// Invalidate all tasks and queued events belonging to the previous account.
+    pub(crate) fn advance_account(&self) -> Self {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.reset_video_generation(None);
+        self.scoped()
+    }
+
+    /// Whether this sender still belongs to the active account.
+    pub(crate) fn is_current(&self) -> bool {
+        self.generation.is_none_or(|generation| {
+            generation == self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+        }) && self.work_generation.is_none_or(|generation| {
+            generation == self.work_epoch.load(std::sync::atomic::Ordering::SeqCst)
+        })
+    }
+
+    /// Start a call's frame lifetime; all its local and remote producers share this token.
+    /// Returns zero when the sender belongs to a previous account.
+    pub fn begin_video_generation(&self) -> u64 {
+        let mut state = self
+            .video_frames
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.is_current() {
+            return 0;
+        }
+        state.generation = state.generation.wrapping_add(1).max(1);
+        state.active = true;
+        state.frames.clear();
+        state.removed.clear();
+        state.clear_textures = true;
+        let generation = state.generation;
+        self.notify_video_frames(&mut state);
+        generation
+    }
+
+    /// Replace a stream's latest frame without buffering one event per frame.
+    /// Returns false for an obsolete account/call, unknown stream, or failed wake-up.
+    pub fn send_video_frame(&self, generation: u64, key: &str, image: egui::ColorImage) -> bool {
+        if !is_call_video_key(key) {
+            return false;
+        }
+        let mut state = self
+            .video_frames
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.is_current() || !state.active || generation != state.generation {
+            return false;
+        }
+        state.removed.remove(key);
+        state.frames.insert(key.to_owned(), image);
+        self.notify_video_frames(&mut state)
+    }
+
+    /// Remove a stream texture through the same bounded, generation-checked mailbox.
+    /// Returns false when the stream or generation is obsolete or a wake-up fails.
+    pub fn clear_video_frame(&self, generation: u64, key: &str) -> bool {
+        if !is_call_video_key(key) {
+            return false;
+        }
+        let mut state = self
+            .video_frames
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.is_current() || !state.active || generation != state.generation {
+            return false;
+        }
+        state.frames.remove(key);
+        state.removed.insert(key.to_owned());
+        self.notify_video_frames(&mut state)
+    }
+
+    /// Stop this call's frame lifetime; an older call cannot invalidate a newer one.
+    pub fn end_video_generation(&self, generation: u64) {
+        if self.is_current() {
+            self.reset_video_generation(Some(generation));
+        }
+    }
+
+    /// Discard pending frames and request texture cleanup. A scoped reset only applies
+    /// while both its account and call generation are current.
+    fn reset_video_generation(&self, generation: Option<u64>) {
+        let mut state = self
+            .video_frames
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if generation.is_some() && !self.is_current() {
+            return;
+        }
+        if generation.is_some_and(|generation| generation != state.generation) {
+            return;
+        }
+        if !state.active && state.frames.is_empty() && !state.clear_textures {
+            return;
+        }
+        state.active = false;
+        state.frames.clear();
+        state.removed.clear();
+        state.clear_textures = true;
+        self.notify_video_frames(&mut state);
+    }
+
+    /// Wake the GUI once per mailbox drain. Returns false and drops pending updates
+    /// if the GUI receiver has closed.
+    fn notify_video_frames(&self, state: &mut VideoFrameState) -> bool {
+        if state.notification_pending {
+            return true;
+        }
+        // This account-independent wake only drains the current mailbox. Old producers
+        // are rejected before insertion, so an account switch cannot strand its latch.
+        if self
+            .tx
+            .send(GuiEvent::VideoFramesReady(self.video_frames.clone()))
+            .is_err()
+        {
+            state.frames.clear();
+            state.removed.clear();
+            return false;
+        }
+        state.notification_pending = true;
+        self.ctx.request_repaint();
+        true
     }
 
     /// Same contract as `Sender::send` (callers already `let _ =` it), plus the wake-up.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, ev: GuiEvent) -> Result<(), std::sync::mpsc::SendError<GuiEvent>> {
+        let ev = if let Some(generation) = self.work_generation {
+            GuiEvent::AccountScoped {
+                epoch: self.work_epoch.clone(),
+                generation,
+                event: Box::new(ev),
+            }
+        } else {
+            ev
+        };
+        let ev = if let Some(generation) = self.generation {
+            GuiEvent::AccountScoped {
+                epoch: self.epoch.clone(),
+                generation,
+                event: Box::new(ev),
+            }
+        } else {
+            ev
+        };
         let res = self.tx.send(ev);
         self.ctx.request_repaint();
         res
+    }
+}
+
+impl GuiEvent {
+    /// Unwrap account-scoped events only if every enclosing generation is still current.
+    pub(crate) fn for_current_account(self) -> Option<Self> {
+        match self {
+            Self::AccountScoped {
+                epoch,
+                generation,
+                event,
+            } => {
+                if epoch.load(std::sync::atomic::Ordering::SeqCst) == generation {
+                    event.for_current_account()
+                } else {
+                    None
+                }
+            }
+            event => Some(event),
+        }
     }
 }
 
@@ -1566,6 +1842,7 @@ pub struct ZaloGuiApp {
     pub(crate) send_hd_original: bool,
     pub(crate) typing_map: HashMap<String, (String, std::time::Instant)>,
     active_call: Option<ActiveCallOverlay>,
+    media_devices_ready: bool,
     image_viewer: Option<ImageViewerModal>,
     pub(crate) video_player: Option<VideoPlayerModal>,
 
@@ -1692,7 +1969,7 @@ pub struct ZaloGuiApp {
     script_code_draft: String,
     script_output: String,
     /// Pending confirmation before permanently deleting a thread (`(idx, tid, name, is_group, last_msg_id)`).
-    pending_delete_thread: Option<(usize, String, String, bool, String)>,
+    pending_delete_thread: Option<(String, String, bool, String)>,
     /// Pending confirmation before leaving a group (`(idx, group_id, group_name)`).
     pub(crate) pending_leave_group: Option<(usize, String, String)>,
     /// Group poll cards (session-only), keyed by poll id.
@@ -1711,6 +1988,7 @@ pub struct ZaloGuiApp {
     allow_quit: bool,
     settings_modal_open: bool,
     settings_tab: SettingsTab,
+    saved_accounts: accounts::SavedAccountsState,
     notification_authorization: crate::native_notifications::AuthorizationState,
     settings: AppSettings,
     update_checking: bool,
@@ -1831,6 +2109,10 @@ fn thread_texts(threads: &[Thread]) -> impl Iterator<Item = &str> {
 }
 
 impl ZaloGuiApp {
+    /// Restore the desktop settings and initial account view, then start background processing.
+    ///
+    /// # Panics
+    /// Panics if the session worker thread cannot be spawned.
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         mut session: Session,
@@ -1934,7 +2216,6 @@ impl ZaloGuiApp {
             .max_by_key(|(_, t)| t.messages.last().map(|m| m.ts).unwrap_or(0))
             .map(|(idx, _)| idx)
             .unwrap_or(0);
-        let startup_sched_db = crate::store::db_path_for_account(&user_uin);
 
         let app = Self {
             dark_mode,
@@ -1970,6 +2251,7 @@ impl ZaloGuiApp {
             send_hd_original: true,
             typing_map: HashMap::new(),
             active_call: None,
+            media_devices_ready: false,
             image_viewer: None,
             video_player: None,
             status_msg: "Trực tuyến · Sẵn sàng".into(),
@@ -2082,6 +2364,7 @@ impl ZaloGuiApp {
             allow_quit: false,
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
+            saved_accounts: Default::default(),
             notification_authorization: Default::default(),
             settings: loaded_settings,
             update_checking: false,
@@ -2121,8 +2404,7 @@ impl ZaloGuiApp {
             schedule_modal_open: false,
             schedule_custom_input: String::new(),
             schedule_editing_id: None,
-            scheduled_items: crate::scheduler::list_pending_scheduled(&startup_sched_db, None)
-                .unwrap_or_default(),
+            scheduled_items: Vec::new(),
             phone_sync_progress: 0.0,
             phone_sync_status: String::new(),
             saved_modal_open: false,
@@ -2183,10 +2465,7 @@ impl ZaloGuiApp {
         app.publish_known_threads();
         spawn_session_worker(
             session,
-            GuiTx {
-                tx,
-                ctx: cc.egui_ctx.clone(),
-            },
+            GuiTx::new(tx, cc.egui_ctx.clone()),
             cc.egui_ctx.clone(),
         );
         ensure_cjk_font(&cc.egui_ctx, thread_texts(&app.threads));
@@ -2360,9 +2639,29 @@ impl ZaloGuiApp {
     }
 
     pub(super) fn refresh_scheduled_items(&mut self) {
-        let db = crate::store::db_path_for_account(&self.user_uin);
-        self.scheduled_items =
-            crate::scheduler::list_pending_scheduled(&db, None).unwrap_or_default();
+        self.request_scheduled_items(false);
+    }
+
+    /// Refresh the displayed account's schedule through the worker, optionally reporting
+    /// sent items. Clear the view when no valid account owns the request.
+    fn request_scheduled_items(&mut self, notify_sent: bool) {
+        if crate::account_manager::validate_uin(&self.user_uin).is_err() {
+            self.scheduled_items.clear();
+            return;
+        }
+        if let Some(tx) = WORKER_TX.get() {
+            if tx
+                .send(WorkerCmd::LoadScheduledMessages {
+                    uin: self.user_uin.clone(),
+                    notify_sent,
+                })
+                .is_err()
+            {
+                self.status_msg = "Không thể tải lịch hẹn: tác vụ nền đã dừng.".into();
+            }
+        } else {
+            self.status_msg = "Không thể tải lịch hẹn: tác vụ nền chưa sẵn sàng.".into();
+        }
     }
     /// Tải lại hộp Đã lưu từ DB acc hiện tại (WaveA2).
     pub(super) fn refresh_saved_items(&mut self) {
@@ -2579,6 +2878,7 @@ impl ZaloGuiApp {
     /// socket control events (`pin_message` / `unpin_topic`) instead.
     fn maybe_refresh_board_pins(&mut self) {}
 
+    /// Publish current thread metadata for polling and queue an account-owned disk snapshot.
     fn persist_threads_async(&self) {
         self.publish_known_threads();
         if self.user_uin.is_empty() {
@@ -2721,9 +3021,15 @@ impl ZaloGuiApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
 
+    /// Apply available worker events to the active view without waiting for new events.
+    /// Discard completions from obsolete account generations before handling them.
     fn check_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.event_rx.try_recv() {
+            let Some(event) = event.for_current_account() else {
+                continue;
+            };
             match event {
+                GuiEvent::AccountScoped { .. } => continue,
                 GuiEvent::NotificationAuthorization { request_id, result } => {
                     self.notification_authorization.finish(request_id, result);
                 }
@@ -2759,20 +3065,29 @@ impl ZaloGuiApp {
                         self.group_summary_pending = None;
                         self.group_jump_pending = None;
                     }
-                    // Refresh (đã login ĐÚNG cùng tài khoản) thì merge, KHÔNG clear —
-                    // đổi sang tài khoản khác PHẢI clear sạch state cũ (#119).
-                    let is_refresh = self.is_logged_in && self.user_uin == uin;
+                    // On session refresh under the same account, keep thread list & unread counts.
+                    // Clearing + re-fetching counts all existing history as brand-new unread (#119).
+                    let is_refresh = same_history_owner(&self.user_uin, &uin);
+                    self.saved_accounts.invalidate();
                     self.is_logged_in = true;
                     self.pending_add_account_uin = None;
                     self.user_name = name;
                     self.user_uin = uin;
                     crate::account_manager::set_active_uin(&self.user_uin);
                     self.background_unread.remove(&self.user_uin);
-                    if avatar.is_some() {
+                    if avatar.is_some() || !is_refresh {
                         self.user_avatar = avatar;
                     }
                     if !is_refresh {
                         self.threads.clear();
+                        self.reaction_inbox = Default::default();
+                        self.input_message.clear();
+                        self.replying_to = None;
+                        self.forward_msg = None;
+                        self.forward_filter.clear();
+                        self.incoming_popup = None;
+                        self.phone_sync_progress = 0.0;
+                        self.phone_sync_status.clear();
                         self.unread_counts.clear();
                         self.reaction_unread_counts.clear();
                         self.notified_msg_ids.clear();
@@ -2789,6 +3104,11 @@ impl ZaloGuiApp {
                         self.refresh_saved_items();
                         self.publish_known_threads();
                     }
+                    self.publish_known_threads();
+                    if let Some(tx) = WORKER_TX.get() {
+                        tx.set_visible_account(&self.user_uin);
+                    }
+                    self.refresh_scheduled_items();
                     self.login_in_progress = false;
                     self.composer_sticker_cache.retain(|_, v| !v.is_empty());
                     self.status_msg = "Trực tuyến · Đồng bộ thời gian thực".into();
@@ -3239,10 +3559,21 @@ impl ZaloGuiApp {
                     self.status_msg = format!("⚠️ {reason} — đang thử lại…");
                 }
                 GuiEvent::LocalDataWiped => {
+                    self.saved_accounts.invalidate();
+                    if let Some(tx) = WORKER_TX.get() {
+                        tx.rebind_visible_scope();
+                    }
                     self.threads.clear();
+                    self.reaction_inbox = Default::default();
+                    self.replying_to = None;
+                    self.forward_msg = None;
+                    self.forward_filter.clear();
                     self.unread_counts.clear();
                     self.reaction_unread_counts.clear();
                     self.notified_msg_ids.clear();
+                    self.history_reached_start.clear();
+                    self.incoming_popup = None;
+                    self.publish_known_threads();
                     self.selected_thread_index = 0;
                     // Sweep không còn gì để quét — clear để đổi acc sau không quét nhầm (#875).
                     if let Ok(mut watch) = VANISH_THREADS.lock() {
@@ -3269,12 +3600,46 @@ impl ZaloGuiApp {
                 GuiEvent::BackgroundAccountActivity(activity) => {
                     self.handle_background_account_activity(activity);
                 }
-                GuiEvent::LoggedOut => {
+                GuiEvent::AccountSwitchFailed(error) => {
+                    self.active_call = None;
+                    self.resume_account_work(error);
+                }
+                GuiEvent::LocalDataWipeFailed(error) => {
+                    self.resume_account_work(error);
+                }
+                GuiEvent::AuthenticationRestarted => {
+                    self.saved_accounts.invalidate();
+                    self.is_logged_in = false;
+                    if let Some(tx) = WORKER_TX.get() {
+                        tx.set_visible_account("");
+                    }
+                    self.active_call = None;
+                    self.scheduled_items.clear();
+                    self.qr_texture = None;
+                    self.qr_status = "Đang xin mã QR mới…".into();
+                    if !self.user_uin.is_empty() && !self.threads.is_empty() {
+                        self.status_msg =
+                            "Đang đăng nhập lại; lịch sử đã lưu vẫn có thể xem được.".into();
+                    }
+                }
+                GuiEvent::AddAccountFailed(error) => self.show_toast(error),
+                GuiEvent::LoggedOut { previous_account } => {
+                    let adding_account = previous_account.is_some();
+                    self.pending_add_account_uin = previous_account;
+                    self.reaction_inbox = Default::default();
+                    self.input_message.clear();
+                    self.replying_to = None;
+                    self.forward_msg = None;
+                    self.forward_filter.clear();
+                    self.saved_accounts.invalidate();
                     self.is_logged_in = false;
                     self.user_name.clear();
                     self.user_uin.clear();
                     crate::account_manager::set_active_uin("");
                     self.background_unread.clear();
+                    if let Some(tx) = WORKER_TX.get() {
+                        tx.set_visible_account("");
+                    }
                     self.threads.clear();
                     self.unread_counts.clear();
                     self.reaction_unread_counts.clear();
@@ -3282,10 +3647,24 @@ impl ZaloGuiApp {
                     if let Ok(mut watch) = VANISH_THREADS.lock() {
                         watch.clear();
                     }
+                    self.active_call = None;
+                    self.scheduled_items.clear();
+                    self.pending_delete_thread = None;
+                    self.pending_leave_group = None;
                     self.selected_thread_index = 0;
                     self.qr_status = "Đang xin mã QR mới…".into();
-                    self.status_msg = "Đã đăng xuất".into();
-                    // Đăng xuất → cache nhóm không còn giá trị.
+                    self.status_msg = if adding_account {
+                        self.qr_texture = None;
+                        self.login_tab = LoginTab::QrCode;
+                        self.login_in_progress = false;
+                        self.login_status_msg.clear();
+                        self.phone_input.clear();
+                        self.password_input.clear();
+                        "Đang xin mã QR đăng nhập tài khoản mới…".into()
+                    } else {
+                        "Đã đăng xuất".into()
+                    };
+                    // Group workspace caches belong to the signed-out account.
                     self.group_note_drafts.clear();
                     self.group_note_loaded.clear();
                     self.group_note_edited_at.clear();
@@ -3307,6 +3686,9 @@ impl ZaloGuiApp {
                     self.incoming_popup = None;
                     self.reaction_inbox = crate::reactions::ReactionInbox::default();
                     self.publish_known_threads();
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::RequestQr);
+                    }
                 }
                 GuiEvent::AccountSwitched {
                     uin,
@@ -3314,14 +3696,17 @@ impl ZaloGuiApp {
                     avatar,
                     threads,
                 } => {
-                    // Worker đã snapshot DB acc cũ trước khi switch — flush pending
-                    // ở đây phòng trường hợp GUI còn draft treo chưa kịp lưu.
+                    // Flush any remaining drafts before changing the UI's account ID.
                     self.flush_group_note_pending();
+                    self.saved_accounts.invalidate();
                     self.is_logged_in = true;
                     self.pending_add_account_uin = None;
                     self.user_uin = uin;
                     crate::account_manager::set_active_uin(&self.user_uin);
                     self.background_unread.remove(&self.user_uin);
+                    if let Some(tx) = WORKER_TX.get() {
+                        tx.set_visible_account(&self.user_uin);
+                    }
                     // Counts were keyed by the previous account's threads. Rebuild them
                     // from the read-points so messages stored while this account was in
                     // the background still show as unread.
@@ -3331,9 +3716,23 @@ impl ZaloGuiApp {
                     self.user_name = name.clone();
                     self.user_avatar = avatar;
                     self.threads = threads;
-                    // Acc mới mang vanish policy riêng — rebuild watch để sweep
-                    // thread khôi phục từ SQLite, không giữ watch của acc cũ (#875).
+                    // Rebuild the vanish watch from the restored account's threads (#875).
                     self.refresh_vanish_watch();
+                    self.active_call = None;
+                    self.scheduled_items.clear();
+                    self.schedule_editing_id = None;
+                    self.schedule_modal_open = false;
+                    self.refresh_scheduled_items();
+                    self.reaction_inbox = Default::default();
+                    self.incoming_popup = None;
+                    self.phone_sync_progress = 0.0;
+                    self.phone_sync_status.clear();
+                    self.pending_delete_thread = None;
+                    self.pending_leave_group = None;
+                    self.input_message.clear();
+                    self.replying_to = None;
+                    self.forward_msg = None;
+                    self.forward_filter.clear();
                     self.selected_thread_index = 0;
                     self.status_msg = format!("Đã chuyển sang tài khoản {name}");
                     self.history_reached_start.clear();
@@ -3544,9 +3943,13 @@ impl ZaloGuiApp {
                                 ..Default::default()
                             });
                         }
+                        let thread = self.threads.iter_mut().find(|t| t.id == thread_id);
+                        if let Some(t) = &thread {
+                            self.reaction_inbox.observe_loaded(&t.messages, &clear_evs);
+                        }
                         self.reaction_inbox.record_new(&clear_evs);
                         let mut changed = false;
-                        if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
+                        if let Some(t) = thread {
                             changed |= self.reaction_inbox.apply_to(&mut t.messages);
                             for m in t.messages.iter_mut() {
                                 if (!msg_id.is_empty() && m.id == msg_id)
@@ -3577,6 +3980,10 @@ impl ZaloGuiApp {
                     // accepted subset so repeats never double-count (#473, #1773).
                     let total = events.len();
                     let pending_before = self.reaction_inbox.pending_len();
+                    for thread in &self.threads {
+                        self.reaction_inbox
+                            .observe_loaded(&thread.messages, &events);
+                    }
                     let accepted = self.reaction_inbox.record_new(&events);
                     let mut changed = false;
                     for t in self.threads.iter_mut() {
@@ -4012,6 +4419,34 @@ impl ZaloGuiApp {
                         self.sticker_textures.remove(&evicted_key);
                     }
                 }
+                GuiEvent::VideoFramesReady(mailbox) => {
+                    let (clear, frames, removed) = mailbox.take();
+                    if clear {
+                        self.sticker_textures
+                            .retain(|key, _| !is_call_video_key(key));
+                    }
+                    for key in removed {
+                        self.sticker_textures.remove(&key);
+                    }
+                    for (key, image) in frames {
+                        if let Some(texture) = self.sticker_textures.get_mut(&key) {
+                            texture.set(image, TextureOptions::LINEAR);
+                        } else {
+                            let texture = ctx.load_texture(&key, image, TextureOptions::LINEAR);
+                            self.sticker_textures.insert(key, texture);
+                        }
+                    }
+                }
+                GuiEvent::MediaDevicesRefreshed { error } => {
+                    self.media_devices_ready = true;
+                    if let Some(error) = error {
+                        self.show_toast(format!("Không thể quét thiết bị âm thanh/video: {error}"));
+                    }
+                    ctx.request_repaint();
+                }
+                GuiEvent::SavedAccountsLoaded { request_id, result } => {
+                    self.saved_accounts.finish(request_id, result);
+                }
                 GuiEvent::StickerImageFailed { key } => {
                     self.loading_stickers.remove(&key);
                     if key.starts_with("call_remote_video") {
@@ -4321,8 +4756,29 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::ScriptLogsUpdated { .. } => {
-                    // Drawer Scripts đọc log trực tiếp từ DB khi render nên chỉ cần repaint.
+                    // The scripts drawer loads the latest logs when it renders.
                     ctx.request_repaint();
+                }
+                GuiEvent::HistoryImportFinished(result) => {
+                    let message = match result {
+                        Ok(message) => message,
+                        Err(error) => format!("Lỗi nhập lịch sử: {error}"),
+                    };
+                    self.show_toast(message);
+                }
+                GuiEvent::ScheduleSendNowFinished(result) => match result {
+                    Ok(true) => self.show_toast("Đang gửi ngay tin nhắn hẹn giờ…"),
+                    Ok(false) => self.show_toast("Lịch hẹn không còn chờ gửi."),
+                    Err(error) => self.show_toast(format!("Không thể gửi lịch hẹn: {error}")),
+                },
+                GuiEvent::ScheduleCancelFinished(result) => {
+                    self.refresh_scheduled_items();
+                    let message = match result {
+                        Ok(true) => "Đã hủy tin nhắn hẹn giờ.".to_string(),
+                        Ok(false) => "Lịch hẹn không còn chờ gửi.".to_string(),
+                        Err(error) => format!("Không thể hủy lịch hẹn: {error}"),
+                    };
+                    self.show_toast(message);
                 }
                 GuiEvent::HistoryReachedStart(tid) => {
                     self.history_reached_start.insert(tid);
@@ -4403,9 +4859,19 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::ScheduledListUpdated => {
+                    self.request_scheduled_items(true);
+                }
+                GuiEvent::ScheduledItemsLoaded { result, notify_sent } => {
                     let prev_cnt = self.scheduled_items.len();
-                    self.refresh_scheduled_items();
-                    if self.scheduled_items.len() < prev_cnt {
+                    let items = match result {
+                        Ok(items) => items,
+                        Err(error) => {
+                            self.status_msg = format!("Không thể tải lịch hẹn: {error}");
+                            continue;
+                        }
+                    };
+                    self.scheduled_items = items;
+                    if notify_sent && self.scheduled_items.len() < prev_cnt {
                         if self.settings.enable_notifications
                             && self.settings.play_notification_sound
                         {
@@ -5000,13 +5466,9 @@ fn file_uri(path: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Lightweight Background Session Worker (2-thread Tokio pool, off-UI disk I/O)
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Main eframe::App Implementation
-// ---------------------------------------------------------------------------
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -5320,9 +5782,7 @@ impl ZaloGuiApp {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Screen Renderers
-// ---------------------------------------------------------------------------
 
 impl ZaloGuiApp {
     fn resize_cursor_for(dir: egui::ResizeDirection) -> CursorIcon {
@@ -5639,7 +6099,6 @@ impl ZaloGuiApp {
                 let mut buttons_left_x = bar_rect.right();
 
                 ui.horizontal_centered(|ui| {
-                    // 1. App Logo (20x20)
                     let (logo_rect, _) =
                         ui.allocate_exact_size(Vec2::new(20.0, 20.0), Sense::hover());
                     if let Some(tex) = &self.app_logo_texture {
@@ -5681,7 +6140,6 @@ impl ZaloGuiApp {
                         );
                     }
 
-                    // 2. Right-side Window Control Buttons
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
 
@@ -5899,7 +6357,6 @@ impl ZaloGuiApp {
                     });
                 });
 
-                // 3. Interactive drag / double-click region covering everything left of the control buttons
                 let drag_rect = Rect::from_min_max(
                     bar_rect.min,
                     Pos2::new((buttons_left_x - 2.0).max(bar_rect.left() + 40.0), bar_rect.max.y),
@@ -6284,35 +6741,17 @@ impl ZaloGuiApp {
 
     /// Open the login screen to sign in one more account while keeping the current one.
     pub(crate) fn begin_add_account(&mut self) {
-        self.flush_group_note_pending();
-        if let Err(e) = crate::account_manager::save_current_account_snapshot(&self.user_uin) {
-            // Without a snapshot the current account could not be restored afterwards.
-            self.show_toast(format!("⚠️ Không lưu được phiên hiện tại: {e}"));
-            self.pending_add_account_uin = None;
-            return;
-        }
-        // Remember the current account so "Thoát thêm tài khoản" can return to it. No
-        // Logout is sent (#103): `RequestQr` signs the worker session out in memory only,
-        // and the saved snapshot keeps the account listening in the background.
-        if !self.user_uin.is_empty() {
-            self.pending_add_account_uin = Some(self.user_uin.clone());
-        }
-        self.is_logged_in = false;
-        self.user_name.clear();
-        self.user_uin.clear();
-        crate::account_manager::set_active_uin("");
-        self.threads.clear();
-        self.selected_thread_index = 0;
-        self.qr_texture = None;
-        self.login_tab = LoginTab::QrCode;
-        self.login_in_progress = true;
-        self.login_status_msg.clear();
-        self.phone_input.clear();
-        self.password_input.clear();
-        self.qr_status = "Đang xin mã QR mới…".into();
-        self.status_msg = "Đang xin mã QR đăng nhập tài khoản mới…".into();
-        if let Some(tx) = WORKER_TX.get() {
-            let _ = tx.send(WorkerCmd::RequestQr);
+        let pending_notes = self
+            .group_note_edited_at
+            .keys()
+            .map(|id| (id.clone(), self.group_note_drafts.get(id).cloned().unwrap_or_default()))
+            .collect();
+        if WORKER_TX.get().is_some_and(|tx| {
+            tx.send(WorkerCmd::BeginAddAccount { pending_notes }).is_ok()
+        }) {
+            self.status_msg = "Đang lưu tài khoản hiện tại…".into();
+        } else {
+            self.show_toast("Không thể chuẩn bị thêm tài khoản: worker chưa sẵn sàng.");
         }
     }
 
@@ -6330,6 +6769,18 @@ impl ZaloGuiApp {
                 target_uin: prev_uin,
             });
         }
+    }
+
+    /// Rebind background work after a transition leaves the displayed account in place.
+    /// Refresh account-dependent views before showing the transition status.
+    fn resume_account_work(&mut self, status: String) {
+        self.saved_accounts.invalidate();
+        if let Some(tx) = WORKER_TX.get() {
+            tx.rebind_visible_scope();
+        }
+        self.publish_known_threads();
+        self.refresh_scheduled_items();
+        self.status_msg = status;
     }
 
     fn show_toast(&mut self, msg: impl Into<String>) {
@@ -6595,6 +7046,12 @@ fn unread_counts_from_read_points(threads: &[Thread]) -> HashMap<String, usize> 
     counts
 }
 
+/// Allow cached history to accompany a session only when a nonempty displayed owner
+/// matches the authenticated account. Cached-history mode can precede authentication.
+fn same_history_owner(displayed_uin: &str, authenticated_uin: &str) -> bool {
+    !displayed_uin.is_empty() && displayed_uin == authenticated_uin
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_newer_semver, phone_sync_completion_message};
@@ -6706,6 +7163,251 @@ mod tests {
             super::advance_thread_read_point(&mut thread).as_deref(),
             Some("215")
         );
+    }
+
+    #[test]
+    fn cached_history_is_preserved_only_for_its_authenticated_owner() {
+        assert!(super::same_history_owner("account-a", "account-a"));
+        assert!(!super::same_history_owner("account-a", "account-b"));
+        assert!(!super::same_history_owner("", "account-b"));
+        assert!(!super::same_history_owner("", ""));
+    }
+
+    fn video_frame(color: eframe::egui::Color32) -> eframe::egui::ColorImage {
+        eframe::egui::ColorImage::new([1, 1], color)
+    }
+
+    /// Exercise a stalled GUI across all supported streams and verify that draining
+    /// the mailbox allows the next frame to schedule a new wake.
+    ///
+    /// # Panics
+    /// Panics if the stream limit, frame coalescing or wake behavior regresses.
+    #[test]
+    fn video_mailbox_keeps_only_latest_frame_per_bounded_stream_when_ui_stalls() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = super::GuiTx::new(tx, eframe::egui::Context::default());
+        let generation = sender.begin_video_generation();
+        let keys = [
+            "call_local_video",
+            "call_remote_video",
+            "call_remote_video_1",
+            "call_remote_video_2",
+            "call_remote_video_3",
+            "call_remote_video_4",
+            "call_remote_video_5",
+        ];
+        for value in 0..=255 {
+            for key in keys {
+                assert!(sender.send_video_frame(
+                    generation,
+                    key,
+                    video_frame(eframe::egui::Color32::from_gray(value))
+                ));
+            }
+        }
+        assert!(!sender.send_video_frame(
+            generation,
+            "call_remote_video_6",
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        let super::GuiEvent::VideoFramesReady(mailbox) = rx.try_recv().unwrap() else {
+            panic!("expected video wake");
+        };
+        assert!(rx.try_recv().is_err());
+        let (clear, frames, _) = mailbox.take();
+        assert!(clear);
+        assert_eq!(frames.len(), 7);
+        assert!(frames
+            .values()
+            .all(|image| image.pixels == [eframe::egui::Color32::WHITE]));
+        assert!(sender.send_video_frame(
+            generation,
+            keys[0],
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(super::GuiEvent::VideoFramesReady(_))
+        ));
+    }
+
+    #[test]
+    fn video_mailbox_rejects_old_call_frames_and_late_stop_when_new_call_starts() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = super::GuiTx::new(tx, eframe::egui::Context::default());
+        let old = sender.begin_video_generation();
+        assert!(sender.send_video_frame(
+            old,
+            "call_local_video",
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        let current = sender.begin_video_generation();
+        sender.end_video_generation(old);
+        assert!(!sender.send_video_frame(
+            old,
+            "call_local_video",
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        assert!(sender.send_video_frame(
+            current,
+            "call_local_video",
+            video_frame(eframe::egui::Color32::WHITE)
+        ));
+        let super::GuiEvent::VideoFramesReady(mailbox) = rx.try_recv().unwrap() else {
+            panic!("expected video wake");
+        };
+        assert_eq!(
+            mailbox.take().1["call_local_video"].pixels,
+            [eframe::egui::Color32::WHITE]
+        );
+        sender.end_video_generation(current);
+        assert!(!sender.send_video_frame(
+            current,
+            "call_local_video",
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        let super::GuiEvent::VideoFramesReady(mailbox) = rx.try_recv().unwrap() else {
+            panic!("expected clear wake");
+        };
+        let (clear, frames, _) = mailbox.take();
+        assert!(clear);
+        assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn video_mailbox_rejects_previous_account_and_reuses_pending_wake_after_switch() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = super::GuiTx::new(tx, eframe::egui::Context::default());
+        let old_sender = root.scoped();
+        let old_generation = old_sender.begin_video_generation();
+        assert!(old_sender.send_video_frame(
+            old_generation,
+            "call_remote_video",
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        let current_sender = root.advance_account();
+        assert_eq!(old_sender.begin_video_generation(), 0);
+        let current_generation = current_sender.begin_video_generation();
+        old_sender.end_video_generation(current_generation);
+        assert!(!old_sender.send_video_frame(
+            current_generation,
+            "call_remote_video",
+            video_frame(eframe::egui::Color32::BLACK)
+        ));
+        assert!(current_sender.send_video_frame(
+            current_generation,
+            "call_remote_video",
+            video_frame(eframe::egui::Color32::WHITE)
+        ));
+        let super::GuiEvent::VideoFramesReady(mailbox) = rx.try_recv().unwrap() else {
+            panic!("expected video wake");
+        };
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            mailbox.take().1["call_remote_video"].pixels,
+            [eframe::egui::Color32::WHITE]
+        );
+    }
+
+    /// Verify that repeated removal of one peer replaces that peer's pending frame
+    /// with a single texture removal, while an earlier call's request is discarded.
+    ///
+    /// # Panics
+    /// Panics if stale removal is accepted or the GUI receives an unexpected mailbox update.
+    #[test]
+    fn video_mailbox_coalesces_peer_removal_and_rejects_old_call_removal() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = super::GuiTx::new(tx, eframe::egui::Context::default());
+        let old = sender.begin_video_generation();
+        let current = sender.begin_video_generation();
+        assert!(!sender.clear_video_frame(old, "call_remote_video"));
+        assert!(sender.send_video_frame(
+            current,
+            "call_remote_video",
+            video_frame(eframe::egui::Color32::WHITE)
+        ));
+        for _ in 0..1000 {
+            assert!(sender.clear_video_frame(current, "call_remote_video"));
+        }
+        let super::GuiEvent::VideoFramesReady(mailbox) = rx.try_recv().unwrap() else {
+            panic!("expected video wake");
+        };
+        assert!(rx.try_recv().is_err());
+        let (_, frames, removed) = mailbox.take();
+        assert!(frames.is_empty());
+        assert_eq!(
+            removed,
+            std::collections::HashSet::from(["call_remote_video".to_owned()])
+        );
+        assert!(sender.clear_video_frame(current, "call_remote_video"));
+        assert!(sender.send_video_frame(
+            current,
+            "call_remote_video",
+            video_frame(eframe::egui::Color32::WHITE)
+        ));
+        let super::GuiEvent::VideoFramesReady(mailbox) = rx.try_recv().unwrap() else {
+            panic!("expected video wake");
+        };
+        let (_, frames, removed) = mailbox.take();
+        assert_eq!(frames.len(), 1);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn account_generation_rejects_queued_and_late_completions() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = super::GuiTx::new(tx, eframe::egui::Context::default());
+        let old = root.scoped();
+        assert!(old
+            .send(super::GuiEvent::ThreadsUpdated(Vec::new()))
+            .is_ok());
+        let current = root.advance_account();
+        assert!(!old.is_current());
+        assert!(current.is_current());
+        assert!(old
+            .send(super::GuiEvent::StatusUpdate("old account".into()))
+            .is_ok());
+        assert!(rx.recv().unwrap().for_current_account().is_none());
+        assert!(rx.recv().unwrap().for_current_account().is_none());
+        assert!(current
+            .send(super::GuiEvent::ThreadsUpdated(Vec::new()))
+            .is_ok());
+        assert!(matches!(
+            rx.recv().unwrap().for_current_account(),
+            Some(super::GuiEvent::ThreadsUpdated(_))
+        ));
+    }
+
+    #[test]
+    fn wiping_history_rejects_old_work_without_interrupting_call_frames() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = super::GuiTx::new(tx, eframe::egui::Context::default());
+        let old = root.scoped();
+        let call = old.for_call();
+        let video = call.begin_video_generation();
+        // Drain the initial video wake before testing the queued history completion.
+        rx.try_recv().unwrap();
+        old.send(super::GuiEvent::ThreadsUpdated(Vec::new()))
+            .unwrap();
+        let current = root.advance_work();
+        assert!(!old.is_current());
+        assert!(call.is_current());
+        assert!(rx.recv().unwrap().for_current_account().is_none());
+        old.send(super::GuiEvent::ThreadsUpdated(Vec::new()))
+            .unwrap();
+        assert!(rx.recv().unwrap().for_current_account().is_none());
+        current.send(super::GuiEvent::LocalDataWiped).unwrap();
+        assert!(matches!(
+            rx.recv().unwrap().for_current_account(),
+            Some(super::GuiEvent::LocalDataWiped)
+        ));
+        assert!(call.send_video_frame(
+            video,
+            "call_remote_video",
+            video_frame(eframe::egui::Color32::WHITE)
+        ));
+        root.advance_account();
+        assert!(!call.is_current());
     }
 
     #[test]

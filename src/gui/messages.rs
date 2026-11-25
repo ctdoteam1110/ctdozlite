@@ -1,8 +1,6 @@
 use super::*;
 
-// ---------------------------------------------------------------------------
 // Chat Bubble & Sticker Widget Rendering
-// ---------------------------------------------------------------------------
 
 pub(super) fn strip_recall_prefix(s: &str) -> &str {
     let trimmed = s.trim();
@@ -689,7 +687,6 @@ pub(super) fn read_clipboard_image_to_png(
                 return None;
             }
 
-            // 1. Try raw PNG stream first (preserves exact RGBA and avoids DIB header quirks)
             for fmt in [cf_png, cf_mime_png] {
                 if fmt != 0 && IsClipboardFormatAvailable(fmt) != 0 {
                     let hmem = GetClipboardData(fmt);
@@ -2336,14 +2333,12 @@ pub(super) fn render_message_body(
         }
     }
 
-    // 1. Optional user comment above the link
     if !caption.is_empty() && caption != url {
         let caption = crate::chat::text_emoticons_to_emoji(&caption);
         render_chat_markdown_block_opts(ui, &caption, text_col, pal, md.enabled, md.zalo_bold);
         ui.add_space(4.0);
     }
 
-    // 2. Optional compact thumbnail directly inside the bubble (no nested card box)
     if let Some(thumb_url) = msg.link_thumb.as_deref().filter(|u| !u.is_empty()) {
         let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
         if thumb_url.starts_with("http://") || thumb_url.starts_with("https://") {
@@ -2381,7 +2376,6 @@ pub(super) fn render_message_body(
         }
     }
 
-    // 3. Bold Title (exact Zalo PC style: no globe icon, no vertical accent bar, no nested border)
     let header_title = msg
         .link_title
         .as_deref()
@@ -2409,7 +2403,6 @@ pub(super) fn render_message_body(
         let _ = open_external_url(&url);
     }
 
-    // 4. Optional short description (only if concise and distinct)
     let desc_opt = msg
         .link_desc
         .as_deref()
@@ -3805,7 +3798,6 @@ fn render_doc_card(
     let (icon, kind_label) = attachment_kind_label(kind);
     let mut action = None;
 
-    // 1. Header: 40x40 Icon Badge on left + File Name & Metadata on right
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(10.0, 0.0);
         let (badge_rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 40.0), Sense::hover());
@@ -3865,7 +3857,6 @@ fn render_doc_card(
 
     ui.add_space(8.0);
 
-    // 2. Action buttons: harmonious dimensions, matching rounding and styling
     let secondary_btn_fill = if pal.is_dark {
         Color32::from_rgba_unmultiplied(255, 255, 255, 14)
     } else {
@@ -5410,7 +5401,6 @@ pub(super) fn bubble_context_menu(
                     // Tin đã biến mất: vô hiệu mọi thao tác media/link (chỉ cho xoá).
                     let vanished =
                         msg.text.trim() == crate::chat::VANISH_EXPIRED_TEXT;
-                    // 0. Hàng emoji thả cảm xúc (giống Zalo gốc khi chuột phải)
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
                         for &(code, key, tooltip) in &REACTION_LIST {
@@ -5459,7 +5449,6 @@ pub(super) fn bubble_context_menu(
                         action = Some(BubbleAction::React(crate::chat::CLEAR_REACTION_CODE));
                         close_menu = true;
                     }
-                    // 1. Trả lời (Quote)
                     if !vanished
                         && menu_item(ui, lucide::QUOTE, "Trả lời", pal.text_primary).clicked()
                     {
@@ -5467,7 +5456,6 @@ pub(super) fn bubble_context_menu(
                         close_menu = true;
                     }
 
-                    // 2. Chia sẻ (Forward)
                     if !vanished
                         && menu_item(ui, lucide::FORWARD, "Chia sẻ", pal.text_primary).clicked()
                     {
@@ -5475,7 +5463,6 @@ pub(super) fn bubble_context_menu(
                         close_menu = true;
                     }
 
-                    // 3. Copy tin nhắn
                     if !vanished
                         && menu_item(ui, lucide::COPY, "Copy tin nhắn", pal.text_primary)
                             .clicked()
@@ -5544,7 +5531,6 @@ pub(super) fn bubble_context_menu(
                         close_menu = true;
                     }
 
-                    // 5. Lưu tin (đồng bộ 2 chiều với star) — WaveA2.
                     let star_label = if msg.is_starred {
                         "Bỏ lưu tin nhắn"
                     } else {
@@ -5555,7 +5541,6 @@ pub(super) fn bubble_context_menu(
                         close_menu = true;
                     }
 
-                    // 5b. Nhắc tôi về tin này (WaveA1 nhắc hẹn trên tin nhắn).
                     if !vanished
                         && menu_item(ui, lucide::BELL, "Nhắc tôi về tin này", pal.text_primary)
                             .clicked()
@@ -5564,7 +5549,6 @@ pub(super) fn bubble_context_menu(
                         close_menu = true;
                     }
 
-                    // 5b. Hẹn giờ / Nhắc hẹn cho tin nhắn này (#94)
                     if !vanished
                         && menu_item(ui, lucide::BELL, "Hẹn giờ / Nhắc hẹn", pal.text_primary)
                             .clicked()
@@ -5573,7 +5557,6 @@ pub(super) fn bubble_context_menu(
                         close_menu = true;
                     }
 
-                    // 6. Nếu là ảnh: Xem ảnh phóng to
                     if !vanished && is_zalo_photo_message(msg) {
                         if let Some(thumb_url) = photo_primary_url(msg) {
                             if menu_item(ui, lucide::SEARCH, "Xem ảnh phóng to", pal.text_primary)
@@ -5620,7 +5603,6 @@ pub(super) fn bubble_context_menu(
                         }
                     }
 
-                    // 7. Nếu là file / video / voice: Lưu tập tin (+ Nghe thoại cho voice)
                     if !vanished && is_zalo_file_or_video_message(msg) {
                         if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
                             let resolved_name = crate::chat::resolve_attachment_file_name(
@@ -5715,7 +5697,6 @@ pub(super) fn bubble_context_menu(
                         }
                     }
 
-                    // 9. Xóa chỉ ở phía tôi
                     if menu_item(
                         ui,
                         lucide::TRASH_2,
@@ -6065,7 +6046,6 @@ pub(super) fn render_hover_reaction_bar(
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
 
-                        // 1. Quick Reply (Quote)
                         let (r_rect, r_resp) =
                             ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
                         if r_resp.hovered() {
@@ -6086,7 +6066,6 @@ pub(super) fn render_hover_reaction_bar(
                             action = Some(BubbleAction::Reply);
                         }
 
-                        // 2. Quick Forward / Share
                         let (f_rect, f_resp) =
                             ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
                         if f_resp.hovered() {
@@ -6107,7 +6086,6 @@ pub(super) fn render_hover_reaction_bar(
                             action = Some(BubbleAction::Forward);
                         }
 
-                        // 3. More Options (`...` -> crisp vector dots, opens full message menu)
                         let (m_rect, m_resp) =
                             ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
                         if m_resp.hovered() {

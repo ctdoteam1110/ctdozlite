@@ -1,8 +1,6 @@
 use super::*;
 
-// ---------------------------------------------------------------------------
 // Semantic Design System Tokens (UI/UX Pro Max — Minimalism & Swiss Style)
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ThemePalette {
@@ -491,9 +489,7 @@ pub(super) fn format_hex_color(c: Color32) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Zero-allocation Vector Icon Painter Primitives (Replaces Emoji Icons)
-// ---------------------------------------------------------------------------
 
 pub(super) fn avatar_color_for(name: &str, is_group: bool) -> Color32 {
     const PALETTE: &[Color32] = &[

@@ -186,9 +186,13 @@ impl ZaloGuiApp {
         Some(hk)
     }
 
+    /// Lay out navigation, conversation search and the active chat at the current
+    /// viewport width, then apply input from those panels.
+    ///
+    /// # Panics
+    /// Panics if a cached row index used during rendering is outside its backing list.
     pub(super) fn render_chat_workspace(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         // Responsive breakpoints based on live viewport width
-        // -------------------------------------------------------------------
         let screen_rect = ctx.screen_rect();
         let screen_w = screen_rect.width();
         let is_compact_w = screen_w < 880.0;
@@ -200,9 +204,7 @@ impl ZaloGuiApp {
         }
         let left_rail_w = if is_narrow_w { 52.0 } else { 62.0 };
 
-        // -------------------------------------------------------------------
         // 1. LEFT NAVIGATION RAIL (Replaces top bar & bottom bar)
-        // -------------------------------------------------------------------
         egui::SidePanel::left("left_nav_rail")
             .resizable(false)
             .exact_width(left_rail_w)
@@ -637,9 +639,7 @@ impl ZaloGuiApp {
             self.render_settings_modal(ctx, pal);
             return;
         }
-        // -------------------------------------------------------------------
         // 2. CONVERSATION LIST SIDEBAR (Responsive width, auto-adapts on resize)
-        // -------------------------------------------------------------------
         let (sidebar_id, sidebar_min_w, sidebar_max_w) = if sidebar_is_rail {
             ("conversation_sidebar_narrow", 68.0_f32, 68.0_f32)
         } else {
@@ -1493,7 +1493,7 @@ impl ZaloGuiApp {
                     SetMute(String, bool, Option<i64>, String),
                     ToggleHide(String, bool, bool),
                     OpenSchedule(usize),
-                    DeleteConv(usize, String, String, bool, String),
+                    DeleteConv(String, String, bool, String),
                     LeaveGroup(usize, String, String),
                     ReportConv(String),
                     /// Gán/bỏ thread vào Chat Folder (WaveA3).
@@ -1945,7 +1945,6 @@ impl ZaloGuiApp {
                                 ui.set_min_width(205.0);
                                 ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
 
-                                // 1. Ghim / Bỏ ghim hội thoại
                                 let pin_label = if is_user_pinned {
                                     "Bỏ ghim hội thoại"
                                 } else {
@@ -1973,7 +1972,6 @@ impl ZaloGuiApp {
 
                                 ui.separator();
 
-                                // 2. Phân loại >
                                 ui.menu_button(
                                     RichText::new("Phân loại")
                                         .size(13.5)
@@ -2045,7 +2043,6 @@ impl ZaloGuiApp {
                                     },
                                 );
 
-                                // 2b. Chat Folders: gán/bỏ thread (WaveA3).
                                 if !self.settings.chat_folders.is_empty() {
                                     ui.menu_button(
                                         RichText::new("Thêm vào folder")
@@ -2126,7 +2123,6 @@ impl ZaloGuiApp {
 
                                 ui.separator();
 
-                                // 4. Tắt thông báo > (hoặc Bật lại thông báo)
                                 if is_muted {
                                     if ui
                                         .add(
@@ -2199,7 +2195,6 @@ impl ZaloGuiApp {
                                     );
                                 }
 
-                                // 5. Ẩn trò chuyện / Bỏ ẩn trò chuyện
                                 let hide_label = if is_hidden {
                                     "Bỏ ẩn trò chuyện"
                                 } else {
@@ -2225,7 +2220,6 @@ impl ZaloGuiApp {
                                     ui.close_menu();
                                 }
 
-                                // 5b. Hẹn giờ gửi tin nhắn / Nhắc hẹn (#38)
                                 if ui
                                     .add(
                                         egui::Button::new(
@@ -2244,7 +2238,6 @@ impl ZaloGuiApp {
 
                                 ui.separator();
 
-                                // 6. Xóa hội thoại (màu đỏ)
                                 if ui
                                     .add(
                                         egui::Button::new(
@@ -2258,7 +2251,6 @@ impl ZaloGuiApp {
                                     .clicked()
                                 {
                                     pending_ctx_action = Some(ThreadCtxAction::DeleteConv(
-                                        i,
                                         tid_cl.clone(),
                                         tname_cl.clone(),
                                         tgroup_cl,
@@ -2291,7 +2283,6 @@ impl ZaloGuiApp {
 
                                 ui.separator();
 
-                                // 7. Báo xấu
                                 if ui
                                     .add(
                                         egui::Button::new(
@@ -2628,9 +2619,8 @@ impl ZaloGuiApp {
                             self.selected_thread_index = idx;
                             self.schedule_modal_open = true;
                         }
-                        ThreadCtxAction::DeleteConv(idx, tid, tname, is_group, last_msg_id) => {
-                            self.pending_delete_thread =
-                                Some((idx, tid, tname, is_group, last_msg_id));
+                        ThreadCtxAction::DeleteConv(tid, tname, is_group, last_msg_id) => {
+                            self.pending_delete_thread = Some((tid, tname, is_group, last_msg_id));
                         }
                         ThreadCtxAction::LeaveGroup(idx, tid, tname) => {
                             self.pending_leave_group = Some((idx, tid, tname));
@@ -2656,9 +2646,7 @@ impl ZaloGuiApp {
             )
         });
 
-        // -------------------------------------------------------------------
         // 3. COLLAPSIBLE RIGHT CONVERSATION INFO DRAWER (Panel >= 880px, Animated Overlay < 880px)
-        // -------------------------------------------------------------------
         let mut open_chat_member: Option<crate::chat::SidebarMember> = None;
         let mut view_profile_member: Option<String> = None;
         if is_compact_w && self.info_drawer_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -2959,7 +2947,6 @@ impl ZaloGuiApp {
                         let drawer_rect = ui.max_rect();
                         ui.set_clip_rect(drawer_rect);
                         ui.set_max_width(drawer_w);
-                        // 0. Top Header ("Thông tin nhóm" / "Thông tin hội thoại") matching native Zalo
                         egui::Frame::none()
                             .fill(pal.bg_sidebar)
                             .inner_margin(Margin::symmetric(16.0, 13.0))
@@ -3243,7 +3230,6 @@ impl ZaloGuiApp {
                                                 resp.on_hover_cursor(CursorIcon::PointingHand)
                                             };
 
-                                        // 1. Tắt / Bật thông báo
                                         if draw_circle_action(
                                             ui,
                                             lucide::BELL,
@@ -3286,7 +3272,6 @@ impl ZaloGuiApp {
                                             }
                                         }
 
-                                        // 2. Ghim hội thoại
                                         if draw_circle_action(
                                             ui,
                                             lucide::PIN,
@@ -3323,7 +3308,6 @@ impl ZaloGuiApp {
                                             }
                                         }
 
-                                        // 3. Thêm thành viên (group) / Hồ sơ & Nhật ký (1-1)
                                         if d_is_group {
                                             if draw_circle_action(
                                                 ui,
@@ -3370,7 +3354,6 @@ impl ZaloGuiApp {
                                             }
                                         }
 
-                                        // 4. Quản lý nhóm / Đồng bộ
                                         if draw_circle_action(
                                             ui,
                                             lucide::SETTINGS,
@@ -5225,7 +5208,6 @@ impl ZaloGuiApp {
                             .show(ui, |ui| {
                                 let danger_col = Color32::from_rgb(220, 38, 38);
 
-                                // 1. Báo xấu
                                 let rep_resp = ui
                                     .horizontal(|ui| {
                                         let (warn_r, _) = ui.allocate_exact_size(
@@ -5255,7 +5237,6 @@ impl ZaloGuiApp {
                                 }
 
                                 ui.add_space(10.0);
-                                // 2. Xoá lịch sử trò chuyện
                                 let del_resp = ui
                                     .horizontal(|ui| {
                                         ui.label(
@@ -5294,7 +5275,6 @@ impl ZaloGuiApp {
 
                                 if d_is_group {
                                     ui.add_space(10.0);
-                                    // 3. Rời nhóm
                                     let leave_resp = ui
                                         .horizontal(|ui| {
                                             ui.label(
@@ -5510,9 +5490,7 @@ impl ZaloGuiApp {
             }
         }
 
-        // -------------------------------------------------------------------
         // 4. CENTRAL CHAT AREA (Clean Header, Messages Stream, Icon Toolbar)
-        // -------------------------------------------------------------------
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
             .show(ctx, |ui| {
@@ -5563,7 +5541,6 @@ impl ZaloGuiApp {
                             .copied()
                             .unwrap_or(crate::chat::FriendshipStatus::Unknown)
                     };
-                    // 1. Clean Conversation Header Bar (No raw 19-digit ID, no bulky sync button)
                     egui::Frame::none()
                         .fill(pal.bg_sidebar)
                         .inner_margin(Margin::symmetric(if header_narrow { 10.0 } else { 18.0 }, 11.0))
@@ -5908,14 +5885,9 @@ impl ZaloGuiApp {
                                         })
                                         .clicked()
                                     {
-                                        let ff_ok = crate::media::is_ffmpeg_available();
                                         let (_, cams) = crate::media::list_media_devices(false);
-                                        let can_cam = ff_ok && !cams.is_empty();
-                                        if !ff_ok {
-                                            self.show_toast(
-                                                "⚠️ Không tìm thấy ffmpeg trong PATH để bật Camera (cài bằng: winget install Gyan.FFmpeg)",
-                                            );
-                                        } else if cams.is_empty() {
+                                        let can_cam = !self.media_devices_ready || !cams.is_empty();
+                                        if !can_cam {
                                             self.show_toast(
                                                 "⚠️ Không phát hiện thiết bị Camera trên máy — đang gọi không hình",
                                             );
@@ -6204,7 +6176,6 @@ impl ZaloGuiApp {
                                 });
                             });
                         });
-                    // 1a. Stranger / Pending Friend Request Banner (matching Zalo PC's top relationship bar)
                     if !is_group
                         && !is_cloud_thread
                         && !is_system_thread
@@ -6383,7 +6354,6 @@ impl ZaloGuiApp {
                                 }
                             });
                     }
-                    // 1b. Pinned Message Banner (hidden: parked until server sync is fully supported to avoid mock display)
                     let pinned_msg_info: Option<(usize, String, String)> = None;
 
                     let mut unpin_idx: Option<usize> = None;
@@ -6540,7 +6510,6 @@ impl ZaloGuiApp {
                         }
                     }
 
-                    // 1c. Starred filter active banner
                     if self.filter_starred_only {
                         egui::Frame::none()
                             .fill(Color32::from_rgb(234, 179, 8).linear_multiply(0.12))
@@ -6567,7 +6536,6 @@ impl ZaloGuiApp {
                             });
                     }
 
-                    // 1d. In-Conversation Message Search Bar (`self.in_chat_search_open`)
                     if self.in_chat_search_open {
                         // Consume Escape so it does not also clear the attachment queue below.
                         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
@@ -6738,7 +6706,6 @@ impl ZaloGuiApp {
                             });
                     }
 
-                    // 2. Scrollable Messages Area
                     let posting_restricted = self.threads.get(self.selected_thread_index)
                         .is_some_and(|thread| thread.is_group && thread.presentation.posting_restricted == Some(true));
 
@@ -7820,12 +7787,10 @@ impl ZaloGuiApp {
                                 });
                             });
                     } else {
-                    // 3. Optional Sticker Picker Drawer (animated height coordination)
                     if sticker_picker_t > 0.01 {
                         self.render_sticker_picker(ui, &thread_id, is_group, pal);
                     }
 
-                    // 3b. Reply banner (quoted message preview above the composer)
                     if self.replying_to.is_some() {
                         let mut cancel = false;
                         if let Some(q) = &self.replying_to {
@@ -8043,7 +8008,6 @@ impl ZaloGuiApp {
                             }
                         }
                     }
-                    // 3c. Pending attachment strip (`Ctrl+V` / `Shift+Insert`, drag-and-drop, pickers)
                     if is_clipboard_paste_triggered(ctx) && self.paste_clipboard_attachments(ctx) {
                         // Swallow the text Paste event so the composer does not also receive a file path.
                         ctx.input_mut(|i| {
@@ -8183,7 +8147,6 @@ impl ZaloGuiApp {
                         }
                     }
 
-                    // 3d. Pending Scheduled Messages Banner (#38)
                     let thread_sched: Vec<crate::scheduler::ScheduledMessage> = self
                         .scheduled_items
                         .iter()
@@ -8223,17 +8186,21 @@ impl ZaloGuiApp {
                                 });
                             });
                         if let Some(cid) = cancel_sched_id {
-                            let db = crate::store::db_path_for_account(&self.user_uin);
-                            let _ = crate::scheduler::cancel_scheduled_message(&db, cid);
-                            self.refresh_scheduled_items();
-                            self.show_toast("Đã hủy tin nhắn hẹn giờ");
+                            if !WORKER_TX.get().is_some_and(|tx| {
+                                tx.send(WorkerCmd::CancelScheduledMessage {
+                                    uin: self.user_uin.clone(),
+                                    id: cid,
+                                })
+                                .is_ok()
+                            }) {
+                                self.show_toast("Không thể hủy tin nhắn hẹn giờ.");
+                            }
                         }
                         if open_sched_mgr {
                             self.schedule_modal_open = true;
                         }
                     }
 
-                    // 4. Bottom Message Composer Bar — Zalo PC 2-row style (Toolbar strip + Full-width Input & Send)
                     let comp_outer_w = ui.available_width();
                     let composer_frame = egui::Frame::none()
                         .fill(pal.bg_sidebar)
@@ -8456,7 +8423,6 @@ impl ZaloGuiApp {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
 
-                                // 1) Compact Sticker Icon Button
                                 let (stk_rect, stk_resp) = ui.allocate_exact_size(
                                     Vec2::new(30.0, 28.0),
                                     Sense::click(),
@@ -8486,7 +8452,6 @@ impl ZaloGuiApp {
                                     self.sticker_picker_open = !self.sticker_picker_open;
                                 }
 
-                                // 2) Compact Photo Upload Icon Button
                                 let (img_rect, img_resp) = ui.allocate_exact_size(
                                     Vec2::new(30.0, 28.0),
                                     Sense::click(),
@@ -8580,7 +8545,6 @@ impl ZaloGuiApp {
                                     self.show_toast(msg.to_string());
                                 }
 
-                                // 3) Compact File Upload Icon Button
                                 let (att_rect, att_resp) = ui.allocate_exact_size(
                                     Vec2::new(30.0, 28.0),
                                     Sense::click(),
@@ -8638,7 +8602,6 @@ impl ZaloGuiApp {
                                     }
                                 }
 
-                                // 4) Screenshot Icon Button (Chụp ảnh màn hình)
                                 let (cam_rect, cam_resp) = ui.allocate_exact_size(
                                     Vec2::new(30.0, 28.0),
                                     Sense::click(),
@@ -8671,7 +8634,6 @@ impl ZaloGuiApp {
                                     }
                                 }
 
-                                // 5) Mic Icon Button (ghi âm tin nhắn thoại)
                                 let (mic_rect, mic_resp) = ui.allocate_exact_size(
                                     Vec2::new(30.0, 28.0),
                                     Sense::click(),
@@ -8716,7 +8678,6 @@ impl ZaloGuiApp {
                                     }
                                 }
 
-                                // 6) Schedule Send Button (`🕒`)
                                 let (sched_rect, sched_resp) = ui.allocate_exact_size(
                                     Vec2::new(30.0, 28.0),
                                     Sense::click(),
@@ -9203,7 +9164,6 @@ impl ZaloGuiApp {
                                 });
                         });
 
-                    // 4a. Floating Mention Suggestion Popover (`egui::Area`, rendered AFTER composer bar)
                     let mut click_chosen_mention = None;
                     if !mention_candidates.is_empty() {
                         if let Some(chosen) = self.render_mention_suggestion_popover(
@@ -9292,7 +9252,7 @@ impl ZaloGuiApp {
         self.render_folder_modal(ctx, pal);
         self.render_settings_modal(ctx, pal);
 
-        if let Some((del_idx, del_tid, del_name, del_is_group, del_last_id)) =
+        if let Some((del_tid, del_name, del_is_group, del_last_id)) =
             self.pending_delete_thread.clone()
         {
             let mut close_confirm = false;
@@ -9365,26 +9325,15 @@ impl ZaloGuiApp {
                     });
                 });
             if confirmed_delete {
-                let uin = self.user_uin.clone();
-                let tid_bg = del_tid.clone();
-                std::thread::spawn(move || {
-                    let db = crate::store::db_path_for_account(&uin);
-                    if let Ok(mut store) = crate::store::MessageStore::open(&db) {
-                        let _ = store.delete_thread(&tid_bg);
-                    }
-                });
-                if let Some(pos) = self.threads.iter().position(|t| t.id == del_tid).or_else(|| {
-                    if del_idx < self.threads.len() {
-                        Some(del_idx)
-                    } else {
-                        None
-                    }
-                }) {
+                if let Some(pos) = self.threads.iter().position(|t| t.id == del_tid) {
                     self.threads.remove(pos);
-                    if self.selected_thread_index >= self.threads.len() && !self.threads.is_empty()
-                    {
-                        self.selected_thread_index = self.threads.len() - 1;
+                    if self.selected_thread_index >= self.threads.len() {
+                        self.selected_thread_index = self.threads.len().saturating_sub(1);
                     }
+                    self.unread_counts.remove(&del_tid);
+                    self.reaction_unread_counts.remove(&del_tid);
+                    self.settings.pinned_threads.retain(|id| id != &del_tid);
+                    self.settings.save();
                 }
                 if let Some(tx) = WORKER_TX.get() {
                     let _ = tx.send(WorkerCmd::DeleteThread {

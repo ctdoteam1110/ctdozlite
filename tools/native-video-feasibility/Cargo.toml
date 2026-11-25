@@ -1,0 +1,12 @@
+[package]
+name = "native-video-feasibility"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[workspace]
+
+[dependencies]
+nokhwa = { version = "=0.10.11", default-features = false, features = ["input-native", "decoding"] }
+openh264 = { version = "=0.9.9", default-features = false, features = ["source"] }

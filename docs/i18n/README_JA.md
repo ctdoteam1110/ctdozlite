@@ -47,10 +47,10 @@ ElectronやChromiumを使用せず、Rust（`eframe`/`egui` + `ratatui`）を用
 ## 🛠️ ソースコードからのビルド
 
 ### 必要な環境
-- **Rustツールチェーン:** Stable Rust（1.80以上推奨、`rustup` で導入）。
+- **Rustツールチェーン:** Rust 1.97以上（ネイティブ同期の Wasmtime が必要とするバージョン。`rustup` で導入）。
 - **システムライブラリ:**
-  - **Linux:** `libasound2-dev`, `libfontconfig1-dev`, `libx11-dev`, `libxcursor-dev`, `libxi-dev`, `libgl1-mesa-dev`, `ffmpeg`.
-  - **Windows / macOS:** 標準Cコンパイラ環境および `ffmpeg`（通話機能用）。
+  - **Linux:** `libasound2-dev`, `libfontconfig1-dev`, `libx11-dev`, `libxcursor-dev`, `libxi-dev`, `libgl1-mesa-dev`, `clang`, `libclang-dev`, `cmake`, `pkg-config`.
+  - **Windows / macOS:** 標準C/C++コンパイラ環境と CMake。カメラはネイティブAPI、動画は同梱の OpenH264 を使用します。
 
 ```bash
 # リポジトリのクローン

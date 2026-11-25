@@ -439,6 +439,7 @@ fn qa_sqlite_timeline_user_feed_and_realtime_like_comment_override() {
 // 2. MULTI-ACCOUNT SNAPSHOT & QUICK-LOGIN LIFECYCLE (`src/account_manager.rs`)
 // ============================================================================
 
+/// Switch between saved identities while preserving each canonical history database.
 #[test]
 fn qa_multi_account_snapshot_list_switch_and_delete_lifecycle() {
     let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -449,49 +450,33 @@ fn qa_multi_account_snapshot_list_switch_and_delete_lifecycle() {
     std::env::set_current_dir(&temp_workspace).unwrap();
 
     let test_result = std::panic::catch_unwind(|| {
-        // 1) Khởi tạo dữ liệu legacy root cho tài khoản 1 (UIN: 111000111) -> migrate 1 lần sang `accounts/`
-        let session_acc1 = json!({
-            "login": {
-                "uin": "111000111",
-                "display_name": "Tài Khoản Số 1",
-                "avatar": "https://ava.zdn.vn/acc1.jpg"
-            }
-        });
-        std::fs::write("session.json", session_acc1.to_string()).unwrap();
-        std::fs::write("threads_cache.json", r#"[{"id":"thread_acc1"}]"#).unwrap();
-        std::fs::write("zalo_history.db", b"sqlite_acc1_bytes").unwrap();
+        use zalo_rust::session::{LoginInfo, Session};
+        use zalo_rust::store::MessageStore;
 
-        save_current_account_snapshot("111000111").unwrap();
-        assert_eq!(
-            std::fs::read_to_string("accounts/111000111_threads.json").unwrap(),
-            r#"[{"id":"thread_acc1"}]"#
-        );
-        assert_eq!(
-            std::fs::read("accounts/111000111_history.db").unwrap(),
-            b"sqlite_acc1_bytes"
-        );
-        assert!(!std::path::Path::new("threads_cache.json").exists());
-        assert!(!std::path::Path::new("zalo_history.db").exists());
-
-        // 2) Tài khoản 2 (UIN: 222000222): lưu trực tiếp vào `accounts/222000222_*`.
-        // Dù root có file cũ còn sót cũng KHÔNG được ghi đè lên tài khoản 2.
-        let session_acc2 = json!({
-            "login": {
-                "uin": "222000222",
-                "display_name": "Tài Khoản Số 2",
-                "avatar": "https://ava.zdn.vn/acc2.jpg"
-            }
-        });
-        std::fs::write("session.json", session_acc2.to_string()).unwrap();
-        std::fs::write("accounts/222000222_threads.json", r#"[{"id":"thread_acc2"}]"#).unwrap();
-        std::fs::write("accounts/222000222_history.db", b"sqlite_acc2_bytes").unwrap();
-        std::fs::write("zalo_history.db", b"stale_leak_bytes").unwrap();
-
-        save_current_account_snapshot("222000222").unwrap();
-        assert_eq!(
-            std::fs::read("accounts/222000222_history.db").unwrap(),
-            b"sqlite_acc2_bytes"
-        );
+        let insert = |store: &MessageStore, id: &str| {
+            store.conn.execute(
+                "INSERT INTO messages(msg_id, thread_id) VALUES (?1, 'thread-1')",
+                [id],
+            ).unwrap();
+        };
+        insert(&MessageStore::open("zalo_history.db").unwrap(), "legacy-only");
+        for (uin, name, message) in [
+            ("111000111", "Tài Khoản Số 1", "account-one"),
+            ("222000222", "Tài Khoản Số 2", "account-two"),
+        ] {
+            let mut session = Session::new(false, false, false).unwrap();
+            session.login = Some(LoginInfo {
+                uin: uin.into(), display_name: name.into(), ..Default::default()
+            });
+            session.save_to_file("session.json").unwrap();
+            insert(&MessageStore::open_account(uin).unwrap(), message);
+            save_current_account_snapshot(uin).unwrap();
+        }
+        std::fs::write("threads_cache.json", r#"[{"id":"thread_acc2"}]"#).unwrap();
+        let stored_ids = |store: MessageStore| -> Vec<String> {
+            let mut stmt = store.conn.prepare("SELECT msg_id FROM messages ORDER BY msg_id").unwrap();
+            stmt.query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+        };
 
         // Kiểm tra `list_saved_accounts` bỏ qua các file `*_threads.json` và đánh dấu `is_current` chuẩn xác
         let saved = list_saved_accounts("222000222");
@@ -512,15 +497,7 @@ fn qa_multi_account_snapshot_list_switch_and_delete_lifecycle() {
             serde_json::from_str(&std::fs::read_to_string("session.json").unwrap()).unwrap();
         assert_eq!(active_session["login"]["uin"], "111000111");
         assert!(!std::path::Path::new("threads_cache.json").exists());
-        assert!(!std::path::Path::new("zalo_history.db").exists());
-        assert_eq!(
-            std::fs::read("accounts/111000111_history.db").unwrap(),
-            b"sqlite_acc1_bytes"
-        );
-        assert_eq!(
-            std::fs::read("accounts/222000222_history.db").unwrap(),
-            b"sqlite_acc2_bytes"
-        );
+        assert_eq!(stored_ids(MessageStore::open_account("111000111").unwrap()), ["account-one"]);
 
         // Chuyển ngược lại sang tài khoản 2 để xác nhận dữ liệu cả hai bên vẫn cô lập toàn vẹn
         switch_to_account("111000111", "222000222").unwrap();
@@ -528,14 +505,8 @@ fn qa_multi_account_snapshot_list_switch_and_delete_lifecycle() {
         let active_session_2: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string("session.json").unwrap()).unwrap();
         assert_eq!(active_session_2["login"]["uin"], "222000222");
-        assert_eq!(
-            std::fs::read("accounts/222000222_history.db").unwrap(),
-            b"sqlite_acc2_bytes"
-        );
-        assert_eq!(
-            std::fs::read("accounts/111000111_history.db").unwrap(),
-            b"sqlite_acc1_bytes"
-        );
+        assert_eq!(stored_ids(MessageStore::open_account("222000222").unwrap()), ["account-two"]);
+        assert_eq!(stored_ids(MessageStore::open("zalo_history.db").unwrap()), ["legacy-only"]);
 
         // Chuyển sang UIN không tồn tại phải trả lỗi an toàn
         assert!(switch_to_account("222000222", "999999999").is_err());
