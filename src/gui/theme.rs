@@ -1701,6 +1701,82 @@ pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
     setup_custom_fonts_with_choice(ctx, "default");
 }
 
+fn load_first_font(fonts: &mut egui::FontDefinitions, key: &str, candidates: &[&str]) -> bool {
+    for path in candidates {
+        if let Ok(font_data) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert(key.to_owned(), egui::FontData::from_owned(font_data));
+            return true;
+        }
+    }
+    false
+}
+
+fn load_system_ui_fonts(fonts: &mut egui::FontDefinitions) -> (bool, bool) {
+    #[cfg(target_os = "macos")]
+    let (regular_candidates, semibold_candidates, mono_candidates): (&[&str], &[&str], &[&str]) = (
+        &[
+            "/System/Library/Fonts/SFNS.ttf",
+            "/System/Library/Fonts/HelveticaNeue.ttc",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ],
+        &[],
+        &[
+            "/System/Library/Fonts/SFNSMono.ttf",
+            "/System/Library/Fonts/Menlo.ttc",
+        ],
+    );
+    #[cfg(target_os = "windows")]
+    let (regular_candidates, semibold_candidates, mono_candidates): (&[&str], &[&str], &[&str]) = (
+        &[
+            "C:\\Windows\\Fonts\\segoeui.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+        ],
+        &[
+            "C:\\Windows\\Fonts\\seguisb.ttf",
+            "C:\\Windows\\Fonts\\segoeuib.ttf",
+        ],
+        &[
+            "C:\\Windows\\Fonts\\CascadiaMono.ttf",
+            "C:\\Windows\\Fonts\\consola.ttf",
+        ],
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let (regular_candidates, semibold_candidates, mono_candidates): (&[&str], &[&str], &[&str]) = (
+        &[
+            "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+            "/usr/share/fonts/cantarell/Cantarell-Regular.otf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ],
+        &[
+            "/usr/share/fonts/google-noto/NotoSans-SemiBold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
+            "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-M.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ],
+        &[
+            "/usr/share/fonts/google-noto/NotoSansMono-Regular.ttf",
+            "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ],
+    );
+
+    let regular_loaded = load_first_font(fonts, "selected_font", regular_candidates);
+    if !semibold_candidates.is_empty() {
+        let _ = load_first_font(fonts, "selected_font_semibold", semibold_candidates);
+    }
+    let mono_loaded = load_first_font(fonts, "selected_font_mono", mono_candidates);
+    (regular_loaded, mono_loaded)
+}
+
 pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool) {
     let mut fonts = egui::FontDefinitions::default();
 
@@ -1711,8 +1787,7 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
         egui::FontData::from_static(LUCIDE_BYTES),
     );
 
-    // 2. Bundled Vietnamese sans-serif (Regular + SemiBold) so diacritics & bold headings
-    //    render identically on every OS. System fonts below are only an optional override.
+    // 2. Bundled Vietnamese sans-serif (Regular + SemiBold) as guaranteed fallback.
     const BUNDLED_SANS: &[u8] = include_bytes!("../assets/fonts/BeVietnamPro-Regular.ttf");
     const BUNDLED_SANS_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/BeVietnamPro-SemiBold.ttf");
     fonts.font_data.insert(
@@ -1725,63 +1800,45 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
     );
     use_bundled_emoji_font(&mut fonts);
 
-    // 3. Optional user-selected system or custom font family (Requirement R2)
+    // 3. System default or user-selected font family
     let mut selected_font_loaded = false;
+    let mut selected_mono_loaded = false;
     let choice_norm = font_choice.trim().to_lowercase();
     match choice_norm.as_str() {
         "segoe_ui" | "segoe" => {
-            let candidates = [
-                "C:\\Windows\\Fonts\\segoeui.ttf",
-                "/usr/share/fonts/truetype/segoeui.ttf",
-            ];
-            for path in candidates {
-                if let Ok(font_data) = std::fs::read(path) {
-                    fonts.font_data.insert(
-                        "selected_font".to_owned(),
-                        egui::FontData::from_owned(font_data),
-                    );
-                    selected_font_loaded = true;
-                    break;
-                }
-            }
+            selected_font_loaded = load_first_font(
+                &mut fonts,
+                "selected_font",
+                &[
+                    "C:\\Windows\\Fonts\\segoeui.ttf",
+                    "/usr/share/fonts/truetype/segoeui.ttf",
+                ],
+            );
         }
         "arial" => {
-            let candidates = [
-                "C:\\Windows\\Fonts\\arial.ttf",
-                "/System/Library/Fonts/Supplemental/Arial.ttf",
-                "/Library/Fonts/Arial.ttf",
-                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            ];
-            for path in candidates {
-                if let Ok(font_data) = std::fs::read(path) {
-                    fonts.font_data.insert(
-                        "selected_font".to_owned(),
-                        egui::FontData::from_owned(font_data),
-                    );
-                    selected_font_loaded = true;
-                    break;
-                }
-            }
+            selected_font_loaded = load_first_font(
+                &mut fonts,
+                "selected_font",
+                &[
+                    "C:\\Windows\\Fonts\\arial.ttf",
+                    "/System/Library/Fonts/Supplemental/Arial.ttf",
+                    "/Library/Fonts/Arial.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                ],
+            );
         }
         "tahoma" => {
-            let candidates = [
-                "C:\\Windows\\Fonts\\tahoma.ttf",
-                "/System/Library/Fonts/Supplemental/Tahoma.ttf",
-            ];
-            for path in candidates {
-                if let Ok(font_data) = std::fs::read(path) {
-                    fonts.font_data.insert(
-                        "selected_font".to_owned(),
-                        egui::FontData::from_owned(font_data),
-                    );
-                    selected_font_loaded = true;
-                    break;
-                }
-            }
+            selected_font_loaded = load_first_font(
+                &mut fonts,
+                "selected_font",
+                &[
+                    "C:\\Windows\\Fonts\\tahoma.ttf",
+                    "/System/Library/Fonts/Supplemental/Tahoma.ttf",
+                ],
+            );
         }
         "open_sans" => {
-            // Bundled Open Sans (OFL), the face Telegram Desktop uses; covers Vietnamese.
             const OPEN_SANS: &[u8] = include_bytes!("../assets/fonts/OpenSans-Regular.ttf");
             const OPEN_SANS_SEMIBOLD: &[u8] =
                 include_bytes!("../assets/fonts/OpenSans-SemiBold.ttf");
@@ -1795,8 +1852,11 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
             );
             selected_font_loaded = true;
         }
-        "default" | "" => {
-            // Uses bundled_sans directly at priority index 0
+        "be_vietnam_pro" => {}
+        "default" | "" | "system" => {
+            let (reg, mono) = load_system_ui_fonts(&mut fonts);
+            selected_font_loaded = reg;
+            selected_mono_loaded = mono;
         }
         _custom_path => {
             if let Ok(font_data) = std::fs::read(font_choice.trim()) {
@@ -1884,6 +1944,9 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default();
+    if selected_mono_loaded {
+        mono.insert(0, "selected_font_mono".to_owned());
+    }
     mono.push("bundled_sans".to_owned());
     if fonts.font_data.contains_key("vietnamese_font") {
         mono.push("vietnamese_font".to_owned());
@@ -1957,6 +2020,7 @@ mod tests {
                 // 🤣 (Unicode 9) and 🫠 (Unicode 14) were missing from egui's copy.
                 assert!(f.has_glyphs(&font, "🤣🫠❤\u{fe0f}"), "{font:?}");
                 assert_eq!(f.glyph_width(&font, '\u{fe0f}'), 0.0, "{font:?}");
+                assert!(f.has_glyphs(&font, "Tiếng Việt ĂÂĐÊÔƠƯ ệữởắỹ"), "{font:?}");
             });
         }
     }

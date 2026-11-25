@@ -2738,17 +2738,21 @@ impl ZaloGuiApp {
                                                         });
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                                             let current_label = match self.settings.font_family.as_str() {
+                                                                "be_vietnam_pro" => "Be Vietnam Pro",
                                                                 "segoe_ui" | "segoe" => "Segoe UI",
                                                                 "arial" => "Arial",
                                                                 "tahoma" => "Tahoma",
                                                                 "open_sans" => "Open Sans",
-                                                                _ => "Mặc định (Be Vietnam Pro)",
+                                                                _ => "Mặc định (Hệ thống)",
                                                             };
                                                             egui::ComboBox::from_id_salt("appearance_font_family_combo")
                                                                 .selected_text(current_label)
                                                                 .width(190.0)
                                                                 .show_ui(ui, |ui| {
-                                                                    if ui.selectable_value(&mut self.settings.font_family, "default".into(), "Mặc định (Be Vietnam Pro)").changed() {
+                                                                    if ui.selectable_value(&mut self.settings.font_family, "default".into(), "Mặc định (Hệ thống)").changed() {
+                                                                        font_changed = true;
+                                                                    }
+                                                                    if ui.selectable_value(&mut self.settings.font_family, "be_vietnam_pro".into(), "Be Vietnam Pro").changed() {
                                                                         font_changed = true;
                                                                     }
                                                                     if ui.selectable_value(&mut self.settings.font_family, "open_sans".into(), "Open Sans").changed() {
