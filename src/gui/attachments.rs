@@ -317,21 +317,20 @@ pub fn read_clipboard_file_list() -> Vec<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        // Finder puts every copied file on the pasteboard as an NSURL; JXA reads them all.
-        let script = "ObjC.import('AppKit');\
-            var pb = $.NSPasteboard.generalPasteboard;\
-            var urls = pb.readObjectsForClassesOptions($([$.NSURL]), $({}));\
-            var out = [];\
-            if (urls) { for (var i = 0; i < urls.count; i++) {\
-              var u = urls.objectAtIndex(i); if (u.isFileURL) out.push(ObjC.unwrap(u.path)); } }\
-            out.join('\\n');";
-        std::process::Command::new("osascript")
-            .args(["-l", "JavaScript", "-e", script])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| parse_line_paths(&String::from_utf8_lossy(&o.stdout)))
-            .unwrap_or_default()
+        extern "C" {
+            fn ctdozlite_macos_clipboard_file_paths() -> *mut std::ffi::c_char;
+            fn ctdozlite_macos_free_buf(ptr: *mut std::ffi::c_void);
+        }
+        let joined = unsafe {
+            let ptr = ctdozlite_macos_clipboard_file_paths();
+            if ptr.is_null() {
+                return Vec::new();
+            }
+            let text = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
+            ctdozlite_macos_free_buf(ptr.cast());
+            text
+        };
+        parse_line_paths(&joined)
             .into_iter()
             .filter(|p| p.is_file())
             .collect()

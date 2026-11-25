@@ -581,10 +581,19 @@ pub(super) fn pick_native_folder_dialog_result(title: &str) -> FolderPick {
 /// because the system clipboard contains an image instead of UTF-8 text.
 pub(super) fn is_clipboard_paste_triggered(ctx: &egui::Context) -> bool {
     let egui_paste = ctx.input(|i| {
-        (i.modifiers.ctrl && i.key_pressed(Key::V))
+        ((i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(Key::V))
             || (i.modifiers.shift && i.key_pressed(Key::Insert))
             || i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
     });
+
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn ctdozlite_macos_take_paste_triggered() -> i32;
+        }
+        let mac_paste = unsafe { ctdozlite_macos_take_paste_triggered() != 0 };
+        return egui_paste || mac_paste;
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -615,7 +624,7 @@ pub(super) fn is_clipboard_paste_triggered(ctx: &egui::Context) -> bool {
         return egui_paste || edge_triggered;
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         egui_paste
     }
@@ -747,29 +756,25 @@ pub(super) fn read_clipboard_image_to_png(
     }
     #[cfg(target_os = "macos")]
     {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let tmp = std::env::temp_dir().join(format!("zalo_mac_clip_{now}.png"));
-        let tmp_str = tmp.to_str().unwrap_or("/tmp/zalo_mac_clip.png");
-        let script = format!(
-            "try\nset img to the clipboard as «class PNGf»\nset fp to open for access (POSIX file \"{tmp_str}\") with write permission\nset eof fp to 0\nwrite img to fp\nclose access fp\nreturn \"ok\"\non error\nreturn \"none\"\nend try"
-        );
-        if let Ok(out) = std::process::Command::new("osascript")
-            .args(["-e", &script])
-            .output()
-        {
-            let s = String::from_utf8_lossy(&out.stdout);
-            if s.trim() == "ok" && tmp.exists() {
-                if let Ok(bytes) = std::fs::read(&tmp) {
-                    let _ = std::fs::remove_file(&tmp);
-                    if let Ok(dyn_img) = image::load_from_memory(&bytes) {
-                        return finalize_clipboard_rgba_image(dyn_img.to_rgba8());
-                    }
+        extern "C" {
+            fn ctdozlite_macos_clipboard_image_png(out_len: *mut usize) -> *mut u8;
+            fn ctdozlite_macos_free_buf(ptr: *mut std::ffi::c_void);
+        }
+        let mut len: usize = 0;
+        let bytes = unsafe {
+            let ptr = ctdozlite_macos_clipboard_image_png(&mut len);
+            if ptr.is_null() || len <= 8 {
+                if !ptr.is_null() {
+                    ctdozlite_macos_free_buf(ptr.cast());
                 }
-                let _ = std::fs::remove_file(&tmp);
+                return None;
             }
+            let owned = std::slice::from_raw_parts(ptr, len).to_vec();
+            ctdozlite_macos_free_buf(ptr.cast());
+            owned
+        };
+        if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+            return finalize_clipboard_rgba_image(dyn_img.to_rgba8());
         }
         None
     }
