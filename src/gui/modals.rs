@@ -9710,11 +9710,18 @@ impl ZaloGuiApp {
 
                 ui.add_space(12.0);
 
-                let active_row_bg = if pal.is_dark {
-                    Color32::from_rgb(28, 56, 98) // Solid dark Zalo blue highlight (like Zalo PC screenshot)
+                let active_row_bg = if cfg!(target_os = "macos") {
+                    pal.glass_selected()
+                } else if pal.is_dark {
+                    Color32::from_rgb(28, 56, 98)
                 } else {
                     Color32::from_rgb(229, 241, 255)
                 };
+                let row_rounding = Rounding::same(if cfg!(target_os = "macos") {
+                    10.0
+                } else {
+                    8.0
+                });
 
                 for (tab, icon, label) in [
                     (ContactsSubTab::Friends, lucide::USER, "Danh sách bạn bè"),
@@ -9739,10 +9746,16 @@ impl ZaloGuiApp {
                         .allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
                     if active {
                         ui.painter()
-                            .rect_filled(row_r, Rounding::same(8.0), active_row_bg);
+                            .rect_filled(row_r, row_rounding, active_row_bg);
+                        #[cfg(target_os = "macos")]
+                        ui.painter().rect_stroke(
+                            row_r,
+                            row_rounding,
+                            Stroke::new(1.0_f32, pal.glass_specular()),
+                        );
                     } else if row_resp.hovered() {
                         ui.painter()
-                            .rect_filled(row_r, Rounding::same(8.0), pal.bg_hover);
+                            .rect_filled(row_r, row_rounding, pal.glass_hover());
                     }
                     draw_lucide_icon(
                         ui.painter(),
@@ -9750,7 +9763,11 @@ impl ZaloGuiApp {
                         icon,
                         17.0,
                         if active {
-                            Color32::WHITE
+                            if pal.is_dark {
+                                Color32::WHITE
+                            } else {
+                                pal.primary
+                            }
                         } else {
                             pal.text_secondary
                         },
@@ -9761,7 +9778,11 @@ impl ZaloGuiApp {
                         label,
                         FontId::proportional(13.5),
                         if active {
-                            Color32::WHITE
+                            if pal.is_dark {
+                                Color32::WHITE
+                            } else {
+                                pal.primary_hover
+                            }
                         } else {
                             pal.text_primary
                         },
@@ -10287,6 +10308,9 @@ impl ZaloGuiApp {
                                 Vec2::new(ui.available_width(), 52.0),
                                 Sense::click(),
                             );
+                            if !ui.is_rect_visible(row_rect) {
+                                continue;
+                            }
                             if is_sel {
                                 let active_bg = if pal.is_dark {
                                     Color32::from_rgb(28, 56, 98)
@@ -10477,40 +10501,48 @@ impl ZaloGuiApp {
                     ui.set_width(col_w - 36.0);
                     if !prof.cover_url.is_empty() && !prof.cover_url.ends_with("/default") {
                         let ckey = format!("cov_{}", crate::crypto::md5_hex(&prof.cover_url));
-                        if !self.sticker_textures.contains_key(&ckey)
-                            && self.loading_stickers.insert(ckey.clone())
-                        {
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                    key: ckey.clone(),
-                                    url: prof.cover_url.clone(),
-                                });
-                            }
-                        }
-                        if let Some(tex) = self.sticker_textures.get(&ckey) {
-                            let w = ui.available_width();
-                            let resp = ui.add(
-                                egui::Image::new((tex.id(), Vec2::new(w, 180.0)))
-                                    .rounding(Rounding::same(10.0))
-                                    .sense(Sense::click()),
+                        let w = ui.available_width();
+                        let (r, resp) =
+                            ui.allocate_exact_size(Vec2::new(w, 180.0), Sense::click());
+                        if ui.clip_rect().expand(180.0).intersects(r) {
+                            queue_sticker_fetch(
+                                &self.sticker_textures,
+                                &mut self.loading_stickers,
+                                &self.failed_stickers,
+                                ckey.clone(),
+                                prof.cover_url.clone(),
                             );
-                            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                let hd = self.request_hd_texture(&prof.cover_url);
-                                self.image_viewer = Some(ImageViewerModal {
-                                    tex_key: ckey,
-                                    hd_tex_key: hd,
-                                    full_url: prof.cover_url.clone(),
-                                    title: format!("Ảnh bìa của {}", prof.display_name),
-                                    sender: prof.display_name.clone(),
-                                    time: String::new(),
-                                    zoom: 1.0,
-                                    pan: Vec2::ZERO,
-                                    gallery: Vec::new(),
-                                    gallery_index: 0,
-                                });
-                            }
-                            ui.add_space(12.0);
                         }
+                        if ui.is_rect_visible(r) {
+                            if let Some(tex) = self.sticker_textures.get(&ckey) {
+                                mark_texture_used(&ckey);
+                                ui.painter().image(
+                                    tex.id(),
+                                    r,
+                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+                            } else {
+                                ui.painter()
+                                    .rect_filled(r, Rounding::same(10.0), pal.bg_hover);
+                            }
+                        }
+                        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            let hd = self.request_hd_texture(&prof.cover_url);
+                            self.image_viewer = Some(ImageViewerModal {
+                                tex_key: ckey,
+                                hd_tex_key: hd,
+                                full_url: prof.cover_url.clone(),
+                                title: format!("Ảnh bìa của {}", prof.display_name),
+                                sender: prof.display_name.clone(),
+                                time: String::new(),
+                                zoom: 1.0,
+                                pan: Vec2::ZERO,
+                                gallery: Vec::new(),
+                                gallery_index: 0,
+                            });
+                        }
+                        ui.add_space(12.0);
                     }
                     ui.horizontal(|ui| {
                         let (av_r, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
@@ -10688,16 +10720,18 @@ impl ZaloGuiApp {
                     ui.horizontal(|ui| {
                         let (av_r, av_resp) =
                             ui.allocate_exact_size(Vec2::splat(42.0), Sense::click());
-                        paint_user_avatar(
-                            ui.painter(),
-                            av_r.center(),
-                            21.0,
-                            &item.author.display_name,
-                            false,
-                            Some(&item.author.avatar_url),
-                            &self.sticker_textures,
-                            &mut self.loading_stickers,
-                        );
+                        if ui.is_rect_visible(av_r) {
+                            paint_user_avatar(
+                                ui.painter(),
+                                av_r.center(),
+                                21.0,
+                                &item.author.display_name,
+                                false,
+                                Some(&item.author.avatar_url),
+                                &self.sticker_textures,
+                                &mut self.loading_stickers,
+                            );
+                        }
                         if av_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             select_uid = Some(item.author.uid.clone());
                         }
@@ -10754,16 +10788,6 @@ impl ZaloGuiApp {
                         if media_cnt == 1 {
                             let m = &item.media_list[0];
                             let mkey = format!("fmed_{}", crate::crypto::md5_hex(&m.thumbnail));
-                            if !self.sticker_textures.contains_key(&mkey)
-                                && self.loading_stickers.insert(mkey.clone())
-                            {
-                                if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                        key: mkey.clone(),
-                                        url: m.thumbnail.clone(),
-                                    });
-                                }
-                            }
                             let img_h = if m.width > 0 && m.height > 0 && avail_w.is_finite() {
                                 (avail_w * (m.height as f32 / m.width as f32)).clamp(200.0, 420.0)
                             } else {
@@ -10771,16 +10795,28 @@ impl ZaloGuiApp {
                             };
                             let (r, resp) =
                                 ui.allocate_exact_size(Vec2::new(avail_w, img_h), Sense::click());
-                            if let Some(tex) = self.sticker_textures.get(&mkey) {
-                                ui.painter().image(
-                                    tex.id(),
-                                    r,
-                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                    Color32::WHITE,
+                            if ui.clip_rect().expand(180.0).intersects(r) {
+                                queue_sticker_fetch(
+                                    &self.sticker_textures,
+                                    &mut self.loading_stickers,
+                                    &self.failed_stickers,
+                                    mkey.clone(),
+                                    m.thumbnail.clone(),
                                 );
-                            } else {
-                                ui.painter()
-                                    .rect_filled(r, Rounding::same(10.0), pal.bg_input);
+                            }
+                            if ui.is_rect_visible(r) {
+                                if let Some(tex) = self.sticker_textures.get(&mkey) {
+                                    mark_texture_used(&mkey);
+                                    ui.painter().image(
+                                        tex.id(),
+                                        r,
+                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                } else {
+                                    ui.painter()
+                                        .rect_filled(r, Rounding::same(10.0), pal.bg_hover);
+                                }
                             }
                             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                                 clicked_image = Some((
@@ -10797,33 +10833,38 @@ impl ZaloGuiApp {
                                 for m in item.media_list.iter().take(6) {
                                     let mkey =
                                         format!("fmed_{}", crate::crypto::md5_hex(&m.thumbnail));
-                                    if !self.sticker_textures.contains_key(&mkey)
-                                        && self.loading_stickers.insert(mkey.clone())
-                                    {
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                                key: mkey.clone(),
-                                                url: m.thumbnail.clone(),
-                                            });
-                                        }
-                                    }
                                     let (r, resp) = ui.allocate_exact_size(
                                         Vec2::new(cell_w, cell_w),
                                         Sense::click(),
                                     );
-                                    if let Some(tex) = self.sticker_textures.get(&mkey) {
-                                        ui.painter().image(
-                                            tex.id(),
-                                            r,
-                                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                            Color32::WHITE,
+                                    if ui.clip_rect().expand(180.0).intersects(r) {
+                                        queue_sticker_fetch(
+                                            &self.sticker_textures,
+                                            &mut self.loading_stickers,
+                                            &self.failed_stickers,
+                                            mkey.clone(),
+                                            m.thumbnail.clone(),
                                         );
-                                    } else {
-                                        ui.painter().rect_filled(
-                                            r,
-                                            Rounding::same(8.0),
-                                            pal.bg_input,
-                                        );
+                                    }
+                                    if ui.is_rect_visible(r) {
+                                        if let Some(tex) = self.sticker_textures.get(&mkey) {
+                                            mark_texture_used(&mkey);
+                                            ui.painter().image(
+                                                tex.id(),
+                                                r,
+                                                Rect::from_min_max(
+                                                    Pos2::ZERO,
+                                                    Pos2::new(1.0, 1.0),
+                                                ),
+                                                Color32::WHITE,
+                                            );
+                                        } else {
+                                            ui.painter().rect_filled(
+                                                r,
+                                                Rounding::same(8.0),
+                                                pal.bg_hover,
+                                            );
+                                        }
                                     }
                                     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                                         clicked_image = Some((
@@ -11004,27 +11045,29 @@ impl ZaloGuiApp {
                 ui.horizontal_wrapped(|ui| {
                     for item in &avatars_snap {
                         let tkey = format!("fava_{}", crate::crypto::md5_hex(&item.thumbnail));
-                        if !self.sticker_textures.contains_key(&tkey)
-                            && self.loading_stickers.insert(tkey.clone())
-                        {
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                    key: tkey.clone(),
-                                    url: item.thumbnail.clone(),
-                                });
-                            }
-                        }
                         let (r, resp) = ui.allocate_exact_size(Vec2::splat(130.0), Sense::click());
-                        if let Some(tex) = self.sticker_textures.get(&tkey) {
-                            ui.painter().image(
-                                tex.id(),
-                                r,
-                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                Color32::WHITE,
+                        if ui.clip_rect().expand(180.0).intersects(r) {
+                            queue_sticker_fetch(
+                                &self.sticker_textures,
+                                &mut self.loading_stickers,
+                                &self.failed_stickers,
+                                tkey.clone(),
+                                item.thumbnail.clone(),
                             );
-                        } else {
-                            ui.painter()
-                                .rect_filled(r, Rounding::same(8.0), pal.bg_input);
+                        }
+                        if ui.is_rect_visible(r) {
+                            if let Some(tex) = self.sticker_textures.get(&tkey) {
+                                mark_texture_used(&tkey);
+                                ui.painter().image(
+                                    tex.id(),
+                                    r,
+                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+                            } else {
+                                ui.painter()
+                                    .rect_filled(r, Rounding::same(8.0), pal.bg_hover);
+                            }
                         }
                         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             let hd = self.request_hd_texture(&item.url);
