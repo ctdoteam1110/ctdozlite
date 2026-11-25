@@ -4932,19 +4932,19 @@ pub(super) fn render_chat_bubble(
                     .ctx()
                     .data(|d| d.get_temp::<bool>(Id::new("chat_overlay_modal_open")))
                     .unwrap_or(false);
-                if dbl_reply_enabled
-                    && !modal_open
-                    && !has_interactive_card
-                    && !vanished
-                    && ui.input(|i| {
-                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                            && i.pointer.interact_pos().is_some_and(|p| {
-                                fr.response.rect.contains(p)
-                                    && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
-                            })
-                    })
-                {
-                    return Some(BubbleAction::Reply);
+                if dbl_reply_enabled && !modal_open && !has_interactive_card && !vanished {
+                    let dbl_click_pos = ui.input(|i| {
+                        i.pointer
+                            .button_double_clicked(egui::PointerButton::Primary)
+                            .then(|| i.pointer.interact_pos())
+                            .flatten()
+                    });
+                    if dbl_click_pos.is_some_and(|p| {
+                        fr.response.rect.contains(p)
+                            && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
+                    }) {
+                        return Some(BubbleAction::Reply);
+                    }
                 }
                 let hover_action = if !vanished && album.len() < 2 {
                     render_hover_reaction_bar(
@@ -5134,19 +5134,19 @@ pub(super) fn render_chat_bubble(
                     .ctx()
                     .data(|d| d.get_temp::<bool>(Id::new("chat_overlay_modal_open")))
                     .unwrap_or(false);
-                if dbl_reply_enabled
-                    && !modal_open
-                    && !has_interactive_card
-                    && !vanished
-                    && ui.input(|i| {
-                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                            && i.pointer.interact_pos().is_some_and(|p| {
-                                fr.response.rect.contains(p)
-                                    && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
-                            })
-                    })
-                {
-                    return Some(BubbleAction::Reply);
+                if dbl_reply_enabled && !modal_open && !has_interactive_card && !vanished {
+                    let dbl_click_pos = ui.input(|i| {
+                        i.pointer
+                            .button_double_clicked(egui::PointerButton::Primary)
+                            .then(|| i.pointer.interact_pos())
+                            .flatten()
+                    });
+                    if dbl_click_pos.is_some_and(|p| {
+                        fr.response.rect.contains(p)
+                            && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
+                    }) {
+                        return Some(BubbleAction::Reply);
+                    }
                 }
                 let hover_action = if !vanished && album.len() < 2 {
                     render_hover_reaction_bar(
