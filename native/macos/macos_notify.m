@@ -1,6 +1,7 @@
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #import <UserNotifications/UserNotifications.h>
+#import <objc/runtime.h>
 
 static BOOL ctdozlite_has_app_bundle(void) {
     NSBundle *main = [NSBundle mainBundle];
@@ -142,5 +143,46 @@ int ctdozlite_macos_notify(const char *title_utf8,
             }
         }];
         return 1;
+    }
+}
+
+static BOOL ctdozlite_reopen_handler(id self, SEL _cmd, NSApplication *sender, BOOL flag) {
+    (void)self;
+    (void)_cmd;
+    (void)flag;
+    for (NSWindow *win in [sender windows]) {
+        NSString *title = [win title];
+        if (title != nil &&
+            ([title isEqualToString:@"ctdozlite"] ||
+             ([title hasPrefix:@"("] && [title hasSuffix:@") ctdozlite"]))) {
+            if ([win isMiniaturized]) {
+                [win deminiaturize:nil];
+            }
+            [win makeKeyAndOrderFront:nil];
+            break;
+        }
+    }
+    [sender unhide:nil];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    [sender activateIgnoringOtherApps:YES];
+#pragma clang diagnostic pop
+    return YES;
+}
+
+void ctdozlite_macos_install_reopen_handler(void) {
+    @autoreleasepool {
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            id delegate = [[NSApplication sharedApplication] delegate];
+            if (delegate != nil) {
+                Class cls = object_getClass(delegate);
+                SEL sel = @selector(applicationShouldHandleReopen:hasVisibleWindows:);
+                if (!class_respondsToSelector(cls, sel)) {
+                    NSString *enc = [NSString stringWithFormat:@"%s@:@%s", @encode(BOOL), @encode(BOOL)];
+                    class_addMethod(cls, sel, (IMP)ctdozlite_reopen_handler, [enc UTF8String]);
+                }
+            }
+        });
     }
 }

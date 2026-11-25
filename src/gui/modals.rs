@@ -1010,6 +1010,7 @@ impl ZaloGuiApp {
                 self.selected_thread_index = idx;
                 self.unread_counts.remove(&tid);
             }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }

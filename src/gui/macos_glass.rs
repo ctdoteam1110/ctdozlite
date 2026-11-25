@@ -36,6 +36,10 @@ extern "C" {
     fn objc_msgSend_stret();
 }
 
+extern "C" {
+    fn ctdozlite_macos_install_reopen_handler();
+}
+
 static VIBRANCY_WINDOW: AtomicUsize = AtomicUsize::new(0);
 static VIBRANCY_VIEW: AtomicUsize = AtomicUsize::new(0);
 
@@ -264,6 +268,7 @@ pub(super) fn install_vibrancy_if_needed(dark_mode: bool) {
         );
         msg0_void(effect, sel(b"release\0"));
 
+        ctdozlite_macos_install_reopen_handler();
         VIBRANCY_VIEW.store(effect as usize, Ordering::Relaxed);
         VIBRANCY_WINDOW.store(target_win as usize, Ordering::Relaxed);
     }

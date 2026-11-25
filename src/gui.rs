@@ -5069,8 +5069,13 @@ impl ZaloGuiApp {
             self.allow_quit = true;
         }
         let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if close_requested && !self.allow_quit && self.hides_to_tray() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        let hide_on_close = cfg!(target_os = "macos") || self.hides_to_tray();
+        let cmd_w_hide = cfg!(target_os = "macos")
+            && ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::W));
+        if (close_requested || cmd_w_hide) && !self.allow_quit && hide_on_close {
+            if close_requested {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         } else if quit_now || close_requested {
             self.allow_quit = true;
