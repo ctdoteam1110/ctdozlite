@@ -884,8 +884,22 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                 tokio::spawn(async {
                     let mut tick = tokio::time::interval(Duration::from_millis(1200));
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    let mut last_wall = std::time::SystemTime::now();
                     loop {
                         tick.tick().await;
+                        let now_wall = std::time::SystemTime::now();
+                        let woke_from_sleep = now_wall
+                            .duration_since(last_wall)
+                            .map(|d| d >= Duration::from_secs(60))
+                            .unwrap_or(false);
+                        last_wall = now_wall;
+                        if woke_from_sleep {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(WorkerCmd::RefreshThreads);
+                            }
+                            continue;
+                        }
                         let known_threads =
                             KNOWN_THREADS.lock().map(|k| k.clone()).unwrap_or_default();
                         if let Some(tx) = WORKER_TX.get() {
@@ -1287,6 +1301,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         > = None;
                         let mut ws_sek = String::new();
                         let mut ws_uin = String::new();
+                        let mut seen_ws_auth = false;
+                        let mut last_reconnect_refresh_sec: i64 = 0;
                         loop {
                             let s_snap = s_ws.lock().await.clone();
                             if s_snap.login.is_some() {
@@ -1300,6 +1316,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 if !cur_sek.is_empty()
                                     && (ws_rx.is_none() || ws_sek != cur_sek || ws_uin != cur_uin)
                                 {
+                                    if ws_uin != cur_uin {
+                                        seen_ws_auth = false;
+                                        last_reconnect_refresh_sec = 0;
+                                    }
                                     ws_sek = cur_sek;
                                     ws_uin = cur_uin;
                                     ws_rx = Some(crate::socket::spawn(s_snap.clone()));
@@ -1312,6 +1332,18 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     .await
                                     {
                                         Ok(Some(ev)) => {
+                                            if ev.cmd == crate::socket::CMD_AUTHEN {
+                                                let now_sec = crate::login::unix_now();
+                                                let should_refresh = seen_ws_auth
+                                                    && now_sec.saturating_sub(last_reconnect_refresh_sec) >= 30;
+                                                seen_ws_auth = true;
+                                                if should_refresh {
+                                                    last_reconnect_refresh_sec = now_sec;
+                                                    if let Some(tx) = WORKER_TX.get() {
+                                                        let _ = tx.send(WorkerCmd::RefreshThreads);
+                                                    }
+                                                }
+                                            }
                                             crate::reactions::trace_ws_payload(
                                                 ev.cmd,
                                                 ev.sub_cmd,
@@ -2602,10 +2634,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         .collect();
 
                                     let mut poll_err: Option<anyhow::Error> = None;
-                                    for _ in 0..3 {
-                                        let poll_res = {
+                                    for _ in 0..20 {
+                                        let (poll_res, cursor_advanced) = {
                                             let mut ps = poll_clone.lock().await;
-                                            crate::chat::get_chat_from_polling(&s, &mut ps).await
+                                            let before_cursor = ps.encode_params();
+                                            let res = crate::chat::get_chat_from_polling(&s, &mut ps).await;
+                                            let advanced = ps.encode_params() != before_cursor;
+                                            (res, advanced)
                                         };
                                         match poll_res {
                                             Ok(lp_resp) => {
@@ -2643,7 +2678,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                     .and_then(serde_json::Value::as_str)
                                                     .map(|r| r != "0" && !r.is_empty())
                                                     .unwrap_or(false);
-                                                if more == 0 && !has_reset {
+                                                if (more == 0 && !has_reset) || !cursor_advanced {
                                                     break;
                                                 }
                                             }

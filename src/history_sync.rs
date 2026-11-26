@@ -651,7 +651,7 @@ where
         0.22,
         "📥 Đang nhận hàng đợi tin nhắn 1-1 & nhóm từ điện thoại…".to_string(),
     );
-    for batch_idx in 0..5 {
+    for batch_idx in 0..20 {
         if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
             let _ = chat::cancel_phone_sync(s, &pub_key).await;
             return Ok(PhoneSyncReport {
@@ -659,9 +659,12 @@ where
                 ..PhoneSyncReport::default()
             });
         }
-        let lp_res = {
+        let (lp_res, cursor_advanced) = {
             let mut ps = poll_state.lock().await;
-            chat::get_chat_from_polling(s, &mut ps).await
+            let before_cursor = ps.encode_params();
+            let res = chat::get_chat_from_polling(s, &mut ps).await;
+            let advanced = ps.encode_params() != before_cursor;
+            (res, advanced)
         };
         let lp_resp = match lp_res {
             Ok(response) => response,
@@ -684,10 +687,10 @@ where
             .and_then(serde_json::Value::as_str)
             .is_some_and(|r| !r.is_empty() && r != "0");
         on_progress(
-            0.22 + (batch_idx as f32 + 1.0) * 0.04,
+            0.22 + ((batch_idx as f32 + 1.0) * 0.012).min(0.22),
             format!("📥 Đã nhận lô hàng đợi #{} từ điện thoại…", batch_idx + 1),
         );
-        if more == 0 && !has_reset {
+        if (more == 0 && !has_reset) || !cursor_advanced {
             break;
         }
     }

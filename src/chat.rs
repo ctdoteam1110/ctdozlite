@@ -6623,7 +6623,13 @@ impl PollState {
     }
 
     pub fn update_from_response(&mut self, resp: &Value) {
-        let mut data_node = resp.get("data").unwrap_or(resp);
+        let parsed_str_data: Option<Value> = resp
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok());
+        let mut data_node = parsed_str_data
+            .as_ref()
+            .unwrap_or_else(|| resp.get("data").unwrap_or(resp));
         if let Some(inner) = data_node.get("data").filter(|v| v.is_object()) {
             data_node = inner;
         }
@@ -6650,11 +6656,16 @@ impl PollState {
         }
         if let Some(qs) = data_node.get("queueStatus").and_then(Value::as_object) {
             for (qid, qval) in qs {
-                // Only update configured HTTP long-polling MSG queues ("1", "2", "3").
-                // Adding socket-only queues ("15", "16", "7", "8") causes lp_chat to reject subsequent requests.
-                let Some(entry) = self.queues.get_mut(qid) else {
+                if qid.is_empty() || !qid.bytes().all(|b| b.is_ascii_digit()) {
                     continue;
-                };
+                }
+                let entry = self
+                    .queues
+                    .entry(qid.clone())
+                    .or_insert_with(|| QueueCursor {
+                        last_id: "1".into(),
+                        ids: Vec::new(),
+                    });
                 if let Some(lid) = pick_str(qval, &["lastId"]) {
                     if lid != "0" {
                         entry.last_id = max_action_id(&entry.last_id, &lid);
@@ -6662,13 +6673,15 @@ impl PollState {
                 }
                 if let Some(ids_arr) = qval.get("ids").and_then(Value::as_array) {
                     let max_lid = entry.last_id.parse::<u128>().unwrap_or(u128::MAX);
-                    let mut new_ids: Vec<String> = ids_arr
+                    let mut new_ids: Vec<String> = entry
+                        .ids
                         .iter()
-                        .filter_map(|v| match v {
+                        .cloned()
+                        .chain(ids_arr.iter().filter_map(|v| match v {
                             Value::String(s) if !s.is_empty() => Some(s.clone()),
                             Value::Number(n) => Some(n.to_string()),
                             _ => None,
-                        })
+                        }))
                         .filter(|s| s.parse::<u128>().map(|n| n <= max_lid).unwrap_or(true))
                         .collect();
                     if !new_ids.is_empty() {
@@ -6847,8 +6860,9 @@ pub async fn poll_new_messages(
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    // 1. Poll live/offline message queues via `getChatFromPolling` (follow `more == 1` / `resetLastActionId` up to 3 batches)
-    for _ in 0..3 {
+    // 1. Poll live/offline message queues via `getChatFromPolling` (drain multi-page backlogs)
+    for _ in 0..20 {
+        let before_cursor = state.encode_params();
         let Ok(lp_resp) = get_chat_from_polling(s, state).await else {
             break;
         };
@@ -6858,7 +6872,7 @@ pub async fn poll_new_messages(
         let has_reset = pick_str(data_node, &["resetLastActionId"])
             .map(|r| r != "0" && !r.is_empty())
             .unwrap_or(false);
-        if more == 0 && !has_reset {
+        if (more == 0 && !has_reset) || state.encode_params() == before_cursor {
             break;
         }
     }
@@ -11788,6 +11802,10 @@ mod tests {
                     "15": {
                         "lastId": "8399036593265",
                         "ids": ["8399036593265"]
+                    },
+                    "16": {
+                        "lastId": "8527156549057",
+                        "ids": ["8526575968401", "8527156549057"]
                     }
                 }
             }
@@ -11800,8 +11818,25 @@ mod tests {
             ps.queues.get("1").unwrap().ids,
             vec!["8399086511016".to_string()]
         );
-        // Socket-only queue "15" must NOT be added to HTTP polling queues
-        assert!(!ps.queues.contains_key("15"));
+        assert_eq!(ps.queues.get("15").unwrap().last_id, "8399036593265");
+        assert_eq!(ps.queues.get("16").unwrap().last_id, "8527156549057");
+        assert_eq!(
+            ps.queues.get("16").unwrap().ids,
+            vec!["8526575968401".to_string(), "8527156549057".to_string()]
+        );
+        let page2 = json!({
+            "data": "{\"lastActionId\":\"8399086511016\",\"queueStatus\":{\"16\":{\"lastId\":\"8527931403880\",\"ids\":[\"8527931403880\"]}}}"
+        });
+        ps.update_from_response(&page2);
+        assert_eq!(ps.queues.get("16").unwrap().last_id, "8527931403880");
+        assert_eq!(
+            ps.queues.get("16").unwrap().ids,
+            vec![
+                "8526575968401".to_string(),
+                "8527156549057".to_string(),
+                "8527931403880".to_string()
+            ]
+        );
     }
 
     #[test]
