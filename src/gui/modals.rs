@@ -3491,6 +3491,43 @@ impl ZaloGuiApp {
                                                             render_toggle_switch(ui, &mut self.settings.hidden_chat_pin_enabled, pal);
                                                         });
                                                     });
+                                                    ui.add_space(6.0);
+                                                    let status_txt = if !self.settings.hidden_chat_pin_hash.is_empty() {
+                                                        format!(
+                                                            "Đã bật mã PIN ({} trò chuyện ẩn) — nhập mã PIN vào ô Tìm kiếm để mở khoá.",
+                                                            self.settings.hidden_threads.len()
+                                                        )
+                                                    } else {
+                                                        "Chưa có mã PIN — đặt mã PIN (tối thiểu 4 ký tự) bên dưới:".to_string()
+                                                    };
+                                                    ui.label(RichText::new(status_txt).color(pal.text_secondary).size(11.8));
+                                                    if self.hidden_chats_unlocked {
+                                                        ui.add_space(6.0);
+                                                        if ui.button("🔒 Khoá trò chuyện ẩn ngay").clicked() {
+                                                            self.lock_hidden_chats();
+                                                            self.show_toast("🔒 Đã khoá lại trò chuyện ẩn");
+                                                        }
+                                                    }
+                                                    if self.settings.hidden_chat_pin_hash.is_empty() {
+                                                        ui.add_space(6.0);
+                                                        ui.horizontal(|ui| {
+                                                            ui.add(
+                                                                egui::TextEdit::singleline(&mut self.hidden_pin_draft)
+                                                                    .password(true)
+                                                                    .hint_text("Nhập mã PIN mới…")
+                                                                    .desired_width(150.0),
+                                                            );
+                                                            if ui.button("Lưu PIN").clicked()
+                                                                && self.hidden_pin_draft.trim().chars().count() >= 4
+                                                            {
+                                                                self.settings.hidden_chat_pin_hash =
+                                                                    crate::crypto::md5_hex(self.hidden_pin_draft.trim());
+                                                                self.hidden_pin_draft.clear();
+                                                                self.settings.save();
+                                                                self.show_toast("🔒 Đã lưu mã PIN cho trò chuyện ẩn");
+                                                            }
+                                                        });
+                                                    }
                                                 });
                                             ui.add_space(14.0);
 
@@ -8234,84 +8271,6 @@ impl ZaloGuiApp {
             match gallery.iter().position(|g| g.tex_key == viewer.tex_key) {
                 Some(i) => {
                     viewer.gallery = gallery;
-                    viewer.gallery_index = i;
-                    self.prefetch_gallery_neighbours(&viewer);
-                }
-                // Opened from elsewhere (feed, media drawer…): browse just this photo.
-                None => {
-                    viewer.gallery = vec![GalleryPhoto {
-                        tex_key: viewer.tex_key.clone(),
-                        thumb_url: String::new(),
-                        full_url: viewer.full_url.clone(),
-                        title: viewer.title.clone(),
-                        sender: viewer.sender.clone(),
-                        time: viewer.time.clone(),
-                    }];
-                    viewer.gallery_index = 0;
-                }
-            }
-        }
-        let gallery_len = viewer.gallery.len();
-        let mut go_to: Option<usize> = None;
-        if gallery_len > 1 {
-            let (left, right) =
-                ctx.input(|i| (i.key_pressed(Key::ArrowLeft), i.key_pressed(Key::ArrowRight)));
-            if left && viewer.gallery_index > 0 {
-                go_to = Some(viewer.gallery_index - 1);
-            } else if right && viewer.gallery_index + 1 < gallery_len {
-                go_to = Some(viewer.gallery_index + 1);
-            }
-        }
-        // Thumbnail strip: up to 11 photos centred on the current one.
-        let strip: Vec<(usize, Option<egui::TextureHandle>)> = if gallery_len > 1 {
-            let half = 5usize;
-            let start = viewer
-                .gallery_index
-                .saturating_sub(half)
-                .min(gallery_len.saturating_sub(half * 2 + 1));
-            let end = (start + half * 2 + 1).min(gallery_len);
-            (start..end)
-                .map(|i| (i, self.sticker_textures.get(&viewer.gallery[i].tex_key).cloned()))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let strip_missing: Vec<(String, String)> = strip
-            .iter()
-            .filter(|(_, t)| t.is_none())
-            .map(|(i, _)| &viewer.gallery[*i])
-            .filter(|g| !g.thumb_url.is_empty())
-            .map(|g| (g.tex_key.clone(), g.thumb_url.clone()))
-            .collect();
-        for (key, url) in strip_missing {
-            self.request_sticker_image(key, url);
-        }
-
-        let screen_rect = ctx.screen_rect();
-        // Start below the 32px custom frameless title bar so window controls stay accessible
-        let viewer_top = (screen_rect.top() + 32.0).min(screen_rect.bottom());
-        let toolbar_h = 46.0_f32;
-        let toolbar_rect = Rect::from_min_max(
-            Pos2::new(screen_rect.left(), viewer_top),
-            Pos2::new(
-                screen_rect.right(),
-                (viewer_top + toolbar_h).min(screen_rect.bottom()),
-            ),
-        );
-        let stage_area_rect = Rect::from_min_max(
-            Pos2::new(screen_rect.left(), toolbar_rect.bottom()),
-            screen_rect.max,
-        );
-        let mut should_close = false;
-
-        let active_tex = if let Some(tex) = viewer
-            .hd_tex_key
-            .as_ref()
-            .and_then(|hk| self.sticker_textures.get(hk).map(|t| (hk.as_str(), t)))
-        {
-            crate::gui::mark_texture_used(tex.0);
-            Some(tex.1.clone())
-        } else if let Some(tex) = self.sticker_textures.get(&viewer.tex_key) {
             crate::gui::mark_texture_used(&viewer.tex_key);
             Some(tex.clone())
         } else {
@@ -9889,6 +9848,8 @@ impl ZaloGuiApp {
                                                 .filter(|t| {
                                                     t.is_group == want_group
                                                         && !t.name.contains("Cloud của tôi")
+                                                        && (self.hidden_chats_unlocked
+                                                            || !self.is_thread_hidden(t))
                                                         && matches_vn_query(
                                                             &t.name, &q_low, &q_fold,
                                                         )

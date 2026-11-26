@@ -1416,12 +1416,66 @@ impl ZaloGuiApp {
                         });
                 }
 
+                if !self.hidden_chats_unlocked
+                    && !query.is_empty()
+                    && !self.settings.hidden_chat_pin_hash.is_empty()
+                    && crate::chat::verify_hidden_pin(&query, &self.settings.hidden_chat_pin_hash)
+                {
+                    self.hidden_chats_unlocked = true;
+                    self.search_query.clear();
+                    self.thread_list_cache = None;
+                    self.show_toast("🔓 Đã mở khoá trò chuyện ẩn — bấm Khoá lại khi xong");
+                }
+                if self.hidden_chats_unlocked && !sidebar_is_rail {
+                    let hidden_cnt = self
+                        .threads
+                        .iter()
+                        .filter(|t| self.is_thread_hidden(t))
+                        .count();
+                    egui::Frame::none()
+                        .fill(pal.primary.linear_multiply(0.14))
+                        .stroke(Stroke::new(1.0_f32, pal.primary.linear_multiply(0.4)))
+                        .rounding(Rounding::same(8.0))
+                        .outer_margin(Margin::symmetric(8.0, 4.0))
+                        .inner_margin(Margin::symmetric(10.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("🔓 Đang hiện {hidden_cnt} trò chuyện ẩn"))
+                                        .size(11.8)
+                                        .color(pal.primary_hover)
+                                        .strong(),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("🔒 Khoá lại")
+                                                    .size(11.5)
+                                                    .color(pal.primary_fg),
+                                            )
+                                            .fill(pal.primary)
+                                            .rounding(Rounding::same(6.0)),
+                                        )
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        self.lock_hidden_chats();
+                                        self.show_toast("🔒 Đã khoá lại trò chuyện ẩn");
+                                    }
+                                });
+                            });
+                        });
+                }
+
                 // Sidebar cache (#135): skip re-filter+sort every frame unless
                 // query/filter/threads/selected changed or 500ms passed.
                 let cache_key_fingerprint: u64 = {
                     use std::hash::{Hash, Hasher};
                     let mut h = std::collections::hash_map::DefaultHasher::new();
                     self.threads.len().hash(&mut h);
+                    self.hidden_chats_unlocked.hash(&mut h);
+                    self.settings.hidden_threads.len().hash(&mut h);
                     self.threads.iter().take(64).for_each(|t| {
                         t.id.hash(&mut h);
                         t.preview.hash(&mut h);
@@ -1467,7 +1521,9 @@ impl ZaloGuiApp {
                         .iter()
                         .enumerate()
                         .filter(|(idx, t)| {
-                            if query.is_empty() && self.settings.hidden_threads.contains(&t.id) {
+                            let is_hidden =
+                                t.presentation.hidden || self.settings.hidden_threads.contains(&t.id);
+                            if is_hidden && !self.hidden_chats_unlocked {
                                 return false;
                             }
                             let pass_filter = match self.thread_filter {
@@ -1477,7 +1533,7 @@ impl ZaloGuiApp {
                             };
                             // Chat Folders (WaveA3): folder active lọc thêm theo rule.
                             let pass_folder = self.thread_passes_active_folder(t);
-                            let not_hidden = !t.presentation.hidden || !query.is_empty();
+                            let not_hidden = !is_hidden || self.hidden_chats_unlocked;
                             // Like official Zalo: hide contacts that have never had any messages unless
                             // actively searching, explicitly enabled in settings, or currently selected.
                             let has_messages = !t.messages.is_empty()
@@ -1538,6 +1594,12 @@ impl ZaloGuiApp {
                             let mut hits = Vec::new();
                             // RAM scan trước (nhanh, giữ hành vi cũ).
                             for (t_idx, t) in self.threads.iter().enumerate() {
+                                if !self.hidden_chats_unlocked
+                                    && (t.presentation.hidden
+                                        || self.settings.hidden_threads.contains(&t.id))
+                                {
+                                    continue;
+                                }
                                 for m in t.messages.iter().rev() {
                                     if matches_vn_query(&m.text, &query, &query_folded) {
                                         hits.push((
@@ -1572,6 +1634,12 @@ impl ZaloGuiApp {
                                             let t_idx = self.threads.iter().position(|t| t.id == sm.thread_id).unwrap_or(usize::MAX);
                                             if t_idx == usize::MAX { continue; }
                                             let t = &self.threads[t_idx];
+                                            if !self.hidden_chats_unlocked
+                                                && (t.presentation.hidden
+                                                    || self.settings.hidden_threads.contains(&t.id))
+                                            {
+                                                continue;
+                                            }
                                             hits.push((t_idx, t.name.clone(), sm.text.clone(), crate::clock::message_time(sm.ts), t.is_group));
                                         }
                                     }
@@ -2728,8 +2796,10 @@ impl ZaloGuiApp {
                         ThreadCtxAction::ToggleHide(tid, is_group, hide) => {
                             if hide {
                                 self.settings.hidden_threads.insert(tid.clone());
+                                self.unread_counts.remove(&tid);
+                                self.reaction_unread_counts.remove(&tid);
                                 self.show_toast(
-                                    "🙈 Đã ẩn trò chuyện (gõ tên vào ô Tìm kiếm để mở lại)",
+                                    "🙈 Đã ẩn trò chuyện (nhập mã PIN vào ô Tìm kiếm để mở lại)",
                                 );
                             } else {
                                 self.settings.hidden_threads.remove(&tid);
@@ -2738,6 +2808,8 @@ impl ZaloGuiApp {
                             if let Some(th) = self.threads.iter_mut().find(|t| t.id == tid) {
                                 th.presentation.hidden = hide;
                             }
+                            self.ensure_visible_selected_thread();
+                            self.thread_list_cache = None;
                             self.settings.save();
                             self.persist_threads_async();
                             if let Some(tx) = WORKER_TX.get() {
@@ -5267,8 +5339,10 @@ impl ZaloGuiApp {
                                                             self.settings
                                                                 .hidden_threads
                                                                 .insert(d_id.clone());
+                                                            self.unread_counts.remove(d_id);
+                                                            self.reaction_unread_counts.remove(d_id);
                                                             self.show_toast(
-                                                                "🙈 Đã ẩn trò chuyện (gõ tên vào ô Tìm kiếm để mở lại)",
+                                                                "🙈 Đã ẩn trò chuyện (nhập mã PIN vào ô Tìm kiếm để mở lại)",
                                                             );
                                                         } else {
                                                             self.settings.hidden_threads.remove(d_id);
@@ -5281,6 +5355,8 @@ impl ZaloGuiApp {
                                                         {
                                                             th.presentation.hidden = new_hide;
                                                         }
+                                                        self.ensure_visible_selected_thread();
+                                                        self.thread_list_cache = None;
                                                         self.settings.save();
                                                         self.persist_threads_async();
                                                         if let Some(tx) = WORKER_TX.get() {

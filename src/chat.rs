@@ -5562,6 +5562,7 @@ pub async fn send_reaction(
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
+
 /// Delete a message for me (`deleteOneOneMessageV2` / `deleteGroupMessageV2` @ `compact-app-pc.js:14373319`, cmd `11779` / `11834`).
 pub async fn delete_message_for_me(
     s: &Session,
@@ -9792,6 +9793,7 @@ pub async fn update_pinned_conversation(
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
+
 /// Mark a conversation as unread or read (`addMarkAsUnread` / `removeMarkAsUnread` @ `compact-app-pc.js:14299958`, cmd `12013` / `12014`).
 pub async fn set_unread_mark(
     s: &Session,
@@ -9838,6 +9840,7 @@ pub async fn set_unread_mark(
     let resp = s.post_form(&url, format!("params={params}")).await?;
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
+
 
 /// Wire action code for muting a conversation (`SET_MUTE` in Official Zalo PC JS).
 pub const MUTE_ACTION_SET: u8 = 1;
@@ -11118,6 +11121,77 @@ pub async fn set_hidden_conversation(
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
+/// Fetch all hidden conversations and the server-stored MD5 PIN hash (`/api/hiddenconvers/get-all`, cmd `10048`).
+pub async fn get_hidden_conversations(s: &Session) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let body = json!({ "imei": s.imei });
+    let params = s.encoded_params(&body)?;
+    let url = format!(
+        "{}/api/hiddenconvers/get-all?{}&params={params}",
+        s.domains.conversation,
+        s.common_params()
+    );
+    let resp = s.get(&url).await?;
+    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+}
+
+/// Parse `(hidden_thread_ids, pin_md5_hash)` from `/api/hiddenconvers/get-all`.
+pub fn parse_hidden_conversations(resp: &Value) -> (Vec<String>, String) {
+    let data = resp.get("data").unwrap_or(resp);
+    let pin_hash = data
+        .get("pin")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut ids = Vec::new();
+    if let Some(arr) = data.get("threads").and_then(Value::as_array) {
+        for item in arr {
+            let raw = item
+                .get("thread_id")
+                .or_else(|| item.get("threadId"))
+                .or_else(|| item.get("id"))
+                .and_then(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .or_else(|| v.as_u64().map(|n| n.to_string()))
+                })
+                .or_else(|| item.as_str().map(str::to_string));
+            if let Some(id) = raw {
+                let clean = id
+                    .trim_start_matches("group_")
+                    .trim_start_matches('g')
+                    .trim_start_matches('G')
+                    .trim()
+                    .to_string();
+                if !clean.is_empty() && !ids.contains(&clean) {
+                    ids.push(clean);
+                }
+            }
+        }
+    }
+    (ids, pin_hash)
+}
+
+/// Apply the authoritative hidden-thread set to every loaded conversation.
+pub fn apply_hidden_threads(threads: &mut [Thread], hidden_ids: &std::collections::HashSet<String>) {
+    for t in threads.iter_mut() {
+        t.presentation.hidden = hidden_ids.contains(&t.id);
+    }
+}
+
+/// Verify a user-entered hidden-chat PIN against the server/local MD5 hex hash.
+pub fn verify_hidden_pin(input: &str, pin_hash: &str) -> bool {
+    let trimmed = input.trim();
+    let hash = pin_hash.trim();
+    if trimmed.is_empty() || hash.len() != 32 {
+        return false;
+    }
+    crate::crypto::md5_hex(trimmed).eq_ignore_ascii_case(hash)
+}
+
+
 /// Delete conversation history for me (`deleteOneOneConversationV2` / `deleteGroupConversationV2` @ `compact-app-pc.js:14374881`, cmd `11778` / `11835`).
 pub async fn delete_conversation(
     s: &Session,
@@ -11837,6 +11911,30 @@ mod tests {
                 "8527931403880".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_and_verify_hidden_conversations() {
+        let pin_hash = crate::crypto::md5_hex("1234");
+        let resp = json!({
+            "error_code": 0,
+            "data": {
+                "pin": pin_hash,
+                "threads": [
+                    { "thread_id": "111", "is_group": 0 },
+                    { "thread_id": "g222", "is_group": 1 },
+                    { "thread_id": "111", "is_group": 0 }
+                ]
+            }
+        });
+        let (ids, parsed_pin) = parse_hidden_conversations(&resp);
+        assert_eq!(ids, vec!["111".to_string(), "222".to_string()]);
+        assert_eq!(parsed_pin, pin_hash);
+        assert!(verify_hidden_pin("1234", &parsed_pin));
+        assert!(verify_hidden_pin(" 1234 ", &parsed_pin));
+        assert!(!verify_hidden_pin("0000", &parsed_pin));
+        assert!(!verify_hidden_pin("", &parsed_pin));
+        assert!(!verify_hidden_pin("1234", ""));
     }
 
     #[test]

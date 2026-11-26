@@ -883,6 +883,10 @@ pub enum GuiEvent {
     ),
     MuteSnapshotSynced(HashMap<String, i64>),
     PinnedSnapshotSynced(Vec<String>),
+    HiddenSnapshotSynced {
+        thread_ids: Vec<String>,
+        pin_hash: String,
+    },
     MuteEventsReceived(Vec<crate::chat::MuteControlEvent>),
     PhoneSyncProgress {
         progress: f32,
@@ -1270,6 +1274,8 @@ pub(crate) struct AppSettings {
     #[serde(skip)]
     quick_reply_draft: String,
     hidden_chat_pin_enabled: bool,
+    #[serde(default)]
+    hidden_chat_pin_hash: String,
     split_priority_inbox: bool,
     excel_paste_mode: String, // "image" | "text" | "ask"
     #[serde(default = "settings_default_true")]
@@ -1364,6 +1370,7 @@ impl Default for AppSettings {
             quick_reply_items: default_quick_reply_items(),
             quick_reply_draft: String::new(),
             hidden_chat_pin_enabled: true,
+            hidden_chat_pin_hash: String::new(),
             split_priority_inbox: false,
             excel_paste_mode: "ask".into(),
             render_markdown: true,
@@ -1639,6 +1646,8 @@ pub struct ZaloGuiApp {
     pending_attachments: Vec<attachments::PendingAttachment>,
     unread_counts: HashMap<String, usize>,
     reaction_unread_counts: HashMap<String, usize>,
+    hidden_chats_unlocked: bool,
+    hidden_pin_draft: String,
     /// Message IDs that have already triggered an unread bump/notification in this session (#146).
     notified_msg_ids: HashSet<String>,
     /// `(uin, banner progress)`: persisted so replayed reactions do not re-banner.
@@ -2039,6 +2048,8 @@ impl ZaloGuiApp {
             pending_attachments: Vec::new(),
             unread_counts: HashMap::new(),
             reaction_unread_counts: HashMap::new(),
+            hidden_chats_unlocked: false,
+            hidden_pin_draft: String::new(),
             notified_msg_ids: HashSet::new(),
             reaction_banner_mark: (String::new(), Default::default()),
             link_metadata_cache: HashMap::new(),
@@ -2174,6 +2185,7 @@ impl ZaloGuiApp {
             win_resize_drag: None,
         };
         let mut app = app;
+        app.ensure_visible_selected_thread();
         let _ = app.reload_custom_sticker_packs();
 
         // Clean up any leftover `.old` executable from a previous in-place self-update
@@ -2583,6 +2595,36 @@ impl ZaloGuiApp {
     /// socket control events (`pin_message` / `unpin_topic`) instead.
     fn maybe_refresh_board_pins(&mut self) {}
 
+    pub(super) fn is_thread_hidden(&self, t: &Thread) -> bool {
+        t.presentation.hidden || self.settings.hidden_threads.contains(&t.id)
+    }
+
+    pub(super) fn is_thread_id_hidden(&self, tid: &str) -> bool {
+        self.settings.hidden_threads.contains(tid)
+            || self.threads.iter().any(|t| t.id == tid && t.presentation.hidden)
+    }
+
+    pub(super) fn ensure_visible_selected_thread(&mut self) {
+        if self.hidden_chats_unlocked {
+            return;
+        }
+        let cur_hidden = self
+            .threads
+            .get(self.selected_thread_index)
+            .is_some_and(|t| self.is_thread_hidden(t));
+        if cur_hidden {
+            if let Some(idx) = self.threads.iter().position(|t| !self.is_thread_hidden(t)) {
+                self.selected_thread_index = idx;
+            }
+        }
+    }
+
+    pub(super) fn lock_hidden_chats(&mut self) {
+        self.hidden_chats_unlocked = false;
+        self.ensure_visible_selected_thread();
+        self.thread_list_cache = None;
+    }
+
     fn persist_threads_async(&self) {
         self.publish_known_threads();
         if self.user_uin.is_empty() {
@@ -2849,9 +2891,15 @@ impl ZaloGuiApp {
                             } else if nt.unread.is_muted() {
                                 nt.presentation.muted = true;
                             }
+                            let is_hidden_target =
+                                self.settings.hidden_threads.contains(&nt.id)
+                                    || nt.presentation.hidden;
                             if let Some(existing) = self.threads.iter_mut().find(|t| t.id == nt.id)
                             {
-                                let is_thread_muted = settings_muted_until.is_some()
+                                let is_thread_hidden =
+                                    is_hidden_target || existing.presentation.hidden;
+                                let is_thread_muted = is_thread_hidden
+                                    || settings_muted_until.is_some()
                                     || existing.presentation.muted
                                     || existing.unread.is_muted()
                                     || nt.presentation.muted
@@ -2916,7 +2964,7 @@ impl ZaloGuiApp {
                                                     })
                                                     .collect();
                                             let inc_cnt = notify_items.len();
-                                            if inc_cnt > 0 {
+                                            if inc_cnt > 0 && !is_thread_hidden {
                                                 *self
                                                     .unread_counts
                                                     .entry(existing.id.clone())
@@ -3062,7 +3110,9 @@ impl ZaloGuiApp {
                                 // event / poll batch tiếp theo) mới đếm qua nhánh
                                 // merge ở trên. Đơn giản và đúng vì mọi tin trong
                                 // batch đầu đều là history, không phải tin mới.
-                                let is_thread_muted = settings_muted_until.is_some()
+                                let is_thread_hidden = is_hidden_target;
+                                let is_thread_muted = is_thread_hidden
+                                    || settings_muted_until.is_some()
                                     || nt.presentation.muted
                                     || nt.unread.is_muted();
                                 let seen = nt.unread.last_seen_id.as_deref().unwrap_or("");
@@ -3086,7 +3136,7 @@ impl ZaloGuiApp {
                                     .map(|m| (m.id.clone(), m.sender.clone(), m.text.clone()))
                                     .collect();
                                 let inc_cnt = unseen_items.len();
-                                if inc_cnt > 0 && (nt.id != active_tid || !is_focused) {
+                                if inc_cnt > 0 && !is_thread_hidden && (nt.id != active_tid || !is_focused) {
                                     *self.unread_counts.entry(nt.id.clone()).or_insert(0) +=
                                         inc_cnt;
                                 }
@@ -3331,7 +3381,10 @@ impl ZaloGuiApp {
                     // the background still show as unread.
                     self.reaction_unread_counts.clear();
                     self.notified_msg_ids.clear();
+                    self.hidden_chats_unlocked = false;
                     self.unread_counts = unread_counts_from_read_points(&threads);
+                    self.unread_counts
+                        .retain(|tid, _| !self.settings.hidden_threads.contains(tid));
                     self.user_name = name.clone();
                     self.user_avatar = avatar;
                     self.threads = threads;
@@ -3623,13 +3676,14 @@ impl ZaloGuiApp {
                             continue;
                         }
                         for t in &self.threads {
-                            let muted = self
-                                .settings
-                                .muted_threads
-                                .get(&t.id)
-                                .copied()
-                                .filter(|&u| u == -1 || u > now_ts_react)
-                                .is_some()
+                            let muted = self.is_thread_hidden(t)
+                                || self
+                                    .settings
+                                    .muted_threads
+                                    .get(&t.id)
+                                    .copied()
+                                    .filter(|&u| u == -1 || u > now_ts_react)
+                                    .is_some()
                                 || t.presentation.muted
                                 || t.unread.is_muted();
                             if muted || !reactions_notify_on {
@@ -3689,13 +3743,14 @@ impl ZaloGuiApp {
                             }
                         }
                         let Some(tid) = hit_tid else { continue };
-                        let is_muted = self
-                            .settings
-                            .muted_threads
-                            .get(&tid)
-                            .copied()
-                            .filter(|&u| u == -1 || u > now_ts_react)
-                            .is_some()
+                        let is_muted = self.is_thread_id_hidden(&tid)
+                            || self
+                                .settings
+                                .muted_threads
+                                .get(&tid)
+                                .copied()
+                                .filter(|&u| u == -1 || u > now_ts_react)
+                                .is_some()
                             || self
                                 .threads
                                 .iter()
@@ -4619,6 +4674,34 @@ impl ZaloGuiApp {
                         }
                     }
                     crate::chat::apply_pinned_threads(&mut self.threads, &pinned_ids);
+                    self.settings.save();
+                    self.persist_threads_async();
+                }
+                GuiEvent::HiddenSnapshotSynced {
+                    thread_ids,
+                    pin_hash,
+                } => {
+                    self.settings.hidden_threads = thread_ids.into_iter().collect();
+                    if !pin_hash.is_empty() {
+                        self.settings.hidden_chat_pin_hash = pin_hash;
+                    }
+                    crate::chat::apply_hidden_threads(
+                        &mut self.threads,
+                        &self.settings.hidden_threads,
+                    );
+                    self.unread_counts
+                        .retain(|tid, _| !self.settings.hidden_threads.contains(tid));
+                    self.reaction_unread_counts
+                        .retain(|tid, _| !self.settings.hidden_threads.contains(tid));
+                    let total_unread: usize = self.unread_counts.values().sum();
+                    let title = if total_unread > 0 {
+                        format!("({total_unread}) ctdozlite")
+                    } else {
+                        "ctdozlite".to_string()
+                    };
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+                    self.ensure_visible_selected_thread();
+                    self.thread_list_cache = None;
                     self.settings.save();
                     self.persist_threads_async();
                 }
@@ -6698,6 +6781,9 @@ fn collect_fresh_incoming_unread<'a>(
 fn unread_counts_from_read_points(threads: &[Thread]) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
     for thread in threads {
+        if thread.presentation.hidden {
+            continue;
+        }
         let Some(seen) = thread.unread.last_seen_id.as_deref().filter(|s| !s.is_empty()) else {
             continue;
         };

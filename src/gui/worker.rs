@@ -2317,6 +2317,15 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                             crate::chat::apply_pinned_threads(&mut list, &pids);
                                                             let _ = gui_tx_clone.send(GuiEvent::PinnedSnapshotSynced(pids));
                                                         }
+                                                        if let Ok(hidden_resp) = crate::chat::get_hidden_conversations(&s).await {
+                                                            let (hids, pin_hash) = crate::chat::parse_hidden_conversations(&hidden_resp);
+                                                            let hset: std::collections::HashSet<String> = hids.iter().cloned().collect();
+                                                            crate::chat::apply_hidden_threads(&mut list, &hset);
+                                                            let _ = gui_tx_clone.send(GuiEvent::HiddenSnapshotSynced {
+                                                                thread_ids: hids,
+                                                                pin_hash,
+                                                            });
+                                                        }
                                                         let sync_snapshot = list.clone();
                                                         if session_matches_active(&s) {
                                                             let _ = gui_tx_clone
@@ -2585,6 +2594,15 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         let pids = crate::chat::parse_pinned_conversations(&pinned_resp);
                                         crate::chat::apply_pinned_threads(&mut list, &pids);
                                         let _ = gui_tx_clone.send(GuiEvent::PinnedSnapshotSynced(pids));
+                                    }
+                                    if let Ok(hidden_resp) = crate::chat::get_hidden_conversations(&s).await {
+                                        let (hids, pin_hash) = crate::chat::parse_hidden_conversations(&hidden_resp);
+                                        let hset: std::collections::HashSet<String> = hids.iter().cloned().collect();
+                                        crate::chat::apply_hidden_threads(&mut list, &hset);
+                                        let _ = gui_tx_clone.send(GuiEvent::HiddenSnapshotSynced {
+                                            thread_ids: hids,
+                                            pin_hash,
+                                        });
                                     }
                                     let total_msgs: usize =
                                         list.iter().map(|t| t.messages.len()).sum();
