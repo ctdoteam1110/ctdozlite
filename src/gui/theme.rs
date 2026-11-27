@@ -409,7 +409,7 @@ impl ThemePalette {
         visuals.widgets.noninteractive.weak_bg_fill = self.glass_sidebar();
         visuals.selection.bg_fill =
             self.primary
-                .linear_multiply(if self.is_dark { 0.45 } else { 0.22 });
+                .linear_multiply(if self.is_dark { 0.36 } else { 0.22 });
         visuals.selection.stroke = Stroke::new(1.5_f32, self.primary);
 
         #[cfg(target_os = "macos")]
@@ -621,8 +621,8 @@ impl ThemePalette {
         }
         if let Some(hex) = bubble_out_hex {
             if let Some(c) = parse_hex_color(hex).filter(|c| c.a() > 0) {
-                let effective = blend_over(c, self.bg_chat_canvas);
                 self.bubble_out_bg = c;
+                let effective = blend_over(self.glass_bubble_out(), self.glass_canvas());
                 let dark_text = Color32::from_rgb(15, 23, 42);
                 let light_text = Color32::from_rgb(235, 240, 246);
                 self.bubble_out_text =
@@ -646,8 +646,8 @@ impl ThemePalette {
         }
         if let Some(hex) = bubble_in_hex {
             if let Some(c) = parse_hex_color(hex).filter(|c| c.a() > 0) {
-                let effective = blend_over(c, self.bg_chat_canvas);
                 self.bubble_in_bg = c;
+                let effective = blend_over(self.glass_bubble_in(), self.glass_canvas());
                 let dark_text = Color32::from_rgb(15, 23, 42);
                 let light_text = Color32::from_rgb(230, 233, 238);
                 self.bubble_in_text =
@@ -2180,10 +2180,21 @@ mod tests {
             None,
             None,
             Some("#1E293B"),
-            None,
+            Some("#A1DBC9"),
         );
         assert_eq!(pal.bubble_out_bg, Color32::from_rgb(30, 41, 59));
         assert_eq!(pal.bubble_out_text, Color32::from_rgb(235, 240, 246));
+        let eff_in = {
+            let fg = pal.glass_bubble_in();
+            let bg = pal.glass_canvas();
+            let a = fg.a() as f32 / 255.0;
+            let mix = |f: u8, b: u8| -> u8 {
+                ((f as f32) * a + (b as f32) * (1.0 - a)).round().clamp(0.0, 255.0) as u8
+            };
+            Color32::from_rgb(mix(fg.r(), bg.r()), mix(fg.g(), bg.g()), mix(fg.b(), bg.b()))
+        };
+        assert!(contrast_ratio(pal.bubble_in_text, eff_in) >= 4.5);
+        assert!(contrast_ratio(pal.bubble_in_meta, eff_in) >= 4.5);
     }
 
     #[test]

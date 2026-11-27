@@ -8104,7 +8104,11 @@ impl ZaloGuiApp {
                                             ui.label(
                                                 RichText::new(format!("Đang trả lời {who}"))
                                                     .size(12.0)
-                                                    .color(pal.primary)
+                                                    .color(if pal.is_dark {
+                                                        pal.link_text
+                                                    } else {
+                                                        pal.primary
+                                                    })
                                                     .strong(),
                                             );
                                             let preview = if q.sticker_id.is_some() {

@@ -1611,30 +1611,42 @@ fn append_md_run_to_job(
                 ..Default::default()
             },
         ),
-        InlineMdRun::Mention(s) => job.append(
-            s,
-            0.0,
-            egui::TextFormat {
-                font_id: FontId::proportional(base_size),
-                color: pal.primary_hover,
-                background: Color32::from_rgba_unmultiplied(
+        InlineMdRun::Mention(s) => {
+            let mention_fg = if pal.is_dark {
+                Color32::from_rgb(191, 219, 254)
+            } else {
+                pal.primary_hover
+            };
+            let mention_bg = if pal.is_dark {
+                Color32::from_rgba_premultiplied(28, 62, 108, 120)
+            } else {
+                Color32::from_rgba_unmultiplied(
                     pal.primary_hover.r(),
                     pal.primary_hover.g(),
                     pal.primary_hover.b(),
-                    if pal.is_dark { 34 } else { 26 },
-                ),
-                underline: Stroke::new(
-                    1.0_f32,
-                    Color32::from_rgba_unmultiplied(
-                        pal.primary_hover.r(),
-                        pal.primary_hover.g(),
-                        pal.primary_hover.b(),
-                        140,
+                    22,
+                )
+            };
+            job.append(
+                s,
+                0.0,
+                egui::TextFormat {
+                    font_id: FontId::proportional(base_size),
+                    color: mention_fg,
+                    background: mention_bg,
+                    underline: Stroke::new(
+                        1.0_f32,
+                        Color32::from_rgba_unmultiplied(
+                            mention_fg.r(),
+                            mention_fg.g(),
+                            mention_fg.b(),
+                            130,
+                        ),
                     ),
-                ),
-                ..Default::default()
-            },
-        ),
+                    ..Default::default()
+                },
+            );
+        }
         InlineMdRun::Link { label, .. } => job.append(
             label,
             0.0,
