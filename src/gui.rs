@@ -960,6 +960,7 @@ pub enum GuiEvent {
         uin: String,
         note: Option<String>,
         watch: Vec<String>,
+        privacy_allowed: bool,
         error: Option<String>,
     },
     /// Kết quả auto-save note (debounce) từ worker thread.
@@ -1679,6 +1680,10 @@ pub struct ZaloGuiApp {
     group_watch_inputs: HashMap<String, String>,
     /// Cache keyword DB để render list (thread_id → keywords).
     group_watch_cache: HashMap<String, Vec<String>>,
+    /// Cached per-thread LLM attachment privacy flag (`thread_id` -> allowed).
+    group_privacy_cache: HashMap<String, bool>,
+    /// Cached Info Drawer shared media/files/links/pins for the active thread.
+    drawer_media_cache: Option<std::sync::Arc<workspace::DrawerMediaCache>>,
     /// Stats nhóm đang hiển thị (thread_id → (fetched_at, stats)).
     group_stats_cache: HashMap<String, (std::time::Instant, crate::group_stats::GroupStats)>,
     /// Nhóm đang nạp note/watch async (tránh spawn trùng mỗi frame).
@@ -2069,6 +2074,8 @@ impl ZaloGuiApp {
             group_note_saved_label: HashMap::new(),
             group_watch_inputs: HashMap::new(),
             group_watch_cache: HashMap::new(),
+            group_privacy_cache: HashMap::new(),
+            drawer_media_cache: None,
             group_stats_cache: HashMap::new(),
             group_note_loading: HashSet::new(),
             group_note_load_error: HashMap::new(),
@@ -2795,6 +2802,8 @@ impl ZaloGuiApp {
                         self.group_note_saved_label.clear();
                         self.group_watch_inputs.clear();
                         self.group_watch_cache.clear();
+                        self.group_privacy_cache.clear();
+                        self.drawer_media_cache = None;
                         self.group_stats_cache.clear();
                         self.script_list_cache.clear();
                         self.script_editing_id = None;
@@ -3310,6 +3319,8 @@ impl ZaloGuiApp {
                     self.group_note_saved_label.clear();
                     self.group_watch_inputs.clear();
                     self.group_watch_cache.clear();
+                    self.group_privacy_cache.clear();
+                    self.drawer_media_cache = None;
                     self.group_stats_cache.clear();
                     self.script_list_cache.clear();
                     self.script_editing_id = None;
@@ -3347,6 +3358,8 @@ impl ZaloGuiApp {
                     self.group_note_saved_label.clear();
                     self.group_watch_inputs.clear();
                     self.group_watch_cache.clear();
+                    self.group_privacy_cache.clear();
+                    self.drawer_media_cache = None;
                     self.group_stats_cache.clear();
                     self.script_list_cache.clear();
                     self.script_editing_id = None;
@@ -3402,6 +3415,8 @@ impl ZaloGuiApp {
                     self.group_note_saved_label.clear();
                     self.group_watch_inputs.clear();
                     self.group_watch_cache.clear();
+                    self.group_privacy_cache.clear();
+                    self.drawer_media_cache = None;
                     self.group_stats_cache.clear();
                     self.script_list_cache.clear();
                     self.script_editing_id = None;
@@ -4387,7 +4402,14 @@ impl ZaloGuiApp {
                     self.history_reached_start.insert(tid);
                     self.show_toast("Đã hiển thị toàn bộ lịch sử tin nhắn của cuộc trò chuyện này");
                 }
-                GuiEvent::GroupNoteLoaded { thread_id, uin, note, watch, error } => {
+                GuiEvent::GroupNoteLoaded {
+                    thread_id,
+                    uin,
+                    note,
+                    watch,
+                    privacy_allowed,
+                    error,
+                } => {
                     self.group_note_loading.remove(&thread_id);
                     // Stale (đổi acc trước khi worker trả) → bỏ, không đè cache acc mới.
                     if uin != self.user_uin {
@@ -4402,6 +4424,8 @@ impl ZaloGuiApp {
                                 self.group_note_drafts.insert(thread_id.clone(), n);
                             }
                             self.group_watch_cache.insert(thread_id.clone(), watch);
+                            self.group_privacy_cache
+                                .insert(thread_id.clone(), privacy_allowed);
                             self.group_note_loaded.insert(thread_id.clone());
                             self.group_note_load_error.remove(&thread_id);
                         }

@@ -1765,20 +1765,55 @@ fn load_first_font(fonts: &mut egui::FontDefinitions, key: &str, candidates: &[&
     false
 }
 
+fn load_ttc_font_pair(
+    fonts: &mut egui::FontDefinitions,
+    path: &str,
+    regular_index: u32,
+    semibold_index: u32,
+) -> bool {
+    if let Ok(bytes) = std::fs::read(path) {
+        let mut regular = egui::FontData::from_owned(bytes.clone());
+        regular.index = regular_index;
+        let mut semibold = egui::FontData::from_owned(bytes);
+        semibold.index = semibold_index;
+        fonts.font_data.insert("selected_font".to_owned(), regular);
+        fonts
+            .font_data
+            .insert("selected_font_semibold".to_owned(), semibold);
+        return true;
+    }
+    false
+}
+
 fn load_system_ui_fonts(fonts: &mut egui::FontDefinitions) -> (bool, bool) {
     #[cfg(target_os = "macos")]
-    let (regular_candidates, semibold_candidates, mono_candidates): (&[&str], &[&str], &[&str]) = (
-        &[
-            "/System/Library/Fonts/SFNS.ttf",
-            "/System/Library/Fonts/HelveticaNeue.ttc",
-            "/System/Library/Fonts/Supplemental/Arial.ttf",
-        ],
-        &[],
-        &[
-            "/System/Library/Fonts/SFNSMono.ttf",
-            "/System/Library/Fonts/Menlo.ttc",
-        ],
-    );
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let sf_reg_user = format!("{home}/Library/Fonts/SF-Pro-Text-Regular.otf");
+        let sf_sb_user = format!("{home}/Library/Fonts/SF-Pro-Text-Semibold.otf");
+        let sf_reg_sys = "/Library/Fonts/SF-Pro-Text-Regular.otf".to_string();
+        let sf_sb_sys = "/Library/Fonts/SF-Pro-Text-Semibold.otf".to_string();
+        let regular_loaded = if load_first_font(
+            fonts,
+            "selected_font",
+            &[sf_reg_user.as_str(), sf_reg_sys.as_str()],
+        ) {
+            let _ = load_first_font(
+                fonts,
+                "selected_font_semibold",
+                &[sf_sb_user.as_str(), sf_sb_sys.as_str()],
+            );
+            true
+        } else {
+            load_ttc_font_pair(fonts, "/System/Library/Fonts/HelveticaNeue.ttc", 0, 10)
+        };
+        let mono_loaded = load_first_font(
+            fonts,
+            "selected_font_mono",
+            &["/System/Library/Fonts/Menlo.ttc"],
+        );
+        return (regular_loaded, mono_loaded);
+    }
     #[cfg(target_os = "windows")]
     let (regular_candidates, semibold_candidates, mono_candidates): (&[&str], &[&str], &[&str]) = (
         &[
@@ -1821,12 +1856,15 @@ fn load_system_ui_fonts(fonts: &mut egui::FontDefinitions) -> (bool, bool) {
         ],
     );
 
-    let regular_loaded = load_first_font(fonts, "selected_font", regular_candidates);
-    if !semibold_candidates.is_empty() {
-        let _ = load_first_font(fonts, "selected_font_semibold", semibold_candidates);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let regular_loaded = load_first_font(fonts, "selected_font", regular_candidates);
+        if !semibold_candidates.is_empty() {
+            let _ = load_first_font(fonts, "selected_font_semibold", semibold_candidates);
+        }
+        let mono_loaded = load_first_font(fonts, "selected_font_mono", mono_candidates);
+        (regular_loaded, mono_loaded)
     }
-    let mono_loaded = load_first_font(fonts, "selected_font_mono", mono_candidates);
-    (regular_loaded, mono_loaded)
 }
 
 pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool) {
@@ -1903,6 +1941,27 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
                 egui::FontData::from_static(OPEN_SANS_SEMIBOLD),
             );
             selected_font_loaded = true;
+        }
+        "sf_pro_text" => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let reg_u = format!("{home}/Library/Fonts/SF-Pro-Text-Regular.otf");
+            let sb_u = format!("{home}/Library/Fonts/SF-Pro-Text-Semibold.otf");
+            selected_font_loaded = load_first_font(
+                &mut fonts,
+                "selected_font",
+                &[reg_u.as_str(), "/Library/Fonts/SF-Pro-Text-Regular.otf"],
+            );
+            if selected_font_loaded {
+                let _ = load_first_font(
+                    &mut fonts,
+                    "selected_font_semibold",
+                    &[sb_u.as_str(), "/Library/Fonts/SF-Pro-Text-Semibold.otf"],
+                );
+            }
+        }
+        "helvetica_neue" => {
+            selected_font_loaded =
+                load_ttc_font_pair(&mut fonts, "/System/Library/Fonts/HelveticaNeue.ttc", 0, 10);
         }
         "be_vietnam_pro" => {}
         "default" | "" | "system" => {
@@ -2011,9 +2070,9 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
     let semibold = fonts.families.entry(font_family_semibold()).or_default();
     if fonts.font_data.contains_key("selected_font_semibold") {
         semibold.push("selected_font_semibold".to_owned());
-    }
-    if selected_font_loaded {
-        semibold.push("selected_font".to_owned());
+        if selected_font_loaded {
+            semibold.push("selected_font".to_owned());
+        }
     }
     semibold.push("bundled_sans_semibold".to_owned());
     semibold.push("bundled_sans".to_owned());

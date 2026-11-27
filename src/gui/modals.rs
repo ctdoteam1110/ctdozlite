@@ -387,24 +387,6 @@ impl ZaloGuiApp {
                             .add_sized(
                                 [200.0, 28.0],
                                 egui::Button::new(
-                                    RichText::new(format!("{}  Nhật ký & Hồ sơ Social", lucide::NEWSPAPER))
-                                        .size(12.2)
-                                        .color(pal.text_primary),
-                                )
-                                .fill(Color32::TRANSPARENT),
-                            )
-                            .on_hover_cursor(CursorIcon::PointingHand)
-                            .clicked()
-                        {
-                            self.feed_modal_open = true;
-                            self.trigger_feed_timeline_load();
-                            close_menu = true;
-                        }
-
-                        if ui
-                            .add_sized(
-                                [200.0, 28.0],
-                                egui::Button::new(
                                     RichText::new(format!("{}  Làm mới hội thoại", lucide::REFRESH))
                                         .size(12.2)
                                         .color(pal.text_primary),
@@ -2738,19 +2720,36 @@ impl ZaloGuiApp {
                                                             ui.label(RichText::new("Tối ưu hóa hiển thị đầy đủ ký tự tiếng Việt").color(pal.text_secondary).size(11.5));
                                                         });
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            let default_font_lbl = if cfg!(target_os = "macos") {
+                                                                "Mặc định (SF Pro / macOS)"
+                                                            } else {
+                                                                "Mặc định (Hệ thống)"
+                                                            };
                                                             let current_label = match self.settings.font_family.as_str() {
+                                                                "sf_pro_text" => "SF Pro Text (Apple)",
+                                                                "helvetica_neue" => "Helvetica Neue (macOS)",
                                                                 "be_vietnam_pro" => "Be Vietnam Pro",
                                                                 "segoe_ui" | "segoe" => "Segoe UI",
                                                                 "arial" => "Arial",
                                                                 "tahoma" => "Tahoma",
                                                                 "open_sans" => "Open Sans",
-                                                                _ => "Mặc định (Hệ thống)",
+                                                                _ => default_font_lbl,
                                                             };
                                                             egui::ComboBox::from_id_salt("appearance_font_family_combo")
                                                                 .selected_text(current_label)
                                                                 .width(190.0)
                                                                 .show_ui(ui, |ui| {
-                                                                    if ui.selectable_value(&mut self.settings.font_family, "default".into(), "Mặc định (Hệ thống)").changed() {
+                                                                    if ui.selectable_value(&mut self.settings.font_family, "default".into(), default_font_lbl).changed() {
+                                                                        font_changed = true;
+                                                                    }
+                                                                    if cfg!(target_os = "macos")
+                                                                        && ui.selectable_value(&mut self.settings.font_family, "sf_pro_text".into(), "SF Pro Text (Apple)").changed()
+                                                                    {
+                                                                        font_changed = true;
+                                                                    }
+                                                                    if cfg!(target_os = "macos")
+                                                                        && ui.selectable_value(&mut self.settings.font_family, "helvetica_neue".into(), "Helvetica Neue (macOS)").changed()
+                                                                    {
                                                                         font_changed = true;
                                                                     }
                                                                     if ui.selectable_value(&mut self.settings.font_family, "be_vietnam_pro".into(), "Be Vietnam Pro").changed() {
@@ -8271,6 +8270,81 @@ impl ZaloGuiApp {
             match gallery.iter().position(|g| g.tex_key == viewer.tex_key) {
                 Some(i) => {
                     viewer.gallery = gallery;
+                    viewer.gallery_index = i;
+                    self.prefetch_gallery_neighbours(&viewer);
+                }
+                None => {
+                    viewer.gallery = vec![GalleryPhoto {
+                        tex_key: viewer.tex_key.clone(),
+                        thumb_url: String::new(),
+                        full_url: viewer.full_url.clone(),
+                        title: viewer.title.clone(),
+                        sender: viewer.sender.clone(),
+                        time: viewer.time.clone(),
+                    }];
+                    viewer.gallery_index = 0;
+                }
+            }
+        }
+        let gallery_len = viewer.gallery.len();
+        let mut go_to: Option<usize> = None;
+        if gallery_len > 1 {
+            let (left, right) =
+                ctx.input(|i| (i.key_pressed(Key::ArrowLeft), i.key_pressed(Key::ArrowRight)));
+            if left && viewer.gallery_index > 0 {
+                go_to = Some(viewer.gallery_index - 1);
+            } else if right && viewer.gallery_index + 1 < gallery_len {
+                go_to = Some(viewer.gallery_index + 1);
+            }
+        }
+        let strip: Vec<(usize, Option<egui::TextureHandle>)> = if gallery_len > 1 {
+            let half = 5usize;
+            let start = viewer
+                .gallery_index
+                .saturating_sub(half)
+                .min(gallery_len.saturating_sub(half * 2 + 1));
+            let end = (start + half * 2 + 1).min(gallery_len);
+            (start..end)
+                .map(|i| (i, self.sticker_textures.get(&viewer.gallery[i].tex_key).cloned()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let strip_missing: Vec<(String, String)> = strip
+            .iter()
+            .filter(|(_, t)| t.is_none())
+            .map(|(i, _)| &viewer.gallery[*i])
+            .filter(|g| !g.thumb_url.is_empty())
+            .map(|g| (g.tex_key.clone(), g.thumb_url.clone()))
+            .collect();
+        for (key, url) in strip_missing {
+            self.request_sticker_image(key, url);
+        }
+
+        let screen_rect = ctx.screen_rect();
+        let viewer_top = (screen_rect.top() + 32.0).min(screen_rect.bottom());
+        let toolbar_h = 46.0_f32;
+        let toolbar_rect = Rect::from_min_max(
+            Pos2::new(screen_rect.left(), viewer_top),
+            Pos2::new(
+                screen_rect.right(),
+                (viewer_top + toolbar_h).min(screen_rect.bottom()),
+            ),
+        );
+        let stage_area_rect = Rect::from_min_max(
+            Pos2::new(screen_rect.left(), toolbar_rect.bottom()),
+            screen_rect.max,
+        );
+        let mut should_close = false;
+
+        let active_tex = if let Some(tex) = viewer
+            .hd_tex_key
+            .as_ref()
+            .and_then(|hk| self.sticker_textures.get(hk).map(|t| (hk.as_str(), t)))
+        {
+            crate::gui::mark_texture_used(tex.0);
+            Some(tex.1.clone())
+        } else if let Some(tex) = self.sticker_textures.get(&viewer.tex_key) {
             crate::gui::mark_texture_used(&viewer.tex_key);
             Some(tex.clone())
         } else {
@@ -10098,6 +10172,7 @@ impl ZaloGuiApp {
             });
     }
 
+    #[allow(dead_code)]
     pub(super) fn trigger_feed_timeline_load(&mut self) {
         if self.feed_loading_timeline {
             return;
@@ -10149,6 +10224,7 @@ impl ZaloGuiApp {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn render_feed_page(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         // Left Friends / Filter Sidebar (292px)
         egui::SidePanel::left("feed_friends_sidebar")

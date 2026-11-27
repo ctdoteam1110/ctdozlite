@@ -2084,23 +2084,21 @@ pub(super) fn render_message_body(
                         .sense(Sense::click());
                     let resp = ui
                         .add(img)
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text("Bấm để xem ảnh phóng to trong ứng dụng");
+                        .on_hover_cursor(CursorIcon::PointingHand);
+                    let photo_hovered = is_pointer_over_media(ui, resp.rect);
                     ui.painter().rect_stroke(
                         resp.rect,
                         Rounding::same(12.0),
                         Stroke::new(
-                            if resp.hovered() { 1.6_f32 } else { 1.0_f32 },
-                            if resp.hovered() {
+                            if photo_hovered { 1.6_f32 } else { 1.0_f32 },
+                            if photo_hovered {
                                 pal.primary
                             } else {
                                 pal.border
                             },
                         ),
                     );
-                    // Pointer-in-rect rather than `hovered()`: the save button on top steals
-                    // hover, and the dimmed overlay should not flicker off under it.
-                    if ui.rect_contains_pointer(resp.rect) {
+                    if photo_hovered {
                         ui.painter().rect_filled(
                             resp.rect,
                             Rounding::same(12.0),
@@ -3463,11 +3461,33 @@ pub(crate) fn compute_video_thumb_size(tw: usize, th: usize, max_text_width: f32
     }
 }
 
+/// Checks whether the pointer is inside the visible portion of `rect` without being occluded by
+/// a modal, drawer, or context menu. Ignores `Order::Tooltip` layers so tooltips spawned over or
+/// near media thumbnails never cause alternating-frame hover flicker.
+fn is_pointer_over_media(ui: &egui::Ui, rect: Rect) -> bool {
+    let clipped = ui.clip_rect().intersect(rect);
+    if !clipped.is_positive() {
+        return false;
+    }
+    let Some(pos) = ui
+        .ctx()
+        .input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()))
+    else {
+        return false;
+    };
+    if !clipped.contains(pos) {
+        return false;
+    }
+    ui.ctx()
+        .layer_id_at(pos)
+        .is_none_or(|l| l == ui.layer_id() || l.order == egui::Order::Tooltip)
+}
+
 /// Round download button over the top-right corner of a photo or video, shown while the
 /// pointer is over `media_rect`. Registered after the media widget so it wins the click.
 /// Returns `true` when it was clicked.
 fn media_save_overlay(ui: &mut egui::Ui, media_rect: Rect, id: Id) -> bool {
-    if !ui.rect_contains_pointer(media_rect) {
+    if !is_pointer_over_media(ui, media_rect) {
         return false;
     }
     let size = (media_rect.width().min(media_rect.height()) * 0.4).clamp(18.0, 30.0);
@@ -3479,7 +3499,11 @@ fn media_save_overlay(ui: &mut egui::Ui, media_rect: Rect, id: Id) -> bool {
         .interact(btn, id, Sense::click())
         .on_hover_cursor(CursorIcon::PointingHand)
         .on_hover_text("Tải về máy (thư mục Downloads)");
-    let alpha = if resp.hovered() { 240 } else { 190 };
+    let alpha = if is_pointer_over_media(ui, btn) {
+        240
+    } else {
+        190
+    };
     ui.painter().circle_filled(
         btn.center(),
         size * 0.5,
@@ -4295,7 +4319,7 @@ fn render_photo_album_grid(
                         resp
                     }
                 };
-                if resp.hovered() {
+                if is_pointer_over_media(ui, resp.rect) {
                     ui.painter().rect_stroke(
                         resp.rect,
                         Rounding::same(6.0),
@@ -4324,7 +4348,6 @@ fn render_photo_album_grid(
                 }
                 let open_clicked = resp
                     .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text("Bấm để xem ảnh phóng to trong ứng dụng")
                     .clicked();
                 if save_clicked {
                     action = Some(BubbleAction::SaveMedia {
@@ -5041,7 +5064,7 @@ pub(super) fn render_chat_bubble(
                     loading_stickers,
                 );
             } else {
-                ui.add_space(30.0);
+                ui.add_space(30.0 + ui.spacing().item_spacing.x);
             }
 
             let fill = if has_sticker || is_frameless_photo {
@@ -5100,8 +5123,10 @@ pub(super) fn render_chat_bubble(
                                 ui.label(
                                     RichText::new(truncate_chars(display_sender, 22))
                                         .color(sender_accent)
-                                        .size(12.0)
-                                        .strong(),
+                                        .font(FontId::new(
+                                            12.2,
+                                            crate::gui::theme::font_family_semibold(),
+                                        )),
                                 );
                                 ui.add_space(2.0);
                             }
@@ -6043,9 +6068,11 @@ pub(super) fn render_hover_reaction_bar(
         .ctx()
         .input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
     let top_layer = pointer_pos.and_then(|p| ui.ctx().layer_id_at(p));
-    let pointer_hits_chat = top_layer.is_none_or(|l| l == ui.layer_id());
-    let pointer_hits_chat_or_bar =
-        top_layer.is_none_or(|l| l == ui.layer_id() || l == bar_layer_id);
+    let pointer_hits_chat =
+        top_layer.is_none_or(|l| l == ui.layer_id() || l.order == egui::Order::Tooltip);
+    let pointer_hits_chat_or_bar = top_layer.is_none_or(|l| {
+        l == ui.layer_id() || l == bar_layer_id || l.order == egui::Order::Tooltip
+    });
     let in_hover_zone =
         pointer_hits_chat_or_bar && pointer_pos.is_some_and(|p| hover_zone.contains(p));
     let in_bubble = pointer_hits_chat
