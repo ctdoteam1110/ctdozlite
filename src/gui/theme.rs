@@ -1336,6 +1336,8 @@ pub(super) fn draw_icon_cloud(painter: &egui::Painter, center: Pos2, size: f32, 
 pub(super) fn draw_icon_settings(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     draw_lucide_icon(painter, center, lucide::SETTINGS, size, color);
 }
+#[allow(dead_code)]
+#[allow(dead_code)]
 pub(super) fn draw_icon_feed(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     draw_lucide_icon(painter, center, lucide::NEWSPAPER, size, color);
 }

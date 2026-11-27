@@ -494,47 +494,6 @@ impl ZaloGuiApp {
                         }
                     }
 
-                    ui.add_space(6.0);
-
-                    // Navigation Icon 4: Nhật ký (Social Feed & Profile)
-                    let (nav4_rect, nav4_resp) =
-                        ui.allocate_exact_size(Vec2::new(42.0, 42.0), Sense::click());
-                    if self.feed_modal_open {
-                        ui.painter().rect_filled(
-                            nav4_rect,
-                            Rounding::same(11.0),
-                            pal.primary.linear_multiply(0.18),
-                        );
-                        let pill = Rect::from_min_size(
-                            Pos2::new(nav4_rect.left() - 6.0, nav4_rect.center().y - 10.0),
-                            Vec2::new(3.5, 20.0),
-                        );
-                        ui.painter()
-                            .rect_filled(pill, Rounding::same(2.0), pal.primary);
-                    } else if nav4_resp.hovered() {
-                        ui.painter()
-                            .rect_filled(nav4_rect, Rounding::same(11.0), pal.glass_hover());
-                    }
-                    draw_icon_feed(
-                        ui.painter(),
-                        nav4_rect.center(),
-                        19.0,
-                        if self.feed_modal_open {
-                            pal.primary_hover
-                        } else {
-                            pal.text_secondary
-                        },
-                    );
-                    if nav4_resp
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text("Tường nhà / Nhật ký bạn bè")
-                        .clicked()
-                    {
-                        self.contacts_view_open = false;
-                        self.feed_modal_open = true;
-                        self.trigger_feed_timeline_load();
-                    }
-
                     // Push bottom actions to the bottom of the Left Rail
                     let bottom_reserve = if cfg!(target_os = "macos") { 148.0 } else { 100.0 };
                     let rem_h = (ui.available_height() - bottom_reserve).max(12.0);
@@ -698,22 +657,6 @@ impl ZaloGuiApp {
 
         if self.contacts_view_open {
             self.render_contacts_page(ctx, pal);
-            self.render_profile_popover(ctx, pal);
-            self.render_wipe_confirm(ctx, pal);
-            self.render_logout_confirm(ctx, pal);
-            self.render_toast_overlay(ctx, pal);
-            self.render_forward_dialog(ctx, pal);
-            self.render_reactions_dialog(ctx, pal);
-            self.render_call_overlay(ctx, pal);
-            self.render_image_viewer_modal(ctx, pal);
-            self.render_video_player_modal(ctx, pal);
-            self.render_doc_viewer_modal(ctx, pal);
-            self.render_phone_lookup_modal(ctx, pal);
-            self.render_settings_modal(ctx, pal);
-            return;
-        }
-        if self.feed_modal_open {
-            self.render_feed_page(ctx, pal);
             self.render_profile_popover(ctx, pal);
             self.render_wipe_confirm(ctx, pal);
             self.render_logout_confirm(ctx, pal);
@@ -2856,7 +2799,6 @@ impl ZaloGuiApp {
         // 3. COLLAPSIBLE RIGHT CONVERSATION INFO DRAWER (Panel >= 880px, Animated Overlay < 880px)
         // -------------------------------------------------------------------
         let mut open_chat_member: Option<crate::chat::SidebarMember> = None;
-        let mut view_profile_member: Option<String> = None;
         if is_compact_w && self.info_drawer_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.info_drawer_open = false;
         }
@@ -3527,7 +3469,7 @@ impl ZaloGuiApp {
                                             }
                                         }
 
-                                        // 3. Thêm thành viên (group) / Hồ sơ & Nhật ký (1-1)
+                                        // 3. Thêm thành viên (group)
                                         if d_is_group {
                                             if draw_circle_action(
                                                 ui,
@@ -3551,26 +3493,6 @@ impl ZaloGuiApp {
                                                 }
                                                 self.fetching_group_members.insert(d_id.clone());
                                                 self.show_toast("Đã mở danh sách thành viên nhóm");
-                                            }
-                                        } else if draw_circle_action(
-                                            ui,
-                                            lucide::NEWSPAPER,
-                                            "Xem hồ sơ",
-                                            "& Nhật ký",
-                                            false,
-                                        )
-                                        .clicked()
-                                        {
-                                            self.feed_modal_open = true;
-                                            self.feed_modal_tab = FeedModalTab::Profile;
-                                            self.feed_target_uid = d_id.clone();
-                                            self.feed_loading_profile = true;
-                                            self.feed_profile_error = None;
-                                            self.trigger_feed_timeline_load();
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::FetchSocialProfile {
-                                                    target_uid: d_id.clone(),
-                                                });
                                             }
                                         }
 
@@ -3924,31 +3846,6 @@ impl ZaloGuiApp {
                                                                 if chat_btn.clicked() {
                                                                     open_chat_member =
                                                                         Some(m.clone());
-                                                                }
-
-                                                                let prof_btn = ui
-                                                                    .add(
-                                                                        egui::Button::new(
-                                                                            RichText::new(
-                                                                                lucide::USER,
-                                                                            )
-                                                                            .size(12.0)
-                                                                            .color(
-                                                                                pal.text_secondary,
-                                                                            ),
-                                                                        )
-                                                                        .fill(Color32::TRANSPARENT)
-                                                                        .frame(false),
-                                                                    )
-                                                                    .on_hover_cursor(
-                                                                        CursorIcon::PointingHand,
-                                                                    )
-                                                                    .on_hover_text(
-                                                                        "Xem trang cá nhân",
-                                                                    );
-                                                                if prof_btn.clicked() {
-                                                                    view_profile_member =
-                                                                        Some(m.id.clone());
                                                                 }
                                                             },
                                                         );
@@ -5724,18 +5621,6 @@ impl ZaloGuiApp {
                 self.persist_threads_async();
             }
             self.show_toast(format!("Đã mở cuộc trò chuyện với {}", m.name));
-        }
-
-        if let Some(uid) = view_profile_member {
-            self.feed_modal_open = true;
-            self.feed_modal_tab = FeedModalTab::Profile;
-            self.feed_target_uid = uid.clone();
-            self.feed_loading_profile = true;
-            self.feed_profile_error = None;
-            self.trigger_feed_timeline_load();
-            if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::FetchSocialProfile { target_uid: uid });
-            }
         }
 
         // -------------------------------------------------------------------
