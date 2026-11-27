@@ -131,6 +131,9 @@ const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) ZaloPC/26.10.11 Chrome/122.0.0.0 Electron/29.0.0 Safari/537.36";
 
 const PING_SECS: u64 = 15;
+const CONNECT_TIMEOUT_SECS: u64 = 15;
+const SEND_TIMEOUT_SECS: u64 = 10;
+const STALE_TIMEOUT_SECS: u64 = PING_SECS * 3;
 
 // -- wire level ----------------------------------------------------------------
 
@@ -449,9 +452,13 @@ fn spawn_with_role(sess: Session, role: SocketRole) -> mpsc::UnboundedReceiver<W
         let mut backoff = 2u64;
         let mut endpoint_idx = 0usize;
         loop {
-            match run_once(&sess, &tx, endpoint_idx, role).await {
+            let mut had_auth = false;
+            match run_once(&sess, &tx, endpoint_idx, role, &mut had_auth).await {
                 Ok(reason) => trace(format!("closed: {reason}")),
                 Err(e) => trace(format!("error: {e:#}")),
+            }
+            if had_auth {
+                backoff = 2;
             }
             if tx.is_closed() {
                 break;
@@ -473,6 +480,7 @@ async fn run_once(
     tx: &mpsc::UnboundedSender<WsEvent>,
     endpoint_idx: usize,
     role: SocketRole,
+    had_auth: &mut bool,
 ) -> Result<String> {
     let url = build_url(sess, endpoint_idx);
     trace(format!("connect {url}"));
@@ -491,22 +499,29 @@ async fn run_once(
         h.insert(USER_AGENT, HeaderValue::from_static(UA));
     }
 
-    let (mut ws, resp) = match connect_async(req).await {
-        Ok(pair) => pair,
-        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+    let (mut ws, resp) = match tokio::time::timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        connect_async(req),
+    )
+    .await
+    {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(tokio_tungstenite::tungstenite::Error::Http(resp))) => {
             let mut detail = format!("handshake status {}", resp.status());
             for (k, v) in resp.headers() {
                 detail.push_str(&format!("\n  {k}: {}", v.to_str().unwrap_or("<bin>")));
             }
             bail!("{detail}");
         }
-        Err(e) => return Err(e.into()),
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => bail!("connect timeout after {CONNECT_TIMEOUT_SECS}s"),
     };
     trace(format!("handshake {}", resp.status()));
 
     const MAX_PENDING_OUTBOUND: usize = 32;
     let mut cipher_key: Option<Vec<u8>> = None;
     let mut authed = false;
+    let mut last_rx = tokio::time::Instant::now();
     let mut pending_outbound: Vec<Vec<u8>> = Vec::new();
     let mut req_id = 0u64;
     let mut ping = tokio::time::interval(Duration::from_secs(PING_SECS));
@@ -533,16 +548,29 @@ async fn run_once(
                 return Ok("receiver dropped".into());
             }
             _ = ping.tick() => {
+                if last_rx.elapsed() >= Duration::from_secs(STALE_TIMEOUT_SECS) {
+                    return Ok(format!("stale connection ({}s without server response)", last_rx.elapsed().as_secs()));
+                }
                 if authed {
                     let body = json!({ "eventId": now_ms() });
                     let f = encode_frame(CMD_PING, SUB_KEEP_CONNECTION, 1, Some(&body));
-                    ws.send(Message::Binary(f.into())).await?;
+                    tokio::time::timeout(
+                        Duration::from_secs(SEND_TIMEOUT_SECS),
+                        ws.send(Message::Binary(f.into())),
+                    )
+                    .await
+                    .map_err(|_| anyhow!("ping send timeout"))??;
                     trace("-> ping");
                 }
             }
             Some(frame) = out_rx.recv() => {
                 if authed {
-                    ws.send(Message::Binary(frame.into())).await?;
+                    tokio::time::timeout(
+                        Duration::from_secs(SEND_TIMEOUT_SECS),
+                        ws.send(Message::Binary(frame.into())),
+                    )
+                    .await
+                    .map_err(|_| anyhow!("outbound send timeout"))??;
                     trace("-> outbound ws frame");
                 } else if pending_outbound.len() < MAX_PENDING_OUTBOUND {
                     pending_outbound.push(frame);
@@ -556,6 +584,7 @@ async fn run_once(
                     return Ok("eof".into());
                 };
                 let incoming = incoming?;
+                last_rx = tokio::time::Instant::now();
                 let buf = match incoming {
                     Message::Binary(b) => b,
                     Message::Text(t) => {
@@ -601,6 +630,7 @@ async fn run_once(
                         return Err(anyhow!("auth rejected: {text}"));
                     }
                     authed = true;
+                    *had_auth = true;
                     let _ = tx.send(WsEvent { cmd, sub_cmd, version, payload: auth.clone() });
 
                     for (qcmd, qsub) in queues_from_auth(&auth) {

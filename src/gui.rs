@@ -23,6 +23,8 @@ use crate::session::Session;
 
 pub(crate) mod attachments;
 mod color_emoji;
+#[cfg(target_os = "macos")]
+mod macos_glass;
 pub(crate) mod messages;
 mod modals;
 mod poll_card;
@@ -881,6 +883,10 @@ pub enum GuiEvent {
     ),
     MuteSnapshotSynced(HashMap<String, i64>),
     PinnedSnapshotSynced(Vec<String>),
+    HiddenSnapshotSynced {
+        thread_ids: Vec<String>,
+        pin_hash: String,
+    },
     MuteEventsReceived(Vec<crate::chat::MuteControlEvent>),
     PhoneSyncProgress {
         progress: f32,
@@ -954,6 +960,7 @@ pub enum GuiEvent {
         uin: String,
         note: Option<String>,
         watch: Vec<String>,
+        privacy_allowed: bool,
         error: Option<String>,
     },
     /// Kết quả auto-save note (debounce) từ worker thread.
@@ -1268,6 +1275,8 @@ pub(crate) struct AppSettings {
     #[serde(skip)]
     quick_reply_draft: String,
     hidden_chat_pin_enabled: bool,
+    #[serde(default)]
+    hidden_chat_pin_hash: String,
     split_priority_inbox: bool,
     excel_paste_mode: String, // "image" | "text" | "ask"
     #[serde(default = "settings_default_true")]
@@ -1362,6 +1371,7 @@ impl Default for AppSettings {
             quick_reply_items: default_quick_reply_items(),
             quick_reply_draft: String::new(),
             hidden_chat_pin_enabled: true,
+            hidden_chat_pin_hash: String::new(),
             split_priority_inbox: false,
             excel_paste_mode: "ask".into(),
             render_markdown: true,
@@ -1637,6 +1647,8 @@ pub struct ZaloGuiApp {
     pending_attachments: Vec<attachments::PendingAttachment>,
     unread_counts: HashMap<String, usize>,
     reaction_unread_counts: HashMap<String, usize>,
+    hidden_chats_unlocked: bool,
+    hidden_pin_draft: String,
     /// Message IDs that have already triggered an unread bump/notification in this session (#146).
     notified_msg_ids: HashSet<String>,
     /// `(uin, banner progress)`: persisted so replayed reactions do not re-banner.
@@ -1668,6 +1680,10 @@ pub struct ZaloGuiApp {
     group_watch_inputs: HashMap<String, String>,
     /// Cache keyword DB để render list (thread_id → keywords).
     group_watch_cache: HashMap<String, Vec<String>>,
+    /// Cached per-thread LLM attachment privacy flag (`thread_id` -> allowed).
+    group_privacy_cache: HashMap<String, bool>,
+    /// Cached Info Drawer shared media/files/links/pins for the active thread.
+    drawer_media_cache: Option<std::sync::Arc<workspace::DrawerMediaCache>>,
     /// Stats nhóm đang hiển thị (thread_id → (fetched_at, stats)).
     group_stats_cache: HashMap<String, (std::time::Instant, crate::group_stats::GroupStats)>,
     /// Nhóm đang nạp note/watch async (tránh spawn trùng mỗi frame).
@@ -1838,6 +1854,8 @@ impl ZaloGuiApp {
         initial_threads: Vec<Thread>,
     ) -> Self {
         let mut loaded_settings = AppSettings::load();
+        #[cfg(not(target_os = "macos"))]
+        crate::os_notify::init_native_notifications(loaded_settings.enable_notifications);
         setup_custom_fonts_with_choice(&cc.egui_ctx, &loaded_settings.font_family);
         let safe_scale = loaded_settings.normalized_font_scale();
         cc.egui_ctx.set_zoom_factor(safe_scale);
@@ -2035,6 +2053,8 @@ impl ZaloGuiApp {
             pending_attachments: Vec::new(),
             unread_counts: HashMap::new(),
             reaction_unread_counts: HashMap::new(),
+            hidden_chats_unlocked: false,
+            hidden_pin_draft: String::new(),
             notified_msg_ids: HashSet::new(),
             reaction_banner_mark: (String::new(), Default::default()),
             link_metadata_cache: HashMap::new(),
@@ -2054,6 +2074,8 @@ impl ZaloGuiApp {
             group_note_saved_label: HashMap::new(),
             group_watch_inputs: HashMap::new(),
             group_watch_cache: HashMap::new(),
+            group_privacy_cache: HashMap::new(),
+            drawer_media_cache: None,
             group_stats_cache: HashMap::new(),
             group_note_loading: HashSet::new(),
             group_note_load_error: HashMap::new(),
@@ -2170,6 +2192,7 @@ impl ZaloGuiApp {
             win_resize_drag: None,
         };
         let mut app = app;
+        app.ensure_visible_selected_thread();
         let _ = app.reload_custom_sticker_packs();
 
         // Clean up any leftover `.old` executable from a previous in-place self-update
@@ -2579,6 +2602,36 @@ impl ZaloGuiApp {
     /// socket control events (`pin_message` / `unpin_topic`) instead.
     fn maybe_refresh_board_pins(&mut self) {}
 
+    pub(super) fn is_thread_hidden(&self, t: &Thread) -> bool {
+        t.presentation.hidden || self.settings.hidden_threads.contains(&t.id)
+    }
+
+    pub(super) fn is_thread_id_hidden(&self, tid: &str) -> bool {
+        self.settings.hidden_threads.contains(tid)
+            || self.threads.iter().any(|t| t.id == tid && t.presentation.hidden)
+    }
+
+    pub(super) fn ensure_visible_selected_thread(&mut self) {
+        if self.hidden_chats_unlocked {
+            return;
+        }
+        let cur_hidden = self
+            .threads
+            .get(self.selected_thread_index)
+            .is_some_and(|t| self.is_thread_hidden(t));
+        if cur_hidden {
+            if let Some(idx) = self.threads.iter().position(|t| !self.is_thread_hidden(t)) {
+                self.selected_thread_index = idx;
+            }
+        }
+    }
+
+    pub(super) fn lock_hidden_chats(&mut self) {
+        self.hidden_chats_unlocked = false;
+        self.ensure_visible_selected_thread();
+        self.thread_list_cache = None;
+    }
+
     fn persist_threads_async(&self) {
         self.publish_known_threads();
         if self.user_uin.is_empty() {
@@ -2749,6 +2802,8 @@ impl ZaloGuiApp {
                         self.group_note_saved_label.clear();
                         self.group_watch_inputs.clear();
                         self.group_watch_cache.clear();
+                        self.group_privacy_cache.clear();
+                        self.drawer_media_cache = None;
                         self.group_stats_cache.clear();
                         self.script_list_cache.clear();
                         self.script_editing_id = None;
@@ -2845,9 +2900,15 @@ impl ZaloGuiApp {
                             } else if nt.unread.is_muted() {
                                 nt.presentation.muted = true;
                             }
+                            let is_hidden_target =
+                                self.settings.hidden_threads.contains(&nt.id)
+                                    || nt.presentation.hidden;
                             if let Some(existing) = self.threads.iter_mut().find(|t| t.id == nt.id)
                             {
-                                let is_thread_muted = settings_muted_until.is_some()
+                                let is_thread_hidden =
+                                    is_hidden_target || existing.presentation.hidden;
+                                let is_thread_muted = is_thread_hidden
+                                    || settings_muted_until.is_some()
                                     || existing.presentation.muted
                                     || existing.unread.is_muted()
                                     || nt.presentation.muted
@@ -2912,7 +2973,7 @@ impl ZaloGuiApp {
                                                     })
                                                     .collect();
                                             let inc_cnt = notify_items.len();
-                                            if inc_cnt > 0 {
+                                            if inc_cnt > 0 && !is_thread_hidden {
                                                 *self
                                                     .unread_counts
                                                     .entry(existing.id.clone())
@@ -3058,7 +3119,9 @@ impl ZaloGuiApp {
                                 // event / poll batch tiếp theo) mới đếm qua nhánh
                                 // merge ở trên. Đơn giản và đúng vì mọi tin trong
                                 // batch đầu đều là history, không phải tin mới.
-                                let is_thread_muted = settings_muted_until.is_some()
+                                let is_thread_hidden = is_hidden_target;
+                                let is_thread_muted = is_thread_hidden
+                                    || settings_muted_until.is_some()
                                     || nt.presentation.muted
                                     || nt.unread.is_muted();
                                 let seen = nt.unread.last_seen_id.as_deref().unwrap_or("");
@@ -3082,7 +3145,7 @@ impl ZaloGuiApp {
                                     .map(|m| (m.id.clone(), m.sender.clone(), m.text.clone()))
                                     .collect();
                                 let inc_cnt = unseen_items.len();
-                                if inc_cnt > 0 && (nt.id != active_tid || !is_focused) {
+                                if inc_cnt > 0 && !is_thread_hidden && (nt.id != active_tid || !is_focused) {
                                     *self.unread_counts.entry(nt.id.clone()).or_insert(0) +=
                                         inc_cnt;
                                 }
@@ -3149,9 +3212,9 @@ impl ZaloGuiApp {
                             if self.settings.play_notification_sound {
                                 crate::media::play_notification_chime();
                             }
-                            #[cfg(not(target_os = "windows"))]
+                            #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
                             crate::os_notify::notify_chat_batch(&chat_banners);
-                            #[cfg(target_os = "windows")]
+                            #[cfg(any(target_os = "windows", target_os = "macos"))]
                             let _ = &chat_banners;
                             ctx.request_repaint();
                             let total_unread: usize = self.unread_counts.values().sum();
@@ -3256,6 +3319,8 @@ impl ZaloGuiApp {
                     self.group_note_saved_label.clear();
                     self.group_watch_inputs.clear();
                     self.group_watch_cache.clear();
+                    self.group_privacy_cache.clear();
+                    self.drawer_media_cache = None;
                     self.group_stats_cache.clear();
                     self.script_list_cache.clear();
                     self.script_editing_id = None;
@@ -3293,6 +3358,8 @@ impl ZaloGuiApp {
                     self.group_note_saved_label.clear();
                     self.group_watch_inputs.clear();
                     self.group_watch_cache.clear();
+                    self.group_privacy_cache.clear();
+                    self.drawer_media_cache = None;
                     self.group_stats_cache.clear();
                     self.script_list_cache.clear();
                     self.script_editing_id = None;
@@ -3327,7 +3394,10 @@ impl ZaloGuiApp {
                     // the background still show as unread.
                     self.reaction_unread_counts.clear();
                     self.notified_msg_ids.clear();
+                    self.hidden_chats_unlocked = false;
                     self.unread_counts = unread_counts_from_read_points(&threads);
+                    self.unread_counts
+                        .retain(|tid, _| !self.settings.hidden_threads.contains(tid));
                     self.user_name = name.clone();
                     self.user_avatar = avatar;
                     self.threads = threads;
@@ -3345,6 +3415,8 @@ impl ZaloGuiApp {
                     self.group_note_saved_label.clear();
                     self.group_watch_inputs.clear();
                     self.group_watch_cache.clear();
+                    self.group_privacy_cache.clear();
+                    self.drawer_media_cache = None;
                     self.group_stats_cache.clear();
                     self.script_list_cache.clear();
                     self.script_editing_id = None;
@@ -3619,13 +3691,14 @@ impl ZaloGuiApp {
                             continue;
                         }
                         for t in &self.threads {
-                            let muted = self
-                                .settings
-                                .muted_threads
-                                .get(&t.id)
-                                .copied()
-                                .filter(|&u| u == -1 || u > now_ts_react)
-                                .is_some()
+                            let muted = self.is_thread_hidden(t)
+                                || self
+                                    .settings
+                                    .muted_threads
+                                    .get(&t.id)
+                                    .copied()
+                                    .filter(|&u| u == -1 || u > now_ts_react)
+                                    .is_some()
                                 || t.presentation.muted
                                 || t.unread.is_muted();
                             if muted || !reactions_notify_on {
@@ -3685,13 +3758,14 @@ impl ZaloGuiApp {
                             }
                         }
                         let Some(tid) = hit_tid else { continue };
-                        let is_muted = self
-                            .settings
-                            .muted_threads
-                            .get(&tid)
-                            .copied()
-                            .filter(|&u| u == -1 || u > now_ts_react)
-                            .is_some()
+                        let is_muted = self.is_thread_id_hidden(&tid)
+                            || self
+                                .settings
+                                .muted_threads
+                                .get(&tid)
+                                .copied()
+                                .filter(|&u| u == -1 || u > now_ts_react)
+                                .is_some()
                             || self
                                 .threads
                                 .iter()
@@ -3736,7 +3810,7 @@ impl ZaloGuiApp {
                         });
                     }
                     if !reaction_banners.is_empty() && reactions_notify_on {
-                        #[cfg(target_os = "windows")]
+                        #[cfg(any(target_os = "windows", target_os = "macos"))]
                         if let Some((tid, title, avt, is_grp, body)) = reaction_banners.last().cloned()
                         {
                             self.incoming_popup = Some(IncomingPopupState::new(
@@ -3744,14 +3818,14 @@ impl ZaloGuiApp {
                             ));
                             ctx.request_repaint();
                         }
-                        #[cfg(not(target_os = "windows"))]
+                        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
                         for (_, title, _, _, body) in &reaction_banners {
                             crate::os_notify::notify(title, body);
                         }
                         if reactions_sound_on {
-                            #[cfg(target_os = "windows")]
+                            #[cfg(any(target_os = "windows", target_os = "macos"))]
                             crate::media::play_notification_chime();
-                            #[cfg(not(target_os = "windows"))]
+                            #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
                             crate::os_notify::play_notification_sound();
                         }
                     }
@@ -4328,7 +4402,14 @@ impl ZaloGuiApp {
                     self.history_reached_start.insert(tid);
                     self.show_toast("Đã hiển thị toàn bộ lịch sử tin nhắn của cuộc trò chuyện này");
                 }
-                GuiEvent::GroupNoteLoaded { thread_id, uin, note, watch, error } => {
+                GuiEvent::GroupNoteLoaded {
+                    thread_id,
+                    uin,
+                    note,
+                    watch,
+                    privacy_allowed,
+                    error,
+                } => {
                     self.group_note_loading.remove(&thread_id);
                     // Stale (đổi acc trước khi worker trả) → bỏ, không đè cache acc mới.
                     if uin != self.user_uin {
@@ -4343,6 +4424,8 @@ impl ZaloGuiApp {
                                 self.group_note_drafts.insert(thread_id.clone(), n);
                             }
                             self.group_watch_cache.insert(thread_id.clone(), watch);
+                            self.group_privacy_cache
+                                .insert(thread_id.clone(), privacy_allowed);
                             self.group_note_loaded.insert(thread_id.clone());
                             self.group_note_load_error.remove(&thread_id);
                         }
@@ -4492,6 +4575,7 @@ impl ZaloGuiApp {
                                             Some(info.latest_version.clone());
                                         self.update_modal_open = true;
                                         self.update_banner_dismissed = false;
+                                        #[cfg(not(target_os = "macos"))]
                                         if self.settings.enable_notifications {
                                             crate::updater::notify_os_new_update(
                                                 &info.latest_version,
@@ -4614,6 +4698,34 @@ impl ZaloGuiApp {
                         }
                     }
                     crate::chat::apply_pinned_threads(&mut self.threads, &pinned_ids);
+                    self.settings.save();
+                    self.persist_threads_async();
+                }
+                GuiEvent::HiddenSnapshotSynced {
+                    thread_ids,
+                    pin_hash,
+                } => {
+                    self.settings.hidden_threads = thread_ids.into_iter().collect();
+                    if !pin_hash.is_empty() {
+                        self.settings.hidden_chat_pin_hash = pin_hash;
+                    }
+                    crate::chat::apply_hidden_threads(
+                        &mut self.threads,
+                        &self.settings.hidden_threads,
+                    );
+                    self.unread_counts
+                        .retain(|tid, _| !self.settings.hidden_threads.contains(tid));
+                    self.reaction_unread_counts
+                        .retain(|tid, _| !self.settings.hidden_threads.contains(tid));
+                    let total_unread: usize = self.unread_counts.values().sum();
+                    let title = if total_unread > 0 {
+                        format!("({total_unread}) ctdozlite")
+                    } else {
+                        "ctdozlite".to_string()
+                    };
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+                    self.ensure_visible_selected_thread();
+                    self.thread_list_cache = None;
                     self.settings.save();
                     self.persist_threads_async();
                 }
@@ -5009,6 +5121,18 @@ fn file_uri(path: &str) -> String {
 // ---------------------------------------------------------------------------
 
 impl eframe::App for ZaloGuiApp {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = visuals;
+            egui::Rgba::TRANSPARENT.to_array()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            visuals.window_fill().to_normalized_gamma_f32()
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.update_frame(ctx, frame);
         self.color_emoji.paint(ctx);
@@ -5040,17 +5164,25 @@ impl eframe::App for ZaloGuiApp {
 impl ZaloGuiApp {
     fn update_frame(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_windows_frameless_subclass(ctx);
+        #[cfg(target_os = "macos")]
+        macos_glass::install_vibrancy_if_needed(self.dark_mode);
 
-        // Ctrl+Q and the tray's "Thoát" quit; closing the window only hides it to the
+        // Ctrl+Q / Cmd+Q and the tray's "Thoát" quit; closing the window only hides it to the
         // tray while a tray icon is shown, so the app keeps receiving messages.
-        let quit_now = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
+        let quit_now = ctx
+            .input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(Key::Q))
             || self.take_tray_quit_request();
         if quit_now {
             self.allow_quit = true;
         }
         let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if close_requested && !self.allow_quit && self.hides_to_tray() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        let hide_on_close = cfg!(target_os = "macos") || self.hides_to_tray();
+        let cmd_w_hide = cfg!(target_os = "macos")
+            && ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::W));
+        if (close_requested || cmd_w_hide) && !self.allow_quit && hide_on_close {
+            if close_requested {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         } else if quit_now || close_requested {
             self.allow_quit = true;
@@ -5093,6 +5225,15 @@ impl ZaloGuiApp {
                 self.settings.animations_enabled,
                 self.settings.normalized_animation_speed(),
             );
+            #[cfg(target_os = "macos")]
+            {
+                macos_glass::sync_vibrancy_theme(self.dark_mode);
+                ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(if self.dark_mode {
+                    egui::SystemTheme::Dark
+                } else {
+                    egui::SystemTheme::Light
+                }));
+            }
             self.theme_dirty = false;
         }
 
@@ -5239,6 +5380,7 @@ impl ZaloGuiApp {
 
         let pal = self.palette();
 
+        #[cfg(not(target_os = "macos"))]
         self.handle_frameless_resize(ctx);
         self.render_custom_title_bar(ctx, &pal);
         // Dev Inspector Panel
@@ -5288,18 +5430,47 @@ impl ZaloGuiApp {
         // Main Workspace
         if !self.is_logged_in {
             egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
+                .frame(egui::Frame::none().fill(pal.glass_canvas()))
                 .show(ctx, |ui| {
                     self.render_login_screen(ui, &pal);
                 });
         } else {
             self.mark_active_thread_read_if_focused(ctx);
             self.render_chat_workspace(ctx, &pal);
+            #[cfg(target_os = "macos")]
+            {
+                let screen = ctx.screen_rect();
+                let drag_zone = Rect::from_min_max(
+                    Pos2::new(screen.left() + 72.0, screen.top()),
+                    Pos2::new(screen.right(), screen.top() + 58.0),
+                );
+                let (want_drag, want_max) = ctx.input(|i| {
+                    let in_zone = i
+                        .pointer
+                        .press_origin()
+                        .or_else(|| i.pointer.interact_pos())
+                        .is_some_and(|p| drag_zone.contains(p));
+                    if !in_zone {
+                        return (false, false);
+                    }
+                    let dbl = i.pointer.button_double_clicked(egui::PointerButton::Primary);
+                    let drag = i.pointer.primary_down() && i.pointer.is_decidedly_dragging();
+                    (drag, dbl)
+                });
+                if !ctx.is_using_pointer() {
+                    if want_max {
+                        self.toggle_maximize(ctx);
+                    } else if want_drag {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                }
+            }
         }
 
         // Auto-notification modal for new GitHub Releases (works on both Login & Chat screens)
         self.render_update_notification_modal(ctx, &pal);
 
+        #[cfg(not(target_os = "macos"))]
         if !self.is_window_maximized(ctx) {
             let screen = ctx.screen_rect();
             ctx.layer_painter(egui::LayerId::new(
@@ -5325,6 +5496,7 @@ impl ZaloGuiApp {
 // ---------------------------------------------------------------------------
 
 impl ZaloGuiApp {
+    #[cfg(not(target_os = "macos"))]
     fn resize_cursor_for(dir: egui::ResizeDirection) -> CursorIcon {
         match dir {
             egui::ResizeDirection::NorthWest | egui::ResizeDirection::SouthEast => {
@@ -5498,6 +5670,7 @@ impl ZaloGuiApp {
         let _ = ctx;
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn handle_frameless_resize(&mut self, ctx: &egui::Context) {
         if self.is_window_maximized(ctx) {
             #[cfg(target_os = "windows")]
@@ -5606,6 +5779,7 @@ impl ZaloGuiApp {
     }
 
     fn render_custom_title_bar(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        #[cfg(not(target_os = "macos"))]
         let is_maximized = self.is_window_maximized(ctx);
         let mut toggle_max_requested = false;
         let mut drag_started = false;
@@ -5620,22 +5794,56 @@ impl ZaloGuiApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(icon))));
             }
         }
+        #[cfg(target_os = "macos")]
+        if self.is_logged_in {
+            return;
+        }
 
-        egui::TopBottomPanel::top("custom_title_bar")
-            .exact_height(32.0)
-            .frame(
+        #[cfg(target_os = "macos")]
+        let (title_bar_height, title_bar_frame) = {
+            let mac_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            let left_inset = if mac_fullscreen { 12.0 } else { 78.0 };
+            (
+                34.0,
                 egui::Frame::none()
-                    .fill(pal.bg_app)
+                    .fill(pal.glass_titlebar())
                     .inner_margin(Margin {
-                        left: 12.0,
-                        right: 0.0,
+                        left: left_inset,
+                        right: 10.0,
                         top: 0.0,
                         bottom: 0.0,
-                    })
-                    .stroke(Stroke::new(1.0_f32, pal.border)),
+                    }),
             )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (title_bar_height, title_bar_frame) = (
+            32.0,
+            egui::Frame::none()
+                .fill(pal.bg_app)
+                .inner_margin(Margin {
+                    left: 12.0,
+                    right: 0.0,
+                    top: 0.0,
+                    bottom: 0.0,
+                })
+                .stroke(Stroke::new(1.0_f32, pal.border)),
+        );
+
+        egui::TopBottomPanel::top("custom_title_bar")
+            .exact_height(title_bar_height)
+            .show_separator_line(false)
+            .frame(title_bar_frame)
             .show(ctx, |ui| {
                 let bar_rect = ui.max_rect();
+                #[cfg(target_os = "macos")]
+                {
+                    let screen = ctx.screen_rect();
+                    let y = bar_rect.bottom() - 0.5;
+                    ui.painter().line_segment(
+                        [Pos2::new(screen.left(), y), Pos2::new(screen.right(), y)],
+                        Stroke::new(1.0_f32, pal.glass_border()),
+                    );
+                }
                 let mut buttons_left_x = bar_rect.right();
 
                 ui.horizontal_centered(|ui| {
@@ -5685,127 +5893,141 @@ impl ZaloGuiApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
 
-                        // Close Button (46x32)
-                        let (close_rect, close_resp) =
-                            ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
-                        if close_resp.hovered() {
-                            ui.painter().rect_filled(
-                                close_rect,
-                                Rounding::ZERO,
-                                Color32::from_rgb(232, 17, 35),
-                            );
-                        }
-                        let close_fg = if close_resp.hovered() {
-                            Color32::WHITE
-                        } else {
-                            pal.text_secondary
-                        };
-                        let cc = close_rect.center();
-                        let d = 4.6_f32;
-                        ui.painter().line_segment(
-                            [Pos2::new(cc.x - d, cc.y - d), Pos2::new(cc.x + d, cc.y + d)],
-                            Stroke::new(1.4_f32, close_fg),
-                        );
-                        ui.painter().line_segment(
-                            [Pos2::new(cc.x + d, cc.y - d), Pos2::new(cc.x - d, cc.y + d)],
-                            Stroke::new(1.4_f32, close_fg),
-                        );
-                        let to_tray = self.hides_to_tray();
-                        let close_resp = close_resp.on_hover_text(if to_tray {
-                            "Ẩn xuống khay hệ thống (thoát: menu icon khay hoặc Ctrl+Q)"
-                        } else {
-                            "Đóng ứng dụng (Ctrl+Q)"
-                        });
-                        if close_resp.clicked() {
-                            if to_tray {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            // Close Button (46x32)
+                            let (close_rect, close_resp) =
+                                ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
+                            if close_resp.hovered() {
+                                ui.painter().rect_filled(
+                                    close_rect,
+                                    Rounding::ZERO,
+                                    Color32::from_rgb(232, 17, 35),
+                                );
+                            }
+                            let close_fg = if close_resp.hovered() {
+                                Color32::WHITE
                             } else {
-                                self.allow_quit = true;
-                                if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::EndCall);
+                                pal.text_secondary
+                            };
+                            let cc = close_rect.center();
+                            let d = 4.6_f32;
+                            ui.painter().line_segment(
+                                [Pos2::new(cc.x - d, cc.y - d), Pos2::new(cc.x + d, cc.y + d)],
+                                Stroke::new(1.4_f32, close_fg),
+                            );
+                            ui.painter().line_segment(
+                                [Pos2::new(cc.x + d, cc.y - d), Pos2::new(cc.x - d, cc.y + d)],
+                                Stroke::new(1.4_f32, close_fg),
+                            );
+                            let to_tray = self.hides_to_tray();
+                            let close_resp = close_resp.on_hover_text(if to_tray {
+                                "Ẩn xuống khay hệ thống (thoát: menu icon khay hoặc Ctrl+Q)"
+                            } else {
+                                "Đóng ứng dụng (Ctrl+Q)"
+                            });
+                            if close_resp.clicked() {
+                                if to_tray {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                                } else {
+                                    self.allow_quit = true;
+                                    if let Some(tx) = WORKER_TX.get() {
+                                        let _ = tx.send(WorkerCmd::EndCall);
+                                    }
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                 }
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+
+                            // Maximize / Restore Button (46x32)
+                            let (max_rect, max_resp) =
+                                ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
+                            if max_resp.hovered() {
+                                ui.painter()
+                                    .rect_filled(max_rect, Rounding::ZERO, pal.bg_hover);
+                            }
+                            let max_fg = if max_resp.hovered() {
+                                pal.text_primary
+                            } else {
+                                pal.text_secondary
+                            };
+                            let mc = max_rect.center();
+                            if is_maximized {
+                                let back = Rect::from_center_size(
+                                    Pos2::new(mc.x + 1.2, mc.y - 1.2),
+                                    Vec2::splat(7.8),
+                                );
+                                let front = Rect::from_center_size(
+                                    Pos2::new(mc.x - 1.2, mc.y + 1.2),
+                                    Vec2::splat(7.8),
+                                );
+                                ui.painter().rect_stroke(
+                                    back,
+                                    Rounding::same(1.0),
+                                    Stroke::new(1.25_f32, max_fg),
+                                );
+                                ui.painter().rect_filled(
+                                    front,
+                                    Rounding::same(1.0),
+                                    if max_resp.hovered() {
+                                        pal.bg_hover
+                                    } else {
+                                        pal.bg_app
+                                    },
+                                );
+                                ui.painter().rect_stroke(
+                                    front,
+                                    Rounding::same(1.0),
+                                    Stroke::new(1.25_f32, max_fg),
+                                );
+                            } else {
+                                let sq = Rect::from_center_size(mc, Vec2::splat(9.5));
+                                ui.painter().rect_stroke(
+                                    sq,
+                                    Rounding::same(1.2),
+                                    Stroke::new(1.3_f32, max_fg),
+                                );
+                            }
+                            if max_resp
+                                .on_hover_text(if is_maximized {
+                                    "Khôi phục kích thước"
+                                } else {
+                                    "Phóng to toàn màn hình"
+                                })
+                                .clicked()
+                            {
+                                toggle_max_requested = true;
+                            }
+
+                            // Minimize Button (46x32)
+                            let (min_rect, min_resp) =
+                                ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
+                            if min_resp.hovered() {
+                                ui.painter()
+                                    .rect_filled(min_rect, Rounding::ZERO, pal.bg_hover);
+                            }
+                            let min_fg = if min_resp.hovered() {
+                                pal.text_primary
+                            } else {
+                                pal.text_secondary
+                            };
+                            let mnc = min_rect.center();
+                            ui.painter().line_segment(
+                                [Pos2::new(mnc.x - 5.0, mnc.y), Pos2::new(mnc.x + 5.0, mnc.y)],
+                                Stroke::new(1.4_f32, min_fg),
+                            );
+                            if min_resp.on_hover_text("Thu nhỏ").clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                             }
                         }
 
-                        // Maximize / Restore Button (46x32)
-                        let (max_rect, max_resp) =
-                            ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
-                        if max_resp.hovered() {
-                            ui.painter()
-                                .rect_filled(max_rect, Rounding::ZERO, pal.bg_hover);
-                        }
-                        let max_fg = if max_resp.hovered() {
-                            pal.text_primary
-                        } else {
-                            pal.text_secondary
-                        };
-                        let mc = max_rect.center();
-                        if is_maximized {
-                            let back = Rect::from_center_size(
-                                Pos2::new(mc.x + 1.2, mc.y - 1.2),
-                                Vec2::splat(7.8),
-                            );
-                            let front = Rect::from_center_size(
-                                Pos2::new(mc.x - 1.2, mc.y + 1.2),
-                                Vec2::splat(7.8),
-                            );
-                            ui.painter()
-                                .rect_stroke(back, Rounding::same(1.0), Stroke::new(1.25_f32, max_fg));
-                            ui.painter().rect_filled(
-                                front,
-                                Rounding::same(1.0),
-                                if max_resp.hovered() {
-                                    pal.bg_hover
-                                } else {
-                                    pal.bg_app
-                                },
-                            );
-                            ui.painter()
-                                .rect_stroke(front, Rounding::same(1.0), Stroke::new(1.25_f32, max_fg));
-                        } else {
-                            let sq = Rect::from_center_size(mc, Vec2::splat(9.5));
-                            ui.painter()
-                                .rect_stroke(sq, Rounding::same(1.2), Stroke::new(1.3_f32, max_fg));
-                        }
-                        if max_resp
-                            .on_hover_text(if is_maximized {
-                                "Khôi phục kích thước"
-                            } else {
-                                "Phóng to toàn màn hình"
-                            })
-                            .clicked()
-                        {
-                            toggle_max_requested = true;
-                        }
-
-                        // Minimize Button (46x32)
-                        let (min_rect, min_resp) =
-                            ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
-                        if min_resp.hovered() {
-                            ui.painter()
-                                .rect_filled(min_rect, Rounding::ZERO, pal.bg_hover);
-                        }
-                        let min_fg = if min_resp.hovered() {
-                            pal.text_primary
-                        } else {
-                            pal.text_secondary
-                        };
-                        let mnc = min_rect.center();
-                        ui.painter().line_segment(
-                            [Pos2::new(mnc.x - 5.0, mnc.y), Pos2::new(mnc.x + 5.0, mnc.y)],
-                            Stroke::new(1.4_f32, min_fg),
-                        );
-                        if min_resp.on_hover_text("Thu nhỏ").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                        }
-
-                        // Quick Theme Toggle (36x32)
-                        let (th_rect, th_resp) =
-                            ui.allocate_exact_size(Vec2::new(36.0, 32.0), Sense::click());
+                        // Quick Theme Toggle
+                        #[cfg(target_os = "macos")]
+                        let (th_size, th_rounding) = (Vec2::new(28.0, 24.0), Rounding::same(6.0));
+                        #[cfg(not(target_os = "macos"))]
+                        let (th_size, th_rounding) = (Vec2::new(36.0, 32.0), Rounding::ZERO);
+                        let (th_rect, th_resp) = ui.allocate_exact_size(th_size, Sense::click());
                         if th_resp.hovered() {
-                            ui.painter()
-                                .rect_filled(th_rect, Rounding::ZERO, pal.bg_hover);
+                            ui.painter().rect_filled(th_rect, th_rounding, pal.bg_hover);
                         }
                         let th_icon = if self.dark_mode {
                             lucide::SUN
@@ -5964,9 +6186,16 @@ impl ZaloGuiApp {
                     let pad_x = if card_w < 300.0 { 16.0 } else { 28.0 };
 
                     egui::Frame::none()
-                        .fill(pal.bg_elevated)
-                        .rounding(Rounding::same(16.0))
-                        .stroke(Stroke::new(1.0_f32, pal.border))
+                        .fill(pal.glass_elevated())
+                        .rounding(Rounding::same(if cfg!(target_os = "macos") { 20.0 } else { 16.0 }))
+                        .stroke(Stroke::new(
+                            1.0_f32,
+                            if cfg!(target_os = "macos") {
+                                pal.glass_specular()
+                            } else {
+                                pal.border
+                            },
+                        ))
                         .inner_margin(Margin::symmetric(pad_x, 24.0))
                         .show(ui, |ui| {
                             ui.set_width(card_w);
@@ -6251,7 +6480,7 @@ impl ZaloGuiApp {
             if self.settings.play_notification_sound {
                 crate::media::play_notification_chime();
             }
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             if let Some((title, body)) = banners.last().cloned() {
                 self.incoming_popup = Some(IncomingPopupState::new(
                     String::new(),
@@ -6262,7 +6491,7 @@ impl ZaloGuiApp {
                     activity.incoming,
                 ));
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
             crate::os_notify::notify_chat_batch(&banners);
         }
     }
@@ -6576,6 +6805,9 @@ fn collect_fresh_incoming_unread<'a>(
 fn unread_counts_from_read_points(threads: &[Thread]) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
     for thread in threads {
+        if thread.presentation.hidden {
+            continue;
+        }
         let Some(seen) = thread.unread.last_seen_id.as_deref().filter(|s| !s.is_empty()) else {
             continue;
         };

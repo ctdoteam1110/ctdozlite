@@ -129,6 +129,241 @@ impl ThemePalette {
         }
     }
 
+    pub(super) fn glass_titlebar(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(13, 20, 31, 212)
+            } else {
+                Color32::from_rgba_unmultiplied(222, 230, 241, 214)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_app
+        }
+    }
+
+    pub(super) fn glass_rail(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(13, 20, 31, 212)
+            } else {
+                Color32::from_rgba_unmultiplied(222, 230, 241, 214)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_app
+        }
+    }
+
+    pub(super) fn glass_sidebar(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(21, 31, 45, 232)
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 244)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_sidebar
+        }
+    }
+
+    pub(super) fn glass_bar(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(22, 33, 48, 236)
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 246)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_sidebar
+        }
+    }
+
+    pub(super) fn glass_canvas(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(13, 20, 31, 224)
+            } else {
+                Color32::from_rgba_unmultiplied(220, 229, 241, 218)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_chat_canvas
+        }
+    }
+
+    pub(super) fn glass_elevated(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(24, 35, 50, 246)
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 248)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_elevated
+        }
+    }
+
+    pub(super) fn glass_input(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(30, 43, 60, 226)
+            } else {
+                Color32::from_rgba_unmultiplied(235, 240, 247, 235)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_input
+        }
+    }
+
+    pub(super) fn glass_selected(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(
+                    self.primary.r(),
+                    self.primary.g(),
+                    self.primary.b(),
+                    165,
+                )
+            } else {
+                Color32::from_rgba_unmultiplied(
+                    self.primary.r(),
+                    self.primary.g(),
+                    self.primary.b(),
+                    34,
+                )
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_selected
+        }
+    }
+
+    pub(super) fn glass_hover(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(38, 52, 72, 115)
+            } else {
+                Color32::from_rgba_unmultiplied(15, 23, 42, 18)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bg_hover
+        }
+    }
+
+    pub(super) fn glass_popup_border(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(74, 96, 124, 110)
+            } else {
+                Color32::from_rgba_unmultiplied(15, 23, 42, 42)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.border
+        }
+    }
+
+    pub(super) fn glass_border(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(56, 74, 98, 68)
+            } else {
+                Color32::from_rgba_unmultiplied(15, 23, 42, 30)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.border
+        }
+    }
+
+    pub(super) fn glass_control_border(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(74, 96, 124, 88)
+            } else {
+                Color32::from_rgba_unmultiplied(15, 23, 42, 42)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.border
+        }
+    }
+
+    pub(super) fn glass_specular(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(74, 96, 124, 82)
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 215)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.border
+        }
+    }
+
+    pub(super) fn glass_bubble_out(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(29, 73, 130, 240)
+            } else {
+                Color32::from_rgba_unmultiplied(219, 234, 254, 240)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bubble_out_bg
+        }
+    }
+
+    pub(super) fn glass_bubble_in(&self) -> Color32 {
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_dark {
+                Color32::from_rgba_unmultiplied(33, 46, 64, 246)
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 250)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.bubble_in_bg
+        }
+    }
+
     pub(super) fn apply_to_ctx_with_anim(
         &self,
         ctx: &egui::Context,
@@ -148,31 +383,52 @@ impl ThemePalette {
         };
         visuals.dark_mode = self.is_dark;
 
-        visuals.panel_fill = self.bg_app;
-        visuals.window_fill = self.bg_elevated;
-        visuals.extreme_bg_color = self.bg_input;
-        visuals.faint_bg_color = self.bg_hover;
+        visuals.panel_fill = self.glass_sidebar();
+        visuals.window_fill = self.glass_elevated();
+        #[cfg(target_os = "macos")]
+        {
+            visuals.window_rounding = Rounding::same(14.0);
+            visuals.window_stroke = Stroke::new(1.0_f32, self.glass_popup_border());
+            visuals.menu_rounding = Rounding::same(10.0);
+            visuals.popup_shadow = egui::epaint::Shadow {
+                offset: Vec2::new(0.0, 6.0),
+                blur: 20.0,
+                spread: 0.0,
+                color: Color32::from_black_alpha(if self.is_dark { 155 } else { 52 }),
+            };
+            visuals.window_shadow = egui::epaint::Shadow {
+                offset: Vec2::new(0.0, 10.0),
+                blur: 28.0,
+                spread: 0.0,
+                color: Color32::from_black_alpha(if self.is_dark { 175 } else { 62 }),
+            };
+        }
+        visuals.extreme_bg_color = self.glass_input();
+        visuals.faint_bg_color = self.glass_hover();
         visuals.override_text_color = Some(self.text_primary);
-        visuals.widgets.noninteractive.weak_bg_fill = self.bg_app;
+        visuals.widgets.noninteractive.weak_bg_fill = self.glass_sidebar();
         visuals.selection.bg_fill =
             self.primary
-                .linear_multiply(if self.is_dark { 0.45 } else { 0.22 });
+                .linear_multiply(if self.is_dark { 0.36 } else { 0.22 });
         visuals.selection.stroke = Stroke::new(1.5_f32, self.primary);
 
+        #[cfg(target_os = "macos")]
+        let r = Rounding::same(10.0);
+        #[cfg(not(target_os = "macos"))]
         let r = Rounding::same(8.0);
-        visuals.widgets.noninteractive.bg_fill = self.bg_app;
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.border);
+        visuals.widgets.noninteractive.bg_fill = self.glass_sidebar();
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.glass_border());
         visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, self.text_primary);
         visuals.widgets.noninteractive.rounding = r;
 
-        visuals.widgets.inactive.bg_fill = self.bg_elevated;
-        visuals.widgets.inactive.weak_bg_fill = self.bg_elevated;
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.border);
+        visuals.widgets.inactive.bg_fill = self.glass_elevated();
+        visuals.widgets.inactive.weak_bg_fill = self.glass_elevated();
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.glass_control_border());
         visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, self.text_primary);
         visuals.widgets.inactive.rounding = r;
 
-        visuals.widgets.hovered.bg_fill = self.bg_hover;
-        visuals.widgets.hovered.weak_bg_fill = self.bg_hover;
+        visuals.widgets.hovered.bg_fill = self.glass_hover();
+        visuals.widgets.hovered.weak_bg_fill = self.glass_hover();
         visuals.widgets.hovered.bg_stroke = Stroke::new(1.2_f32, self.primary);
         visuals.widgets.hovered.fg_stroke = Stroke::new(1.2_f32, self.text_primary);
         visuals.widgets.hovered.rounding = r;
@@ -333,12 +589,22 @@ impl ThemePalette {
             if let Some(c) = parse_hex_color(hex).filter(|c| c.a() > 0) {
                 let effective = blend_over(c, self.bg_app);
                 self.primary = c;
-                self.primary_hover = Color32::from_rgba_unmultiplied(
-                    c.r().saturating_add(25),
-                    c.g().saturating_add(25),
-                    c.b().saturating_add(25),
-                    c.a(),
-                );
+                self.primary_hover = if self.is_dark {
+                    let lift = |v: u8| -> u8 {
+                        ((v as f32) + (255.0 - v as f32) * 0.42)
+                            .round()
+                            .clamp(0.0, 255.0) as u8
+                    };
+                    Color32::from_rgba_unmultiplied(lift(c.r()), lift(c.g()), lift(c.b()), c.a())
+                } else {
+                    Color32::from_rgba_unmultiplied(
+                        c.r().saturating_sub(14),
+                        c.g().saturating_sub(14),
+                        c.b().saturating_sub(14),
+                        c.a(),
+                    )
+                };
+                self.link_text = self.primary_hover;
                 self.primary_fg = if contrast_ratio(Color32::WHITE, effective)
                     >= contrast_ratio(Color32::from_rgb(15, 23, 42), effective)
                 {
@@ -355,8 +621,8 @@ impl ThemePalette {
         }
         if let Some(hex) = bubble_out_hex {
             if let Some(c) = parse_hex_color(hex).filter(|c| c.a() > 0) {
-                let effective = blend_over(c, self.bg_chat_canvas);
                 self.bubble_out_bg = c;
+                let effective = blend_over(self.glass_bubble_out(), self.glass_canvas());
                 let dark_text = Color32::from_rgb(15, 23, 42);
                 let light_text = Color32::from_rgb(235, 240, 246);
                 self.bubble_out_text =
@@ -380,8 +646,8 @@ impl ThemePalette {
         }
         if let Some(hex) = bubble_in_hex {
             if let Some(c) = parse_hex_color(hex).filter(|c| c.a() > 0) {
-                let effective = blend_over(c, self.bg_chat_canvas);
                 self.bubble_in_bg = c;
+                let effective = blend_over(self.glass_bubble_in(), self.glass_canvas());
                 let dark_text = Color32::from_rgb(15, 23, 42);
                 let light_text = Color32::from_rgb(230, 233, 238);
                 self.bubble_in_text =
@@ -1070,6 +1336,8 @@ pub(super) fn draw_icon_cloud(painter: &egui::Painter, center: Pos2, size: f32, 
 pub(super) fn draw_icon_settings(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     draw_lucide_icon(painter, center, lucide::SETTINGS, size, color);
 }
+#[allow(dead_code)]
+#[allow(dead_code)]
 pub(super) fn draw_icon_feed(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     draw_lucide_icon(painter, center, lucide::NEWSPAPER, size, color);
 }
@@ -1485,6 +1753,120 @@ pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
     setup_custom_fonts_with_choice(ctx, "default");
 }
 
+fn load_first_font(fonts: &mut egui::FontDefinitions, key: &str, candidates: &[&str]) -> bool {
+    for path in candidates {
+        if let Ok(font_data) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert(key.to_owned(), egui::FontData::from_owned(font_data));
+            return true;
+        }
+    }
+    false
+}
+
+fn load_ttc_font_pair(
+    fonts: &mut egui::FontDefinitions,
+    path: &str,
+    regular_index: u32,
+    semibold_index: u32,
+) -> bool {
+    if let Ok(bytes) = std::fs::read(path) {
+        let mut regular = egui::FontData::from_owned(bytes.clone());
+        regular.index = regular_index;
+        let mut semibold = egui::FontData::from_owned(bytes);
+        semibold.index = semibold_index;
+        fonts.font_data.insert("selected_font".to_owned(), regular);
+        fonts
+            .font_data
+            .insert("selected_font_semibold".to_owned(), semibold);
+        return true;
+    }
+    false
+}
+
+fn load_system_ui_fonts(fonts: &mut egui::FontDefinitions) -> (bool, bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let sf_reg_user = format!("{home}/Library/Fonts/SF-Pro-Text-Regular.otf");
+        let sf_sb_user = format!("{home}/Library/Fonts/SF-Pro-Text-Semibold.otf");
+        let sf_reg_sys = "/Library/Fonts/SF-Pro-Text-Regular.otf".to_string();
+        let sf_sb_sys = "/Library/Fonts/SF-Pro-Text-Semibold.otf".to_string();
+        let regular_loaded = if load_first_font(
+            fonts,
+            "selected_font",
+            &[sf_reg_user.as_str(), sf_reg_sys.as_str()],
+        ) {
+            let _ = load_first_font(
+                fonts,
+                "selected_font_semibold",
+                &[sf_sb_user.as_str(), sf_sb_sys.as_str()],
+            );
+            true
+        } else {
+            load_ttc_font_pair(fonts, "/System/Library/Fonts/HelveticaNeue.ttc", 0, 10)
+        };
+        let mono_loaded = load_first_font(
+            fonts,
+            "selected_font_mono",
+            &["/System/Library/Fonts/Menlo.ttc"],
+        );
+        return (regular_loaded, mono_loaded);
+    }
+    #[cfg(target_os = "windows")]
+    let (regular_candidates, semibold_candidates, mono_candidates): (&[&str], &[&str], &[&str]) = (
+        &[
+            "C:\\Windows\\Fonts\\segoeui.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+        ],
+        &[
+            "C:\\Windows\\Fonts\\seguisb.ttf",
+            "C:\\Windows\\Fonts\\segoeuib.ttf",
+        ],
+        &[
+            "C:\\Windows\\Fonts\\CascadiaMono.ttf",
+            "C:\\Windows\\Fonts\\consola.ttf",
+        ],
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let (regular_candidates, semibold_candidates, mono_candidates): (&[&str], &[&str], &[&str]) = (
+        &[
+            "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+            "/usr/share/fonts/cantarell/Cantarell-Regular.otf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ],
+        &[
+            "/usr/share/fonts/google-noto/NotoSans-SemiBold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
+            "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-M.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ],
+        &[
+            "/usr/share/fonts/google-noto/NotoSansMono-Regular.ttf",
+            "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ],
+    );
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let regular_loaded = load_first_font(fonts, "selected_font", regular_candidates);
+        if !semibold_candidates.is_empty() {
+            let _ = load_first_font(fonts, "selected_font_semibold", semibold_candidates);
+        }
+        let mono_loaded = load_first_font(fonts, "selected_font_mono", mono_candidates);
+        (regular_loaded, mono_loaded)
+    }
+}
+
 pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool) {
     let mut fonts = egui::FontDefinitions::default();
 
@@ -1495,8 +1877,7 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
         egui::FontData::from_static(LUCIDE_BYTES),
     );
 
-    // 2. Bundled Vietnamese sans-serif (Regular + SemiBold) so diacritics & bold headings
-    //    render identically on every OS. System fonts below are only an optional override.
+    // 2. Bundled Vietnamese sans-serif (Regular + SemiBold) as guaranteed fallback.
     const BUNDLED_SANS: &[u8] = include_bytes!("../assets/fonts/BeVietnamPro-Regular.ttf");
     const BUNDLED_SANS_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/BeVietnamPro-SemiBold.ttf");
     fonts.font_data.insert(
@@ -1509,63 +1890,45 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
     );
     use_bundled_emoji_font(&mut fonts);
 
-    // 3. Optional user-selected system or custom font family (Requirement R2)
+    // 3. System default or user-selected font family
     let mut selected_font_loaded = false;
+    let mut selected_mono_loaded = false;
     let choice_norm = font_choice.trim().to_lowercase();
     match choice_norm.as_str() {
         "segoe_ui" | "segoe" => {
-            let candidates = [
-                "C:\\Windows\\Fonts\\segoeui.ttf",
-                "/usr/share/fonts/truetype/segoeui.ttf",
-            ];
-            for path in candidates {
-                if let Ok(font_data) = std::fs::read(path) {
-                    fonts.font_data.insert(
-                        "selected_font".to_owned(),
-                        egui::FontData::from_owned(font_data),
-                    );
-                    selected_font_loaded = true;
-                    break;
-                }
-            }
+            selected_font_loaded = load_first_font(
+                &mut fonts,
+                "selected_font",
+                &[
+                    "C:\\Windows\\Fonts\\segoeui.ttf",
+                    "/usr/share/fonts/truetype/segoeui.ttf",
+                ],
+            );
         }
         "arial" => {
-            let candidates = [
-                "C:\\Windows\\Fonts\\arial.ttf",
-                "/System/Library/Fonts/Supplemental/Arial.ttf",
-                "/Library/Fonts/Arial.ttf",
-                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            ];
-            for path in candidates {
-                if let Ok(font_data) = std::fs::read(path) {
-                    fonts.font_data.insert(
-                        "selected_font".to_owned(),
-                        egui::FontData::from_owned(font_data),
-                    );
-                    selected_font_loaded = true;
-                    break;
-                }
-            }
+            selected_font_loaded = load_first_font(
+                &mut fonts,
+                "selected_font",
+                &[
+                    "C:\\Windows\\Fonts\\arial.ttf",
+                    "/System/Library/Fonts/Supplemental/Arial.ttf",
+                    "/Library/Fonts/Arial.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                ],
+            );
         }
         "tahoma" => {
-            let candidates = [
-                "C:\\Windows\\Fonts\\tahoma.ttf",
-                "/System/Library/Fonts/Supplemental/Tahoma.ttf",
-            ];
-            for path in candidates {
-                if let Ok(font_data) = std::fs::read(path) {
-                    fonts.font_data.insert(
-                        "selected_font".to_owned(),
-                        egui::FontData::from_owned(font_data),
-                    );
-                    selected_font_loaded = true;
-                    break;
-                }
-            }
+            selected_font_loaded = load_first_font(
+                &mut fonts,
+                "selected_font",
+                &[
+                    "C:\\Windows\\Fonts\\tahoma.ttf",
+                    "/System/Library/Fonts/Supplemental/Tahoma.ttf",
+                ],
+            );
         }
         "open_sans" => {
-            // Bundled Open Sans (OFL), the face Telegram Desktop uses; covers Vietnamese.
             const OPEN_SANS: &[u8] = include_bytes!("../assets/fonts/OpenSans-Regular.ttf");
             const OPEN_SANS_SEMIBOLD: &[u8] =
                 include_bytes!("../assets/fonts/OpenSans-SemiBold.ttf");
@@ -1579,8 +1942,32 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
             );
             selected_font_loaded = true;
         }
-        "default" | "" => {
-            // Uses bundled_sans directly at priority index 0
+        "sf_pro_text" => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let reg_u = format!("{home}/Library/Fonts/SF-Pro-Text-Regular.otf");
+            let sb_u = format!("{home}/Library/Fonts/SF-Pro-Text-Semibold.otf");
+            selected_font_loaded = load_first_font(
+                &mut fonts,
+                "selected_font",
+                &[reg_u.as_str(), "/Library/Fonts/SF-Pro-Text-Regular.otf"],
+            );
+            if selected_font_loaded {
+                let _ = load_first_font(
+                    &mut fonts,
+                    "selected_font_semibold",
+                    &[sb_u.as_str(), "/Library/Fonts/SF-Pro-Text-Semibold.otf"],
+                );
+            }
+        }
+        "helvetica_neue" => {
+            selected_font_loaded =
+                load_ttc_font_pair(&mut fonts, "/System/Library/Fonts/HelveticaNeue.ttc", 0, 10);
+        }
+        "be_vietnam_pro" => {}
+        "default" | "" | "system" => {
+            let (reg, mono) = load_system_ui_fonts(&mut fonts);
+            selected_font_loaded = reg;
+            selected_mono_loaded = mono;
         }
         _custom_path => {
             if let Ok(font_data) = std::fs::read(font_choice.trim()) {
@@ -1668,6 +2055,9 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default();
+    if selected_mono_loaded {
+        mono.insert(0, "selected_font_mono".to_owned());
+    }
     mono.push("bundled_sans".to_owned());
     if fonts.font_data.contains_key("vietnamese_font") {
         mono.push("vietnamese_font".to_owned());
@@ -1680,9 +2070,9 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
     let semibold = fonts.families.entry(font_family_semibold()).or_default();
     if fonts.font_data.contains_key("selected_font_semibold") {
         semibold.push("selected_font_semibold".to_owned());
-    }
-    if selected_font_loaded {
-        semibold.push("selected_font".to_owned());
+        if selected_font_loaded {
+            semibold.push("selected_font".to_owned());
+        }
     }
     semibold.push("bundled_sans_semibold".to_owned());
     semibold.push("bundled_sans".to_owned());
@@ -1741,6 +2131,7 @@ mod tests {
                 // 🤣 (Unicode 9) and 🫠 (Unicode 14) were missing from egui's copy.
                 assert!(f.has_glyphs(&font, "🤣🫠❤\u{fe0f}"), "{font:?}");
                 assert_eq!(f.glyph_width(&font, '\u{fe0f}'), 0.0, "{font:?}");
+                assert!(f.has_glyphs(&font, "Tiếng Việt ĂÂĐÊÔƠƯ ệữởắỹ"), "{font:?}");
             });
         }
     }
@@ -1789,10 +2180,21 @@ mod tests {
             None,
             None,
             Some("#1E293B"),
-            None,
+            Some("#A1DBC9"),
         );
         assert_eq!(pal.bubble_out_bg, Color32::from_rgb(30, 41, 59));
         assert_eq!(pal.bubble_out_text, Color32::from_rgb(235, 240, 246));
+        let eff_in = {
+            let fg = pal.glass_bubble_in();
+            let bg = pal.glass_canvas();
+            let a = fg.a() as f32 / 255.0;
+            let mix = |f: u8, b: u8| -> u8 {
+                ((f as f32) * a + (b as f32) * (1.0 - a)).round().clamp(0.0, 255.0) as u8
+            };
+            Color32::from_rgb(mix(fg.r(), bg.r()), mix(fg.g(), bg.g()), mix(fg.b(), bg.b()))
+        };
+        assert!(contrast_ratio(pal.bubble_in_text, eff_in) >= 4.5);
+        assert!(contrast_ratio(pal.bubble_in_meta, eff_in) >= 4.5);
     }
 
     #[test]
@@ -1832,17 +2234,23 @@ mod tests {
         assert_eq!(ctx.theme(), egui::Theme::Dark);
         let dark_style = ctx.style();
         assert!(dark_style.visuals.dark_mode);
-        assert_eq!(dark_style.visuals.extreme_bg_color, dark.bg_input);
-        assert_eq!(dark_style.visuals.widgets.inactive.weak_bg_fill, dark.bg_elevated);
-        assert_eq!(dark_style.visuals.panel_fill, dark.bg_app);
+        assert_eq!(dark_style.visuals.extreme_bg_color, dark.glass_input());
+        assert_eq!(
+            dark_style.visuals.widgets.inactive.weak_bg_fill,
+            dark.glass_elevated()
+        );
+        assert_eq!(dark_style.visuals.panel_fill, dark.glass_sidebar());
 
         let light = ThemePalette::light();
         light.apply_to_ctx_with_anim(&ctx, false, 1.0);
         assert_eq!(ctx.theme(), egui::Theme::Light);
         let light_style = ctx.style();
         assert!(!light_style.visuals.dark_mode);
-        assert_eq!(light_style.visuals.extreme_bg_color, light.bg_input);
-        assert_eq!(light_style.visuals.widgets.inactive.weak_bg_fill, light.bg_elevated);
-        assert_eq!(light_style.visuals.panel_fill, light.bg_app);
+        assert_eq!(light_style.visuals.extreme_bg_color, light.glass_input());
+        assert_eq!(
+            light_style.visuals.widgets.inactive.weak_bg_fill,
+            light.glass_elevated()
+        );
+        assert_eq!(light_style.visuals.panel_fill, light.glass_sidebar());
     }
 }

@@ -2073,7 +2073,7 @@ pub(crate) fn next_client_message_id() -> u64 {
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     let previous = LAST_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
             Some(now.max(last.saturating_add(1)))
         })
         .unwrap_or_else(|last| last);
@@ -5562,6 +5562,7 @@ pub async fn send_reaction(
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
+
 /// Delete a message for me (`deleteOneOneMessageV2` / `deleteGroupMessageV2` @ `compact-app-pc.js:14373319`, cmd `11779` / `11834`).
 pub async fn delete_message_for_me(
     s: &Session,
@@ -6623,7 +6624,13 @@ impl PollState {
     }
 
     pub fn update_from_response(&mut self, resp: &Value) {
-        let mut data_node = resp.get("data").unwrap_or(resp);
+        let parsed_str_data: Option<Value> = resp
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok());
+        let mut data_node = parsed_str_data
+            .as_ref()
+            .unwrap_or_else(|| resp.get("data").unwrap_or(resp));
         if let Some(inner) = data_node.get("data").filter(|v| v.is_object()) {
             data_node = inner;
         }
@@ -6650,11 +6657,16 @@ impl PollState {
         }
         if let Some(qs) = data_node.get("queueStatus").and_then(Value::as_object) {
             for (qid, qval) in qs {
-                // Only update configured HTTP long-polling MSG queues ("1", "2", "3").
-                // Adding socket-only queues ("15", "16", "7", "8") causes lp_chat to reject subsequent requests.
-                let Some(entry) = self.queues.get_mut(qid) else {
+                if qid.is_empty() || !qid.bytes().all(|b| b.is_ascii_digit()) {
                     continue;
-                };
+                }
+                let entry = self
+                    .queues
+                    .entry(qid.clone())
+                    .or_insert_with(|| QueueCursor {
+                        last_id: "1".into(),
+                        ids: Vec::new(),
+                    });
                 if let Some(lid) = pick_str(qval, &["lastId"]) {
                     if lid != "0" {
                         entry.last_id = max_action_id(&entry.last_id, &lid);
@@ -6662,13 +6674,15 @@ impl PollState {
                 }
                 if let Some(ids_arr) = qval.get("ids").and_then(Value::as_array) {
                     let max_lid = entry.last_id.parse::<u128>().unwrap_or(u128::MAX);
-                    let mut new_ids: Vec<String> = ids_arr
+                    let mut new_ids: Vec<String> = entry
+                        .ids
                         .iter()
-                        .filter_map(|v| match v {
+                        .cloned()
+                        .chain(ids_arr.iter().filter_map(|v| match v {
                             Value::String(s) if !s.is_empty() => Some(s.clone()),
                             Value::Number(n) => Some(n.to_string()),
                             _ => None,
-                        })
+                        }))
                         .filter(|s| s.parse::<u128>().map(|n| n <= max_lid).unwrap_or(true))
                         .collect();
                     if !new_ids.is_empty() {
@@ -6847,8 +6861,9 @@ pub async fn poll_new_messages(
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    // 1. Poll live/offline message queues via `getChatFromPolling` (follow `more == 1` / `resetLastActionId` up to 3 batches)
-    for _ in 0..3 {
+    // 1. Poll live/offline message queues via `getChatFromPolling` (drain multi-page backlogs)
+    for _ in 0..20 {
+        let before_cursor = state.encode_params();
         let Ok(lp_resp) = get_chat_from_polling(s, state).await else {
             break;
         };
@@ -6858,7 +6873,7 @@ pub async fn poll_new_messages(
         let has_reset = pick_str(data_node, &["resetLastActionId"])
             .map(|r| r != "0" && !r.is_empty())
             .unwrap_or(false);
-        if more == 0 && !has_reset {
+        if (more == 0 && !has_reset) || state.encode_params() == before_cursor {
             break;
         }
     }
@@ -9778,6 +9793,7 @@ pub async fn update_pinned_conversation(
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
+
 /// Mark a conversation as unread or read (`addMarkAsUnread` / `removeMarkAsUnread` @ `compact-app-pc.js:14299958`, cmd `12013` / `12014`).
 pub async fn set_unread_mark(
     s: &Session,
@@ -9824,6 +9840,7 @@ pub async fn set_unread_mark(
     let resp = s.post_form(&url, format!("params={params}")).await?;
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
+
 
 /// Wire action code for muting a conversation (`SET_MUTE` in Official Zalo PC JS).
 pub const MUTE_ACTION_SET: u8 = 1;
@@ -11104,6 +11121,77 @@ pub async fn set_hidden_conversation(
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
+/// Fetch all hidden conversations and the server-stored MD5 PIN hash (`/api/hiddenconvers/get-all`, cmd `10048`).
+pub async fn get_hidden_conversations(s: &Session) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let body = json!({ "imei": s.imei });
+    let params = s.encoded_params(&body)?;
+    let url = format!(
+        "{}/api/hiddenconvers/get-all?{}&params={params}",
+        s.domains.conversation,
+        s.common_params()
+    );
+    let resp = s.get(&url).await?;
+    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+}
+
+/// Parse `(hidden_thread_ids, pin_md5_hash)` from `/api/hiddenconvers/get-all`.
+pub fn parse_hidden_conversations(resp: &Value) -> (Vec<String>, String) {
+    let data = resp.get("data").unwrap_or(resp);
+    let pin_hash = data
+        .get("pin")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut ids = Vec::new();
+    if let Some(arr) = data.get("threads").and_then(Value::as_array) {
+        for item in arr {
+            let raw = item
+                .get("thread_id")
+                .or_else(|| item.get("threadId"))
+                .or_else(|| item.get("id"))
+                .and_then(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .or_else(|| v.as_u64().map(|n| n.to_string()))
+                })
+                .or_else(|| item.as_str().map(str::to_string));
+            if let Some(id) = raw {
+                let clean = id
+                    .trim_start_matches("group_")
+                    .trim_start_matches('g')
+                    .trim_start_matches('G')
+                    .trim()
+                    .to_string();
+                if !clean.is_empty() && !ids.contains(&clean) {
+                    ids.push(clean);
+                }
+            }
+        }
+    }
+    (ids, pin_hash)
+}
+
+/// Apply the authoritative hidden-thread set to every loaded conversation.
+pub fn apply_hidden_threads(threads: &mut [Thread], hidden_ids: &std::collections::HashSet<String>) {
+    for t in threads.iter_mut() {
+        t.presentation.hidden = hidden_ids.contains(&t.id);
+    }
+}
+
+/// Verify a user-entered hidden-chat PIN against the server/local MD5 hex hash.
+pub fn verify_hidden_pin(input: &str, pin_hash: &str) -> bool {
+    let trimmed = input.trim();
+    let hash = pin_hash.trim();
+    if trimmed.is_empty() || hash.len() != 32 {
+        return false;
+    }
+    crate::crypto::md5_hex(trimmed).eq_ignore_ascii_case(hash)
+}
+
+
 /// Delete conversation history for me (`deleteOneOneConversationV2` / `deleteGroupConversationV2` @ `compact-app-pc.js:14374881`, cmd `11778` / `11835`).
 pub async fn delete_conversation(
     s: &Session,
@@ -11788,6 +11876,10 @@ mod tests {
                     "15": {
                         "lastId": "8399036593265",
                         "ids": ["8399036593265"]
+                    },
+                    "16": {
+                        "lastId": "8527156549057",
+                        "ids": ["8526575968401", "8527156549057"]
                     }
                 }
             }
@@ -11800,8 +11892,49 @@ mod tests {
             ps.queues.get("1").unwrap().ids,
             vec!["8399086511016".to_string()]
         );
-        // Socket-only queue "15" must NOT be added to HTTP polling queues
-        assert!(!ps.queues.contains_key("15"));
+        assert_eq!(ps.queues.get("15").unwrap().last_id, "8399036593265");
+        assert_eq!(ps.queues.get("16").unwrap().last_id, "8527156549057");
+        assert_eq!(
+            ps.queues.get("16").unwrap().ids,
+            vec!["8526575968401".to_string(), "8527156549057".to_string()]
+        );
+        let page2 = json!({
+            "data": "{\"lastActionId\":\"8399086511016\",\"queueStatus\":{\"16\":{\"lastId\":\"8527931403880\",\"ids\":[\"8527931403880\"]}}}"
+        });
+        ps.update_from_response(&page2);
+        assert_eq!(ps.queues.get("16").unwrap().last_id, "8527931403880");
+        assert_eq!(
+            ps.queues.get("16").unwrap().ids,
+            vec![
+                "8526575968401".to_string(),
+                "8527156549057".to_string(),
+                "8527931403880".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_and_verify_hidden_conversations() {
+        let pin_hash = crate::crypto::md5_hex("1234");
+        let resp = json!({
+            "error_code": 0,
+            "data": {
+                "pin": pin_hash,
+                "threads": [
+                    { "thread_id": "111", "is_group": 0 },
+                    { "thread_id": "g222", "is_group": 1 },
+                    { "thread_id": "111", "is_group": 0 }
+                ]
+            }
+        });
+        let (ids, parsed_pin) = parse_hidden_conversations(&resp);
+        assert_eq!(ids, vec!["111".to_string(), "222".to_string()]);
+        assert_eq!(parsed_pin, pin_hash);
+        assert!(verify_hidden_pin("1234", &parsed_pin));
+        assert!(verify_hidden_pin(" 1234 ", &parsed_pin));
+        assert!(!verify_hidden_pin("0000", &parsed_pin));
+        assert!(!verify_hidden_pin("", &parsed_pin));
+        assert!(!verify_hidden_pin("1234", ""));
     }
 
     #[test]

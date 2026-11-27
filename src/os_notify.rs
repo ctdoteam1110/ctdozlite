@@ -9,6 +9,29 @@
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn ctdozlite_macos_notify_setup(request_if_undetermined: std::ffi::c_int);
+    fn ctdozlite_macos_notify(
+        title_utf8: *const std::ffi::c_char,
+        body_utf8: *const std::ffi::c_char,
+        sound_utf8: *const std::ffi::c_char,
+    ) -> std::ffi::c_int;
+}
+
+/// Register the native macOS `UNUserNotificationCenter` delegate when running inside `.app`.
+pub fn init_native_notifications(request_permission: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: Checks for a valid `.app` bundle before touching UserNotifications.
+        unsafe {
+            ctdozlite_macos_notify_setup(if request_permission { 1 } else { 0 });
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = request_permission;
+}
+
 /// Collapse whitespace/newlines and truncate to `max_chars` characters
 /// (char boundary safe). Appends "…" when truncated.
 pub(crate) fn compact_text(raw: &str, max_chars: usize) -> String {
@@ -27,7 +50,7 @@ pub(crate) fn compact_text(raw: &str, max_chars: usize) -> String {
 }
 
 /// Escape for embedding inside a double-quoted AppleScript string literal.
-#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn escape_osascript(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -50,24 +73,17 @@ fn dispatch(title: &str, body: &str, linux_icon: &str, mac_sound: Option<&str>) 
 
     #[cfg(target_os = "macos")]
     {
-        let script = match mac_sound {
-            Some(sound) => format!(
-                "display notification \"{}\" with title \"{}\" sound name \"{sound}\"",
-                escape_osascript(&body),
-                escape_osascript(&title),
-            ),
-            None => format!(
-                "display notification \"{}\" with title \"{}\"",
-                escape_osascript(&body),
-                escape_osascript(&title),
-            ),
-        };
-        let _ = std::process::Command::new("osascript")
-            .args(["-e", &script])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        let strip_nul = |s: &str| s.replace('\0', " ");
+        let c_title = std::ffi::CString::new(strip_nul(&title)).ok();
+        let c_body = std::ffi::CString::new(strip_nul(&body)).ok();
+        let c_sound = mac_sound.and_then(|s| std::ffi::CString::new(strip_nul(s)).ok());
+        if let (Some(t), Some(b)) = (c_title.as_ref(), c_body.as_ref()) {
+            let sound_ptr = c_sound.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+            // SAFETY: Pointers are NUL-terminated `CString`s valid for the FFI call.
+            unsafe {
+                let _ = ctdozlite_macos_notify(t.as_ptr(), b.as_ptr(), sound_ptr);
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

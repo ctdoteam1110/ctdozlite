@@ -4,6 +4,13 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/assets/app_icon.ico");
     println!("cargo:rerun-if-changed=src/assets/app_icon.png");
+    println!("cargo:rerun-if-changed=native/macos/macos_notify.m");
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        if let Err(e) = build_macos_notify_bridge() {
+            panic!("Failed to build macOS notification bridge: {e}");
+        }
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -11,6 +18,65 @@ fn main() {
             println!("cargo:warning=Could not embed Windows icon resource: {e}");
         }
     }
+}
+
+fn build_macos_notify_bridge() -> Result<(), Box<dyn std::error::Error>> {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
+    let obj_path = out_dir.join("macos_notify.o");
+    let lib_path = out_dir.join("libctdozlite_macos_notify.a");
+    let raw_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_arch = match raw_arch.as_str() {
+        "aarch64" | "" => "arm64",
+        "x86_64" => "x86_64",
+        other => other,
+    };
+
+    let sdk_out = Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()?;
+    if !sdk_out.status.success() {
+        return Err("xcrun --show-sdk-path failed".into());
+    }
+    let sdk_path = String::from_utf8(sdk_out.stdout)?.trim().to_string();
+
+    let cc_status = Command::new("xcrun")
+        .args([
+            "clang",
+            "-arch",
+            target_arch,
+            "-mmacosx-version-min=11.0",
+            "-isysroot",
+            &sdk_path,
+            "-fobjc-arc",
+            "-O2",
+            "-c",
+            "native/macos/macos_notify.m",
+            "-o",
+        ])
+        .arg(&obj_path)
+        .status()?;
+    if !cc_status.success() {
+        return Err("clang failed compiling native/macos/macos_notify.m".into());
+    }
+
+    let ar_status = Command::new("xcrun")
+        .args(["ar", "rcs"])
+        .arg(&lib_path)
+        .arg(&obj_path)
+        .status()?;
+    if !ar_status.success() {
+        return Err("ar failed archiving libctdozlite_macos_notify.a".into());
+    }
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=ctdozlite_macos_notify");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+    println!("cargo:rustc-link-lib=framework=AppKit");
+    println!("cargo:rustc-link-lib=framework=UserNotifications");
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]

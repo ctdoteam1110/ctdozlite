@@ -732,17 +732,7 @@ pub fn notify_os_new_update(latest_version: &str, current_version: &str, release
 
     #[cfg(target_os = "macos")]
     {
-        let esc_title = title.replace('\\', "\\\\").replace('"', "\\\"");
-        let esc_body = body.replace('\\', "\\\\").replace('"', "\\\"");
-        let script = format!(
-            "display notification \"{esc_body}\" with title \"{esc_title}\" sound name \"Glass\""
-        );
-        let _ = std::process::Command::new("osascript")
-            .args(["-e", &script])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        crate::os_notify::notify_update(&title, &body);
     }
 
     #[cfg(target_os = "linux")]

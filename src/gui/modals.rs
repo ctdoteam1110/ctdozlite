@@ -387,24 +387,6 @@ impl ZaloGuiApp {
                             .add_sized(
                                 [200.0, 28.0],
                                 egui::Button::new(
-                                    RichText::new(format!("{}  Nhật ký & Hồ sơ Social", lucide::NEWSPAPER))
-                                        .size(12.2)
-                                        .color(pal.text_primary),
-                                )
-                                .fill(Color32::TRANSPARENT),
-                            )
-                            .on_hover_cursor(CursorIcon::PointingHand)
-                            .clicked()
-                        {
-                            self.feed_modal_open = true;
-                            self.trigger_feed_timeline_load();
-                            close_menu = true;
-                        }
-
-                        if ui
-                            .add_sized(
-                                [200.0, 28.0],
-                                egui::Button::new(
                                     RichText::new(format!("{}  Làm mới hội thoại", lucide::REFRESH))
                                         .size(12.2)
                                         .color(pal.text_primary),
@@ -650,7 +632,7 @@ impl ZaloGuiApp {
         let mut close_popup = false;
 
         if let Some(ref mut popup) = self.incoming_popup {
-            const POPUP_DURATION_MS: u64 = 6500;
+            const POPUP_DURATION_MS: u64 = 8000;
             let elapsed_ms = popup.created_at.elapsed().as_millis() as u64;
             if elapsed_ms >= POPUP_DURATION_MS || !self.settings.enable_notifications {
                 close_popup = true;
@@ -663,7 +645,7 @@ impl ZaloGuiApp {
                 let popup_h = 164.0_f32;
                 let corner_pos = get_desktop_bottom_right_pos(ctx, popup_w, popup_h);
                 let vp_id = egui::ViewportId::from_hash_of("zalo_corner_notification_popup");
-                let builder = egui::ViewportBuilder::default()
+                let mut builder = egui::ViewportBuilder::default()
                     .with_title(POPUP_TITLE)
                     .with_decorations(false)
                     .with_always_on_top()
@@ -671,6 +653,10 @@ impl ZaloGuiApp {
                     .with_resizable(false)
                     .with_position(corner_pos)
                     .with_inner_size([popup_w, popup_h]);
+                #[cfg(target_os = "macos")]
+                {
+                    builder = builder.with_transparent(true);
+                }
 
                 let tid_cl = popup.thread_id.clone();
                 let s_name = popup.sender_name.clone();
@@ -702,13 +688,19 @@ impl ZaloGuiApp {
                         close_popup = true;
                     }
 
-                    let card_bg = pal.bg_elevated;
+                    let card_bg = pal.glass_elevated();
+                    let card_border = pal.glass_popup_border();
+                    let card_rounding = Rounding::same(if cfg!(target_os = "macos") {
+                        16.0
+                    } else {
+                        12.0
+                    });
                     egui::CentralPanel::default()
                         .frame(
                             egui::Frame::none()
                                 .fill(card_bg)
-                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                .rounding(Rounding::same(12.0))
+                                .stroke(Stroke::new(1.0_f32, card_border))
+                                .rounding(card_rounding)
                                 .inner_margin(Margin::symmetric(14.0, 10.0)),
                         )
                         .show(vp_ctx, |ui| {
@@ -1000,6 +992,7 @@ impl ZaloGuiApp {
                 self.selected_thread_index = idx;
                 self.unread_counts.remove(&tid);
             }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
@@ -2727,18 +2720,39 @@ impl ZaloGuiApp {
                                                             ui.label(RichText::new("Tối ưu hóa hiển thị đầy đủ ký tự tiếng Việt").color(pal.text_secondary).size(11.5));
                                                         });
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            let default_font_lbl = if cfg!(target_os = "macos") {
+                                                                "Mặc định (SF Pro / macOS)"
+                                                            } else {
+                                                                "Mặc định (Hệ thống)"
+                                                            };
                                                             let current_label = match self.settings.font_family.as_str() {
+                                                                "sf_pro_text" => "SF Pro Text (Apple)",
+                                                                "helvetica_neue" => "Helvetica Neue (macOS)",
+                                                                "be_vietnam_pro" => "Be Vietnam Pro",
                                                                 "segoe_ui" | "segoe" => "Segoe UI",
                                                                 "arial" => "Arial",
                                                                 "tahoma" => "Tahoma",
                                                                 "open_sans" => "Open Sans",
-                                                                _ => "Mặc định (Be Vietnam Pro)",
+                                                                _ => default_font_lbl,
                                                             };
                                                             egui::ComboBox::from_id_salt("appearance_font_family_combo")
                                                                 .selected_text(current_label)
                                                                 .width(190.0)
                                                                 .show_ui(ui, |ui| {
-                                                                    if ui.selectable_value(&mut self.settings.font_family, "default".into(), "Mặc định (Be Vietnam Pro)").changed() {
+                                                                    if ui.selectable_value(&mut self.settings.font_family, "default".into(), default_font_lbl).changed() {
+                                                                        font_changed = true;
+                                                                    }
+                                                                    if cfg!(target_os = "macos")
+                                                                        && ui.selectable_value(&mut self.settings.font_family, "sf_pro_text".into(), "SF Pro Text (Apple)").changed()
+                                                                    {
+                                                                        font_changed = true;
+                                                                    }
+                                                                    if cfg!(target_os = "macos")
+                                                                        && ui.selectable_value(&mut self.settings.font_family, "helvetica_neue".into(), "Helvetica Neue (macOS)").changed()
+                                                                    {
+                                                                        font_changed = true;
+                                                                    }
+                                                                    if ui.selectable_value(&mut self.settings.font_family, "be_vietnam_pro".into(), "Be Vietnam Pro").changed() {
                                                                         font_changed = true;
                                                                     }
                                                                     if ui.selectable_value(&mut self.settings.font_family, "open_sans".into(), "Open Sans").changed() {
@@ -3476,6 +3490,43 @@ impl ZaloGuiApp {
                                                             render_toggle_switch(ui, &mut self.settings.hidden_chat_pin_enabled, pal);
                                                         });
                                                     });
+                                                    ui.add_space(6.0);
+                                                    let status_txt = if !self.settings.hidden_chat_pin_hash.is_empty() {
+                                                        format!(
+                                                            "Đã bật mã PIN ({} trò chuyện ẩn) — nhập mã PIN vào ô Tìm kiếm để mở khoá.",
+                                                            self.settings.hidden_threads.len()
+                                                        )
+                                                    } else {
+                                                        "Chưa có mã PIN — đặt mã PIN (tối thiểu 4 ký tự) bên dưới:".to_string()
+                                                    };
+                                                    ui.label(RichText::new(status_txt).color(pal.text_secondary).size(11.8));
+                                                    if self.hidden_chats_unlocked {
+                                                        ui.add_space(6.0);
+                                                        if ui.button("🔒 Khoá trò chuyện ẩn ngay").clicked() {
+                                                            self.lock_hidden_chats();
+                                                            self.show_toast("🔒 Đã khoá lại trò chuyện ẩn");
+                                                        }
+                                                    }
+                                                    if self.settings.hidden_chat_pin_hash.is_empty() {
+                                                        ui.add_space(6.0);
+                                                        ui.horizontal(|ui| {
+                                                            ui.add(
+                                                                egui::TextEdit::singleline(&mut self.hidden_pin_draft)
+                                                                    .password(true)
+                                                                    .hint_text("Nhập mã PIN mới…")
+                                                                    .desired_width(150.0),
+                                                            );
+                                                            if ui.button("Lưu PIN").clicked()
+                                                                && self.hidden_pin_draft.trim().chars().count() >= 4
+                                                            {
+                                                                self.settings.hidden_chat_pin_hash =
+                                                                    crate::crypto::md5_hex(self.hidden_pin_draft.trim());
+                                                                self.hidden_pin_draft.clear();
+                                                                self.settings.save();
+                                                                self.show_toast("🔒 Đã lưu mã PIN cho trò chuyện ẩn");
+                                                            }
+                                                        });
+                                                    }
                                                 });
                                             ui.add_space(14.0);
 
@@ -8222,7 +8273,6 @@ impl ZaloGuiApp {
                     viewer.gallery_index = i;
                     self.prefetch_gallery_neighbours(&viewer);
                 }
-                // Opened from elsewhere (feed, media drawer…): browse just this photo.
                 None => {
                     viewer.gallery = vec![GalleryPhoto {
                         tex_key: viewer.tex_key.clone(),
@@ -8247,7 +8297,6 @@ impl ZaloGuiApp {
                 go_to = Some(viewer.gallery_index + 1);
             }
         }
-        // Thumbnail strip: up to 11 photos centred on the current one.
         let strip: Vec<(usize, Option<egui::TextureHandle>)> = if gallery_len > 1 {
             let half = 5usize;
             let start = viewer
@@ -8273,7 +8322,6 @@ impl ZaloGuiApp {
         }
 
         let screen_rect = ctx.screen_rect();
-        // Start below the 32px custom frameless title bar so window controls stay accessible
         let viewer_top = (screen_rect.top() + 32.0).min(screen_rect.bottom());
         let toolbar_h = 46.0_f32;
         let toolbar_rect = Rect::from_min_max(
@@ -9586,12 +9634,25 @@ impl ZaloGuiApp {
         egui::SidePanel::left("contacts_left_sidebar")
             .resizable(false)
             .exact_width(300.0)
-            .frame(
+            .show_separator_line(false)
+            .frame(if cfg!(target_os = "macos") {
                 egui::Frame::none()
-                    .fill(pal.bg_sidebar)
+                    .fill(pal.glass_sidebar())
+                    .rounding(Rounding::same(14.0))
+                    .outer_margin(Margin {
+                        left: 2.0,
+                        right: 6.0,
+                        top: 8.0,
+                        bottom: 8.0,
+                    })
+                    .stroke(Stroke::new(1.0_f32, pal.glass_border()))
+                    .inner_margin(Margin::symmetric(12.0, 14.0))
+            } else {
+                egui::Frame::none()
+                    .fill(pal.glass_sidebar())
                     .stroke(Stroke::new(1.0_f32, pal.border))
-                    .inner_margin(Margin::symmetric(12.0, 14.0)),
-            )
+                    .inner_margin(Margin::symmetric(12.0, 14.0))
+            })
             .show(ctx, |ui| {
                 // Search bar + Add friend / Create group buttons (matching Chat Sidebar header)
                 ui.horizontal(|ui| {
@@ -9601,7 +9662,7 @@ impl ZaloGuiApp {
                         ui.allocate_exact_size(Vec2::new(sbox_w, 32.0), Sense::hover());
                     let has_q = !self.contacts_search_query.is_empty();
                     ui.painter()
-                        .rect_filled(sbox_rect, Rounding::same(8.0), pal.bg_input);
+                        .rect_filled(sbox_rect, Rounding::same(8.0), pal.glass_input());
                     ui.painter().rect_stroke(
                         sbox_rect,
                         Rounding::same(8.0),
@@ -9610,7 +9671,7 @@ impl ZaloGuiApp {
                             if has_q {
                                 pal.primary.linear_multiply(0.65)
                             } else {
-                                pal.border
+                                pal.glass_control_border()
                             },
                         ),
                     );
@@ -9696,11 +9757,18 @@ impl ZaloGuiApp {
 
                 ui.add_space(12.0);
 
-                let active_row_bg = if pal.is_dark {
-                    Color32::from_rgb(28, 56, 98) // Solid dark Zalo blue highlight (like Zalo PC screenshot)
+                let active_row_bg = if cfg!(target_os = "macos") {
+                    pal.glass_selected()
+                } else if pal.is_dark {
+                    Color32::from_rgb(28, 56, 98)
                 } else {
                     Color32::from_rgb(229, 241, 255)
                 };
+                let row_rounding = Rounding::same(if cfg!(target_os = "macos") {
+                    10.0
+                } else {
+                    8.0
+                });
 
                 for (tab, icon, label) in [
                     (ContactsSubTab::Friends, lucide::USER, "Danh sách bạn bè"),
@@ -9725,10 +9793,16 @@ impl ZaloGuiApp {
                         .allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
                     if active {
                         ui.painter()
-                            .rect_filled(row_r, Rounding::same(8.0), active_row_bg);
+                            .rect_filled(row_r, row_rounding, active_row_bg);
+                        #[cfg(target_os = "macos")]
+                        ui.painter().rect_stroke(
+                            row_r,
+                            row_rounding,
+                            Stroke::new(1.0_f32, pal.glass_specular()),
+                        );
                     } else if row_resp.hovered() {
                         ui.painter()
-                            .rect_filled(row_r, Rounding::same(8.0), pal.bg_hover);
+                            .rect_filled(row_r, row_rounding, pal.glass_hover());
                     }
                     draw_lucide_icon(
                         ui.painter(),
@@ -9736,7 +9810,11 @@ impl ZaloGuiApp {
                         icon,
                         17.0,
                         if active {
-                            Color32::WHITE
+                            if pal.is_dark {
+                                Color32::WHITE
+                            } else {
+                                pal.primary
+                            }
                         } else {
                             pal.text_secondary
                         },
@@ -9747,7 +9825,11 @@ impl ZaloGuiApp {
                         label,
                         FontId::proportional(13.5),
                         if active {
-                            Color32::WHITE
+                            if pal.is_dark {
+                                Color32::WHITE
+                            } else {
+                                pal.primary_hover
+                            }
                         } else {
                             pal.text_primary
                         },
@@ -9761,7 +9843,11 @@ impl ZaloGuiApp {
 
         // 2. Main Central Directory Panel
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
+            .frame(egui::Frame::none().fill(if cfg!(target_os = "macos") {
+                Color32::TRANSPARENT
+            } else {
+                pal.glass_canvas()
+            }))
             .show(ctx, |ui| {
                 let (header_icon, header_title) = match self.contacts_sub_tab {
                     ContactsSubTab::Friends => (lucide::USER, "Danh sách bạn bè"),
@@ -9773,14 +9859,32 @@ impl ZaloGuiApp {
                 };
 
                 // Full-width Top Header Bar (stretches 100% across CentralPanel)
-                let (hdr_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 56.0), Sense::hover());
-                ui.painter()
-                    .rect_filled(hdr_rect, Rounding::ZERO, pal.bg_sidebar);
-                ui.painter().line_segment(
-                    [hdr_rect.left_bottom(), hdr_rect.right_bottom()],
-                    Stroke::new(1.0_f32, pal.border),
-                );
+                let (hdr_outer, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), if cfg!(target_os = "macos") { 64.0 } else { 56.0 }), Sense::hover());
+                let hdr_rect = if cfg!(target_os = "macos") {
+                    Rect::from_min_max(
+                        Pos2::new(hdr_outer.left() + 4.0, hdr_outer.top() + 8.0),
+                        Pos2::new(hdr_outer.right() - 10.0, hdr_outer.bottom() - 4.0),
+                    )
+                } else {
+                    hdr_outer
+                };
+                if cfg!(target_os = "macos") {
+                    ui.painter()
+                        .rect_filled(hdr_rect, Rounding::same(18.0), pal.glass_bar());
+                    ui.painter().rect_stroke(
+                        hdr_rect,
+                        Rounding::same(18.0),
+                        Stroke::new(1.0_f32, pal.glass_border()),
+                    );
+                } else {
+                    ui.painter()
+                        .rect_filled(hdr_rect, Rounding::ZERO, pal.glass_sidebar());
+                    ui.painter().line_segment(
+                        [hdr_rect.left_bottom(), hdr_rect.right_bottom()],
+                        Stroke::new(1.0_f32, pal.glass_border()),
+                    );
+                }
                 draw_lucide_icon(
                     ui.painter(),
                     Pos2::new(hdr_rect.left() + 30.0, hdr_rect.center().y),
@@ -9818,6 +9922,8 @@ impl ZaloGuiApp {
                                                 .filter(|t| {
                                                     t.is_group == want_group
                                                         && !t.name.contains("Cloud của tôi")
+                                                        && (self.hidden_chats_unlocked
+                                                            || !self.is_thread_hidden(t))
                                                         && matches_vn_query(
                                                             &t.name, &q_low, &q_fold,
                                                         )
@@ -10066,6 +10172,7 @@ impl ZaloGuiApp {
             });
     }
 
+    #[allow(dead_code)]
     pub(super) fn trigger_feed_timeline_load(&mut self) {
         if self.feed_loading_timeline {
             return;
@@ -10117,17 +10224,31 @@ impl ZaloGuiApp {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn render_feed_page(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         // Left Friends / Filter Sidebar (292px)
         egui::SidePanel::left("feed_friends_sidebar")
             .resizable(false)
             .exact_width(292.0)
-            .frame(
+            .show_separator_line(false)
+            .frame(if cfg!(target_os = "macos") {
                 egui::Frame::none()
-                    .fill(pal.bg_sidebar)
+                    .fill(pal.glass_sidebar())
+                    .rounding(Rounding::same(14.0))
+                    .outer_margin(Margin {
+                        left: 2.0,
+                        right: 6.0,
+                        top: 8.0,
+                        bottom: 8.0,
+                    })
+                    .stroke(Stroke::new(1.0_f32, pal.glass_border()))
+                    .inner_margin(Margin::symmetric(14.0, 14.0))
+            } else {
+                egui::Frame::none()
+                    .fill(pal.glass_sidebar())
                     .stroke(Stroke::new(1.0_f32, pal.border))
-                    .inner_margin(Margin::symmetric(14.0, 14.0)),
-            )
+                    .inner_margin(Margin::symmetric(14.0, 14.0))
+            })
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -10273,6 +10394,9 @@ impl ZaloGuiApp {
                                 Vec2::new(ui.available_width(), 52.0),
                                 Sense::click(),
                             );
+                            if !ui.is_rect_visible(row_rect) {
+                                continue;
+                            }
                             if is_sel {
                                 let active_bg = if pal.is_dark {
                                     Color32::from_rgb(28, 56, 98)
@@ -10345,20 +10469,42 @@ impl ZaloGuiApp {
 
         // Main Central Panel — Social Timeline Stream
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
+            .frame(egui::Frame::none().fill(if cfg!(target_os = "macos") {
+                Color32::TRANSPARENT
+            } else {
+                pal.glass_canvas()
+            }))
             .show(ctx, |ui| {
                 // Full-width Top Header Bar (54px)
-                let (hdr_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 54.0), Sense::hover());
-                ui.painter()
-                    .rect_filled(hdr_rect, Rounding::ZERO, pal.bg_sidebar);
-                ui.painter().line_segment(
-                    [
-                        Pos2::new(hdr_rect.left(), hdr_rect.bottom()),
-                        Pos2::new(hdr_rect.right(), hdr_rect.bottom()),
-                    ],
-                    Stroke::new(1.0_f32, pal.border),
-                );
+                let (hdr_outer, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), if cfg!(target_os = "macos") { 62.0 } else { 54.0 }), Sense::hover());
+                let hdr_rect = if cfg!(target_os = "macos") {
+                    Rect::from_min_max(
+                        Pos2::new(hdr_outer.left() + 4.0, hdr_outer.top() + 8.0),
+                        Pos2::new(hdr_outer.right() - 10.0, hdr_outer.bottom() - 4.0),
+                    )
+                } else {
+                    hdr_outer
+                };
+                if cfg!(target_os = "macos") {
+                    ui.painter()
+                        .rect_filled(hdr_rect, Rounding::same(18.0), pal.glass_bar());
+                    ui.painter().rect_stroke(
+                        hdr_rect,
+                        Rounding::same(18.0),
+                        Stroke::new(1.0_f32, pal.glass_border()),
+                    );
+                } else {
+                    ui.painter()
+                        .rect_filled(hdr_rect, Rounding::ZERO, pal.glass_sidebar());
+                    ui.painter().line_segment(
+                        [
+                            Pos2::new(hdr_rect.left(), hdr_rect.bottom()),
+                            Pos2::new(hdr_rect.right(), hdr_rect.bottom()),
+                        ],
+                        Stroke::new(1.0_f32, pal.glass_border()),
+                    );
+                }
                 let tab_inner = Rect::from_min_max(
                     Pos2::new(hdr_rect.left() + 24.0, hdr_rect.top() + 10.0),
                     Pos2::new(hdr_rect.right() - 24.0, hdr_rect.bottom() - 10.0),
@@ -10463,40 +10609,48 @@ impl ZaloGuiApp {
                     ui.set_width(col_w - 36.0);
                     if !prof.cover_url.is_empty() && !prof.cover_url.ends_with("/default") {
                         let ckey = format!("cov_{}", crate::crypto::md5_hex(&prof.cover_url));
-                        if !self.sticker_textures.contains_key(&ckey)
-                            && self.loading_stickers.insert(ckey.clone())
-                        {
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                    key: ckey.clone(),
-                                    url: prof.cover_url.clone(),
-                                });
-                            }
-                        }
-                        if let Some(tex) = self.sticker_textures.get(&ckey) {
-                            let w = ui.available_width();
-                            let resp = ui.add(
-                                egui::Image::new((tex.id(), Vec2::new(w, 180.0)))
-                                    .rounding(Rounding::same(10.0))
-                                    .sense(Sense::click()),
+                        let w = ui.available_width();
+                        let (r, resp) =
+                            ui.allocate_exact_size(Vec2::new(w, 180.0), Sense::click());
+                        if ui.clip_rect().expand(180.0).intersects(r) {
+                            queue_sticker_fetch(
+                                &self.sticker_textures,
+                                &mut self.loading_stickers,
+                                &self.failed_stickers,
+                                ckey.clone(),
+                                prof.cover_url.clone(),
                             );
-                            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                let hd = self.request_hd_texture(&prof.cover_url);
-                                self.image_viewer = Some(ImageViewerModal {
-                                    tex_key: ckey,
-                                    hd_tex_key: hd,
-                                    full_url: prof.cover_url.clone(),
-                                    title: format!("Ảnh bìa của {}", prof.display_name),
-                                    sender: prof.display_name.clone(),
-                                    time: String::new(),
-                                    zoom: 1.0,
-                                    pan: Vec2::ZERO,
-                                    gallery: Vec::new(),
-                                    gallery_index: 0,
-                                });
-                            }
-                            ui.add_space(12.0);
                         }
+                        if ui.is_rect_visible(r) {
+                            if let Some(tex) = self.sticker_textures.get(&ckey) {
+                                mark_texture_used(&ckey);
+                                ui.painter().image(
+                                    tex.id(),
+                                    r,
+                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+                            } else {
+                                ui.painter()
+                                    .rect_filled(r, Rounding::same(10.0), pal.bg_hover);
+                            }
+                        }
+                        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            let hd = self.request_hd_texture(&prof.cover_url);
+                            self.image_viewer = Some(ImageViewerModal {
+                                tex_key: ckey,
+                                hd_tex_key: hd,
+                                full_url: prof.cover_url.clone(),
+                                title: format!("Ảnh bìa của {}", prof.display_name),
+                                sender: prof.display_name.clone(),
+                                time: String::new(),
+                                zoom: 1.0,
+                                pan: Vec2::ZERO,
+                                gallery: Vec::new(),
+                                gallery_index: 0,
+                            });
+                        }
+                        ui.add_space(12.0);
                     }
                     ui.horizontal(|ui| {
                         let (av_r, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
@@ -10674,16 +10828,18 @@ impl ZaloGuiApp {
                     ui.horizontal(|ui| {
                         let (av_r, av_resp) =
                             ui.allocate_exact_size(Vec2::splat(42.0), Sense::click());
-                        paint_user_avatar(
-                            ui.painter(),
-                            av_r.center(),
-                            21.0,
-                            &item.author.display_name,
-                            false,
-                            Some(&item.author.avatar_url),
-                            &self.sticker_textures,
-                            &mut self.loading_stickers,
-                        );
+                        if ui.is_rect_visible(av_r) {
+                            paint_user_avatar(
+                                ui.painter(),
+                                av_r.center(),
+                                21.0,
+                                &item.author.display_name,
+                                false,
+                                Some(&item.author.avatar_url),
+                                &self.sticker_textures,
+                                &mut self.loading_stickers,
+                            );
+                        }
                         if av_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             select_uid = Some(item.author.uid.clone());
                         }
@@ -10740,16 +10896,6 @@ impl ZaloGuiApp {
                         if media_cnt == 1 {
                             let m = &item.media_list[0];
                             let mkey = format!("fmed_{}", crate::crypto::md5_hex(&m.thumbnail));
-                            if !self.sticker_textures.contains_key(&mkey)
-                                && self.loading_stickers.insert(mkey.clone())
-                            {
-                                if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                        key: mkey.clone(),
-                                        url: m.thumbnail.clone(),
-                                    });
-                                }
-                            }
                             let img_h = if m.width > 0 && m.height > 0 && avail_w.is_finite() {
                                 (avail_w * (m.height as f32 / m.width as f32)).clamp(200.0, 420.0)
                             } else {
@@ -10757,16 +10903,28 @@ impl ZaloGuiApp {
                             };
                             let (r, resp) =
                                 ui.allocate_exact_size(Vec2::new(avail_w, img_h), Sense::click());
-                            if let Some(tex) = self.sticker_textures.get(&mkey) {
-                                ui.painter().image(
-                                    tex.id(),
-                                    r,
-                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                    Color32::WHITE,
+                            if ui.clip_rect().expand(180.0).intersects(r) {
+                                queue_sticker_fetch(
+                                    &self.sticker_textures,
+                                    &mut self.loading_stickers,
+                                    &self.failed_stickers,
+                                    mkey.clone(),
+                                    m.thumbnail.clone(),
                                 );
-                            } else {
-                                ui.painter()
-                                    .rect_filled(r, Rounding::same(10.0), pal.bg_input);
+                            }
+                            if ui.is_rect_visible(r) {
+                                if let Some(tex) = self.sticker_textures.get(&mkey) {
+                                    mark_texture_used(&mkey);
+                                    ui.painter().image(
+                                        tex.id(),
+                                        r,
+                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                } else {
+                                    ui.painter()
+                                        .rect_filled(r, Rounding::same(10.0), pal.bg_hover);
+                                }
                             }
                             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                                 clicked_image = Some((
@@ -10783,33 +10941,38 @@ impl ZaloGuiApp {
                                 for m in item.media_list.iter().take(6) {
                                     let mkey =
                                         format!("fmed_{}", crate::crypto::md5_hex(&m.thumbnail));
-                                    if !self.sticker_textures.contains_key(&mkey)
-                                        && self.loading_stickers.insert(mkey.clone())
-                                    {
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                                key: mkey.clone(),
-                                                url: m.thumbnail.clone(),
-                                            });
-                                        }
-                                    }
                                     let (r, resp) = ui.allocate_exact_size(
                                         Vec2::new(cell_w, cell_w),
                                         Sense::click(),
                                     );
-                                    if let Some(tex) = self.sticker_textures.get(&mkey) {
-                                        ui.painter().image(
-                                            tex.id(),
-                                            r,
-                                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                            Color32::WHITE,
+                                    if ui.clip_rect().expand(180.0).intersects(r) {
+                                        queue_sticker_fetch(
+                                            &self.sticker_textures,
+                                            &mut self.loading_stickers,
+                                            &self.failed_stickers,
+                                            mkey.clone(),
+                                            m.thumbnail.clone(),
                                         );
-                                    } else {
-                                        ui.painter().rect_filled(
-                                            r,
-                                            Rounding::same(8.0),
-                                            pal.bg_input,
-                                        );
+                                    }
+                                    if ui.is_rect_visible(r) {
+                                        if let Some(tex) = self.sticker_textures.get(&mkey) {
+                                            mark_texture_used(&mkey);
+                                            ui.painter().image(
+                                                tex.id(),
+                                                r,
+                                                Rect::from_min_max(
+                                                    Pos2::ZERO,
+                                                    Pos2::new(1.0, 1.0),
+                                                ),
+                                                Color32::WHITE,
+                                            );
+                                        } else {
+                                            ui.painter().rect_filled(
+                                                r,
+                                                Rounding::same(8.0),
+                                                pal.bg_hover,
+                                            );
+                                        }
                                     }
                                     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                                         clicked_image = Some((
@@ -10990,27 +11153,29 @@ impl ZaloGuiApp {
                 ui.horizontal_wrapped(|ui| {
                     for item in &avatars_snap {
                         let tkey = format!("fava_{}", crate::crypto::md5_hex(&item.thumbnail));
-                        if !self.sticker_textures.contains_key(&tkey)
-                            && self.loading_stickers.insert(tkey.clone())
-                        {
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                    key: tkey.clone(),
-                                    url: item.thumbnail.clone(),
-                                });
-                            }
-                        }
                         let (r, resp) = ui.allocate_exact_size(Vec2::splat(130.0), Sense::click());
-                        if let Some(tex) = self.sticker_textures.get(&tkey) {
-                            ui.painter().image(
-                                tex.id(),
-                                r,
-                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                Color32::WHITE,
+                        if ui.clip_rect().expand(180.0).intersects(r) {
+                            queue_sticker_fetch(
+                                &self.sticker_textures,
+                                &mut self.loading_stickers,
+                                &self.failed_stickers,
+                                tkey.clone(),
+                                item.thumbnail.clone(),
                             );
-                        } else {
-                            ui.painter()
-                                .rect_filled(r, Rounding::same(8.0), pal.bg_input);
+                        }
+                        if ui.is_rect_visible(r) {
+                            if let Some(tex) = self.sticker_textures.get(&tkey) {
+                                mark_texture_used(&tkey);
+                                ui.painter().image(
+                                    tex.id(),
+                                    r,
+                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+                            } else {
+                                ui.painter()
+                                    .rect_filled(r, Rounding::same(8.0), pal.bg_hover);
+                            }
                         }
                         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             let hd = self.request_hd_texture(&item.url);

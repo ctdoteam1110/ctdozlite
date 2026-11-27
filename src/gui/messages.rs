@@ -581,10 +581,19 @@ pub(super) fn pick_native_folder_dialog_result(title: &str) -> FolderPick {
 /// because the system clipboard contains an image instead of UTF-8 text.
 pub(super) fn is_clipboard_paste_triggered(ctx: &egui::Context) -> bool {
     let egui_paste = ctx.input(|i| {
-        (i.modifiers.ctrl && i.key_pressed(Key::V))
+        ((i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(Key::V))
             || (i.modifiers.shift && i.key_pressed(Key::Insert))
             || i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
     });
+
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn ctdozlite_macos_take_paste_triggered() -> i32;
+        }
+        let mac_paste = unsafe { ctdozlite_macos_take_paste_triggered() != 0 };
+        return egui_paste || mac_paste;
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -615,7 +624,7 @@ pub(super) fn is_clipboard_paste_triggered(ctx: &egui::Context) -> bool {
         return egui_paste || edge_triggered;
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         egui_paste
     }
@@ -747,29 +756,25 @@ pub(super) fn read_clipboard_image_to_png(
     }
     #[cfg(target_os = "macos")]
     {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let tmp = std::env::temp_dir().join(format!("zalo_mac_clip_{now}.png"));
-        let tmp_str = tmp.to_str().unwrap_or("/tmp/zalo_mac_clip.png");
-        let script = format!(
-            "try\nset img to the clipboard as «class PNGf»\nset fp to open for access (POSIX file \"{tmp_str}\") with write permission\nset eof fp to 0\nwrite img to fp\nclose access fp\nreturn \"ok\"\non error\nreturn \"none\"\nend try"
-        );
-        if let Ok(out) = std::process::Command::new("osascript")
-            .args(["-e", &script])
-            .output()
-        {
-            let s = String::from_utf8_lossy(&out.stdout);
-            if s.trim() == "ok" && tmp.exists() {
-                if let Ok(bytes) = std::fs::read(&tmp) {
-                    let _ = std::fs::remove_file(&tmp);
-                    if let Ok(dyn_img) = image::load_from_memory(&bytes) {
-                        return finalize_clipboard_rgba_image(dyn_img.to_rgba8());
-                    }
+        extern "C" {
+            fn ctdozlite_macos_clipboard_image_png(out_len: *mut usize) -> *mut u8;
+            fn ctdozlite_macos_free_buf(ptr: *mut std::ffi::c_void);
+        }
+        let mut len: usize = 0;
+        let bytes = unsafe {
+            let ptr = ctdozlite_macos_clipboard_image_png(&mut len);
+            if ptr.is_null() || len <= 8 {
+                if !ptr.is_null() {
+                    ctdozlite_macos_free_buf(ptr.cast());
                 }
-                let _ = std::fs::remove_file(&tmp);
+                return None;
             }
+            let owned = std::slice::from_raw_parts(ptr, len).to_vec();
+            ctdozlite_macos_free_buf(ptr.cast());
+            owned
+        };
+        if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+            return finalize_clipboard_rgba_image(dyn_img.to_rgba8());
         }
         None
     }
@@ -1606,17 +1611,42 @@ fn append_md_run_to_job(
                 ..Default::default()
             },
         ),
-        InlineMdRun::Mention(s) => job.append(
-            s,
-            0.0,
-            egui::TextFormat {
-                font_id: FontId::proportional(base_size),
-                color: pal.link_text,
-                background: pal.primary.linear_multiply(0.14),
-                underline: Stroke::new(1.0_f32, pal.link_text.linear_multiply(0.6)),
-                ..Default::default()
-            },
-        ),
+        InlineMdRun::Mention(s) => {
+            let mention_fg = if pal.is_dark {
+                Color32::from_rgb(191, 219, 254)
+            } else {
+                pal.primary_hover
+            };
+            let mention_bg = if pal.is_dark {
+                Color32::from_rgba_premultiplied(28, 62, 108, 120)
+            } else {
+                Color32::from_rgba_unmultiplied(
+                    pal.primary_hover.r(),
+                    pal.primary_hover.g(),
+                    pal.primary_hover.b(),
+                    22,
+                )
+            };
+            job.append(
+                s,
+                0.0,
+                egui::TextFormat {
+                    font_id: FontId::proportional(base_size),
+                    color: mention_fg,
+                    background: mention_bg,
+                    underline: Stroke::new(
+                        1.0_f32,
+                        Color32::from_rgba_unmultiplied(
+                            mention_fg.r(),
+                            mention_fg.g(),
+                            mention_fg.b(),
+                            130,
+                        ),
+                    ),
+                    ..Default::default()
+                },
+            );
+        }
         InlineMdRun::Link { label, .. } => job.append(
             label,
             0.0,
@@ -2066,23 +2096,21 @@ pub(super) fn render_message_body(
                         .sense(Sense::click());
                     let resp = ui
                         .add(img)
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text("Bấm để xem ảnh phóng to trong ứng dụng");
+                        .on_hover_cursor(CursorIcon::PointingHand);
+                    let photo_hovered = is_pointer_over_media(ui, resp.rect);
                     ui.painter().rect_stroke(
                         resp.rect,
                         Rounding::same(12.0),
                         Stroke::new(
-                            if resp.hovered() { 1.6_f32 } else { 1.0_f32 },
-                            if resp.hovered() {
+                            if photo_hovered { 1.6_f32 } else { 1.0_f32 },
+                            if photo_hovered {
                                 pal.primary
                             } else {
                                 pal.border
                             },
                         ),
                     );
-                    // Pointer-in-rect rather than `hovered()`: the save button on top steals
-                    // hover, and the dimmed overlay should not flicker off under it.
-                    if ui.rect_contains_pointer(resp.rect) {
+                    if photo_hovered {
                         ui.painter().rect_filled(
                             resp.rect,
                             Rounding::same(12.0),
@@ -3445,11 +3473,33 @@ pub(crate) fn compute_video_thumb_size(tw: usize, th: usize, max_text_width: f32
     }
 }
 
+/// Checks whether the pointer is inside the visible portion of `rect` without being occluded by
+/// a modal, drawer, or context menu. Ignores `Order::Tooltip` layers so tooltips spawned over or
+/// near media thumbnails never cause alternating-frame hover flicker.
+fn is_pointer_over_media(ui: &egui::Ui, rect: Rect) -> bool {
+    let clipped = ui.clip_rect().intersect(rect);
+    if !clipped.is_positive() {
+        return false;
+    }
+    let Some(pos) = ui
+        .ctx()
+        .input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()))
+    else {
+        return false;
+    };
+    if !clipped.contains(pos) {
+        return false;
+    }
+    ui.ctx()
+        .layer_id_at(pos)
+        .is_none_or(|l| l == ui.layer_id() || l.order == egui::Order::Tooltip)
+}
+
 /// Round download button over the top-right corner of a photo or video, shown while the
 /// pointer is over `media_rect`. Registered after the media widget so it wins the click.
 /// Returns `true` when it was clicked.
 fn media_save_overlay(ui: &mut egui::Ui, media_rect: Rect, id: Id) -> bool {
-    if !ui.rect_contains_pointer(media_rect) {
+    if !is_pointer_over_media(ui, media_rect) {
         return false;
     }
     let size = (media_rect.width().min(media_rect.height()) * 0.4).clamp(18.0, 30.0);
@@ -3461,7 +3511,11 @@ fn media_save_overlay(ui: &mut egui::Ui, media_rect: Rect, id: Id) -> bool {
         .interact(btn, id, Sense::click())
         .on_hover_cursor(CursorIcon::PointingHand)
         .on_hover_text("Tải về máy (thư mục Downloads)");
-    let alpha = if resp.hovered() { 240 } else { 190 };
+    let alpha = if is_pointer_over_media(ui, btn) {
+        240
+    } else {
+        190
+    };
     ui.painter().circle_filled(
         btn.center(),
         size * 0.5,
@@ -4277,7 +4331,7 @@ fn render_photo_album_grid(
                         resp
                     }
                 };
-                if resp.hovered() {
+                if is_pointer_over_media(ui, resp.rect) {
                     ui.painter().rect_stroke(
                         resp.rect,
                         Rounding::same(6.0),
@@ -4306,7 +4360,6 @@ fn render_photo_album_grid(
                 }
                 let open_clicked = resp
                     .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text("Bấm để xem ảnh phóng to trong ứng dụng")
                     .clicked();
                 if save_clicked {
                     action = Some(BubbleAction::SaveMedia {
@@ -4798,7 +4851,7 @@ pub(super) fn render_chat_bubble(
                         pal.bg_elevated
                     }
                 } else {
-                    pal.bubble_out_bg
+                    pal.glass_bubble_out()
                 };
                 let stroke = if has_sticker || is_frameless_photo {
                     Stroke::NONE
@@ -4811,12 +4864,22 @@ pub(super) fn render_chat_bubble(
                         Color32::from_rgb(34, 197, 94).linear_multiply(0.55)
                     };
                     Stroke::new(1.2_f32, border_col)
+                } else if cfg!(target_os = "macos") {
+                    if pal.is_dark {
+                        Stroke::NONE
+                    } else {
+                        Stroke::new(1.0_f32, pal.glass_border())
+                    }
                 } else if !pal.is_dark {
                     Stroke::new(1.0_f32, Color32::from_rgb(199, 224, 255))
                 } else {
                     Stroke::NONE
                 };
-                let rounding = Rounding::same(12.0);
+                let rounding = Rounding::same(if cfg!(target_os = "macos") {
+                    16.0
+                } else {
+                    12.0
+                });
 
                 let mut card_action = None;
                 let mut quote_action = None;
@@ -4926,19 +4989,19 @@ pub(super) fn render_chat_bubble(
                     .ctx()
                     .data(|d| d.get_temp::<bool>(Id::new("chat_overlay_modal_open")))
                     .unwrap_or(false);
-                if dbl_reply_enabled
-                    && !modal_open
-                    && !has_interactive_card
-                    && !vanished
-                    && ui.input(|i| {
-                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                            && i.pointer.interact_pos().is_some_and(|p| {
-                                fr.response.rect.contains(p)
-                                    && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
-                            })
-                    })
-                {
-                    return Some(BubbleAction::Reply);
+                if dbl_reply_enabled && !modal_open && !has_interactive_card && !vanished {
+                    let dbl_click_pos = ui.input(|i| {
+                        i.pointer
+                            .button_double_clicked(egui::PointerButton::Primary)
+                            .then(|| i.pointer.interact_pos())
+                            .flatten()
+                    });
+                    if dbl_click_pos.is_some_and(|p| {
+                        fr.response.rect.contains(p)
+                            && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
+                    }) {
+                        return Some(BubbleAction::Reply);
+                    }
                 }
                 let hover_action = if !vanished && album.len() < 2 {
                     render_hover_reaction_bar(
@@ -4983,7 +5046,21 @@ pub(super) fn render_chat_bubble(
             } else {
                 thread_name
             };
-            let sender_accent = avatar_color_for(display_sender, false);
+            let raw_sender_accent = avatar_color_for(display_sender, false);
+            let sender_accent = if pal.is_dark {
+                let lift = |v: u8| -> u8 {
+                    ((v as f32) + (255.0 - v as f32) * 0.44)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
+                Color32::from_rgb(
+                    lift(raw_sender_accent.r()),
+                    lift(raw_sender_accent.g()),
+                    lift(raw_sender_accent.b()),
+                )
+            } else {
+                raw_sender_accent
+            };
 
             // Sender Avatar (only on first message of a consecutive group)
             if !prev_same_sender {
@@ -4999,7 +5076,7 @@ pub(super) fn render_chat_bubble(
                     loading_stickers,
                 );
             } else {
-                ui.add_space(30.0);
+                ui.add_space(30.0 + ui.spacing().item_spacing.x);
             }
 
             let fill = if has_sticker || is_frameless_photo {
@@ -5015,7 +5092,7 @@ pub(super) fn render_chat_bubble(
                     pal.bg_elevated
                 }
             } else {
-                pal.bubble_in_bg
+                pal.glass_bubble_in()
             };
             let stroke = if has_sticker || is_frameless_photo {
                 Stroke::NONE
@@ -5028,10 +5105,16 @@ pub(super) fn render_chat_bubble(
                     Color32::from_rgb(34, 197, 94).linear_multiply(0.55)
                 };
                 Stroke::new(1.2_f32, border_col)
+            } else if cfg!(target_os = "macos") {
+                Stroke::new(if pal.is_dark { 0.8_f32 } else { 1.0_f32 }, pal.glass_border())
             } else {
                 Stroke::new(1.0_f32, pal.bubble_in_border)
             };
-            let rounding = Rounding::same(12.0);
+            let rounding = Rounding::same(if cfg!(target_os = "macos") {
+                16.0
+            } else {
+                12.0
+            });
 
             ui.vertical(|ui| {
                 ui.set_max_width(total_bubble_w);
@@ -5052,8 +5135,10 @@ pub(super) fn render_chat_bubble(
                                 ui.label(
                                     RichText::new(truncate_chars(display_sender, 22))
                                         .color(sender_accent)
-                                        .size(12.0)
-                                        .strong(),
+                                        .font(FontId::new(
+                                            12.2,
+                                            crate::gui::theme::font_family_semibold(),
+                                        )),
                                 );
                                 ui.add_space(2.0);
                             }
@@ -5122,19 +5207,19 @@ pub(super) fn render_chat_bubble(
                     .ctx()
                     .data(|d| d.get_temp::<bool>(Id::new("chat_overlay_modal_open")))
                     .unwrap_or(false);
-                if dbl_reply_enabled
-                    && !modal_open
-                    && !has_interactive_card
-                    && !vanished
-                    && ui.input(|i| {
-                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                            && i.pointer.interact_pos().is_some_and(|p| {
-                                fr.response.rect.contains(p)
-                                    && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
-                            })
-                    })
-                {
-                    return Some(BubbleAction::Reply);
+                if dbl_reply_enabled && !modal_open && !has_interactive_card && !vanished {
+                    let dbl_click_pos = ui.input(|i| {
+                        i.pointer
+                            .button_double_clicked(egui::PointerButton::Primary)
+                            .then(|| i.pointer.interact_pos())
+                            .flatten()
+                    });
+                    if dbl_click_pos.is_some_and(|p| {
+                        fr.response.rect.contains(p)
+                            && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
+                    }) {
+                        return Some(BubbleAction::Reply);
+                    }
                 }
                 let hover_action = if !vanished && album.len() < 2 {
                     render_hover_reaction_bar(
@@ -5381,18 +5466,24 @@ pub(super) fn bubble_context_menu(
         .fixed_pos(pos)
         .show(ui.ctx(), |ui| {
             egui::Frame::none()
-                .fill(if pal.is_dark {
+                .fill(if cfg!(target_os = "macos") {
+                    pal.glass_elevated()
+                } else if pal.is_dark {
                     Color32::from_rgb(33, 37, 43)
                 } else {
                     Color32::WHITE
                 })
-                .stroke(Stroke::new(1.0_f32, pal.border))
-                .rounding(Rounding::same(8.0))
+                .stroke(Stroke::new(1.0_f32, pal.glass_popup_border()))
+                .rounding(Rounding::same(if cfg!(target_os = "macos") {
+                    12.0
+                } else {
+                    8.0
+                }))
                 .shadow(egui::epaint::Shadow {
-                    offset: Vec2::new(0.0, 4.0),
-                    blur: 16.0,
+                    offset: Vec2::new(0.0, 6.0),
+                    blur: 20.0,
                     spread: 0.0,
-                    color: Color32::from_black_alpha(if pal.is_dark { 130 } else { 45 }),
+                    color: Color32::from_black_alpha(if pal.is_dark { 155 } else { 52 }),
                 })
                 .inner_margin(Margin::symmetric(10.0, 10.0))
                 .show(ui, |ui| {
@@ -5989,9 +6080,11 @@ pub(super) fn render_hover_reaction_bar(
         .ctx()
         .input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
     let top_layer = pointer_pos.and_then(|p| ui.ctx().layer_id_at(p));
-    let pointer_hits_chat = top_layer.is_none_or(|l| l == ui.layer_id());
-    let pointer_hits_chat_or_bar =
-        top_layer.is_none_or(|l| l == ui.layer_id() || l == bar_layer_id);
+    let pointer_hits_chat =
+        top_layer.is_none_or(|l| l == ui.layer_id() || l.order == egui::Order::Tooltip);
+    let pointer_hits_chat_or_bar = top_layer.is_none_or(|l| {
+        l == ui.layer_id() || l == bar_layer_id || l.order == egui::Order::Tooltip
+    });
     let in_hover_zone =
         pointer_hits_chat_or_bar && pointer_pos.is_some_and(|p| hover_zone.contains(p));
     let in_bubble = pointer_hits_chat
