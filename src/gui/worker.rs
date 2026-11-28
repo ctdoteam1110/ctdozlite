@@ -1570,27 +1570,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     });
                 }
 
-                // 3) Periodic GitHub Releases API update checker (polls every 30 minutes)
-                {
-                    let gui_tx_upd = gui_tx.clone();
-                    let ctx_upd = egui_ctx.clone();
-                    tokio::spawn(async move {
-                        let mut ticker = tokio::time::interval(Duration::from_secs(30 * 60));
-                        // First tick fires immediately; skip it because ZaloGuiApp::new already
-                        // dispatches an initial CheckForUpdates on startup.
-                        ticker.tick().await;
-                        loop {
-                            ticker.tick().await;
-                            let res = fetch_github_latest_release().await;
-                            let _ = gui_tx_upd.send(GuiEvent::UpdateCheckFinished {
-                                result: res,
-                                silent: true,
-                            });
-                            ctx_upd.request_repaint();
-                        }
-                    });
-                }
-
                 // Inactive accounts keep a passive socket so they still notify (multi-account).
                 {
                     let gui_tx_bg = gui_tx.clone();

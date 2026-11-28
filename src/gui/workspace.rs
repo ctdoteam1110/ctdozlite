@@ -602,11 +602,7 @@ impl ZaloGuiApp {
                     }
 
                     // Bottom Action 2: Settings Modal Button
-                    let has_upd_badge = self
-                        .update_info
-                        .as_ref()
-                        .map(|u| u.has_update)
-                        .unwrap_or(false);
+                    let has_upd_badge = false;
                     let (set_rect, set_resp) =
                         ui.allocate_exact_size(Vec2::new(40.0, 40.0), Sense::click());
                     if self.settings_modal_open {
@@ -638,18 +634,7 @@ impl ZaloGuiApp {
                             pal.accent_online,
                         );
                     }
-                    let set_tip = if let Some(ref u) = self.update_info {
-                        if u.has_update {
-                            format!(
-                                "Cài đặt Zalo (🚀 Có bản cập nhật mới v{})",
-                                u.latest_version
-                            )
-                        } else {
-                            format!("Cài đặt Zalo (v{})", env!("CARGO_PKG_VERSION"))
-                        }
-                    } else {
-                        format!("Cài đặt Zalo (v{})", env!("CARGO_PKG_VERSION"))
-                    };
+                    let set_tip = format!("Cài đặt Zalo (v{})", env!("CARGO_PKG_VERSION"));
 
                     if set_resp
                         .on_hover_cursor(CursorIcon::PointingHand)
@@ -6669,6 +6654,7 @@ impl ZaloGuiApp {
                     // 1c-0. GitHub Release Update Available Notification Banner
                     if let Some(upd) = self.update_info.clone() {
                         if upd.has_update
+                            && self.update_downloading
                             && !self.update_banner_dismissed
                             && self.settings.skipped_update_version != upd.latest_version
                         {

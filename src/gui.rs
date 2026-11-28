@@ -1392,7 +1392,7 @@ impl Default for AppSettings {
             thread_labels: HashMap::new(),
             chat_folders: Vec::new(),
             active_chat_folder: String::new(),
-            auto_check_updates: true,
+            auto_check_updates: false,
             skipped_update_version: String::new(),
             proxy_url: String::new(),
             multi_profile_name: "acc2".into(),
@@ -2112,7 +2112,7 @@ impl ZaloGuiApp {
             update_status: String::new(),
             update_info: None,
             update_modal_open: false,
-            update_banner_dismissed: false,
+            update_banner_dismissed: true,
             last_notified_update_version: None,
             dev_mode,
             dev_panel_open: false,
@@ -2220,7 +2220,6 @@ impl ZaloGuiApp {
             } else {
                 let _ = wtx.send(WorkerCmd::RequestQr);
             }
-            let _ = wtx.send(WorkerCmd::CheckForUpdates { silent: true });
         }
         app
     }
@@ -4568,7 +4567,7 @@ impl ZaloGuiApp {
                                     && self.settings.skipped_update_version == info.latest_version;
                                 let already_notified = self.last_notified_update_version.as_deref()
                                     == Some(info.latest_version.as_str());
-                                if !is_skipped {
+                                if !silent && !is_skipped {
                                     self.show_toast(msg);
                                     if !already_notified || !silent {
                                         self.last_notified_update_version =
@@ -6063,7 +6062,7 @@ impl ZaloGuiApp {
                         buttons_left_x = th_rect.left();
 
                         if let Some(ref upd) = self.update_info {
-                            if upd.has_update && !compact_title_bar {
+                            if upd.has_update && self.update_downloading && !compact_title_bar {
                                 ui.add_space(6.0);
                                 let badge_txt = if self.update_downloading {
                                     let (dl, tot) = self.update_progress.unwrap_or((0, 0));
